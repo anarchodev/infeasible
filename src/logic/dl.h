@@ -54,6 +54,13 @@ void dl_add_fact(dl_theory *t, dl_lit fact);
 /* Atoms must all be interned before solving (the result is sized to the
  * intern table at call time). */
 dl_result *dl_solve(dl_theory *t);
+
+/* Experimental: same result as dl_solve via an order-independent worklist
+ * driver (no O(n^2) scan-order cliff; substrate for incremental global-tier
+ * re-solve). Currently regresses the dense scene-tier workload, so it is not
+ * the default -- see dl.c. */
+dl_result *dl_solve_wl(dl_theory *t);
+
 void       dl_result_free(dl_result *r);
 
 dl_verdict dl_definite(const dl_result *r, dl_lit q);    /* +Delta / -Delta */

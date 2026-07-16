@@ -28,6 +28,12 @@ foreach(t IN ITEMS test_dl test_world)
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
 
+# Solver micro-benchmark (not a test). Built -O2 regardless of build type so
+# the numbers reflect release codegen: `./build/bench_dl [natoms] [fanin] [iters]`.
+add_executable(bench_dl tests/bench_dl.c)
+target_link_libraries(bench_dl PRIVATE infeasible_core)
+target_compile_options(bench_dl PRIVATE -O2)
+
 if(INFEASIBLE_BUILD_APP)
   include(FetchContent)
   set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)

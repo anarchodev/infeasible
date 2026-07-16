@@ -123,12 +123,61 @@ static int test_strict_wins(void)
     return 0;
 }
 
+/* The two solve drivers must agree on every literal, on a theory that
+ * exercises facts, chains, a defeater, and superiority (team defeat). */
+static int test_drivers_agree(void)
+{
+    intern *sy = intern_new();
+    enum { N = 40 };
+    uint32_t a[N];
+    char buf[16];
+    for (int i = 0; i < N; i++) {
+        snprintf(buf, sizeof buf, "a%d", i);
+        a[i] = intern_id(sy, buf);
+    }
+
+    dl_theory *t = dl_theory_new(sy);
+    dl_add_fact(t, dl_pos(a[0]));
+    dl_add_fact(t, dl_pos(a[1]));
+    for (int i = 2; i < N; i++) {
+        /* a[i] normally follows from a[i-2]; a competing rule from a[i-1]
+         * argues the negation and is beaten by the supporting rule. */
+        dl_lit sup_body = dl_pos(a[i - 2]);
+        snprintf(buf, sizeof buf, "for%d", i);
+        int rf = dl_add_rule(t, buf, DL_DEFEASIBLE, dl_pos(a[i]), &sup_body, 1);
+        dl_lit att_body = dl_pos(a[i - 1]);
+        snprintf(buf, sizeof buf, "against%d", i);
+        int ra = dl_add_rule(t, buf, DL_DEFEASIBLE, dl_neg(a[i]), &att_body, 1);
+        if (i % 2 == 0)
+            dl_add_sup(t, rf, ra);   /* superiority only on some, to vary status */
+    }
+    /* a lone defeater with no supporting rule, to cover that path */
+    dl_lit d = dl_pos(a[3]);
+    dl_add_rule(t, "block", DL_DEFEATER, dl_neg(a[0]), &d, 1);
+
+    dl_result *s = dl_solve(t);
+    dl_result *w = dl_solve_wl(t);
+    for (uint32_t id = 0; id < intern_count(sy); id++) {
+        for (int neg = 0; neg < 2; neg++) {
+            dl_lit q = neg ? dl_neg(id) : dl_pos(id);
+            CHECK(dl_definite(s, q) == dl_definite(w, q));
+            CHECK(dl_defeasible(s, q) == dl_defeasible(w, q));
+        }
+    }
+    dl_result_free(s);
+    dl_result_free(w);
+    dl_theory_free(t);
+    intern_free(sy);
+    return 0;
+}
+
 int main(void)
 {
     if (test_tweety()) return 1;
     if (test_defeater()) return 1;
     if (test_unresolved_conflict()) return 1;
     if (test_strict_wins()) return 1;
+    if (test_drivers_agree()) return 1;
     printf("test_dl: all passed\n");
     return 0;
 }
