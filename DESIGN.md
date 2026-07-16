@@ -620,8 +620,8 @@ so they are decided *before* the syntax freezes.
    Rules declare a band; higher bands beat lower by default; explicit `>` is
    reserved for intra-band exceptions. Scope-depth superiority (§5.5) is one
    instance of the same principle. This is the largest authoring-throughput
-   lever and it is domain-specific, so it must be designed into the rule
-   grammar from the start.
+   lever and it is domain-specific, so it had to be designed before the
+   grammar freeze — done: §6.2.
 4. **Conflictable-pair detection at compile time.** Promote §9's item to Tier
    1: turn the *runtime* "conflict = authoring error" of §5.3 into a *build
    time* one — "rules A and B can both conclude `p` with no priority between
@@ -659,9 +659,105 @@ partition-checker error. The moment an author must think about `f'`, ergonomics
 has failed.
 
 **Milestone pull-in.** Items 1, 2, and 4 are M1 semantic-analysis passes and
-land with the parser. Item 3 is a rule-grammar decision and must be settled
-*before* the M1 grammar freeze. Items 5–8 track M2–M5 tooling but their data
-(traces, action log, dependency cones) already exists in the scaffold.
+land with the parser. Item 3 is settled (§6.2) and lands with the M1 grammar.
+Items 5–8 track M2–M5 tooling but their data (traces, action log, dependency
+cones) already exists in the scaffold.
+
+### 6.2 Priority bands (decided)
+
+The largest authoring-throughput lever (§6.1 item 3), now designed. Bands are
+**pure compile-time sugar over pairwise `>`**: a ladder compiles to
+superiority edges between rules that actually conflict (pairs the conflict
+analysis already computes), and the engine, the ABGM semantics, `dl_why`, and
+the M3 transformation pipeline never learn bands exist. Acyclicity is trivial
+within a ladder (total order); ladders, scope edges, and pairwise `>` all
+feed the single superiority relation, with one global acyclicity check over
+the union.
+
+```
+bands stat_stack: base < condition < feat < immunity
+
+rule dwarf_speed(X):  dwarf(X)                => speed(X) := 25   @base
+rule restrained(X):   restrained(X)           => speed(X) := 0    @condition
+rule freedom(X):      freedom_of_movement(X)  => ~(speed(X) := 0) @immunity
+```
+
+Decisions:
+
+- **Named, not numbered.** Numbered priorities are the z-index disease:
+  gap-numbering folklore, meaningless magnitudes. A declared ordered list of
+  names forces each tier to mean something, and reading `@condition` on a
+  rule states its defeat relationships against the whole family in one
+  token — the legibility payoff scattered pairwise edges can never give.
+- **Multiple ladders; comparability only within one.** Quest logic, combat
+  stats, and social state need not share a ladder. A conflict between rules
+  on different ladders, or banded vs. unbanded, is exactly as unresolved as
+  before bands existed: explicit `>` or contested. (CSS arrived at the same
+  fix in 2022: cascade layers are named, ordered, declared once, and
+  specificity competes only within a layer.)
+- **Unbanded rules are incomparable, never silently defaulted.** A default
+  band would let a rule's defeat behavior change because a ladder was
+  declared *elsewhere* — the non-local surprise §6.1 exists to prevent.
+  Instead the conflictable-pair pass gains a nudge: "rule X conflicts with
+  `@condition` rule Y but has no band; assign one or add `>`." Opt-in and
+  backwards compatible with every hand-built world.
+- **Explicit `>` is intra-band; contradicting a ladder is an error unless
+  annotated.** A silent ladder-inverting edge makes band annotations lies;
+  a hard ban forces band inflation or — worse — band *misassignment*, which
+  corrupts what tiers mean invisibly. The genuine need is the pair-scoped
+  exception-to-the-exception: Boots of Haste (`@base`) must beat Slow
+  (`@condition`) while still losing to Restrained (`@condition`) — a shape
+  band reassignment cannot express, since bands act uniformly against a
+  whole tier. So the sharp tool announces itself (the §5.5/defeater house
+  pattern):
+
+  ```
+  boots_of_haste > slow  overriding stat_stack
+  ```
+
+  Unannotated contradictions stay compile errors, so accidents — the common
+  case — are still caught; the annotation distinguishes intent. For the
+  annotated pair the ladder edge is suppressed and the pairwise edge
+  emitted; the boots still lose to Restrained via the ordinary ladder edge.
+  `dl_why` reports it distinctly: "beaten by `boots_of_haste` — explicit
+  override of `stat_stack`."
+- **The ladder name is mandatory: escape hatches must be claims, not
+  permissions.** `overriding stat_stack` is a checkable proposition — the
+  compiler errors if the edge doesn't actually contradict that ladder, so a
+  refactor that re-bands the rules makes the stale annotation an error
+  ("drop it") rather than letting it rot into blanket pre-authorization for
+  contradictions the author never saw ("this edge now contradicts
+  `speed_rules`, which your annotation doesn't cover"). A bare keyword would
+  inherit `!important`'s decay pattern: consent that outlives its reason.
+  What it does *not* inherit even bare is the arms race — edges name both
+  endpoints and counter-overrides are superiority cycles, already rejected.
+- **No override escalator.** There is no `!important` band. Beating
+  `@immunity` means declaring a band above it, visible in the ladder for
+  every future reader. Punctures that accumulate are a design smell surfaced
+  by tooling, not semantics: the compiler warns past a threshold
+  ("`stat_stack` is overridden 12 times; restructure the bands") — the
+  cardinality-warning philosophy applied to superiority.
+- **Scope-depth superiority (§5.5) slots in below bands**, as a tiebreak
+  between conflicting rules that bands did not decide (same band or both
+  unbanded), for rules that opted in. Explicit band assignment is louder
+  intent than lexical position. The opt-in form stays open until M4 (§12);
+  its precedence slot is reserved now, which is all the grammar needs.
+
+Prior art: CSS cascade layers (`@layer`) and `!important` as the
+anti-pattern, with the diagnosis above; clingo's weak-constraint priority
+levels (`[w@l]`); Grosof's courteous logic programs (prioritized conflict
+handling for rules at business scale, though pairwise); and the legal
+tradition — *lex superior* (constitution > statute > regulation) is a
+ladder, *lex specialis* is the scope tiebreak, and centuries of case law
+suggest the two-mechanism structure is stable.
+
+**Semantic-pass tests to pin it (M1):** a ladder generates edges only
+between conflicting pairs; the boots/Slow/Restrained triangle resolves as
+above; an unannotated ladder-contradicting `>` is an error naming both
+declarations; a stale `overriding` annotation is an error after re-banding;
+the 5e stack resolves dwarf speed under Restrained to 0 and back to 25
+under freedom of movement, with `dl_why` naming the band comparison at each
+step.
 
 ## 7. Runtime (C)
 
@@ -765,7 +861,8 @@ error doesn't cascade.
 - Scope-depth superiority (§5.5): should `encounter > area > world` be an
   opt-in a rule requests, a per-scope default an author can flip, or always
   explicit? Leaning opt-in-per-rule for `why?` transparency; revisit once M4
-  has real nested worlds to author against.
+  has real nested worlds to author against. Its precedence slot is now fixed
+  — a tiebreak *below* bands (§6.2); only the opt-in form remains open.
 
 ## 13. References
 
@@ -796,6 +893,13 @@ error doesn't cascade.
 - R. Evans, E. Short, *Versu — A Simulationist Storytelling System*, IEEE
   TCIAIG 6(2), 2014. (exclusion logic: multi-valued state as the core
   representation of a shipped narrative engine)
+- B. Grosof, *Prioritized Conflict Handling for Logic Programs*, ILPS 1997.
+  (courteous logic programs — rule priorities at business-rules scale)
+- W3C, *CSS Cascading and Inheritance Level 5*. (cascade layers: named
+  ordered tiers over an unmanageable pairwise system; `!important` is the
+  escape-hatch anti-pattern §6.2 refuses)
+- M. Gebser, R. Kaminski, B. Kaufmann, T. Schaub, *Answer Set Solving in
+  Practice*, Morgan & Claypool 2012. (weak-constraint priority levels)
 - Wizards of the Coast, *Magic: The Gathering Comprehensive Rules*, §613
   ("Interaction of Continuous Effects"). (fixed set-before-add pipeline for
   simultaneous effects; its timestamp system is the cautionary half)
