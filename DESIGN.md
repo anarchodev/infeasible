@@ -482,15 +482,81 @@ loop: primed-numeric cycles genuinely oscillate ("heal if `hp'<5`, curse if
 `hp'>=5`") and have no answer to converge to. A program with no primed
 numeric guards is the degenerate one-stratum case.
 
-Open (§12): concurrent numeric effects — two causal rules writing the same
-fluent in one step. Reject as conflict, or combine (additive fluents: Lee &
-Lifschitz 2003)? Must be settled before the M5 combat slice, which hits two
-damage sources on one tick on day one.
+**Concurrent effects: combine by operator class, never by order.** Two causal
+rules writing the same numeric fluent in one step (two damage sources on one
+tick) is normal gameplay, not an authoring error — but any answer that picks
+an order among *rules* (declaration order, commit order, timestamps) is the
+Osiris disease reintroduced. The resolution is a fixed order among operator
+*classes* — arithmetic precedence, not execution order — with order-*freedom*
+inside each class:
+
+- **Absolute effects (`:=`) are value conclusions.** "Set hp to 10" claims a
+  value exactly as `door=open` does, so `:=` effects compete under §5.7:
+  strict-team defeat, bands, superiority; two unresolved `:=`s on one fluent
+  = contested step, statically detectable as a conflictable pair. No new
+  semantics.
+- **Relative effects (`+=`, `-=`) combine by summation** (additive fluents:
+  Lee & Lifschitz 2003) — the genuinely new class, possible only because
+  numeric domains have group structure. Addition commutes, so contributions
+  from distinct rules sum order-free, and the `why?` trace is an itemized
+  receipt: "hp' = 5: base 12, −3 (goblin_stab), −4 (fire_aura)". A defeated
+  effect of either class contributes nothing (defeat is all-or-nothing).
+- **The pipeline** is global, fixed, and small: *base* (winning `:=`, else
+  inertia) → *Σ undefeated deltas* → *clamp to the fluent's declared range*
+  (`fluent hp : int in 0..20` — the schema is the outermost clamp, so
+  explicit min/max effects are rarely needed). Full-heal while standing in
+  fire gives full − 4, deterministically, every contribution named.
+- **Admissibility criterion for the closed operator set**: an effect operator
+  (or collision resolver) is admissible iff its combine is commutative and
+  associative. `sum`, `min`, `max` qualify; "first" and "latest" never do.
+  Multipliers get no `*=` stage — whether a game wants `(base+adds)×mult` or
+  `base×mult+adds` is game-specific, so multiplication lives in effect
+  *expressions*, where the author has parentheses.
+
+Prior art: MTG's layer system (Comprehensive Rules 613) resolves simultaneous
+continuous effects by a fixed global pipeline with *setting* effects before
+*additive* ones — set-before-add, shipped for decades in the most
+rules-lawyered game in existence. Its cautionary half is timestamps
+(order-among-rules within a layer, and exactly where the confusing judge
+calls live): we take the layer pipeline and refuse the timestamps. PDDL 2.1
+similarly forbids simultaneous `assign` + `increase`; superiority lets us be
+slightly more generous.
+
+**Escape hatches** — flexibility lives in *what* composes and *who wins*,
+never in *when* anything ran. Parentheses work in arithmetic because one
+author owns the whole expression; cross-rule composition has no such owner,
+so the hatches are shaped for strangers:
+
+1. *Within one rule*: effect RHSs are full expressions —
+   `causes hp := max(1, hp - damage)` — the parenthesis, for single-author
+   composition.
+2. *Suppression across rules*: defeat. "Heal ignores this tick's damage" is
+   the heal rule beating the damage rules (bands/superiority), already
+   traced by `why?`.
+3. *Per-fluent collision resolution*: a fluent may declare a commutative
+   resolver for same-stage `:=` collisions — `fluent speed : int combine min`
+   gives 5e's "two effects set your speed: the most restrictive applies".
+   Static, declared in one place, admissibility-checked, named in the trace.
+4. *Bespoke pipelines are modeled, not configured*: a real damage pipeline
+   (base → resistances → vulnerability → clamp) is written as derived
+   judgment values (`incoming_damage(X)` through the ordinary defeasible
+   layer, bands arbitrating modifiers) committed by a *single* effect — the
+   MTG move of writing CR 613 as rules. Costs no engine feature; `why?`
+   traces every stage because every stage is a rule.
+
+Deliberately not offered: per-rule stage reordering (recreates the conflict
+one level up), timestamps in any costume, and a content-configurable global
+pipeline (fixed stage order is why the system is learnable; MTG's pain is
+the timestamps, not the fixedness).
 
 **Golden tests to pin it:** the dying trigger concludes `dead'` in the same
 step as the damage, and the torch ramification cascades from it within that
 step; the heal/curse oscillator is rejected at compile time naming the cycle;
-a damage effect that crosses no threshold provably wakes no rules.
+a damage effect that crosses no threshold provably wakes no rules; two damage
+sources on one tick sum; heal-plus-fire yields full-minus-delta through the
+full pipeline (base, deltas, clamp exercised in one step); two unresolved
+`:=`s reject naming both rules; `combine min` resolves two speed-setters to
+the most restrictive; and the trace test asserts the itemized receipt.
 
 ### Invariants (compiler/engine enforced)
 
@@ -686,11 +752,12 @@ error doesn't cascade.
   abstraction + closed effect operators, integer-only, stratified primed
   guards (§5.8). Remaining M1 syntax details: the exact effect-operator set
   and domain-declaration surface.
-- Concurrent actions in one step: allowed (the step function already takes a
-  set) but needs author-facing conflict rules of thumb. The sharp case is
-  **concurrent numeric effects** on one fluent (§5.8): reject as conflict, or
-  combine à la additive fluents (Lee & Lifschitz 2003)? Settle before the M5
-  combat slice.
+- ~~Concurrent numeric effects~~ — **resolved** (§5.8): combine by operator
+  class through a fixed pipeline (base → Σ deltas → declared-range clamp);
+  `:=` competes as a value conclusion under §5.7; commutative-associative
+  admissibility gates the operator set; four static escape hatches, no
+  timestamps. Remaining rules of thumb for concurrent *actions* generally
+  (non-numeric interactions) still owed author-facing docs.
 - Ambiguity propagation variant: blocked for now (predictability); revisit if
   authors want "conflicting rumors" semantics.
 - Team defeat: currently on (matches intuition for "several weak reasons
@@ -729,5 +796,8 @@ error doesn't cascade.
 - R. Evans, E. Short, *Versu — A Simulationist Storytelling System*, IEEE
   TCIAIG 6(2), 2014. (exclusion logic: multi-valued state as the core
   representation of a shipped narrative engine)
+- Wizards of the Coast, *Magic: The Gathering Comprehensive Rules*, §613
+  ("Interaction of Continuous Effects"). (fixed set-before-add pipeline for
+  simultaneous effects; its timestamp system is the cautionary half)
 - Larian's Osiris: DOS2/BG3 modding documentation (community wiki).
 - inkle, *ink* — https://github.com/inkle/ink
