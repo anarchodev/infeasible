@@ -330,7 +330,8 @@ The integration splits along the EDB / provider line:
 
 **Functional fluents are the one new primitive this forces**, and they are
 now pinned: `at(X) : cell` is a multi-valued fluent (§5.7) over an entity
-domain. Closed-world (§5.3) generalizes from "`f` or `~f`" to "exactly one
+domain, store-backed per §5.8's implementation shape — one `uint32` per
+actor, never |cells| atoms. Closed-world (§5.3) generalizes from "`f` or `~f`" to "exactly one
 `at(X)=c` per tick"; inertia generalizes to "position persists unless a move
 fires" — Yale-shooting for coordinates, correct by the same construction.
 Space is the construct's first heavy consumer.
@@ -356,7 +357,9 @@ construction is 𝒞+'s multi-valued fluent constants (Giunchiglia et al. 2004):
 closed-world generalizes from "`f` or `~f`" to "exactly one `f=v`", and each
 fluent compiles to one propositional atom per domain value plus mutual
 exclusion — after compilation the engine is still propositional DL and Maher's
-linearity result still applies. Functional fluents (`at(X) : cell`, §5.6) are
+linearity result still applies. (That is the *semantics*; §5.8's
+implementation shape lets the compiler back a fluent with a value-store slot
+instead of atoms when no judgment rule concludes its values.) Functional fluents (`at(X) : cell`, §5.6) are
 this with an entity domain. Inertia gets *cheaper*, not more complex: since
 exactly one value holds, the step generates a single inertia instance per
 fluent — `f=v ⇒ f'=v` for the currently held `v` — with the usual
@@ -548,6 +551,39 @@ Deliberately not offered: per-rule stage reordering (recreates the conflict
 one level up), timestamps in any costume, and a content-configurable global
 pipeline (fixed stage order is why the system is learnable; MTG's pain is
 the timestamps, not the fixedness).
+
+**Implementation shape: the value store is entity-indexed arrays.**
+Interning makes the obvious "map" degenerate into something better: entity
+domains are finite and declared, ids are dense `uint32`s, so a one-key
+fluent (`hp(actor) : int`, `at(X) : cell`) is a flat array indexed by entity
+id, allocated once from the owning scope's arena at world build — no
+hashing, no allocation in the solve loop, teardown rides the scope's arena
+release (§5.5), and serialization is an integer array dump (I4-exact). Each
+fluent carries a second buffer: effects write `next[]`, commit swaps — the
+§5.3 logical double-buffer made literal on the numeric side. The key set is
+**frozen at build time**: a slot exists because a fluent and its keyed
+domain were declared; there is no runtime key insertion — dynamic vocabulary
+would break closed-world assembly and the orphan pass. Compound keys
+(`distance(X,Y)`) stay provider territory; store fluents take one entity key
+in M1.
+
+The store also generalizes §5.7's implementation: exactly-one-value fluents
+admit two faithful backings of the same semantics. *Logic-backed* — one atom
+per domain value plus exclusion — is required when judgment rules *conclude*
+values defeasibly mid-fixpoint (`stance(X) = aggressive` as a derived,
+defeatable judgment). *Store-backed* — one slot, with equality guards
+(`door = locked`) minted landmark-style only for the values rules actually
+mention — costs one word per instance, and loses nothing for writes because
+this section already resolves `:=` competition at the *rule* level, not the
+literal level: the winning causal rule's value lands in the slot at commit.
+The compiler chooses per fluent, invisibly (§6.1's cross-cutting rule):
+concluded by a judgment, or small domain → logic-backed; otherwise
+store-backed. The payoff case is §5.6's position fluent: logic-backed
+`at(X) : cell` over a real battlefield would mint |cells| atoms per actor
+plus exclusion — the blow-up the provider wall exists to prevent — while
+store-backed position is one `uint32` per actor, equality guards only for
+the rare named-cell rule ("anyone reaches the altar"), and the spatial index
+reads the array directly as its broadphase input.
 
 **Golden tests to pin it:** the dying trigger concludes `dead'` in the same
 step as the damage, and the torch ramification cascades from it within that
