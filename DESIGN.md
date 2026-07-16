@@ -96,6 +96,12 @@ Three tiers, one semantics:
   what are the next base facts?).
 - **Weave** compiles to a bytecode VM (later milestone). It cannot mutate
   facts except via `do <action>`.
+- The shape is **model–view–update with a logic database as the model**:
+  `world_step` is the reducer (inertia generated instead of hand-copied),
+  judgments are selectors (with proof trees), the weave and renderer are
+  pure views whose only write-back channel is `do action`, and wake-ups are
+  the subscription mechanism. Exact time travel (§6.1 item 6) falls out
+  because the action log is the save format.
 
 ### 4.1 Two-tier evaluation at scale
 
@@ -256,6 +262,15 @@ disappears, so there is nothing to carry inertia across the boundary — the
 frame problem (§5.3) never crosses a scope, because primed atoms are always
 same-scope. World fluents keep their inertia in the persistent tier. A scope's
 lifetime is therefore the lifetime of its declared fluents, no more.
+
+The same fact answers runtime creation: **spawning is scope instantiation.**
+Summons and reinforcements never insert vocabulary at runtime (key sets are
+frozen at build, §5.8); an encounter *template* scope declares its entities,
+and "summon" loads an instance — the vocabulary arrives whole,
+arena-allocated, and despawn is teardown. Dynamic creation without dynamic
+vocabulary. Instantiating a template more than once raises an
+entity-identity question (two wolves from one template need distinct ids) —
+open, §12.
 
 **Scope-depth superiority (opt-in).** When an inner rule and an outer rule
 conflict on the same head, the natural default is that the *more local* rule
@@ -567,6 +582,19 @@ would break closed-world assembly and the orphan pass. Compound keys
 (`distance(X,Y)`) stay provider territory; store fluents take one entity key
 in M1.
 
+Dense arrays are the base representation; a fluent may declare a
+**default** (`fluent terrain(cell) : tile default floor`), backing it with
+exceptions only — storage and serialization hold just the cells that
+differ, and the editor emits init facts only for the interesting ones.
+"Absent means default" is the closed-world assumption wearing storage
+clothes; dense vs. default-plus-exceptions is one more backing the compiler
+picks invisibly (by domain size and init density). This is what lets a
+pico-8-scale tile map — terrain as a store-backed fluent keyed by cell,
+mutable only through actions (destructible walls with inertia, exact
+replay, and `why?` traces), read directly by the renderer as its tilemap —
+live in the world model without ceremony, while sprite *pixels* stay out
+(§8).
+
 The store also generalizes §5.7's implementation: exactly-one-value fluents
 admit two faithful backings of the same semantics. *Logic-backed* — one atom
 per domain value plus exclusion — is required when judgment rules *conclude*
@@ -826,7 +854,23 @@ examples/  .story surface-language files
   changes, not database size. Never maintain non-monotonic conclusions
   incrementally — scope the recompute instead.
 - Crowds/presentation entities stay renderer-side; promotion into the fact
-  store is an explicit design act.
+  store is an explicit design act. The precise boundary: **assets stay out,
+  references may come in.** The store never holds pixels or geometry, but
+  `sprite(grunk) = 17` is an ordinary integer fact whose interpretation
+  lives renderer-side — the same indirection as `at(X) = cell` naming a
+  cell whose geometry lives in the provider. Static asset bindings are
+  edit-time init facts; *appearance as gameplay state* (disguise,
+  polymorph, visible wounds) is a fluent changed only by actions, with the
+  sprite index a derived judgment — so NPC rules and the renderer read the
+  same fact, and a disguise that fools NPCs necessarily fools the player.
+  No visual-desync bug class: there is no second copy of appearance to
+  desync.
+- **Presentation reads the store and judgments; it never writes** (the only
+  channel back into state is `do action`). The renderer is a query client
+  symmetric with the weave: the weave asks judgments and fires actions; the
+  renderer asks judgments and draws. Rendering runs per frame; solves run
+  per step — judgments recompute on base-fact change (wake-ups), so frames
+  read cached conclusions and pay nothing while nothing changes.
 
 ## 9. Tooling (first-class, built early)
 
@@ -839,6 +883,15 @@ examples/  .story surface-language files
 - These items are prioritized for authoring impact and mapped to milestones in
   §6.1 (`why not?` traces, orphan-atom detection, priority bands, and
   conflictable-pair detection are the Tier-1 set).
+- **Editors emit the surface language.** A map/scope editor's save format
+  is a `.story` module — entity declarations plus init facts (placements,
+  terrain exceptions, asset bindings); no side-channel binary formats, so
+  content is diffable, mergeable, and reviewable. An editor linking
+  `infeasible_core` runs the *real* solver against the map as it is edited:
+  place a goblin, watch `alerted` derive, ask `why?` — one semantics, no
+  second implementation approximating game behavior. Map edits change t=0
+  base facts and so invalidate old action logs; saves carry a content hash
+  and say so loudly rather than replaying divergence.
 - Later: rule hot-reload (sound because conclusions are derived), fact-store
   diff viewer between steps, dependency-graph visualization.
 
@@ -894,6 +947,10 @@ error doesn't cascade.
   authors want "conflicting rumors" semantics.
 - Team defeat: currently on (matches intuition for "several weak reasons
   jointly outweighed"); needs author-facing docs either way.
+- Template-scope identity (§5.5): spawning is scope instantiation, and
+  instantiating a template more than once needs distinct entity ids per
+  instance (two summoned wolves from one template). Decide the id scheme
+  (scope-qualified atoms?) with M4's module system.
 - Scope-depth superiority (§5.5): should `encounter > area > world` be an
   opt-in a rule requests, a per-scope default an author can flip, or always
   explicit? Leaning opt-in-per-rule for `why?` transparency; revisit once M4
