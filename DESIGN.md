@@ -89,7 +89,8 @@ Three tiers, one semantics:
 
 - **Fact store**: interned ground atoms; the single source of truth. Scalars
   (hp, gold) live in a value store beside the atoms; rules see them only
-  through evaluated guard literals (`hp(X) < 10`).
+  through evaluated guard literals (`hp(X) < 10`) — see §5.8 for the full
+  numeric design.
 - **Inference** runs in two modes over the same rule format: *query* mode
   (what is defeasibly provable now?) and *step* mode (given occurring actions,
   what are the next base facts?).
@@ -327,13 +328,12 @@ The integration splits along the EDB / provider line:
   as defeasible action theory is the GOAP research hole §2 rules out. The index
   and any pathing must be seeded and float-free to preserve I4.
 
-**Functional fluents are the one new primitive this forces**, and they are the
-scalar-fluent open question (§12) in another guise. Closed-world (§5.3)
-generalizes from "`f` or `~f`" to "exactly one `at(X)=c` per tick"; inertia
-generalizes to "position persists unless a move fires" — Yale-shooting for
-coordinates, correct by the same construction. Deciding functional fluents is
-owed to the design regardless; space is its first heavy consumer, so pin it
-before M1 fixes the fluent syntax.
+**Functional fluents are the one new primitive this forces**, and they are
+now pinned: `at(X) : cell` is a multi-valued fluent (§5.7) over an entity
+domain. Closed-world (§5.3) generalizes from "`f` or `~f`" to "exactly one
+`at(X)=c` per tick"; inertia generalizes to "position persists unless a move
+fires" — Yale-shooting for coordinates, correct by the same construction.
+Space is the construct's first heavy consumer.
 
 **Scale and scopes fit without new machinery.** The active map is a scene-tier
 concern; loaded actors' positions are scene facts. An encounter grid is a set
@@ -346,6 +346,151 @@ proximity rule fires iff the provider reports the actors within range, and
 recomputes when a move changes that range (I3); and a rule with no spatial
 anchor over a populated grid raises the cardinality warning rather than
 grounding the cross product.
+
+### 5.7 Multi-valued fluents and defeat across values
+
+Fluents generalize from booleans to **finite domains**: `door : { locked,
+closed, open }` declares a fluent whose value is exactly one element of its
+domain each tick; a boolean fluent is the two-element special case. The
+construction is 𝒞+'s multi-valued fluent constants (Giunchiglia et al. 2004):
+closed-world generalizes from "`f` or `~f`" to "exactly one `f=v`", and each
+fluent compiles to one propositional atom per domain value plus mutual
+exclusion — after compilation the engine is still propositional DL and Maher's
+linearity result still applies. Functional fluents (`at(X) : cell`, §5.6) are
+this with an entity domain. Inertia gets *cheaper*, not more complex: since
+exactly one value holds, the step generates a single inertia instance per
+fluent — `f=v ⇒ f'=v` for the currently held `v` — with the usual
+causal-beats-inertia superiority. Numeric fluents are **not** this construct;
+they never become atoms at all (§5.8).
+
+What 𝒞+ cannot decide for us — it has no superiority relation — is what
+defeat means among more than two competitors. Decisions:
+
+- **Attack = concludes a different value; team = concludes the same value.**
+  `+∂(f=a)` holds iff `+Δ(f=a)`, or: some strict/defeasible rule for `f=a` is
+  applicable, no other value is `+Δ`, and every rule concluding a different
+  value (or `~(f=a)`) is inapplicable or beaten by some applicable rule for
+  `f=a`. At `|domain| = 2` this is verbatim ABGM team defeat (§5.1) — the
+  existing golden suite pins the general definition automatically, and that
+  degeneration is the acceptance criterion for any implementation.
+- **Strict teams, not coalitions.** With three or more values it becomes a
+  real question whether an attacker of `a` may be beaten by a rule from a
+  *third* value's team ("coalition defeat"). Example: `r1 => f=a`,
+  `r2 => f=b`, `r3 => f=c`, with `r1 > r3 > r2` and no `r1 > r2` edge, all
+  applicable. Coalition semantics quietly proves `f=a` (`r3`, though itself
+  defeated, still beats `r2` on `a`'s behalf); strict teams reject the state
+  as contested. We choose **strict**: priority bands (§6.1 item 3) are totally
+  ordered, hence transitive, so for banded rules the highest applicable band
+  beats every attacker directly and the two semantics agree; the only programs
+  they disagree on are intransitive hand-written chains — almost always a
+  forgotten edge, which should be a legible error ("`r1` doesn't beat `r2` —
+  missing `r1 > r2`, or assign bands?") rather than a silently clever answer.
+  Same tiebreaker as §5.5: prefer the variant whose failure mode is legible.
+- **Negative heads are value-specific defeaters.** `~(f=v)` cannot be
+  *concluded* ("some other value" is a disjunction; DL has none) but is
+  coherent as an attacker: it conflicts with `f=v` and nothing else — not with
+  `f=u`. A rule with a negative head may win by superiority, and winning only
+  ever means blocking — so it *is* a defeater on that value; the surface forms
+  `~> f=v` and `=> ~(f=v)` collapse into one construct. The pattern this
+  enables: `sealed ~> ~(door=open)` blocks every open-rule, attacks nothing
+  else, and **inertia resolves the vacancy** — the door stays whatever it was.
+  Block + frame axiom compose into "unchanged", with no value forced.
+- **At most one value wins.** Under strict teams and acyclic superiority, two
+  values both `+∂` would each need to beat the other's applicable supporters —
+  a superiority cycle. The step function's read-off relies on this; the engine
+  asserts it. "No value `+∂`" remains the §5.3 contested-step error,
+  generalized.
+
+**Golden tests to pin it:** a multi-valued flip-flop (two causal rules force
+`door` to different values, no superiority → step rejected naming the fluent
+and both rules); the sealed door (defeater on one value + inertia keeps the
+current one); the intransitive chain above rejected as contested while the
+same three rules in bands 3/2/1 resolve cleanly (this pair *is* the
+strict-vs-coalition decision, made executable); and the boolean suite running
+unchanged over `{true, false}` domains.
+
+### 5.8 Numeric fluents: a value store, not a solver
+
+`hp(actor) : int` is *not* a big domain — numbers never become atoms. The
+prior art splits cleanly: single-valued fluents over small finite domains are
+solved (§5.7); unbounded numerics are never solved *inside* a grounded logic,
+only escaped. Bounded grounding (CCalc's declared `0..20` ranges) is the
+toy-problem regime; the mature systems (ASPMT / functional stable models —
+Bartholomew & Lee; Lee & Meng 2013) stop grounding and delegate arithmetic to
+an SMT solver. But a solver answers "what values would make this true?" — a
+search this engine never performs (§2 rules out planning). A game engine only
+asks "given these values, what is true?" — evaluation. So the numeric layer
+keeps the DPLL(T) *interface* — opaque guard atoms at the boundary — with a
+lookup where the solver would be:
+
+- **The value store is numeric EDB.** Base values are the only mutable
+  numeric state, written exclusively by step effects (I2); guard atoms are
+  derived, never stored (I1); a save is base facts + base values + action log
+  (I4). Scalars never enter the intern table.
+- **Landmark abstraction** (predicate abstraction: Graf & Saïdi 1997; quantity
+  spaces: Forbus 1984). The compiler harvests every comparison guard over a
+  numeric fluent — the predicate set *is* the set of guards the author wrote;
+  nothing to discover — and mints one guard atom per threshold per ground
+  instance. To the solver these are strict inputs: asserted closed-world each
+  evaluation (never UNDECIDED), usable as antecedents, never concluded by any
+  rule. On a value change the provider re-buckets (one binary search over the
+  fluent's sorted thresholds) and only the atoms that actually flipped root
+  invalidation cones (I3) — chip damage that crosses no threshold wakes no
+  rules.
+- **Generated entailment rules.** Thresholds are ordered constants, so the
+  compiler emits the ordering as strict rules (`hp<=0 -> hp<10`). Arithmetic
+  entailment becomes a finite strict chain: visible to defeat, traced by
+  `why?` like any rule, still linear. This is SMT-style theory propagation,
+  compiled statically. The same pass flags unsatisfiable guard conjunctions
+  (`hp<5 & hp>=10`) for free. Entailment across *different* fluents stays
+  invisible by design — if "badly wounded implies wounded" matters, the author
+  writes that rule. `why?` traces bottom out at the guard with the evaluated
+  value ("`hp(guard) < 10` — value store: 8"), so the moat has no hole at the
+  numeric boundary.
+- **Effects are a closed operator set** (PDDL 2.1-shaped: `:=`, `+=`, `-=`;
+  exact set is M1 syntax), executed against the value store at commit time.
+  Right-hand sides are expressions through an ordinary expression compiler —
+  constant folding, then bytecode on the same small VM as the weave (M2);
+  AOT-to-C stays open for shipping builds. **Integer/fixed-point only — no
+  floats in the core.** Cross-platform FP divergence (FMA contraction,
+  reassociation, libm variance) breaks exact replay, and threshold comparison
+  is a divergence *amplifier*: one ulp of drift flips a guard atom, which
+  flips a verdict, and the replay is a different story. Floats live on the
+  renderer side of the I4 wall, which is the same line as the raylib wall.
+- **The compiler may solve; the engine only evaluates.** Build-time
+  diagnostics (conflictable-pair witnesses §6.1 item 4, vacuous guards) are
+  satisfiability queries — cheap and decidable over finite interval
+  partitions. Determinism and the microsecond budget bind at runtime only.
+
+**Stratified primed numeric guards.** A tick is *evaluate* (arithmetic →
+guard-atom facts) → *propagate* (pure table-driven fixpoint, no arithmetic) →
+*commit* (effect arithmetic against the value store). A ramification guard
+over a *primed* numeric ("if `hp' <= 0` then `dead'`" — the dying trigger)
+breaks the sandwich: the guard needs next-state arithmetic mid-fixpoint.
+(Boolean ramifications are unaffected — the fixpoint is their evaluator; the
+problem is only that numeric guards are answered by a foreign oracle. Primed
+guards over *multi-valued* fluents — "if `door'=open` then …" — are likewise
+free: §5.7 fluents compile to propositional atoms, so the fixpoint evaluates
+them like any boolean; no stratification needed. A golden test pins this.)
+Decision — **layer it**, the same hammer as §5.2's cycle rejection: the
+compiler builds the dependency graph among numeric fluents through primed
+guards; if acyclic, it orders strata within one tick — settle every rule that
+can write `hp'`, compute `hp'`, assert its primed guard atoms, resume
+propagation downstream — so arithmetic still never runs *inside* a propagation
+stratum; the phases repeat per layer. If cyclic, compile error naming the
+loop: primed-numeric cycles genuinely oscillate ("heal if `hp'<5`, curse if
+`hp'>=5`") and have no answer to converge to. A program with no primed
+numeric guards is the degenerate one-stratum case.
+
+Open (§12): concurrent numeric effects — two causal rules writing the same
+fluent in one step. Reject as conflict, or combine (additive fluents: Lee &
+Lifschitz 2003)? Must be settled before the M5 combat slice, which hits two
+damage sources on one tick on day one.
+
+**Golden tests to pin it:** the dying trigger concludes `dead'` in the same
+step as the damage, and the torch ramification cascades from it within that
+step; the heal/curse oscillator is rejected at compile time naming the cycle;
+a damage effect that crosses no threshold provably wakes no rules.
 
 ### Invariants (compiler/engine enforced)
 
@@ -518,8 +663,10 @@ error doesn't cascade.
    golden tests (Yale shooting, cellar, torch ramification, conflict), raylib
    app shell with an interactive cellar demo.
 2. **M1 — language front half**: lexer + recursive-descent parser for
-   declarations/rules/actions; semantic checks; `cellar.story` compiles and
-   replaces the hand-built test worlds.
+   declarations/rules/actions; semantic checks; fluent syntax implements
+   §5.7–5.8 (domains, threshold harvesting, effect operators, guard
+   stratification); `cellar.story` compiles and replaces the hand-built test
+   worlds.
 3. **M2 — weave**: knot/choice/divert VM, text alternatives, guards, `do`;
    playable text cellar in raylib.
 4. **M3 — engine hardening**: Maher linear algorithm + transformation
@@ -534,13 +681,16 @@ error doesn't cascade.
 
 ## 12. Open questions
 
-- Scalar fluents: how much arithmetic lives in guards vs providers; syntax for
-  assignment effects (`causes hp(X) -= damage`). Includes **functional
-  fluents** (exactly-one-value, e.g. `at(X) : cell`, §5.6): closed-world and
-  inertia must generalize from `f`/`~f` to a single-valued domain, and space is
-  the first heavy consumer, so settle this before the M1 fluent syntax.
+- ~~Scalar and functional fluents~~ — **resolved**: multi-valued fluents with
+  strict-team defeat across values (§5.7); numerics via value store + landmark
+  abstraction + closed effect operators, integer-only, stratified primed
+  guards (§5.8). Remaining M1 syntax details: the exact effect-operator set
+  and domain-declaration surface.
 - Concurrent actions in one step: allowed (the step function already takes a
-  set) but needs author-facing conflict rules of thumb.
+  set) but needs author-facing conflict rules of thumb. The sharp case is
+  **concurrent numeric effects** on one fluent (§5.8): reject as conflict, or
+  combine à la additive fluents (Lee & Lifschitz 2003)? Settle before the M5
+  combat slice.
 - Ambiguity propagation variant: blocked for now (predictability); revisit if
   authors want "conflicting rumors" semantics.
 - Team defeat: currently on (matches intuition for "several weak reasons
@@ -564,5 +714,20 @@ error doesn't cascade.
   Causal Theories* (𝒞+), AIJ 2004.
 - M. Shanahan, *Solving the Frame Problem*, MIT Press 1997.
 - E. Mueller, *Commonsense Reasoning*, 2nd ed., 2014.
+- J. Lee, V. Lifschitz, *Describing Additive Fluents in Action Language C+*,
+  IJCAI 2003. (concurrent numeric effects that combine)
+- M. Bartholomew, J. Lee, *Stable Models of Formulas with Intensional
+  Functions*, KR 2012. (functional stable models / ASPMT)
+- J. Lee, Y. Meng, *Answer Set Programming Modulo Theories and Reasoning
+  about Continuous Changes*, IJCAI 2013. (𝒞+ over continuous domains via SMT)
+- M. Fox, D. Long, *PDDL2.1: An Extension to PDDL for Expressing Temporal
+  Planning Domains*, JAIR 20, 2003. (numeric effects as a closed operator set)
+- S. Graf, H. Saïdi, *Construction of Abstract State Graphs with PVS*,
+  CAV 1997, LNCS 1254. (predicate abstraction — §5.8's landmark guards)
+- K. Forbus, *Qualitative Process Theory*, AIJ 24, 1984. (quantity spaces:
+  numeric state as ordered landmark intervals)
+- R. Evans, E. Short, *Versu — A Simulationist Storytelling System*, IEEE
+  TCIAIG 6(2), 2014. (exclusion logic: multi-valued state as the core
+  representation of a shipped narrative engine)
 - Larian's Osiris: DOS2/BG3 modding documentation (community wiki).
 - inkle, *ink* — https://github.com/inkle/ink
