@@ -95,7 +95,8 @@ Three tiers, one semantics:
   (what is defeasibly provable now?) and *step* mode (given occurring actions,
   what are the next base facts?).
 - **Weave** compiles to a bytecode VM (later milestone). It cannot mutate
-  facts except via `do <action>`.
+  facts except via `do <action>` — and it is a *client* of the kernel, not
+  a tier above it; see §4.2.
 - The shape is **model–view–update with a logic database as the model**:
   `world_step` is the reducer (inertia generated instead of hand-copied),
   judgments are selectors (with proof trees), the weave and renderer are
@@ -115,6 +116,67 @@ Three tiers, one semantics:
   then recomputed defeasibly.
 
 This split is an optimization, not a second semantics — see §5.4.
+
+### 4.2 Kernel, driver, clients
+
+The tier diagram above is the *semantics*. The runtime architecture around
+it is a kernel with clients:
+
+```
+                driver (host loop — dumb transport)
+       player input ──┐          ┌── NPC intents (judgments)
+                      ▼          ▼
+                   action set ──► world_step
+                      ▲               │ commit; wake-ups
+       weave VM ──────┘ (proposes)    ▼
+       clients: weave VM · renderer · editor · debugger ◄── query / why?
+```
+
+- **The kernel is the world**: facts, rules, step, query. Two ports — ask
+  (query/`why?`) and do (actions). Nothing else exists at this layer.
+- **The driver decides nothing.** Someone must assemble each step's action
+  set; the driver is that owner, and it is deliberately dumb transport:
+  collect player input, read intent judgments (`wants_flee(X)` — NPC
+  decision-making stays in rules, where it is defeatable and
+  `why?`-traceable), assemble the set, call `world_step`, let clients
+  re-query. All reasoning lives in rules; the driver is a loop with no
+  opinions.
+- **The weave is a client, not a tier.** Ink itself is middleware — the
+  host calls `Continue()`, receives text, feeds back a choice index; it
+  never owns the loop. Ours is the same: the weave VM queries judgments,
+  emits text, offers guard-filtered choices, and *proposes* actions into
+  the driver's set — so a dialogue's `do` composes in one fixpoint with
+  everything else that tick (a guard shoved mid-sentence). It never calls
+  `world_step` itself.
+- **Weave state lives in the store** (decided): current knot and visit
+  counts are fluents mutated through generated actions, so the VM is
+  stateless between turns, narrative position survives saves, replays
+  exactly (I4), appears in the fact-store diff, and time travel covers
+  dialogue. Interruption is "stop pulling"; resumption is the next
+  `weave_continue`.
+- **Triggering runs both directions.** Host-initiated: input plus a gate
+  judgment (`can_parley`) → divert. Logic-initiated: rules conclude a scene
+  — `pending_scene(X) := guard_warning`, a multi-valued judgment whose
+  values are knots (interned atoms like everything else) — wake-ups flip
+  it, and the host diverts when presentation allows. Rules decide *which*
+  and *whether*; the host decides *when*; the weave decides what happens
+  inside. Competing scenes are conflicting rules arbitrated by bands
+  (`@quest` beats `@ambient`) — a drama manager for free, with proof
+  traces for "why did this scene fire?". Valve's response-rules system
+  (Ruskin, GDC 2012) is the shipped precedent: most-specific-match bark
+  selection is "specific beats general" as ad-hoc scoring; here it falls
+  out of superiority.
+- **The weave uses zero private APIs** — the acceptance test of this
+  layering. Everything the weave compiler and VM do (declare fluents,
+  register actions, emit synthetic guard rules, query, propose) goes
+  through the public surface any client gets; `world.h` already *is* that
+  surface, and the hand-built test worlds are the proof. Three supported
+  postures follow: no narrative layer at all (pure systemic sim); an
+  external dialogue engine that only queries and fires actions (its
+  conversation state then sits outside the save — a real loss, and its own
+  to accept); or a fact-store-backed custom engine using the same
+  externalized-state pattern as the weave, inheriting saves, replay, and
+  `why?`. The weave is the **reference client**, not a blessed one.
 
 ## 5. Logical foundations
 
@@ -823,6 +885,63 @@ the 5e stack resolves dwarf speed under Restrained to 0 and back to 25
 under freedom of movement, with `dl_why` naming the band comparison at each
 step.
 
+### 6.3 Compilation model: erasure and provenance
+
+The language is TypeScript-shaped: the C API (`world.h`) is the substrate —
+complete and hand-authorable; the golden tests build worlds by hand, and
+predate the language the way JS predates TS — and `.story` is optional
+tooling above it whose chief product is the *checker*. The failure mode of
+a fact database is silent (a misspelled atom is silently always false, like
+`undefined` propagating), and the Tier-1 passes are static confidence over
+that substrate: orphan detection is `noImplicitAny` for facts,
+conclusions-typed-distinctly (I1 as a type error) is `readonly`,
+conflictable-pair detection is exhaustiveness checking, cardinality
+warnings are the lint.
+
+One front end, two backends, one residue:
+
+- **Rules and declarations lower to data** — theory tables, schema, step
+  tables. Transpilation: the runtime executing them is the fixed engine.
+- **Weave blocks lower to bytecode** for the VM (§4.2). Its opcodes: emit
+  text, query a literal, offer choices, divert, propose an action. There is
+  no write-fact opcode and no assignment opcode — I1/I2 hold for the
+  narrative layer by *unrepresentability*, not by review.
+- **The stitching residue**: generated `at_knot`/visit-count fluents with
+  their implicit actions (§4.2), and **synthetic guard rules** — a compound
+  choice guard `{ a & ~b }` compiles to an anonymous judgment rule
+  concluding a fresh atom, so the guard op is a single-literal query.
+  Choice availability thereby inherits the entire diagnostic suite: typos
+  in narrative guards hit the orphan pass, and "why is this choice greyed
+  out?" is `dl_why` on the synthetic atom.
+
+**Erasure is a rule, not an accident:** no surface construct may require
+runtime representation beyond engine structures. Bands erase to pairwise
+edges (§6.2), thresholds to guard atoms and entailment rules (§5.8), types
+and vocabulary closure to nothing; the M3 pipeline erases defeaters and
+superiority within the logic itself. Weave bytecode is the one deliberate
+exception — a backend target, not a checked construct's runtime shadow.
+
+**Provenance is the source map, and it is an M1 hard deliverable.** The
+debugger is the product, and it will trace through machinery the author
+never wrote: generated inertia, band-expanded edges, generated entailments,
+synthetic guard rules, strata. A trace that says "beaten by rule
+`__gen_sup_417`" forfeits the moat. So every generated rule, atom, and edge
+carries its source span and generation reason in the compiled module, and
+`dl_why` renders in source terms: "beaten by `@immunity` over `@condition`
+(ladder `stat_stack`, combat5e.story:18)"; "inertia on `door` (generated;
+declared cellar.story:12)". §6.1's cross-cutting rule says authors never
+*write* the machinery; provenance is how they never have to *read* it
+either. (§5.4's declared scope interfaces are the `.d.ts` analog, consumed
+by M4's module system.)
+
+**The weave must not become a scripting language.** Every production
+narrative system grows "let me compute in the dialogue layer" requests; Ink
+grew variables, functions, and arithmetic, and it is the muddiest part of
+Ink. The refusal has a principled home: computation belongs in rules
+(truth) or providers (services), where it is declared, checked, and traced.
+The weave's poverty is load-bearing — the same §2 posture that refused
+logic-side Turing-completeness, applied to the narrative tier.
+
 ## 7. Runtime (C)
 
 ```
@@ -917,9 +1036,16 @@ error doesn't cascade.
    declarations/rules/actions; semantic checks; fluent syntax implements
    §5.7–5.8 (domains, threshold harvesting, effect operators, guard
    stratification); `cellar.story` compiles and replaces the hand-built test
-   worlds.
-3. **M2 — weave**: knot/choice/divert VM, text alternatives, guards, `do`;
-   playable text cellar in raylib.
+   worlds; provenance carried on every generated construct, rendered by
+   `dl_why` in source terms (§6.3).
+3. **M2 — client contract + weave**: define the public client contract —
+   the `world_*` API plus the externalized-state pattern (§4.2) — and ship
+   the weave as its first consumer: knot/choice/divert VM (bytecode per
+   §6.3), text alternatives, synthetic guard rules, `do` proposing into the
+   driver's action set, weave state as fluents; embedding API
+   (`weave_divert` / `weave_continue` / `weave_pending_actions`); playable
+   text cellar in raylib. A trivial second client in tests pins the
+   optionality claim the way golden tests pin semantics.
 4. **M3 — engine hardening**: Maher linear algorithm + transformation
    pipeline behind the same API; tick-time join matcher for variables/typed
    entities (until then: ground rules per entity by hand/codegen).
@@ -997,4 +1123,8 @@ error doesn't cascade.
   ("Interaction of Continuous Effects"). (fixed set-before-add pipeline for
   simultaneous effects; its timestamp system is the cautionary half)
 - Larian's Osiris: DOS2/BG3 modding documentation (community wiki).
+- E. Ruskin, *AI-driven Dynamic Dialog through Fuzzy Pattern Matching*,
+  GDC 2012. (Left 4 Dead response rules: most-specific-match dialogue
+  selection — "specific beats general" as ad-hoc scoring; §4.2's
+  `pending_scene` gets the same behavior from superiority, with traces)
 - inkle, *ink* — https://github.com/inkle/ink
