@@ -334,6 +334,30 @@ vocabulary. Instantiating a template more than once raises an
 entity-identity question (two wolves from one template need distinct ids) —
 open, §12.
 
+**Unloading is a reachability optimization, and it is provably invisible.**
+§5.4's argument — dependency is monotonic, scopes are dependency-closed —
+was made to justify scoped *recompute*; it extends verbatim to *existence*:
+if no in-scope evaluation can reach an unloaded scope's facts except
+through its interface, not loading it is unobservable. **A scope at rest is
+its interface facts.** The area exports `gate_open`; while unloaded, that
+fact lives on in the outer tier and outer rules keep working, while the
+interior facts do not exist in memory — virtual-memory semantics for the
+fact base, with the interface as the resident set. Unloading is nearly
+free, and I1 is why: the persistent footprint is base facts and values
+only (conclusions recompute on reload; rules and bytecode are static
+content), so suspension is "serialize a few arrays, release the arena."
+And the optimization is *checked*: a rule reaching past an interface is a
+compile-time partition violation, not a runtime "actor not found" — the
+bug class where open-world engines bleed. One dependency graph now serves
+four masters: wake-ups (§4.1), partition checking (§5.4), load soundness
+(here), and the LSP's cone queries (§6.1 item 7). Prior art: region-based
+memory management (Tofte & Talpin) — lifetimes as lexical regions,
+whole-region deallocation, statically checked escapes. Arena-per-scope
+plus the closure check is region typing for facts, and the classic
+region-incompatibility weakness (a value that must outlive its region) is
+answered here by escalation *copying outward* through a declared action
+rather than referencing inward.
+
 **Scope-depth superiority (opt-in).** When an inner rule and an outer rule
 conflict on the same head, the natural default is that the *more local* rule
 wins: `encounter > area > world`. This is the logical form of D&D's "specific
@@ -684,6 +708,55 @@ full pipeline (base, deltas, clamp exercised in one step); two unresolved
 `:=`s reject naming both rules; `combine min` resolves two speed-setters to
 the most restrictive; and the trace test asserts the itemized receipt.
 
+### 5.9 Spawning: pools, scopes, counts, promotion
+
+Vocabulary is closed — atoms interned at build, value-store arrays sized to
+declared domains, rules ground per entity, replay logs referencing stable
+ids — so nothing ever mints identity at runtime. The rule: **new instances
+of prebaked kinds, arriving only at load boundaries — never new kinds, and
+never mid-fixpoint.** Every engine lives this discipline somewhere (Quake's
+fixed edict array, object pools, "no malloc in the frame loop"); here the
+capacity is declared and checkable instead of a `#define` that fails by
+corruption. Four mechanisms, chosen by what kind of thing spawns:
+
+1. **Pools — same-scope spawning.** `entity goblin[8] : actor` (sugar for
+   `goblin_1..goblin_8`) plus an `active(X)` fluent; spawning is an
+   ordinary action (`causes active(goblin_3) & at(goblin_3) := gate &
+   hp(goblin_3) := 7`), so inertia, saves, replay, and `why?` see a normal
+   fluent flip. Inactive members cost memory and grounding size, not tick
+   time: no facts, no joins (M3). Pool exhaustion is a detectable,
+   traceable condition, and the declared bound feeds the §8 budget and the
+   cardinality estimates. Recycling a slot is a spawn action with a
+   complete effect list (compiler sugar: `reset(X)`); replay stays exact
+   because the reset is in the log. Tooling should display generation
+   counters so two "lives" of `goblin_3` read distinctly — semantics needs
+   none.
+2. **Scope instantiation — encounter-lifetime spawning** (§5.5). A summon
+   loads an instance of a template scope; the vocabulary arrives whole,
+   grounding happens at the load boundary (never mid-fixpoint), and
+   despawn is arena teardown. Template identity is the §12 question.
+3. **Counts — fungible items are not entities.** Identity is the expensive
+   thing; grant it only when a rule must track *this one* rather than *how
+   many*. Loot is `causes potions(X) += 1` on a numeric fluent (§5.8);
+   only distinct items (the rusty key, a named artifact) need entity-hood,
+   and those are authored, not spawned.
+4. **Promotion — binding clutter to a slot.** §8's renderer-side crowds
+   get logical existence by binding to a pool member the moment a rule
+   first needs to reason about one, and demote back after.
+
+Spawn *decisions* (encounter rolls, loot tables) are seeded-provider
+answers feeding an action — never wall-clock or unseeded RNG (I4) — so the
+roll is in the log and replay reproduces the ambush.
+
+Honest fit: this suite covers the BG3-shaped target (authored worlds,
+bounded encounters, story entities). Unbounded procedural spawning
+(roguelike floors, survival hordes) would lean hard on pool recycling —
+the same trade Osiris made, accepted for the same reason.
+
+**Golden test to pin it:** spawn from a pool, act, despawn, respawn the
+slot; replay from the log reproduces every state exactly, and the
+exhausted-pool condition reports rather than corrupts.
+
 ### Invariants (compiler/engine enforced)
 
 - **I1 — No write-back.** Derived conclusions are never stored as base facts.
@@ -1021,6 +1094,11 @@ examples/  .story surface-language files
   same fact, and a disguise that fools NPCs necessarily fools the player.
   No visual-desync bug class: there is no second copy of appearance to
   desync.
+- Memory model of a shipped game: the world tier always resident; areas
+  paged in and out at their interfaces (§5.5 — a scope at rest is its
+  interface facts); encounters ephemeral in arenas; pools (§5.9) bounding
+  concurrent identity within each. Pay-for-what-you-touch, provably
+  invisible to the semantics.
 - **Presentation reads the store and judgments; it never writes** (the only
   channel back into state is `do action`). The renderer is a query client
   symmetric with the weave: the weave asks judgments and fires actions; the
@@ -1157,6 +1235,9 @@ error doesn't cascade.
 - R. Evans, E. Short, *Versu — A Simulationist Storytelling System*, IEEE
   TCIAIG 6(2), 2014. (exclusion logic: multi-valued state as the core
   representation of a shipped narrative engine)
+- M. Tofte, J.-P. Talpin, *Region-Based Memory Management*, Information
+  and Computation 132(2), 1997. (arena-per-scope + dependency-closure
+  checking is region typing for facts, §5.5)
 - B. Grosof, *Prioritized Conflict Handling for Logic Programs*, ILPS 1997.
   (courteous logic programs — rule priorities at business-rules scale)
 - W3C, *CSS Cascading and Inheritance Level 5*. (cascade layers: named
