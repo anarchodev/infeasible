@@ -495,23 +495,36 @@ defeat means among more than two competitors. Decisions:
   coherent as an attacker: it conflicts with `f=v` and nothing else — not with
   `f=u`. A rule with a negative head may win by superiority, and winning only
   ever means blocking — so it *is* a defeater on that value; the surface forms
-  `~> f=v` and `=> ~(f=v)` collapse into one construct. The pattern this
-  enables: `sealed ~> ~(door=open)` blocks every open-rule, attacks nothing
-  else, and **inertia resolves the vacancy** — the door stays whatever it was.
-  Block + frame axiom compose into "unchanged", with no value forced.
+  `~> f=v` and `=> ~(f=v)` collapse into one construct. **Corrected by the
+  golden tests** (`tests/test_multival.c`): the originally-claimed pattern —
+  `sealed ~> ~(door=open)` blocks the open-rule and *inertia keeps the door
+  as it was* — is **not** what the propositional erasure gives. The blocked
+  rule's sibling shadows (`~locked'`) remain applicable and still defeat
+  inertia, so block + frame axiom compose into a **contested step**, not
+  "unchanged". The authoring pattern that does keep state is a
+  requires-condition (`requires ~sealed`): an inapplicable rule withdraws
+  its whole family, and inertia holds. Whether the M1 multi-valued step
+  should *make* the defeater version behave as first described — a defeated
+  value conclusion withdrawing its entire effect family — is an open
+  semantic decision (§12).
 - **At most one value wins.** Under strict teams and acyclic superiority, two
   values both `+∂` would each need to beat the other's applicable supporters —
   a superiority cycle. The step function's read-off relies on this; the engine
   asserts it. "No value `+∂`" remains the §5.3 contested-step error,
   generalized.
 
-**Golden tests to pin it:** a multi-valued flip-flop (two causal rules force
-`door` to different values, no superiority → step rejected naming the fluent
-and both rules); the sealed door (defeater on one value + inertia keeps the
-current one); the intransitive chain above rejected as contested while the
-same three rules in bands 3/2/1 resolve cleanly (this pair *is* the
-strict-vs-coalition decision, made executable); and the boolean suite running
-unchanged over `{true, false}` domains.
+**Golden tests — implemented in `tests/test_multival.c`** via the erasure
+encoding (per-value atoms; rule families with same-body shadows against
+sibling values; mirrored superiority; exactly-one-value facts; no strict
+exclusion axioms, which would cycle): the multi-valued flip-flop (step
+rejected, state untouched; single writer commits exactly-one); the sealed
+door **pair** (defeater version pins the contested outcome above;
+requires-condition version pins state preservation); the intransitive chain
+leaving no value provable — with the deadlock landing exactly on the
+would-be winner, which is why "add `r1 > r2`" is the right compile
+diagnostic — while bands 3/2/1 resolve cleanly with at most one winner (the
+strict-vs-coalition decision, executable); and two-value domains collapsing
+to the boolean suite's behavior.
 
 ### 5.8 Numeric fluents: a value store, not a solver
 
@@ -707,6 +720,11 @@ sources on one tick sum; heal-plus-fire yields full-minus-delta through the
 full pipeline (base, deltas, clamp exercised in one step); two unresolved
 `:=`s reject naming both rules; `combine min` resolves two speed-setters to
 the most restrictive; and the trace test asserts the itemized receipt.
+*Status*: the guard-boundary half (threshold entailment chains; guard atoms
+as closed-world strict inputs, never UNDECIDED) is pinned in
+`tests/test_landmark.c`; the pipeline, dying-trigger, and oscillator tests
+await the M1 value store and are listed in that file's header so the gap
+stays visible.
 
 ### 5.9 Spawning: pools, scopes, counts, promotion
 
@@ -755,7 +773,11 @@ the same trade Osiris made, accepted for the same reason.
 
 **Golden test to pin it:** spawn from a pool, act, despawn, respawn the
 slot; replay from the log reproduces every state exactly, and the
-exhausted-pool condition reports rather than corrupts.
+exhausted-pool condition reports rather than corrupts. *Status*: the
+lifecycle, recycle-reset, inactive-member inertia, and exact-replay tests
+are pinned in `tests/test_spawn.c` (including the stale-flag-on-inactive-
+slot behavior that motivates the reset rule); exhaustion reporting is
+compiler surface and awaits M1.
 
 ### Invariants (compiler/engine enforced)
 
@@ -1196,6 +1218,15 @@ error doesn't cascade.
   authors want "conflicting rumors" semantics.
 - Team defeat: currently on (matches intuition for "several weak reasons
   jointly outweighed"); needs author-facing docs either way.
+- Defeated-family withdrawal (§5.7, found by `tests/test_multival.c`):
+  should a causal rule whose value conclusion is defeated (e.g. by a
+  value-specific defeater) withdraw its *entire* effect family, so that
+  "sealed blocks open, inertia keeps locked" works as prose intended? Under
+  the pure erasure it does not — the sibling shadows still fire and the
+  step contests. Options: rule-level family withdrawal in the M1
+  multi-valued step (matches §5.8's rule-level `:=` framing), or keep the
+  erasure semantics and teach the pattern as a requires-condition. Decide
+  with the M1 step implementation.
 - Template-scope identity (§5.5): spawning is scope instantiation, and
   instantiating a template more than once needs distinct entity ids per
   instance (two summoned wolves from one template). Decide the id scheme
