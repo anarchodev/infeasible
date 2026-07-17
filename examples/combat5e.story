@@ -140,5 +140,5 @@ rule death_drop(X: actor, T: item):
 //   wants_flee(grunk)     -> the goblin's own intent judgment; the driver
 //                            may act on it without player input
 //   dead(grunk)           -> end the encounter
-// This slice is deliberately weave-free: it is the proof that a game is
-// buildable on judgments + actions alone (§11, M5).
+// This slice is the proof that a game is buildable on judgments + actions
+// alone, with no narrative layer (§11, M5).

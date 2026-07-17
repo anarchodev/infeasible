@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `infeasible` is a narrative game engine in C where **the world is a logic database**. One non-monotonic logic (propositional *defeasible logic*) serves as the single semantics for both *what is true* (stats, judgments) and *what happens next* (state transitions via defeasible inertia). Games are built as host code against a generated, vocabulary-checked C API; raylib handles presentation.
 
-**A narrative/dialogue layer is explicitly out of scope** (DESIGN.md §12.1). An Ink-style "weave" was designed and then removed to keep the project focused on the rules engine. Do not reintroduce weave concepts — knots, choices, diverts, a narrative VM — into the design or code; §12.1 records the seam it would reattach at if it ever returns.
+**A narrative/dialogue layer is out of scope** (DESIGN.md §2). Games are built as host code against the generated, vocabulary-checked C header (§6.3). Do not add narrative concepts — knots, choices, diverts, a dialogue VM — to the design or code; a narrative front end, if ever built, is a client above the `world_*` surface, not part of the engine.
 
 **Read `DESIGN.md` before non-trivial work** — it is the source of truth for semantics, invariants, and the milestone plan. The current tree is **M0 (scaffold)**: core + logic engine + step function + golden tests + raylib shell. The `.story` language and its parser do **not exist yet** (M1). `examples/cellar.story` is a sketch of the *future* surface syntax, not something that compiles today — worlds are built via the C API.
 

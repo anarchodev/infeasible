@@ -5,8 +5,8 @@ rules for judgments, defeasible inertia for change, and host code driving it
 through a generated, vocabulary-checked API. raylib for presentation, CMake
 for builds.*
 
-*A narrative/dialogue layer is deliberately **out of scope** — see §12.1 for
-the seam it reattaches at. Everything below is the rules engine.*
+*A narrative/dialogue layer is deliberately **out of scope** (§2). Everything
+below is the rules engine.*
 
 ---
 
@@ -32,8 +32,7 @@ ad-hoc flag system can offer.
 **Goals**
 
 - One custom language (working name: `.story` files) spanning two layers:
-  declarations + rules, and actions. The language is complete without a
-  narrative layer; §12.1 records the seam one would attach at.
+  declarations + rules, and actions.
 - Defeasible logic as the *only* inference semantics; forward chaining as the
   *only* execution model.
 - Deterministic, serializable, replayable: a save is base facts + action log.
@@ -49,6 +48,12 @@ ad-hoc flag system can offer.
   hatches go through C providers, not logic-side Turing-completeness.
 - GOAP-style planning (defeasible action theories make planning research-grade;
   revisit only if NPC planning becomes core).
+- A narrative/dialogue layer. Games are built as host code against the
+  generated header (§6.3); a knot/choice/divert front end would be a client
+  above that surface, and is out of scope. If one is ever added it enters as
+  a front end on the interface artifact, keeps computation in rules or
+  providers (not the dialogue layer), and re-opens §6.3's total-erasure rule
+  deliberately.
 
 ## 3. Influences and prior art
 
@@ -329,10 +334,8 @@ are tentative; M1 fixes the syntax.)
    cannot be part of the reachable-change cone of the inner step.
 4. **Write only your own scope — facts *and* judgments.** A step commits
    `+∂`-primed literals only for fluents declared in the scope it runs in,
-   and a rule concludes only into its own scope's vocabulary. The second
-   half is what 1 buys: previously this discipline governed facts while
-   judgments were exempt, so any scope could conclude anything about any
-   atom. Both halves of the store now obey one rule.
+   and a rule concludes only into its own scope's vocabulary. Both halves of
+   the store obey one rule: this is what point 1 buys.
 5. **Escalate outward only through a declared action.** The single way an
    inner scope affects an outer one is by firing an action whose effect lands
    on an outer fluent — a declared interface, which is what §5.4 already calls
@@ -354,15 +357,12 @@ are §5.3's construct pointed at the other axis:
 "Things stay as they were unless something changes them" and "outer truth
 holds inside unless something local overrides it" are the same sentence.
 Same generated rule, same generated superiority edge, same erasure to plain
-DL, same provenance obligation. The prior design let inner and outer rules
-compete over one shared atom, which had two defects: an encounter could only
-override by naming a rule in a scope it did not own (the §6.2 asymmetry,
-crossing a scope boundary), and judgments were *already* scope-relative by
-accident — since outer cannot see inner (rule 1), an inner rule concluding
-`~q` left the outer tier still proving `q`, one atom quietly carrying two
-answers depending on who asked. Rules 1–2 make that partition explicit and
-principled rather than emergent. The construction is Bikakis & Antoniou's
-**Contextual Defeasible Logic** (§13): local theories, defeasible mappings,
+DL, same provenance obligation. Private vocabulary is what lets an encounter
+override locally without contesting the world and without naming a rule it
+does not own (the §6.2 asymmetry would otherwise cross the scope boundary):
+the inner rule beats its own import, and `world:can_force_door` is untouched.
+The construction is Bikakis & Antoniou's **Contextual Defeasible Logic**
+(§13): local theories, defeasible mappings,
 contexts ranked for the conflicts that survive.
 
 **This applies to the scope axis only.** Extending a module (§6) shares
@@ -408,17 +408,6 @@ plus the closure check is region typing for facts, and the classic
 region-incompatibility weakness (a value that must outlive its region) is
 answered here by escalation *copying outward* through a declared action
 rather than referencing inward.
-
-**Why there is no scope-depth superiority.** An earlier revision proposed
-`encounter > area > world` as an opt-in per-rule tiebreak, for the case where
-an inner rule and an outer rule conflict *on the same head*. Private
-vocabulary (points 1–2) removes the case: they never share a head. The inner
-rule concludes into `encounter:`, the outer into `world:`, and the only thing
-the inner rule beats is its own generated import. The locality intuition the
-proposal was chasing — "the more local rule wins" — is exactly what
-import-loses-to-local already delivers, but structurally rather than as a
-flag an author must remember, and without the hazard that killed it (ambient
-superiority silently defeating an outer rule nobody remembered was in scope).
 
 **Implementation shape (M4).** The current API is flat — one `world`, one
 `intern`, one fact set. Two representations:
@@ -1126,11 +1115,6 @@ Decisions:
   by tooling, not semantics: the compiler warns past a threshold
   ("`stat_stack` is overridden 12 times; restructure the bands") — the
   cardinality-warning philosophy applied to superiority.
-- **No scope-depth tiebreak.** An earlier revision reserved a precedence slot
-  below bands for `encounter > area > world`. Private scope vocabulary (§5.5)
-  removed the case it addressed — inner and outer rules never conflict on a
-  head — so the slot is gone and the union feeding the superiority relation
-  is just ladders plus pairwise `>`.
 
 Prior art: CSS cascade layers (`@layer`) and `!important` as the
 anti-pattern, with the diagnosis above; clingo's weak-constraint priority
@@ -1175,7 +1159,7 @@ against it.
 - **Rules and declarations lower to data** — theory tables, schema, step
   tables. Transpilation: the runtime executing them is the fixed engine.
 - **The artifact is the extension point.** Any future front end — a
-  narrative language (§12.1), a quest editor, a third-party tool —
+  narrative language (§2), a quest editor, a third-party tool —
   *fact-checks* against it rather than reaching into the compiler: every
   guard atom resolves against the exported vocabulary (orphan errors
   included), every action reference checks arity and entity types against
@@ -1194,18 +1178,18 @@ host build instead of silently never firing. A combat loop (initiative,
 targeting UI, NPC turns) is then ordinary host code driven by the outer
 engine, with full vocabulary checking. **This header is the primary client
 surface** — the way a game is expected to be built on the engine, and an
-M1/M2 hard deliverable rather than a convenience. Any future front end
-(§12.1) targets the same artifact and gets no privileges the header lacks.
+M1/M2 hard deliverable rather than a convenience. Any future front end (§2)
+targets the same artifact and gets no privileges the header lacks.
 
 **Erasure is a rule, not an accident:** no surface construct may require
 runtime representation beyond engine structures. Bands erase to pairwise
 edges (§6.2), thresholds to guard atoms and entailment rules (§5.8), types
 and vocabulary closure to nothing; the M3 pipeline erases defeaters and
-superiority within the logic itself. **Erasure is now total** — with the
-weave gone (§12.1), no surface construct has a runtime shadow. The
-expression VM (§5.8) is not an exception: it evaluates numeric right-hand
-sides, which are engine machinery, not a checked construct's residue. Any
-future front end that wants a bytecode backend re-opens this rule
+superiority within the logic itself. **Erasure is total** — no surface
+construct has a runtime shadow. The expression VM (§5.8) is not an
+exception: it evaluates numeric right-hand sides, which are engine
+machinery, not a checked construct's residue. Any future front end (§2)
+that wants a bytecode backend re-opens this rule
 deliberately, and must argue for it.
 
 **Provenance is the source map, and it is an M1 hard deliverable.** The
@@ -1292,7 +1276,7 @@ scope instantiation); each live instance is its own vocabulary —
 `cellar_fight#1:wolf_hp` and `cellar_fight#2:wolf_hp` are different atoms
 because they are different scope instances. Two wolves from one template get
 distinct identity from the same mechanism that generates the imports, with
-no separate id scheme (§12.2).
+no separate id scheme (§12).
 
 ## 7. Runtime (C)
 
@@ -1378,7 +1362,7 @@ error messages and recovery (author-facing tool, so "expected `=>` after rule
 body, found `->`" quality matters), no generator dependency. Structure:
 hand-written lexer → recursive descent with Pratt expression parsing for
 guards/arithmetic (the guard-expression parser is a standalone library, so
-a future front end can reuse it — §12.1) → AST in arenas → semantic passes
+a future front end can reuse it — §2) → AST in arenas → semantic passes
 (types, safety, stratification, conflict pairs, partitions) →
 ground/compile to engine structures + interface artifact. Panic-mode
 recovery at declaration boundaries so one error doesn't cascade.
@@ -1422,76 +1406,28 @@ recovery at declaration boundaries so one error doesn't cascade.
    `why?` in the UI — all driven by host code against the generated header
    (§6.3). The quest is the interesting half: a multi-step quest with no
    narrative layer is the honest test of whether rules alone carry story
-   state, and of what §12.1 will actually need to add.
+   state.
 
 ## 12. Open questions
 
-### 12.1 Deferred: the narrative layer
-
-An Ink-style weave (knots, choices, diverts; a bytecode VM as a client) was
-designed into earlier revisions and **removed to keep the project focused on
-the rules engine** — a scope decision, not a repudiation. It was cheap to
-remove because it was already a client (§4.2) and a separate front end
-(§6.3), holding no privileges and no primitive status in the core language;
-see git history for the removed text.
-
-**The seam.** A narrative layer re-enters as a front end consuming the
-interface artifact (§6.3) and a client on the public `world_*` surface
-(§4.2) — the same terms any third-party tool gets. It should externalize
-its state (§4.2), or knowingly accept that conversation state sits outside
-the save. Two constraints bind it:
-
-- **Erasure (§6.3) is now total.** Weave bytecode was its one deliberate
-  exception. A narrative backend re-opens that rule and must argue for it
-  rather than inherit it.
-- **It must not become a scripting language.** Ink grew variables,
-  functions, and arithmetic, and that is the muddiest part of Ink.
-  Computation belongs in rules (truth) or providers (services), where it is
-  declared, checked, and traced — the same §2 posture that refused
-  logic-side Turing-completeness.
-
-### 12.2 Live questions
-
-- ~~Scalar and functional fluents~~ — **resolved**: multi-valued fluents with
-  strict-team defeat across values (§5.7); numerics via value store + landmark
-  abstraction + closed effect operators, integer-only, stratified primed
-  guards (§5.8). Remaining M1 syntax details: the exact effect-operator set
-  and domain-declaration surface.
-- ~~Concurrent numeric effects~~ — **resolved** (§5.8): combine by operator
-  class through a fixed pipeline (base → Σ deltas → declared-range clamp);
-  `:=` competes as a value conclusion under §5.7; commutative-associative
-  admissibility gates the operator set; four static escape hatches, no
-  timestamps. Remaining rules of thumb for concurrent *actions* generally
-  (non-numeric interactions) still owed author-facing docs.
-- Ambiguity propagation variant: blocked for now (predictability); revisit if
-  authors want "conflicting rumors" semantics.
-- Team defeat: currently on (matches intuition for "several weak reasons
-  jointly outweighed"); needs author-facing docs either way.
-- ~~Defeated-family withdrawal~~ — **resolved** (§5.7): assignments are
-  reified as `fires_R` atoms, so a defeated value conclusion withdraws its
-  whole family and "sealed blocks open, inertia keeps locked" works as
-  prose intended. Withdrawal is per *assignment*, not per rule; conflict
-  and superiority stay at the value level; booleans never reify. It erases
-  to a fresh atom and ordinary defeasible rules — no engine change.
-  Remaining M1 work is mechanical: emit the layer in the compiler, render
-  `fires_R` in `dl_why` as the source assignment (§6.3 provenance — a trace
-  naming `fires_R` directly would forfeit the moat), and measure the
-  grounding cost.
-- ~~Scope-depth superiority~~ — **dissolved**, not answered (§5.5, §6.4).
-  The question ("should `encounter > area > world` be opt-in per rule?")
-  presupposed that inner and outer rules compete for one shared atom. They
-  no longer do: scopes have private vocabulary, an inner rule beats its own
-  generated *import*, and there is no depth-precedence to opt into.
-- Template-scope identity (§5.5) — **mostly resolved** (§6.4): scope
-  instances have private vocabulary, so two wolves from one template are
-  distinguished by `cellar_fight#1:` vs `cellar_fight#2:` — the id scheme
-  §12 guessed at ("scope-qualified atoms?") is just what the import
-  mechanism already does, with nothing extra to design. **Still open at the
-  boundary**: escalation is by declared action onto an outer fluent (§5.5
-  rule 5), and if the outer fluent needs to name *which* wolf, the identity
-  has to survive a crossing that scope-qualification does not obviously
-  carry. `wolves_killed : int` is fine; `dead(wolf)` at world scope is not
-  yet. Decide with M4.
+- **Effect-operator set and domain-declaration surface** (§5.8): the numeric
+  semantics are fixed, but the exact operator set (`:=`, `+=`, `-=`, …) and
+  the domain-declaration syntax are M1 decisions, not yet frozen.
+- **Concurrent non-numeric action interactions**: the numeric pipeline (§5.8)
+  and multi-valued defeat (§5.7) settle the mechanics; the author-facing
+  rules of thumb for actions that interact through neither still need docs.
+- **Ambiguity propagation**: blocked for now, for predictability. Revisit if
+  authors want "conflicting rumours" semantics where an undecided premise
+  should taint downstream conclusions.
+- **Team defeat**: on, matching "several weak reasons jointly outweighed."
+  Needs author-facing docs either way.
+- **Cross-scope entity identity** (§5.5, §6.4): scope-qualified atoms give a
+  spawned instance identity *within* its scope, but escalation fires an
+  action onto an outer fluent (§5.5 rule 5), and if that fluent must name a
+  specific instance — `dead(wolf)` at world scope, not just a
+  `wolves_killed` counter — the identity has to survive a boundary that
+  scope-qualification does not obviously carry across. Decide with M4's
+  module system.
 
 ## 13. References
 
@@ -1553,10 +1489,10 @@ the save. Two constraints bind it:
   G. Simari, *Computing Generalized Specificity*, J. Applied Non-Classical
   Logics 13(1), 2003. (DeLP: no superiority relation at all — argument
   comparison by *generalized specificity*, computed rather than declared.
-  The road not taken, and the deepest fork available: it removes §6.4's
-  naming asymmetry entirely — nothing to name, so a core rule defends
-  itself against mods that do not exist yet. Refused on three counts.
-  Dialectical trees are not linear, and §5.2's whole engine choice rests on
+  It removes §6.4's naming asymmetry entirely — nothing to name, so a core
+  rule defends itself against mods that do not exist yet — but is refused on
+  three counts. Dialectical trees are not linear, and §5.2's engine choice
+  rests on
   Maher-linearity. A computed criterion gives a `why?` that derives rather
   than explains — "A is more specific" is a worse answer to a designer than
   "beaten by `@immunity` over `@condition`". And decisively for §6.2's
@@ -1590,5 +1526,7 @@ the save. Two constraints bind it:
   GDC 2012. (Left 4 Dead response rules: most-specific-match dialogue
   selection — "specific beats general" as ad-hoc scoring; §4.2's
   `pending_scene` gets the same behavior from superiority, with traces)
-- inkle, *ink* — https://github.com/inkle/ink (surface model for the
-  deferred narrative layer, and its cautionary half: §12.1)
+- inkle, *ink* — https://github.com/inkle/ink (surface model for a narrative
+  layer should one be built as a client (§2); its growth of variables,
+  functions, and arithmetic is the cautionary half — computation belongs in
+  rules or providers, not a dialogue layer)

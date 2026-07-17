@@ -4,8 +4,7 @@ A narrative game engine in C: the world is a logic database. Defeasible logic
 for judgments, defeasible inertia for state transitions. Host code drives it
 through a generated, vocabulary-checked C API. raylib for presentation.
 
-A narrative/dialogue layer is deliberately deferred — see DESIGN.md §12.1 for
-the seam it will reattach at.
+A narrative/dialogue layer is out of scope — see DESIGN.md §2.
 
 **Read [DESIGN.md](DESIGN.md) first** — it explains the semantics, the
 architecture, and the milestone plan. `examples/cellar.story` sketches the
