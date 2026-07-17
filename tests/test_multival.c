@@ -19,15 +19,37 @@
  * per-literal. The doc's strict-vs-coalition decision is also the natural
  * one under erasure; test_strict_team_contested pins it.
  *
- * DISCOVERY pinned by the sealed-door pair below: DESIGN.md 5.7's claim
- * that a value-specific defeater ("sealed ~> ~(door=open)") composes with
- * inertia into "unchanged" is NOT what the erasure gives. The blocked
- * rule's shadow (~locked') is still applicable and still beats inertia,
- * so no value is provable and the step is rejected. Getting the
- * documented behavior needs the whole effect family to withdraw when its
- * value conclusion is defeated -- an M1 semantic decision. The authoring
- * pattern that works today is a requires-condition (rule inapplicable =>
- * shadows inapplicable => inertia holds); both truths are pinned. */
+ * FAMILY REIFICATION (DESIGN.md 5.7, resolved). The naive erasure above
+ * LEAKS: a value-specific defeater ("sealed ~> ~(door=open)") blocks the
+ * primary f_open, but the family's sibling shadow (~f_locked) shares the
+ * body, stays applicable, and still beats inertia -- so no value is
+ * provable and the step is rejected, rather than "sealed blocks open,
+ * inertia keeps locked" as 5.7's prose intends. The author wrote ONE
+ * assignment; defeating half of it is not a state the surface language
+ * can express.
+ *
+ * The fix is an extra erasure layer, not an engine change. Each
+ * ASSIGNMENT (not each rule) is reified as a fresh atom:
+ *
+ *     body      => fires_R        (the assignment's unit of defeat)
+ *     sealed    ~> ~fires_R       (negative heads retarget here)
+ *     fires_R   => f_open         (value level: conflict + superiority)
+ *     fires_R   => ~f_locked
+ *
+ * Blocking fires_R withdraws the whole family at once. Conflict and
+ * superiority stay at the VALUE level, so flip-flops still contest
+ * (fires_A and fires_B do not conflict with each other -- if the shadows
+ * didn't still contest, a flip-flop would silently commit; pinned below).
+ *
+ * Reification applies only where the erasure has >1 head, i.e. domains of
+ * 3+ values. A boolean fluent erases to a single head with no sibling
+ * shadow, so it never reifies and 5.7's boolean-degeneration criterion
+ * holds untouched.
+ *
+ * The sealed-door TRIO below pins all three truths: the naive erasure's
+ * leak (why reification exists), the reified fix, and the
+ * requires-condition, which works either way and stays the right pattern
+ * for a hard precondition. */
 
 #include "logic/dl.h"
 #include "state/world.h"
@@ -238,13 +260,14 @@ static int test_boolean_degeneration(void)
     return 0;
 }
 
-/* Sealed door, defeater version -- pins the DISCOVERY (header comment):
- * one hand-built step theory over primed atoms, door : {locked, open}
- * currently locked, an open-action whose family is (open', ~locked'),
- * and a defeater sealed ~> ~open'. The defeater blocks open', but the
- * family's shadow ~locked' is still applicable and beats locked-inertia,
- * so NEITHER value is provable: the step would be rejected, the door is
- * not "kept locked by inertia" as 5.7's prose claims. */
+/* Sealed door 1/3 -- the LEAK the reification exists to fix. Naive
+ * erasure, no fires_R atom: door : {locked, open} currently locked, an
+ * open-action whose family is (open', ~locked'), and a defeater
+ * sealed ~> ~open'. The defeater blocks open', but the family's shadow
+ * ~locked' shares the body, stays applicable, and beats locked-inertia,
+ * so NEITHER value is provable: the step is rejected and the door is not
+ * "kept locked by inertia" as 5.7 intends. This test pins the motivation;
+ * test_sealed_family_withdraws pins the semantics the M1 compiler emits. */
 static int test_sealed_defeater_contested(void)
 {
     intern *sy = intern_new();
@@ -289,7 +312,154 @@ static int test_sealed_defeater_contested(void)
     return 0;
 }
 
-/* Sealed door, requires version -- the authoring pattern that works: the
+/* Sealed door 2/3 -- family reification, the decided semantics. Same
+ * theory as 1/3, but the assignment is reified: the defeater retargets to
+ * fires_open, so blocking it withdraws BOTH shadows and inertia keeps the
+ * door locked -- 5.7's prose intent, from a fresh atom and ordinary
+ * defeasible rules. Unsealing restores the normal override. */
+static int test_sealed_family_withdraws(void)
+{
+    intern *sy = intern_new();
+    uint32_t locked = intern_id(sy, "locked"), open = intern_id(sy, "open"),
+             locked_p = intern_id(sy, "locked_p"), open_p = intern_id(sy, "open_p"),
+             act = intern_id(sy, "act_open"), sealed = intern_id(sy, "sealed"),
+             fires = intern_id(sy, "fires_open_door");
+
+    dl_theory *t = dl_theory_new(sy);
+    dl_lit l_now = dl_pos(locked), no_now = dl_neg(open),
+           b_act = dl_pos(act), b_sealed = dl_pos(sealed), b_fires = dl_pos(fires);
+
+    int i_lp = dl_add_rule(t, "inertia+locked", DL_DEFEASIBLE,
+                           dl_pos(locked_p), &l_now, 1);
+    int i_no = dl_add_rule(t, "inertia-open", DL_DEFEASIBLE,
+                           dl_neg(open_p), &no_now, 1);
+    /* the assignment, reified: body => fires, then fires => each value */
+    dl_add_rule(t, "open_door@fires", DL_DEFEASIBLE, dl_pos(fires), &b_act, 1);
+    int c_open = dl_add_rule(t, "open_door=open", DL_DEFEASIBLE,
+                             dl_pos(open_p), &b_fires, 1);
+    int c_notlocked = dl_add_rule(t, "open_door=~locked", DL_DEFEASIBLE,
+                                  dl_neg(locked_p), &b_fires, 1);
+    dl_add_sup(t, c_open, i_no);
+    dl_add_sup(t, c_notlocked, i_lp);
+    /* the seal: negative head retargeted from the value to the family */
+    dl_add_rule(t, "sealed_blocks", DL_DEFEATER, dl_neg(fires), &b_sealed, 1);
+
+    dl_add_fact(t, dl_pos(locked));
+    dl_add_fact(t, dl_neg(open));
+    dl_add_fact(t, dl_pos(act));
+    dl_add_fact(t, dl_pos(sealed));
+
+    dl_result *res = dl_solve(t);
+    CHECK(dl_defeasible(res, dl_pos(fires)) == DL_REFUTED);   /* family blocked */
+    CHECK(dl_defeasible(res, dl_pos(locked_p)) == DL_PROVED); /* inertia HELD */
+    CHECK(dl_defeasible(res, dl_pos(open_p)) == DL_REFUTED);
+    CHECK(dl_defeasible(res, dl_neg(open_p)) == DL_PROVED);
+    dl_result_free(res);
+    dl_theory_free(t);
+
+    /* unsealed: the family fires and overrides inertia as usual */
+    t = dl_theory_new(sy);
+    i_lp = dl_add_rule(t, "inertia+locked", DL_DEFEASIBLE, dl_pos(locked_p), &l_now, 1);
+    i_no = dl_add_rule(t, "inertia-open", DL_DEFEASIBLE, dl_neg(open_p), &no_now, 1);
+    dl_add_rule(t, "open_door@fires", DL_DEFEASIBLE, dl_pos(fires), &b_act, 1);
+    c_open = dl_add_rule(t, "open_door=open", DL_DEFEASIBLE, dl_pos(open_p), &b_fires, 1);
+    c_notlocked = dl_add_rule(t, "open_door=~locked", DL_DEFEASIBLE, dl_neg(locked_p), &b_fires, 1);
+    dl_add_sup(t, c_open, i_no);
+    dl_add_sup(t, c_notlocked, i_lp);
+    dl_add_rule(t, "sealed_blocks", DL_DEFEATER, dl_neg(fires), &b_sealed, 1);
+
+    dl_add_fact(t, dl_pos(locked));
+    dl_add_fact(t, dl_neg(open));
+    dl_add_fact(t, dl_pos(act));
+    dl_add_fact(t, dl_neg(sealed));
+
+    res = dl_solve(t);
+    CHECK(dl_defeasible(res, dl_pos(fires)) == DL_PROVED);
+    CHECK(dl_defeasible(res, dl_pos(open_p)) == DL_PROVED);
+    CHECK(dl_defeasible(res, dl_neg(locked_p)) == DL_PROVED);
+    dl_result_free(res);
+    dl_theory_free(t);
+    intern_free(sy);
+    return 0;
+}
+
+/* Reification must not swallow conflicts. fires_A and fires_B do NOT
+ * conflict with each other -- both families fire happily. The exclusion
+ * has to stay at the VALUE level, or a flip-flop would silently commit
+ * instead of being rejected. Pins both halves: unprioritised concurrent
+ * writers still contest, and a mirrored superiority still resolves. */
+static int test_reified_conflict_survives(void)
+{
+    intern *sy = intern_new();
+    uint32_t locked = intern_id(sy, "locked"), open = intern_id(sy, "open"),
+             locked_p = intern_id(sy, "locked_p"), open_p = intern_id(sy, "open_p"),
+             a1 = intern_id(sy, "act_open"), a2 = intern_id(sy, "act_lock"),
+             fA = intern_id(sy, "fires_A"), fB = intern_id(sy, "fires_B");
+
+    dl_lit l_now = dl_pos(locked), no_now = dl_neg(open),
+           b1 = dl_pos(a1), b2 = dl_pos(a2), bA = dl_pos(fA), bB = dl_pos(fB);
+
+    /* two reified families writing different values, no superiority */
+    dl_theory *t = dl_theory_new(sy);
+    int i_lp = dl_add_rule(t, "inertia+locked", DL_DEFEASIBLE, dl_pos(locked_p), &l_now, 1);
+    int i_no = dl_add_rule(t, "inertia-open", DL_DEFEASIBLE, dl_neg(open_p), &no_now, 1);
+    dl_add_rule(t, "A@fires", DL_DEFEASIBLE, dl_pos(fA), &b1, 1);
+    int a_open = dl_add_rule(t, "A=open", DL_DEFEASIBLE, dl_pos(open_p), &bA, 1);
+    int a_nolk = dl_add_rule(t, "A=~locked", DL_DEFEASIBLE, dl_neg(locked_p), &bA, 1);
+    dl_add_sup(t, a_open, i_no);
+    dl_add_sup(t, a_nolk, i_lp);
+    dl_add_rule(t, "B@fires", DL_DEFEASIBLE, dl_pos(fB), &b2, 1);
+    int b_lk = dl_add_rule(t, "B=locked", DL_DEFEASIBLE, dl_pos(locked_p), &bB, 1);
+    int b_noop = dl_add_rule(t, "B=~open", DL_DEFEASIBLE, dl_neg(open_p), &bB, 1);
+    dl_add_sup(t, b_lk, i_lp);
+    dl_add_sup(t, b_noop, i_no);
+
+    dl_add_fact(t, dl_pos(locked));
+    dl_add_fact(t, dl_neg(open));
+    dl_add_fact(t, dl_pos(a1));
+    dl_add_fact(t, dl_pos(a2));
+
+    dl_result *res = dl_solve(t);
+    CHECK(dl_defeasible(res, dl_pos(fA)) == DL_PROVED);      /* families fire... */
+    CHECK(dl_defeasible(res, dl_pos(fB)) == DL_PROVED);
+    CHECK(dl_defeasible(res, dl_pos(open_p)) == DL_REFUTED); /* ...values contest */
+    CHECK(dl_defeasible(res, dl_pos(locked_p)) == DL_REFUTED);
+    dl_result_free(res);
+    dl_theory_free(t);
+
+    /* same, plus A > B mirrored onto the conflicting members: A wins */
+    t = dl_theory_new(sy);
+    i_lp = dl_add_rule(t, "inertia+locked", DL_DEFEASIBLE, dl_pos(locked_p), &l_now, 1);
+    i_no = dl_add_rule(t, "inertia-open", DL_DEFEASIBLE, dl_neg(open_p), &no_now, 1);
+    dl_add_rule(t, "A@fires", DL_DEFEASIBLE, dl_pos(fA), &b1, 1);
+    a_open = dl_add_rule(t, "A=open", DL_DEFEASIBLE, dl_pos(open_p), &bA, 1);
+    a_nolk = dl_add_rule(t, "A=~locked", DL_DEFEASIBLE, dl_neg(locked_p), &bA, 1);
+    dl_add_sup(t, a_open, i_no);
+    dl_add_sup(t, a_nolk, i_lp);
+    dl_add_rule(t, "B@fires", DL_DEFEASIBLE, dl_pos(fB), &b2, 1);
+    b_lk = dl_add_rule(t, "B=locked", DL_DEFEASIBLE, dl_pos(locked_p), &bB, 1);
+    b_noop = dl_add_rule(t, "B=~open", DL_DEFEASIBLE, dl_neg(open_p), &bB, 1);
+    dl_add_sup(t, b_lk, i_lp);
+    dl_add_sup(t, b_noop, i_no);
+    dl_add_sup(t, a_open, b_noop);
+    dl_add_sup(t, a_nolk, b_lk);
+
+    dl_add_fact(t, dl_pos(locked));
+    dl_add_fact(t, dl_neg(open));
+    dl_add_fact(t, dl_pos(a1));
+    dl_add_fact(t, dl_pos(a2));
+
+    res = dl_solve(t);
+    CHECK(dl_defeasible(res, dl_pos(open_p)) == DL_PROVED);
+    CHECK(dl_defeasible(res, dl_pos(locked_p)) == DL_REFUTED);
+    dl_result_free(res);
+    dl_theory_free(t);
+    intern_free(sy);
+    return 0;
+}
+
+/* Sealed door 3/3 -- the requires version, which works under either
+ * encoding: the
  * seal is a body condition, the rule is inapplicable, the whole family
  * (shadows included) is inapplicable, and inertia keeps the door locked.
  * Unsealing restores the normal override. */
@@ -332,6 +502,8 @@ int main(void)
     if (test_flipflop_step()) return 1;
     if (test_boolean_degeneration()) return 1;
     if (test_sealed_defeater_contested()) return 1;
+    if (test_sealed_family_withdraws()) return 1;
+    if (test_reified_conflict_survives()) return 1;
     if (test_sealed_requires_holds()) return 1;
     printf("test_multival: all passed\n");
     return 0;

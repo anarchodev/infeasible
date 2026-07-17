@@ -493,18 +493,42 @@ defeat means among more than two competitors. Decisions:
   coherent as an attacker: it conflicts with `f=v` and nothing else — not with
   `f=u`. A rule with a negative head may win by superiority, and winning only
   ever means blocking — so it *is* a defeater on that value; the surface forms
-  `~> f=v` and `=> ~(f=v)` collapse into one construct. **Corrected by the
-  golden tests** (`tests/test_multival.c`): the originally-claimed pattern —
-  `sealed ~> ~(door=open)` blocks the open-rule and *inertia keeps the door
-  as it was* — is **not** what the propositional erasure gives. The blocked
-  rule's sibling shadows (`~locked'`) remain applicable and still defeat
-  inertia, so block + frame axiom compose into a **contested step**, not
-  "unchanged". The authoring pattern that does keep state is a
-  requires-condition (`requires ~sealed`): an inapplicable rule withdraws
-  its whole family, and inertia holds. Whether the M1 multi-valued step
-  should *make* the defeater version behave as first described — a defeated
-  value conclusion withdrawing its entire effect family — is an open
-  semantic decision (§12).
+  `~> f=v` and `=> ~(f=v)` collapse into one construct. A negative head
+  withdraws the **whole assignment** it attacks — see reification below.
+- **Assignments are reified; the family is the unit of defeat** (decided;
+  `tests/test_multival.c`). The naive erasure leaks: `sealed ~> ~(door=open)`
+  blocks the primary `open'`, but the assignment's sibling shadow `~locked'`
+  shares the body, stays applicable, and still defeats inertia — so block +
+  frame axiom compose into a **contested step**, not the "sealed blocks
+  open, inertia keeps locked" the prose intends. That is an erasure defect,
+  not a semantics to teach around: the author wrote *one* assignment, and
+  half an assignment is not a state the surface language can express. Every
+  other optimization here is semantically invisible (§5.4); this one was
+  not. The fix is one more erasure layer, not an engine change — each
+  assignment gets a fresh atom, `body => fires_R`, with the value shadows
+  hanging off it (`fires_R => open'`, `fires_R => ~locked'`) and negative
+  heads retargeted from the value to `fires_R`. Blocking `fires_R` withdraws
+  the family whole; it stays propositional and linear. Consequences, all
+  pinned by tests:
+  - Conflict and superiority stay at the **value** level. `fires_A` and
+    `fires_B` do not conflict with each other, so exclusion must not migrate
+    up to the family atom — a flip-flop would then silently commit instead
+    of being rejected.
+  - The unit is the **assignment, not the rule**. `causes door := open,
+    lamp := fallen` is two families; a defeater on `door=open` withdraws the
+    door family and the lamp still falls. This is the minimal repair of the
+    leak: it keeps negative heads value-specific, as their definition above
+    requires, instead of silently suppressing effects the defeater never
+    mentioned. All-or-nothing across a rule's effects is what `requires` is
+    for.
+  - Only domains of 3+ values reify. A boolean erases to a single head with
+    no sibling shadow, so the boolean-degeneration criterion above holds
+    untouched.
+  - Cost is one atom and one rule per multi-head assignment instance, which
+    lands on grounding cardinality — measure it in M1 (§8) rather than
+    assume it.
+  `requires ~sealed` remains the right pattern for a hard precondition, and
+  behaves identically under either encoding.
 - **At most one value wins.** Under strict teams and acyclic superiority, two
   values both `+∂` would each need to beat the other's applicable supporters —
   a superiority cycle. The step function's read-off relies on this; the engine
@@ -516,8 +540,12 @@ encoding (per-value atoms; rule families with same-body shadows against
 sibling values; mirrored superiority; exactly-one-value facts; no strict
 exclusion axioms, which would cycle): the multi-valued flip-flop (step
 rejected, state untouched; single writer commits exactly-one); the sealed
-door **pair** (defeater version pins the contested outcome above;
-requires-condition version pins state preservation); the intransitive chain
+door **trio** (naive erasure pins the leak that motivates reification;
+the reified version pins the decided semantics — family withdrawn, inertia
+holds, and the normal override restored when unsealed; the
+requires-condition version pins the hard-precondition pattern), plus
+reified conflict survival (two families fire, values still contest, and a
+mirrored superiority still resolves); the intransitive chain
 leaving no value provable — with the deadlock landing exactly on the
 would-be winner, which is why "add `r1 > r2`" is the right compile
 diagnostic — while bands 3/2/1 resolve cleanly with at most one winner (the
@@ -1214,15 +1242,16 @@ the save. Two constraints bind it:
   authors want "conflicting rumors" semantics.
 - Team defeat: currently on (matches intuition for "several weak reasons
   jointly outweighed"); needs author-facing docs either way.
-- Defeated-family withdrawal (§5.7, found by `tests/test_multival.c`):
-  should a causal rule whose value conclusion is defeated (e.g. by a
-  value-specific defeater) withdraw its *entire* effect family, so that
-  "sealed blocks open, inertia keeps locked" works as prose intended? Under
-  the pure erasure it does not — the sibling shadows still fire and the
-  step contests. Options: rule-level family withdrawal in the M1
-  multi-valued step (matches §5.8's rule-level `:=` framing), or keep the
-  erasure semantics and teach the pattern as a requires-condition. Decide
-  with the M1 step implementation.
+- ~~Defeated-family withdrawal~~ — **resolved** (§5.7): assignments are
+  reified as `fires_R` atoms, so a defeated value conclusion withdraws its
+  whole family and "sealed blocks open, inertia keeps locked" works as
+  prose intended. Withdrawal is per *assignment*, not per rule; conflict
+  and superiority stay at the value level; booleans never reify. It erases
+  to a fresh atom and ordinary defeasible rules — no engine change.
+  Remaining M1 work is mechanical: emit the layer in the compiler, render
+  `fires_R` in `dl_why` as the source assignment (§6.3 provenance — a trace
+  naming `fires_R` directly would forfeit the moat), and measure the
+  grounding cost.
 - Template-scope identity (§5.5): spawning is scope instantiation, and
   instantiating a template more than once needs distinct entity ids per
   instance (two summoned wolves from one template). Decide the id scheme
