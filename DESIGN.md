@@ -68,7 +68,15 @@ ad-hoc flag system can offer.
   explicit superiority relation.
 - **D&D 5e** — "specific beats general" is the PHB's stated rules-interaction
   principle; the 5e condition/feat/immunity stack is a defeasible theory in
-  prose. A 5e-ish combat slice is a milestone acceptance test.
+  prose. A 5e-ish combat slice is a milestone acceptance test. Note what 5e
+  does *not* do: it states no procedure for deciding which of two rules is
+  more specific. Every interaction is spelled out individually — "an
+  invisible creature outlined by faerie fire can be seen" is a sentence
+  someone authored, not a consequence anyone derived. So "specific beats
+  general" is a description of the *outcomes* the designers hand-wrote, not
+  an inference rule, and reading it as one invites the lex specialis mistake
+  §6.2 refuses. Our bands encode the tiers; the individual exceptions stay
+  hand-written, exactly as the PHB has them.
 
 ## 4. Architecture
 
@@ -992,6 +1000,69 @@ while mod load order is arbitrary, so the same rule is a coin flip wearing a
 principle's clothes. "Last one loaded wins" is the attractor every ad-hoc
 system drifts into; naming it here is how we stay out.
 
+**The invariant: superiority derives from *declarations*, never from
+*bodies*.** Bands look like an exception to "priorities must be declared" —
+the compiler emits edges nobody wrote — so the line has to be drawn
+precisely, and this is where:
+
+| edge | derived from | stable under body edits? |
+|---|---|---|
+| band ladder → pairwise `>` | rule's `@band` + the ladder | ✓ both declarations |
+| import loses to local (§5.5) | rule's scope (file header) | ✓ declaration |
+| causal beats inertia (§5.3) | rule kind | ✓ declaration |
+| `A > B` | written by hand | ✓ it *is* the declaration |
+
+Every generated edge is a function of something an author states *about* a
+rule, never of what the rule *says*. Declarations are edited deliberately and
+rarely; bodies are edited constantly, by people fixing unrelated things. A
+band ladder emits edges from two visible declarations, and editing a body
+never moves a rule between bands — which is exactly why bands are safe and
+"the compiler works out the priorities" in general is not.
+
+The rule this forbids is **lex specialis** — "the more specific rule wins",
+inferred from bodies (A beats B when A's body is a strict superset of B's).
+It is perennially tempting, and it fails twice over.
+
+*It is not a decision procedure, even in law.* Rules overlap far more often
+than they nest: `invisible(X)` and `faerie_fired(X)` (§6.2's own
+`outlined > unseen`) are in no subset relation, and neither are most real
+conflicts — partial overlap is the common case, and the subset case is the
+rare clean one you would have got right anyway. Law has had two thousand
+years on this and did not formalize it: lex specialis is not codified in the
+Vienna Convention nor "elsewhere as a rule of general application", its
+relationship to the other meta-rules "has not been clarified" (it can
+contradict lex posterior outright — an older specific law against a newer
+general one — with no meta-meta-rule to appeal to), and determining which
+norm is more specific "depends on the context of the dispute and the
+interpretive methodologies employed by courts": *what appears specific in one
+scenario might be deemed general in another*. It is analyzed as a
+**reason-giving norm** — an argument a judge weighs, itself defeasible,
+whose primacy other reasons can reverse. So the formalizable version (the
+syntactic subset test) is not lex specialis; it is a narrow accident that
+happens to agree with it sometimes, and the actual principle is exactly the
+part that would not compile.
+
+*And the formalizable fragment breaks the invariant anyway,* with the failure
+mode this engine exists to kill: given `crowbar ⊃ can_force`, editing
+**`can_force`** to add a condition breaks the subset relation, the edge
+**silently evaporates**, and `crowbar` starts contesting a rule it used to
+beat. Nobody touched `crowbar`; nothing errors at the edit site; the rule
+whose behaviour changed is not the rule that was edited. That is Osiris's
+stale-fact bug relocated into the rule graph — a derived fact that was true
+when written and is a lie now, with nothing to notice. Declared priorities
+cannot rot this way.
+
+There is a ladder of badness here, and it is worth stating because each rung
+has advocates: **declared** (changes only when a declaration changes) →
+**body-derived** (lex specialis: changes when any body is edited, at least at
+compile time) → **derivation-derived** (DeLP's generalized specificity:
+changes when bodies *or facts* change — its criterion is context-sensitive,
+"determined dynamically during the dialectical analysis", so which of two
+rules wins can differ **between two game states**, with no edit at all). The
+last is unfixable by authoring discipline, and its honest trace reads "A beat
+B *this time*" — strictly worse to hand a designer than "beaten by
+`@immunity` over `@condition`". §13 records the DeLP fork in full.
+
 ```
 bands stat_stack: base < condition < feat < immunity
 
@@ -1065,9 +1136,14 @@ Prior art: CSS cascade layers (`@layer`) and `!important` as the
 anti-pattern, with the diagnosis above; clingo's weak-constraint priority
 levels (`[w@l]`); Grosof's courteous logic programs (prioritized conflict
 handling for rules at business scale, though pairwise); and the legal
-tradition — *lex superior* (constitution > statute > regulation) is a
-ladder, *lex specialis* is the scope tiebreak, and centuries of case law
-suggest the two-mechanism structure is stable.
+tradition, from which we take exactly one meta-rule. *Lex superior*
+(constitution > statute > regulation) is a ladder, declared, and is what
+bands are. *Lex posterior* and *lex specialis* are both refused above —
+the first because mod load order is not a legislature's timeline, the
+second because it is not a procedure even in law. That the legal system
+needs three meta-rules, cannot rank them against each other, and litigates
+the boundaries indefinitely is the argument *for* taking only the ladder:
+one declared mechanism has no meta-rule conflicts to resolve.
 
 **Semantic-pass tests to pin it (M1):** a ladder generates edges only
 between conflicting pairs; the boots/Slow/Restrained triangle resolves as
@@ -1453,6 +1529,19 @@ the save. Two constraints bind it:
   preference ordering over contexts — §5.5's nested scopes are this
   construction; the mapping-is-defeasible rule is what lets a scene override
   locally without contesting the world)
+- A. Lindroos, *Addressing Norm Conflicts in a Fragmented Legal System: The
+  Doctrine of Lex Specialis*, Nordic J. Int'l Law 74, 2005; M. Koskenniemi,
+  *Fragmentation of International Law* (ILC study, 2006); and the
+  reason-giving-norm reading (*Lex Specialis as a Reason-Giving Norm*, Int'l
+  Community Law Review 27(3), 2025). (§6.2 takes *lex superior* — a declared
+  ladder — and refuses the other two. The cautionary value is in how badly
+  lex specialis resists formalization in the domain that invented it: not
+  codified in the Vienna Convention nor as a rule of general application, its
+  relation to the other meta-rules unclarified, capable of contradicting lex
+  posterior with no tiebreak above them, and specificity itself
+  context-dependent — "what appears specific in one scenario might be deemed
+  general in another". It is an argument judges weigh, defeasible in its own
+  right, not a function)
 - B. Grosof, *Prioritized Conflict Handling for Logic Programs*, ILPS 1997;
   *Representing E-Commerce Rules via Situated Courteous Logic Programs*,
   ECRA 2003. (courteous LP: `overrides(r1, r2)` over rule labels, plus mutex
@@ -1460,11 +1549,23 @@ the save. Two constraints bind it:
   authors — the closest prior art to §6.4's `extend`, and it too resolves
   conflicts by declared priority rather than by any implicit criterion)
 - A. García, G. Simari, *Defeasible Logic Programming: An Argumentative
-  Approach*, TPLP 4(2), 2004. (DeLP: no superiority relation at all —
-  argument comparison by *generalized specificity*, computed rather than
-  declared. The road not taken: it removes §6.4's naming asymmetry entirely,
-  at the cost of dialectical trees (not linear) and of a `why?` that derives
-  rather than explains)
+  Approach*, TPLP 4(2), 2004; F. Stolzenburg, A. García, C. Chesñevar,
+  G. Simari, *Computing Generalized Specificity*, J. Applied Non-Classical
+  Logics 13(1), 2003. (DeLP: no superiority relation at all — argument
+  comparison by *generalized specificity*, computed rather than declared.
+  The road not taken, and the deepest fork available: it removes §6.4's
+  naming asymmetry entirely — nothing to name, so a core rule defends
+  itself against mods that do not exist yet. Refused on three counts.
+  Dialectical trees are not linear, and §5.2's whole engine choice rests on
+  Maher-linearity. A computed criterion gives a `why?` that derives rather
+  than explains — "A is more specific" is a worse answer to a designer than
+  "beaten by `@immunity` over `@condition`". And decisively for §6.2's
+  invariant: the criterion is context-sensitive — preference is "determined
+  dynamically during the dialectical analysis" — so priority is a function
+  of the *fact base*, and which of two rules wins can differ between two game
+  states with no edit at all. That is the bottom rung of §6.2's ladder:
+  unfixable by authoring discipline, because there is no authoring act that
+  pins it)
 - E. Oikarinen, T. Janhunen, *Modular Equivalence for Normal Logic Programs*
   / module theorem; V. Lifschitz, H. Turner, *Splitting a Logic Program*,
   ICLP 1994. (compositionality of answer sets under **disjoint output
