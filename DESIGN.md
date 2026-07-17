@@ -697,16 +697,23 @@ the most restrictive; and the trace test asserts the itemized receipt.
 
 ## 6. Language sketch
 
-See `examples/cellar.story` for the running example. Construct → tier mapping:
+See `examples/cellar.story` for the running example. Two languages, one
+file format: the **core language** (declarations, rules, actions) is
+complete on its own and compiles to engine structures plus an **interface
+artifact** (§6.3); the **weave language** is a *separate front end* that
+fact-checks against that artifact. Colocation is packaging, not grammar:
+`=== knot ===` blocks in a `.story` file are lexically extracted and
+dispatched to the weave front end, Vue-SFC style — the core parser never
+parses weave syntax.
 
-| Construct | Compiles to |
-|---|---|
-| `entity`, `fluent`, `scene` | fact-store schema; partition declarations |
-| `rule … -> / => / unless`, `A > B` | defeasible theory (strict/defeasible/defeater/superiority) |
-| `action … requires … causes` | causal rules for the step function |
-| bare `causes` rules | ramifications |
-| `=== knot ===`, `+`/`*` choices, `->` diverts, `{ … }` guards | weave VM; guards are defeasible queries |
-| `do action(...)` | fire the step function |
+| Construct | Front end | Compiles to |
+|---|---|---|
+| `entity`, `fluent`, `scene` | core | fact-store schema; partition declarations |
+| `rule … -> / => / unless`, `A > B`, bands | core | defeasible theory (strict/defeasible/defeater/superiority) |
+| `action … requires … causes` | core | causal rules for the step function |
+| bare `causes` rules | core | ramifications |
+| `=== knot ===`, `+`/`*` choices, `->` diverts, `{ … }` guards | weave | bytecode + core-language residue (§6.3); guards are defeasible queries |
+| `do action(...)` | weave | propose an action to the driver (§4.2) |
 
 Authoring principles: authors never see primed atoms, inertia, or time
 indices; `unless` sugars to a defeater; the same guard syntax works in rules
@@ -898,21 +905,51 @@ conclusions-typed-distinctly (I1 as a type error) is `readonly`,
 conflictable-pair detection is exhaustiveness checking, cardinality
 warnings are the lint.
 
-One front end, two backends, one residue:
+Two front ends, one contract between them. Compiling the core language
+produces, beside the theory tables, an **interface artifact**: the declared
+vocabulary — entities and their types, fluents with domains, judgment
+heads, action signatures. It is the compile-time twin of `world.h`'s
+runtime contract, and every front end and client checks against it. The
+weave is **not primitive in the core language**; the core language is
+complete without it.
 
-- **Rules and declarations lower to data** — theory tables, schema, step
-  tables. Transpilation: the runtime executing them is the fixed engine.
-- **Weave blocks lower to bytecode** for the VM (§4.2). Its opcodes: emit
-  text, query a literal, offer choices, divert, propose an action. There is
-  no write-fact opcode and no assignment opcode — I1/I2 hold for the
-  narrative layer by *unrepresentability*, not by review.
-- **The stitching residue**: generated `at_knot`/visit-count fluents with
-  their implicit actions (§4.2), and **synthetic guard rules** — a compound
-  choice guard `{ a & ~b }` compiles to an anonymous judgment rule
-  concluding a fresh atom, so the guard op is a single-literal query.
-  Choice availability thereby inherits the entire diagnostic suite: typos
-  in narrative guards hit the orphan pass, and "why is this choice greyed
-  out?" is `dl_why` on the synthetic atom.
+- **Core: rules and declarations lower to data** — theory tables, schema,
+  step tables. Transpilation: the runtime executing them is the fixed
+  engine.
+- **Weave: a separate front end.** It *fact-checks* against the interface
+  artifact — every guard atom resolves against the exported vocabulary
+  (orphan errors included) and every `do` checks arity and entity types
+  against the exported action signature — then lowers to bytecode for the
+  VM (§4.2). Its opcodes: emit text, query a literal, offer choices,
+  divert, propose an action. There is no write-fact opcode and no
+  assignment opcode — I1/I2 hold for the narrative layer by
+  *unrepresentability*, not by review. Both front ends link one shared
+  guard-expression library, so guards mean the same thing in rules and
+  weave.
+- **The stitching residue is emitted as generated core-language text**:
+  the `at_knot`/visit-count fluents with their implicit actions (§4.2),
+  and **synthetic guard rules** — a compound choice guard `{ a & ~b }`
+  compiles to an anonymous judgment rule concluding a fresh atom, so the
+  guard op is a single-literal query. The core compiler just compiles one
+  more module, whose provenance points into weave source; it never knows
+  the weave exists, even at compile time. Choice availability thereby
+  inherits the entire diagnostic suite: typos in narrative guards hit the
+  orphan pass, and "why is this choice greyed out?" is `dl_why` on the
+  synthetic atom.
+
+**The interface artifact also compiles to a generated C header.** Host
+code is a client too, and the intern table gives C the exact silent
+failure mode the orphan pass exists to kill:
+`world_query(w, lit(intern(syms, "can_atack_goblin")))` interns a fresh,
+always-false atom. Codegen closes it, protobuf-style — typed atom/action
+constants and arity-typed helpers (`q_can_parley(w, who)`,
+`do_unlock(&acts, who)`) — so renaming a fluent in `.story` breaks the
+host build instead of silently never firing. A combat loop (initiative,
+targeting UI, NPC turns) is then ordinary host code driven by the outer
+engine, with full vocabulary checking and zero weave; the M5 combat slice
+is deliberately weave-free as the proof that the layering is real.
+Third-party narrative languages target the same artifact: the weave is the
+reference *front end* the way §4.2 makes it the reference client.
 
 **Erasure is a rule, not an accident:** no surface construct may require
 runtime representation beyond engine structures. Bands erase to pairwise
@@ -1018,12 +1055,15 @@ examples/  .story surface-language files
 
 **Hand-rolled recursive descent** (decided). Rationale: full control over
 error messages and recovery (author-facing tool, so "expected `=>` after rule
-body, found `->`" quality matters), no generator dependency, trivial to embed
-significant-indentation weave blocks alongside declaration syntax. Structure:
-hand-written lexer → recursive descent with Pratt expression parsing for
-guards/arithmetic → AST in arenas → semantic passes (types, safety,
-stratification, conflict pairs, partitions) → ground/compile to engine
-structures. Panic-mode recovery at declaration and knot boundaries so one
+body, found `->`" quality matters), no generator dependency. The core parser
+does **not** embed weave syntax: `=== knot ===` blocks are lexically
+extracted at the fences and handed to the weave front end together with the
+interface artifact (§6.3, §6). Structure: hand-written lexer → recursive
+descent with Pratt expression parsing for guards/arithmetic (the
+guard-expression parser is a shared library used by both front ends) → AST
+in arenas → semantic passes (types, safety, stratification, conflict pairs,
+partitions) → ground/compile to engine structures + interface artifact.
+Panic-mode recovery at declaration and extraction-fence boundaries so one
 error doesn't cascade.
 
 ## 11. Milestones
@@ -1037,15 +1077,18 @@ error doesn't cascade.
    §5.7–5.8 (domains, threshold harvesting, effect operators, guard
    stratification); `cellar.story` compiles and replaces the hand-built test
    worlds; provenance carried on every generated construct, rendered by
-   `dl_why` in source terms (§6.3).
+   `dl_why` in source terms (§6.3); interface artifact and generated C
+   header emitted (§6.3).
 3. **M2 — client contract + weave**: define the public client contract —
    the `world_*` API plus the externalized-state pattern (§4.2) — and ship
-   the weave as its first consumer: knot/choice/divert VM (bytecode per
-   §6.3), text alternatives, synthetic guard rules, `do` proposing into the
-   driver's action set, weave state as fluents; embedding API
-   (`weave_divert` / `weave_continue` / `weave_pending_actions`); playable
-   text cellar in raylib. A trivial second client in tests pins the
-   optionality claim the way golden tests pin semantics.
+   the weave as its first consumer *and* as a separate front end consuming
+   the M1 interface artifact (fact-checked guards, bytecode + generated
+   core-language residue, §6.3): knot/choice/divert VM, text alternatives,
+   synthetic guard rules, `do` proposing into the driver's action set,
+   weave state as fluents; embedding API (`weave_divert` /
+   `weave_continue` / `weave_pending_actions`); playable text cellar in
+   raylib. A trivial second client in tests pins the optionality claim the
+   way golden tests pin semantics.
 4. **M3 — engine hardening**: Maher linear algorithm + transformation
    pipeline behind the same API; tick-time join matcher for variables/typed
    entities (until then: ground rules per entity by hand/codegen).
@@ -1054,7 +1097,9 @@ error doesn't cascade.
    serialization, hot reload.
 6. **M5 — proof-of-thesis demo**: one region, ~20 NPCs, a 5e-ish combat slice
    where conditions/feats interact through superiority, one multi-step quest,
-   `why?` in the UI.
+   `why?` in the UI. The combat slice is deliberately **weave-free** —
+   driven by host code against the generated header (§6.3) — as the proof
+   that the client layering is real.
 
 ## 12. Open questions
 
