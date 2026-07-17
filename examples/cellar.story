@@ -3,18 +3,26 @@
 
 scene cellar
 
-entity guard : actor
-entity rusty_key, torch, antidote : item
+sort actor, item
 
-fluent holding(actor, item)
-fluent hp(actor) : int
-fluent door : { locked, closed, open }
-fluent poisoned(actor)
+entity (
+    guard : actor
+    rusty_key, torch, antidote : item
+)
 
-init door = locked
-init holding(guard, torch)
-init hp(guard) = 12
-init poisoned(player)
+state (
+    holding(actor, item)
+    hp(actor) : int
+    door : { locked, closed, open }
+    poisoned(actor)
+)
+
+init (
+    door = locked
+    holding(guard, torch)
+    hp(guard) = 12
+    poisoned(player)
+)
 
 // ---- rules: judgments derived from state (never stored) ----
 // `->` strict, `=>` defeasible, `unless` introduces a defeater

@@ -225,7 +225,7 @@ propagation sweep.
   compiler-enforced):
   1. *Safety / range restriction*: every rule variable must occur in a
      positive body atom over a finite relation (Datalog safety).
-  2. *Typed variables* (`X : actor`) bound every domain.
+  2. *Typed variables* (`X : actor`) over declared sorts bound every domain.
   3. *Dense computed relations come from providers*: spatial/LOS-style guards
      (`near(X,Y,5)`) are answered by engine-side indices registered in C; the
      logic layer only ever joins sparse results. The logic engine consumes the
@@ -690,7 +690,7 @@ inside each class:
   effect of either class contributes nothing (defeat is all-or-nothing).
 - **The pipeline** is global, fixed, and small: *base* (winning `:=`, else
   inertia) → *Σ undefeated deltas* → *clamp to the fluent's declared range*
-  (`fluent hp : int in 0..20` — the schema is the outermost clamp, so
+  (`state hp : int in 0..20` — the schema is the outermost clamp, so
   explicit min/max effects are rarely needed). Full-heal while standing in
   fire gives full − 4, deterministically, every contribution named.
 - **Admissibility criterion for the closed operator set**: an effect operator
@@ -721,7 +721,7 @@ so the hatches are shaped for strangers:
    the heal rule beating the damage rules (bands/superiority), already
    traced by `why?`.
 3. *Per-fluent collision resolution*: a fluent may declare a commutative
-   resolver for same-stage `:=` collisions — `fluent speed : int combine min`
+   resolver for same-stage `:=` collisions — `state speed : int combine min`
    gives 5e's "two effects set your speed: the most restrictive applies".
    Static, declared in one place, admissibility-checked, named in the trace.
 4. *Bespoke pipelines are modeled, not configured*: a real damage pipeline
@@ -752,7 +752,7 @@ would break closed-world assembly and the orphan pass. Compound keys
 in M1.
 
 Dense arrays are the base representation; a fluent may declare a
-**default** (`fluent terrain(cell) : tile default floor`), backing it with
+**default** (`state terrain(cell) : tile default floor`), backing it with
 exceptions only — storage and serialization hold just the cells that
 differ, and the editor emits init facts only for the interesting ones.
 "Absent means default" is the closed-world assumption wearing storage
@@ -869,15 +869,28 @@ every client and any future front end checks against.
 
 | Construct | Compiles to |
 |---|---|
-| `entity`, `fluent` | fact-store schema |
+| `sort`, `entity`, `state` | fact-store schema (`sort` = entity type; `state` = fluent) |
 | `module` / `extend` / `scene … in` | vocabulary ownership; generated imports (§6.4) |
 | `rule … -> / => / unless`, `A > B`, bands | defeasible theory (strict/defeasible/defeater/superiority) |
 | `action … requires … causes` | causal rules for the step function |
 | bare `causes` rules | ramifications |
 
 Authoring principles: authors never see primed atoms, inertia, time
-indices, or scope imports; `unless` sugars to a defeater; conclusions are
-typed distinctly from fluents so I1 is a type error, not a runtime surprise.
+indices, or scope imports; the surface keyword `state` declares a fluent
+(the semantic term used throughout §5); `unless` sugars to a defeater;
+conclusions are typed distinctly from fluents so I1 is a type error, not a
+runtime surprise.
+
+**Declarations batch; scopes brace.** Each declaration keyword (`sort`,
+`entity`, `state`, `init`, `provider`) takes either a single item or a
+Go-style parenthesized group of them (`state ( … )`) — pure lexical batching,
+not a new construct. A group is a *list, not an archetype*: its members share
+no vocabulary or key, so `()` never implies the grouped fluents belong to one
+thing. The two brackets mean different things — `()` is a batch of
+declarations, `{}` is reserved for a *scope body* (`scene`, `module`). `rule`
+and `action` keep their per-item keyword: they carry bodies and superiority
+relationships, and a batch would imply a togetherness that their conflict
+edges (§6.2) cut across.
 
 ### 6.1 Authoring ergonomics (prioritized)
 
@@ -980,6 +993,22 @@ Grosof's courteous LP (§13) hit the same wall building for rule-base merging
 and also concluded that priorities must be declared; DeLP's answer (compute
 specificity, declare nothing) is the real alternative, and §13 says why it is
 refused.
+
+**Rule labels are optional, because superiority is the only rule-addressed
+construct.** Everything else names *conclusions* — bodies and heads reference
+literals, defeaters attack literals, queries and subscriptions (§11) watch
+literals — all declared vocabulary, always named. Only `>` points at a rule,
+so an author-given label is needed only where an author writes such a
+reference: an explicit `A > B`, its cross-module `overriding` form (hence a
+base rule mods may reorder must be a *named, exported* extension point, §6.4 —
+extending §6.3's interface artifact, which today exports atoms/heads/actions
+but not rule labels), or a why-trace assertion test (§6.1 item 5). Bands — the
+primary priority mechanism — generate their edges by head-conflict analysis
+over the compiler's internal rule identity, needing no labels, so most rules
+are anonymous. Every rule still carries a stable identity (head plus source
+span) that `dl_why` renders and tooling references; an explicit label is sugar
+that makes it legible (`beaten by fey_ancestry`, not `combat5e.story:81`) and
+hand-referenceable. The label is the name superiority needs, nothing more.
 
 The precedent is exact. This is the meta-rule legal reasoning calls **lex
 superior** — conflicts resolve by the authority ranking of the source — and
@@ -1214,8 +1243,8 @@ them follows.
 ```
 // world.story — the base game
 module world
-fluent door : { locked, closed, open }
-fluent cursed(actor)
+state door : { locked, closed, open }
+state cursed(actor)
 bands stat_stack: base < condition < feat < immunity
 rule can_force(X): strength(X) >= 4 & door = closed  =>  can_force_door(X)  @base
 ```
@@ -1389,7 +1418,16 @@ recovery at declaration boundaries so one error doesn't cascade.
    `world_query(w, can_force_door)` is ill-formed — there are two atoms.
    Either a scope parameter or a scoped view handle (`world_view_in(w, enc)`)
    lands here, and the generated helpers grow with it. Prefer the view: most
-   clients know their scope once, not per call. Playable cellar in raylib
+   clients know their scope once, not per call. The client's reactive channel
+   is a **unified subscription**, `world_subscribe(view, literal)`: register
+   interest in a literal and receive it in each step's delta when its value
+   flips. State facts are the free leaf case — the step already computes its
+   changeset, and the raw fact-store diff (§9) is subscribe-to-all-base-facts
+   — while derived judgments are the cone-recompute case (§4.1 wake-ups); the
+   call is identical either way, and a subscribe to a large-cone judgment is a
+   cardinality-style warning, not a different primitive. Subscription names
+   *conclusions*, so a fluent refactored into a judgment (or back) never
+   touches a client call site. Playable cellar in raylib
    driven entirely by host code against the generated header. A trivial
    second client in tests pins the no-private-APIs claim (§4.2) the way
    golden tests pin semantics — with no reference client, this test is the

@@ -8,44 +8,54 @@
 
 scene skirmish
 
-entity aria : actor          // elf fighter (the player)
-entity grunk : actor         // goblin
-entity longsword, shortbow : item
+sort actor, item
+
+entity (
+    aria  : actor          // elf fighter (the player)
+    grunk : actor          // goblin
+    longsword, shortbow : item
+)
 
 // ---- the priority ladder (§6.2): the 5e stack, verbatim ----
 
 bands stat_stack: base < condition < feat < immunity
 
-// ---- fluents ----
+// ---- state ----
 
-fluent hp(actor) : int in 0 .. hp_max(actor)
-    // declared range = the outermost clamp stage (§5.8): "any leftover
-    // damage is lost" (PHB) is schema, not a rule anyone can forget
-fluent hp_max(actor) : int
-fluent speed(actor) : int in 0 .. 60  combine min
-    // per-fluent collision resolver (§5.8 escape hatch 3): two effects
-    // set your speed -> the most restrictive applies
-fluent elf(actor)
-fluent monster(actor)
-fluent restrained(actor)
-fluent encumbered(actor)
-fluent slept(actor)                 // under magical sleep
-fluent invisible(actor)
-fluent faerie_fired(actor)
-fluent freedom_of_movement(actor)
-fluent dead(actor)
-fluent holding(actor, item)
-fluent on_floor(item)
+state (
+    hp(actor)     : int in 0 .. hp_max(actor)
+        // declared range = the outermost clamp stage (§5.8): "any leftover
+        // damage is lost" (PHB) is schema, not a rule anyone can forget
+    hp_max(actor) : int
+    speed(actor)  : int in 0 .. 60  combine min
+        // per-fluent collision resolver (§5.8 escape hatch 3): two effects
+        // set your speed -> the most restrictive applies
+    elf(actor)
+    monster(actor)
+    restrained(actor)
+    encumbered(actor)
+    slept(actor)                    // under magical sleep
+    invisible(actor)
+    faerie_fired(actor)
+    freedom_of_movement(actor)
+    dead(actor)
+    holding(actor, item)
+    on_floor(item)
+)
 
-init elf(aria)          init monster(grunk)
-init hp_max(aria) = 20  init hp(aria) = 20
-init hp_max(grunk) = 7  init hp(grunk) = 7
-init holding(aria, longsword)
-init holding(grunk, shortbow)
+init (
+    elf(aria)              monster(grunk)
+    hp_max(aria) = 20      hp(aria) = 20
+    hp_max(grunk) = 7      hp(grunk) = 7
+    holding(aria, longsword)
+    holding(grunk, shortbow)
+)
 
 // spatial guards are provider-answered, never enumerated (§5.6)
-provider adjacent(actor, actor)
-provider los(actor, actor)
+provider (
+    adjacent(actor, actor)
+    los(actor, actor)
+)
 
 // ---- judgments: the 5e stack through bands (§6.2) ----
 
