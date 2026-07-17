@@ -40,23 +40,12 @@ action force_door(X: actor):
 rule drop_on_death(X: actor, T: item):        // ramification: fires during any step
     dead(X) & holding(X, T)  causes  on_floor(T)
 
-// ---- narrative: queries conclusions, fires actions ----
-
-=== cellar_door ===
-The cellar door is shut fast.
-{ door = locked: A heavy padlock glints in the torchlight. }
-
-+ { holding(player, rusty_key) & door = locked } [Try the rusty key]
-      do unlock(player)
-      The padlock falls away with a clunk.
-      -> cellar_door
-
-+ { can_force_door(player) } [Shoulder the door open]
-      do force_door(player)
-      It gives way in a shower of splinters. -> inside
-
-+ { weakened(player) & door = closed } [Shoulder the door open]
-      You brace yourself — and your poisoned limbs betray you.
-      -> cellar_door
-
-* [Retreat upstairs] -> hallway
+// ---- driving it ----
+// There is no narrative layer (DESIGN.md §12.1). A host presents the door
+// by querying these judgments and offering the actions whose `requires`
+// currently hold:
+//   can_force_door(player)                  -> offer force_door(player)
+//   holding(player, rusty_key) & door=locked -> offer unlock(player)
+//   weakened(player) & door=closed          -> the shoulder attempt fails
+// Chosen actions go into the next world_step; a greyed-out option is
+// world_why(can_force_door(player)) away from an explanation.

@@ -132,17 +132,13 @@ rule death_drop(X: actor, T: item):
     // cascades in the same step as the killing blow (boolean primed guards
     // ride the fixpoint; no stratification needed)
 
-// ---- narrative: queries conclusions, fires actions ----
-
-=== melee ===
-The goblin circles, shortbow half-drawn.
-{ bloodied(grunk): It is limping now, one eye on the exit. }
-
-+ { adjacent(aria, grunk) } [Strike with the longsword]
-      do sword_strike(aria, grunk)
-      Steel bites. -> melee
-
-+ { wants_flee(grunk) } [Let it run]
-      The goblin bolts for the stairs. -> aftermath
-
-* { dead(grunk) } [Search the body] -> aftermath
+// ---- driving it ----
+// No narrative layer (DESIGN.md §12.1). The combat loop is ordinary host
+// code against the generated header (§6.3): each turn it reads judgments
+// and offers the legal actions, e.g.
+//   adjacent(aria, grunk) -> offer sword_strike(aria, grunk)
+//   wants_flee(grunk)     -> the goblin's own intent judgment; the driver
+//                            may act on it without player input
+//   dead(grunk)           -> end the encounter
+// This slice is deliberately weave-free: it is the proof that a game is
+// buildable on judgments + actions alone (§11, M5).
