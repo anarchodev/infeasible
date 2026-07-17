@@ -295,26 +295,71 @@ are tentative; M1 fixes the syntax.)
 
 **The discipline (lexical scope + an effect rule):**
 
-1. **Read down the stack freely.** An inner rule may read facts and
-   conclusions from any enclosing scope. Encounter rules see area and world
-   facts; the reverse is forbidden.
-2. **Outer facts are pinned during an inner pass.** While an encounter's
+1. **Scopes do not share vocabulary; reading down is a generated defeasible
+   import.** There is no atom `can_force_door` — there is
+   `world:can_force_door` and `cellar_fight:can_force_door`, and they are
+   *different atoms*. An inner rule that names an outer atom does not reach
+   the outer atom; the compiler emits an import rule
+   (`world:f => cellar_fight:f`) and rewrites the reference to the local
+   twin. Inner scopes see outer conclusions only through those imports; the
+   reverse is forbidden. Authors write the unqualified name and never see
+   the machinery (§6.1's cross-cutting rule); provenance renders it —
+   "import of `can_force_door` from `world` (generated; declared
+   world.story:12)".
+2. **Imports lose to local rules** (generated superiority, as inertia loses
+   to causal rules). This is the whole point of 1: an encounter that
+   concludes `~can_force_door` beats its own *import*, not the world's rule.
+   The world's answer is unchanged, the encounter's differs, and nothing is
+   contested — "in this fight the rules are different" without reaching into
+   another scope's rulebook, and without naming a rule the scope does not
+   own.
+3. **Outer facts are pinned during an inner pass.** While an encounter's
    defeasible pass runs, every fact it reads from an enclosing scope is an
    immutable input — nothing outer changes mid-fixpoint. The inner cone reaches
    outward but only across a frozen boundary, so the scoped recompute is sound
    for exactly the §5.4 reason: dependency is monotonic, and a pinned input
    cannot be part of the reachable-change cone of the inner step.
-3. **Write only your own scope.** A step commits `+∂`-primed literals only for
-   fluents declared in the scope it runs in.
-4. **Escalate outward only through a declared action.** The single way an
+4. **Write only your own scope — facts *and* judgments.** A step commits
+   `+∂`-primed literals only for fluents declared in the scope it runs in,
+   and a rule concludes only into its own scope's vocabulary. The second
+   half is what 1 buys: previously this discipline governed facts while
+   judgments were exempt, so any scope could conclude anything about any
+   atom. Both halves of the store now obey one rule.
+5. **Escalate outward only through a declared action.** The single way an
    inner scope affects an outer one is by firing an action whose effect lands
    on an outer fluent — a declared interface, which is what §5.4 already calls
    the module system. This keeps I1/I2 intact: cross-scope influence still
    travels as base facts through the step function, never as a stored
    conclusion and never as a silent write.
-5. **Outer changes wake inner subscribers.** The global-tier subscription
+6. **Outer changes wake inner subscribers.** The global-tier subscription
    mechanism of §4.1 points *downward*: a world-fact change wakes the inner
    scopes whose static cones include it, and they recompute defeasibly.
+
+**Import is inertia across space.** Rules 1–2 introduce no new concept; they
+are §5.3's construct pointed at the other axis:
+
+| | generated default | beaten by |
+|---|---|---|
+| **inertia** (time) | `f => f'` | causal rules |
+| **import** (space) | `world:f => encounter:f` | local rules |
+
+"Things stay as they were unless something changes them" and "outer truth
+holds inside unless something local overrides it" are the same sentence.
+Same generated rule, same generated superiority edge, same erasure to plain
+DL, same provenance obligation. The prior design let inner and outer rules
+compete over one shared atom, which had two defects: an encounter could only
+override by naming a rule in a scope it did not own (the §6.2 asymmetry,
+crossing a scope boundary), and judgments were *already* scope-relative by
+accident — since outer cannot see inner (rule 1), an inner rule concluding
+`~q` left the outer tier still proving `q`, one atom quietly carrying two
+answers depending on who asked. Rules 1–2 make that partition explicit and
+principled rather than emergent. The construction is Bikakis & Antoniou's
+**Contextual Defeasible Logic** (§13): local theories, defeasible mappings,
+contexts ranked for the conflicts that survive.
+
+**This applies to the scope axis only.** Extending a module (§6) shares
+vocabulary deliberately and is *not* affected — see there for the two verbs
+and why they differ.
 
 **Lifetime falls out of vocabulary, not of extra machinery.** An encounter's
 fluents exist only while the encounter does; at teardown the vocabulary
@@ -356,16 +401,16 @@ region-incompatibility weakness (a value that must outlive its region) is
 answered here by escalation *copying outward* through a declared action
 rather than referencing inward.
 
-**Scope-depth superiority (opt-in).** When an inner rule and an outer rule
-conflict on the same head, the natural default is that the *more local* rule
-wins: `encounter > area > world`. This is the logical form of D&D's "specific
-beats general" (§3) — the same thing `too_weak > can_force` writes by hand in
-`cellar.story`, but induced by structure. It is powerful and dangerous:
-ambient scope-superiority can silently defeat an outer rule an author forgot
-was in scope, which is the opposite of the `why?` transparency that is the
-product's point. Therefore it is **opt-in per rule, never ambient**, and
-`dl_why` always names the deciding scope explicitly ("beaten by encounter-scope
-rule R"). Tracked as an open question (§12).
+**Why there is no scope-depth superiority.** An earlier revision proposed
+`encounter > area > world` as an opt-in per-rule tiebreak, for the case where
+an inner rule and an outer rule conflict *on the same head*. Private
+vocabulary (points 1–2) removes the case: they never share a head. The inner
+rule concludes into `encounter:`, the outer into `world:`, and the only thing
+the inner rule beats is its own generated import. The locality intuition the
+proposal was chasing — "the more local rule wins" — is exactly what
+import-loses-to-local already delivers, but structurally rather than as a
+flag an author must remember, and without the hazard that killed it (ambient
+superiority silently defeating an outer rule nobody remembered was in scope).
 
 **Implementation shape (M4).** The current API is flat — one `world`, one
 `intern`, one fact set. Two representations:
@@ -379,10 +424,12 @@ rule R"). Tracked as an open question (§12).
   superiority cross tiers within a single pass.
 
 Take the **hybrid**: logically (B), so a single defeasible pass spans the
-visible stack (points 1–2) and scope-depth superiority is expressible;
-physically (A)'s arena-per-scope, so an encounter tears down in one free and
-solve stays allocation-free (§7). The scope id is a small tag on the atom;
-grounding and wake-up respect it.
+visible stack and the generated imports (points 1–2) are ordinary rules in
+one theory; physically (A)'s arena-per-scope, so an encounter tears down in
+one free and solve stays allocation-free (§7). The scope id is a small tag on
+the atom — which is also what makes `world:f` and `encounter:f` distinct
+atoms in the first place, and what gives scope *instances* their identity
+(§6.4); grounding and wake-up respect it.
 
 **Golden test to pin the meaning** (mirroring how Yale-shooting pins inertia):
 an encounter fluent set true does **not** survive the encounter's teardown,
@@ -825,14 +872,15 @@ every client and any future front end checks against.
 
 | Construct | Compiles to |
 |---|---|
-| `entity`, `fluent`, `scene` | fact-store schema; partition declarations |
+| `entity`, `fluent` | fact-store schema |
+| `module` / `extend` / `scene … in` | vocabulary ownership; generated imports (§6.4) |
 | `rule … -> / => / unless`, `A > B`, bands | defeasible theory (strict/defeasible/defeater/superiority) |
 | `action … requires … causes` | causal rules for the step function |
 | bare `causes` rules | ramifications |
 
-Authoring principles: authors never see primed atoms, inertia, or time
-indices; `unless` sugars to a defeater; conclusions are typed distinctly
-from fluents so I1 is a type error, not a runtime surprise.
+Authoring principles: authors never see primed atoms, inertia, time
+indices, or scope imports; `unless` sugars to a defeater; conclusions are
+typed distinctly from fluents so I1 is a type error, not a runtime surprise.
 
 ### 6.1 Authoring ergonomics (prioritized)
 
@@ -865,10 +913,11 @@ so they are decided *before* the syntax freezes.
    dictates the fix: 5e stacks in named tiers (base → condition → feat →
    immunity) and "specific beats general" is *layering*, not a thousand facts.
    Rules declare a band; higher bands beat lower by default; explicit `>` is
-   reserved for intra-band exceptions. Scope-depth superiority (§5.5) is one
-   instance of the same principle. This is the largest authoring-throughput
-   lever and it is domain-specific, so it had to be designed before the
-   grammar freeze — done: §6.2.
+   reserved for intra-band exceptions. This is the largest
+   authoring-throughput lever and it is domain-specific, so it had to be
+   designed before the grammar freeze — done: §6.2, which also shows bands
+   are load-bearing for *modularity*, not only throughput: a declared tier is
+   the only defence against an attacker who does not exist yet (§6.4).
 4. **Conflictable-pair detection at compile time.** Promote §9's item to Tier
    1: turn the *runtime* "conflict = authoring error" of §5.3 into a *build
    time* one — "rules A and B can both conclude `p` with no priority between
@@ -917,9 +966,31 @@ The largest authoring-throughput lever (§6.1 item 3), now designed. Bands are
 superiority edges between rules that actually conflict (pairs the conflict
 analysis already computes), and the engine, the ABGM semantics, `dl_why`, and
 the M3 transformation pipeline never learn bands exist. Acyclicity is trivial
-within a ladder (total order); ladders, scope edges, and pairwise `>` all
-feed the single superiority relation, with one global acyclicity check over
-the union.
+within a ladder (total order); ladders and pairwise `>` both feed the single
+superiority relation, with one global acyclicity check over the union.
+
+**Sugar, but not optional: bands are how open extension survives** (§6.4).
+Defeaters are *literal*-addressed — a rule attacks a conclusion by naming an
+atom, needing no handle on, or knowledge of, the rule it kills. Superiority
+is *rule*-addressed. So attacking costs nothing and defending costs you the
+attacker's name, and no author can name a mod that does not exist yet. Team
+defeat sharpens it: an applicable attacker must be beaten by *every*
+applicable rule on the other side, so an explicit edge against mod A does
+nothing about mod B. **A declared tier is the only defence against an unknown
+attacker, and the only thing that can arbitrate two mods that have never
+heard of each other** — hence §6.4's rule that `extend` requires a band.
+Grosof's courteous LP (§13) hit the same wall building for rule-base merging
+and also concluded that priorities must be declared; DeLP's answer (compute
+specificity, declare nothing) is the real alternative, and §13 says why it is
+refused.
+
+The precedent is exact. This is the meta-rule legal reasoning calls **lex
+superior** — conflicts resolve by the authority ranking of the source — and
+the one it calls **lex posterior** (the later rule wins) is what we refuse:
+legislatures are totally ordered in time, so "later" is principled there,
+while mod load order is arbitrary, so the same rule is a coin flip wearing a
+principle's clothes. "Last one loaded wins" is the attractor every ad-hoc
+system drifts into; naming it here is how we stay out.
 
 ```
 bands stat_stack: base < condition < feat < immunity
@@ -984,11 +1055,11 @@ Decisions:
   by tooling, not semantics: the compiler warns past a threshold
   ("`stat_stack` is overridden 12 times; restructure the bands") — the
   cardinality-warning philosophy applied to superiority.
-- **Scope-depth superiority (§5.5) slots in below bands**, as a tiebreak
-  between conflicting rules that bands did not decide (same band or both
-  unbanded), for rules that opted in. Explicit band assignment is louder
-  intent than lexical position. The opt-in form stays open until M4 (§12);
-  its precedence slot is reserved now, which is all the grammar needs.
+- **No scope-depth tiebreak.** An earlier revision reserved a precedence slot
+  below bands for `encounter > area > world`. Private scope vocabulary (§5.5)
+  removed the case it addressed — inner and outer rules never conflict on a
+  head — so the slot is gone and the union feeding the superiority relation
+  is just ladders plus pairwise `>`.
 
 Prior art: CSS cascade layers (`@layer`) and `!important` as the
 anti-pattern, with the diagnosis above; clingo's weak-constraint priority
@@ -1073,6 +1144,79 @@ declared cellar.story:12)". §6.1's cross-cutting rule says authors never
 *write* the machinery; provenance is how they never have to *read* it
 either. (§5.4's declared scope interfaces are the `.d.ts` analog, consumed
 by M4's module system.)
+
+### 6.4 Two verbs: `extend` and `scene … in`
+
+There are exactly two ways to build on an existing module, and they differ
+in one thing — whether you **share its vocabulary**. Everything else about
+them follows.
+
+```
+// world.story — the base game
+module world
+fluent door : { locked, closed, open }
+fluent cursed(actor)
+bands stat_stack: base < condition < feat < immunity
+rule can_force(X): strength(X) >= 4 & door = closed  =>  can_force_door(X)  @base
+```
+
+```
+// curse_mod.story — a MOD. Horizontal: joins world's vocabulary.
+extend world
+rule cursed_cant(X): cursed(X)  =>  ~world:can_force_door(X)   @condition
+```
+
+```
+// cellar_fight.story — a SCENE. Vertical: own vocabulary, generated imports.
+scene cellar_fight in world
+rule cursed_cant(X): cursed(X)  =>  ~can_force_door(X)
+```
+
+The rule bodies are the same rule. The header picks what it means:
+
+- **`extend M` — open extension, shared vocabulary.** The mod's
+  `can_force_door` *is* world's atom. It attacks the base game directly,
+  globally, permanently, and — this is the point — **without naming
+  `can_force`**, which it neither owns nor can be sure exists. `@condition`
+  beats `@base` by the ladder. This is the Emacs-advice posture (§3): any
+  module may reach any conclusion, and the `why?` trace is what makes it
+  survivable.
+- **`scene S in M` — a nested scope (§5.5), private vocabulary.** The
+  scene's `can_force_door` is `cellar_fight:can_force_door`, a distinct atom
+  fed by a generated defeasible import. Concluding `~can_force_door` beats
+  the *import*, not world's rule. World's answer is untouched; only this
+  fight sees the curse.
+
+**`extend` requires a band on any rule attacking a foreign atom;
+unbanded is a compile error.** Not a style rule — it is exactly the case
+where pairwise `>` cannot save you. Within your own module you may write
+`A > B` freely: you own both rules. Across an `extend` you cannot name a
+mod that does not exist yet, so a declared tier is the *only* defence
+against a future attacker, and the ladder is the only thing that can
+arbitrate two mods that have never heard of each other. Bands are therefore
+load-bearing for modularity, not ergonomic sugar (§6.2). A scene needs no
+band: it attacks nobody, it overrides its own import.
+
+**Foreign writes are qualified at the site.** In an `extend`, naming
+another module's atom in a head requires `world:can_force_door`, not the
+bare name. The header alone is too thin a tell for a rule whose blast radius
+is global — this is Python's `global`, Rust's `unsafe`, the discipline of
+marking the non-local act where it happens rather than at the top of the
+file. It also makes `grep 'world:can_force_door'` a complete census of what
+touches that conclusion. Inside a `scene`, the bare name keeps meaning the
+local import, and qualification is the escape hatch for asking what the
+outer scope thinks:
+
+```
+rule surprised(X): world:can_force_door(X) & ~can_force_door(X)  =>  confused(X)
+```
+
+**Instantiation.** A `scene` declaration is a *template* (§5.9: spawning is
+scope instantiation); each live instance is its own vocabulary —
+`cellar_fight#1:wolf_hp` and `cellar_fight#2:wolf_hp` are different atoms
+because they are different scope instances. Two wolves from one template get
+distinct identity from the same mechanism that generates the imports, with
+no separate id scheme (§12.2).
 
 ## 7. Runtime (C)
 
@@ -1180,7 +1324,12 @@ recovery at declaration boundaries so one error doesn't cascade.
    the `world_*` API plus the externalized-state pattern (§4.2) — and make
    the generated C header (§6.3) the way games are actually written against
    it: typed atom/action constants, arity-typed query and action helpers,
-   a rename in `.story` breaking the host build. Playable cellar in raylib
+   a rename in `.story` breaking the host build. **Queries carry a scope**
+   (§5.5, §6.4): with private per-scope vocabulary, bare
+   `world_query(w, can_force_door)` is ill-formed — there are two atoms.
+   Either a scope parameter or a scoped view handle (`world_view_in(w, enc)`)
+   lands here, and the generated helpers grow with it. Prefer the view: most
+   clients know their scope once, not per call. Playable cellar in raylib
    driven entirely by host code against the generated header. A trivial
    second client in tests pins the no-private-APIs claim (§4.2) the way
    golden tests pin semantics — with no reference client, this test is the
@@ -1252,15 +1401,21 @@ the save. Two constraints bind it:
   `fires_R` in `dl_why` as the source assignment (§6.3 provenance — a trace
   naming `fires_R` directly would forfeit the moat), and measure the
   grounding cost.
-- Template-scope identity (§5.5): spawning is scope instantiation, and
-  instantiating a template more than once needs distinct entity ids per
-  instance (two summoned wolves from one template). Decide the id scheme
-  (scope-qualified atoms?) with M4's module system.
-- Scope-depth superiority (§5.5): should `encounter > area > world` be an
-  opt-in a rule requests, a per-scope default an author can flip, or always
-  explicit? Leaning opt-in-per-rule for `why?` transparency; revisit once M4
-  has real nested worlds to author against. Its precedence slot is now fixed
-  — a tiebreak *below* bands (§6.2); only the opt-in form remains open.
+- ~~Scope-depth superiority~~ — **dissolved**, not answered (§5.5, §6.4).
+  The question ("should `encounter > area > world` be opt-in per rule?")
+  presupposed that inner and outer rules compete for one shared atom. They
+  no longer do: scopes have private vocabulary, an inner rule beats its own
+  generated *import*, and there is no depth-precedence to opt into.
+- Template-scope identity (§5.5) — **mostly resolved** (§6.4): scope
+  instances have private vocabulary, so two wolves from one template are
+  distinguished by `cellar_fight#1:` vs `cellar_fight#2:` — the id scheme
+  §12 guessed at ("scope-qualified atoms?") is just what the import
+  mechanism already does, with nothing extra to design. **Still open at the
+  boundary**: escalation is by declared action onto an outer fluent (§5.5
+  rule 5), and if the outer fluent needs to name *which* wolf, the identity
+  has to survive a crossing that scope-qualification does not obviously
+  carry. `wolves_killed : int` is fine; `dead(wolf)` at world scope is not
+  yet. Decide with M4.
 
 ## 13. References
 
@@ -1291,6 +1446,31 @@ the save. Two constraints bind it:
 - R. Evans, E. Short, *Versu — A Simulationist Storytelling System*, IEEE
   TCIAIG 6(2), 2014. (exclusion logic: multi-valued state as the core
   representation of a shipped narrative engine)
+- A. Bikakis, G. Antoniou, *Contextual Defeasible Logic and Its Application
+  to Ambient Intelligence*, IEEE Trans. SMC-A 41(4), 2011; and *Local and
+  Distributed Defeasible Reasoning in Multi-Context Systems*, RuleML 2008.
+  (contexts with private vocabulary, defeasible mappings between them, a
+  preference ordering over contexts — §5.5's nested scopes are this
+  construction; the mapping-is-defeasible rule is what lets a scene override
+  locally without contesting the world)
+- B. Grosof, *Prioritized Conflict Handling for Logic Programs*, ILPS 1997;
+  *Representing E-Commerce Rules via Situated Courteous Logic Programs*,
+  ECRA 2003. (courteous LP: `overrides(r1, r2)` over rule labels, plus mutex
+  declarations, built explicitly for *merging* rule bases from different
+  authors — the closest prior art to §6.4's `extend`, and it too resolves
+  conflicts by declared priority rather than by any implicit criterion)
+- A. García, G. Simari, *Defeasible Logic Programming: An Argumentative
+  Approach*, TPLP 4(2), 2004. (DeLP: no superiority relation at all —
+  argument comparison by *generalized specificity*, computed rather than
+  declared. The road not taken: it removes §6.4's naming asymmetry entirely,
+  at the cost of dialectical trees (not linear) and of a `why?` that derives
+  rather than explains)
+- E. Oikarinen, T. Janhunen, *Modular Equivalence for Normal Logic Programs*
+  / module theorem; V. Lifschitz, H. Turner, *Splitting a Logic Program*,
+  ICLP 1994. (compositionality of answer sets under **disjoint output
+  signatures** — the formal version of §5.4's invisibility claim, and the
+  proof that open extension and a composability theorem are exclusive: §6.4's
+  `extend` is precisely two modules defining one atom, which these forbid)
 - M. Tofte, J.-P. Talpin, *Region-Based Memory Management*, Information
   and Computation 132(2), 1997. (arena-per-scope + dependency-closure
   checking is region typing for facts, §5.5)
