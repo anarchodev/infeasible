@@ -272,6 +272,18 @@ Defeasible logic defines consequence, not time. Time lives in the fact store:
 - Sanity anchor: the **Yale shooting problem** behaves correctly by
   construction — inertia on `loaded` is only defeated by a rule that actually
   fires against it; nothing fires during `wait`. This is a golden test.
+- **Reactions are a host protocol, not new step semantics.** A step is
+  one-shot: an action set goes in, the next state comes out. Interrupts that
+  fire in response to an action and change whether it lands (5e Shield turning
+  a hit into a miss, Counterspell nullifying a cast) are a *driver* two-phase
+  drive — propose an action, let the host read the resulting judgments, offer
+  reactions that add facts or actions, then commit the resolved step — layered
+  above `world_step`, needing no `.story` syntax. The one core affordance it
+  requires is a **dry-run query**: the host can evaluate a proposed action's
+  judgments (its would-be hit/miss) *without committing* the step. Shield then
+  needs nothing special — it sets a temporary AC-boost fluent and the hit
+  judgment (never stored, I1) recomputes on the committed step; its duration is
+  the host turn-counter of §5.10's `tick`.
 
 ### 5.4 Why the two-tier optimization is semantically invisible
 
@@ -849,6 +861,71 @@ are pinned in `tests/test_spawn.c` (including the stale-flag-on-inactive-
 slot behavior that motivates the reset rule); exhaustion reporting is
 compiler surface and awaits M1.
 
+### 5.10 Randomness: a seeded lookup, not a stream
+
+Games need dice; a deterministic core (I4) cannot hold an RNG. The resolution:
+**a random value is a provider (§5.2), not core state and not a host-injected
+outcome.** The logic consumes a draw exactly as it consumes adjacency — a
+seeded, side-effect-free answer computed engine-side — so the core neither
+holds RNG state nor computes the draw, and I4's "no unseeded randomness in the
+logic core" holds by construction.
+
+**Lookup, not draw — the mental model.** Picture one immutable table per
+`(seed, tick)`, its entries keyed by a stable *site* string, each holding a
+number. `roll(site)` is a table lookup: the same site returns the same number,
+and reading never consumes it. That property is what lets randomness sit
+*inside* the fixpoint. A defeasible solve re-evaluates a guard many times as it
+converges (§5.1); a stream would advance on each re-read and the solve would
+not be well-defined, and two sites drawn in evaluation order would shear if
+that order changed. A keyed lookup is **idempotent under re-read** and
+**independent across sites** — order-blind in exactly the two ways the solver
+needs. Conceptually the table is infinite and precomputed; in practice each
+consulted entry is `hash(seed, tick, site)`, computed on demand, nothing
+stored. The `tick` is a monotone step counter (deterministic, not wall-clock —
+the same distinguished counter §5.3's durations want), so a site rolls afresh
+each step; the `seed` is save-file state and selects the whole family of
+per-tick tables at once.
+
+**The site is ambient — keyed per ground rule-instance.** An author never
+spells out which rule or which entities a roll belongs to. When a rule consults
+`roll(...)`, the engine folds the *calling rule's identity and its current
+binding tuple* into the site — the rule is the namespace (lexical scoping for
+roll sites), so a tag need only be unique within a rule, and every ground
+instance (`save(grik)` vs `save(gnok)`) gets its own independent roll for free.
+The author supplies only the residual they control:
+
+```
+rule save(X):  ... roll()         // keyed (seed, tick, save#X)
+rule dmg(A,D): ... roll("d6", i)  // 8d6: a tag + index disambiguate intra-rule draws
+```
+
+Two rules writing `roll("d6")` never collide — their rule identities differ.
+Intentional *correlation* (one environmental d20 several rules must agree on)
+is the explicit exception: `shared_roll("storm")` names a rule-independent
+global site. Safe-because-independent is the zero-boilerplate default;
+sharp-because-shared is visible. Die-shaping is ordinary numeric work: the
+provider yields a number and `roll() + mod(A) >= dc(D)` is a value-store guard
+(§5.8) — the raw draw is the only new primitive.
+
+**Replay and lockstep.** A save is base facts + **seed** + action log. Because
+*which* draws happen is decided by rule evaluation — part of the
+deterministically-compiled theory (I4 extends to compile, §12) — re-solving the
+log from the seed reproduces every roll exactly. Editing a rule reshapes its
+instance keys and so shifts its rolls; within a version (all live play, all
+lockstep peers) that never arises, and across versions it is the ordinary "a
+rule edit changes behavior" concern — pin a roll with an explicit rule label (a
+new reason for the optional labels of §6.2) or log outcomes rather than the
+seed when a stored *old* log must replay stably. In lockstep, every peer's
+table is fixed by the shared seed and identical compiled rules, so all peers
+derive identical rolls with nothing to reconcile; the per-tick state hash (§12)
+catches any peer whose build diverged.
+
+**Golden test to pin it:** a rule consulting `roll()` yields the same value
+across repeated solves of one tick (idempotence) and a different value the next
+tick; two ground instances of one rule draw independently; `shared_roll` gives
+two rules the same value; and a full action-log replay from a stored seed
+reproduces every rolled outcome exactly (I4).
+
 ### Invariants (compiler/engine enforced)
 
 - **I1 — No write-back.** Derived conclusions are never stored as base facts.
@@ -857,8 +934,9 @@ compiler surface and awaits M1.
   change facts exclusively via the step function.
 - **I3 — Providers are dependencies.** Index-backed guards invalidate their
   cones when their underlying index changes.
-- **I4 — Determinism.** No wall-clock, no unseeded randomness inside the
-  logic core; a save is base facts + action log; replay is exact.
+- **I4 — Determinism.** No wall-clock, and no unseeded randomness inside the
+  logic core: randomness enters only as a seeded lookup provider (§5.10). A
+  save is base facts + seed + action log; replay is exact.
 
 ## 6. Language sketch
 
@@ -1534,6 +1612,20 @@ primed-atom trace) rather than only static state, are the target.
 - **Effect-operator set and domain-declaration surface** (§5.8): the numeric
   semantics are fixed, but the exact operator set (`:=`, `+=`, `-=`, …) and
   the domain-declaration syntax are M1 decisions, not yet frozen.
+- **Set-quantified effect binder** (`examples/srd_probe*.story`): the one
+  effect-side construct the M1 parser must not front-run. An effect that ranges
+  over a provider-answered set — `for each T where <guard> [limit n]: <effect>
+  [when <cond>]` — is what AoE (Fireball), set-retract (concentration ending),
+  variable-count spawning (summon N), and zone painting all reduce to, and it
+  is the M3 grounding risk in surface form. Its riders (per-target `when`,
+  transient action-scoped inputs like a save outcome, relational effect
+  provenance) are decided with it. Declarations, judgment rules, bands, and
+  fixed-arity actions can be parsed *before* this is frozen; the effect grammar
+  cannot.
+- **First-class value domains beyond entity sorts**: `cell`/`point` for
+  targeted and area spells (§5.6), and `enum`-style value domains distinct from
+  `sort` (which is for entities). Orthogonal to and smaller than the binder,
+  but on the same M1 effect-surface critical path.
 - **Concurrent non-numeric action interactions**: the numeric pipeline (§5.8)
   and multi-valued defeat (§5.7) settle the mechanics; the author-facing
   rules of thumb for actions that interact through neither still need docs.
@@ -1557,6 +1649,23 @@ primed-atom trace) rather than only static state, are the target.
   Results for Defeasible Logic*, ACM TOCL 2(2), 2001.
 - M. Maher, A. Rock, G. Antoniou, D. Billington, T. Miller, *Efficient
   Defeasible Reasoning Systems*, IJAIT 10(4), 2001. (Delores.)
+- H.-P. Lam, G. Governatori, *The Making of SPINdle*, RuleML 2009, LNCS 5858,
+  pp. 315–322. (the closest implementation to M3's target: the TOCL
+  transformations as a theory normalizer in front of a linear propositional
+  engine, scaling past a million rules. Propositional by construction — its
+  algorithms assume the Herbrand base of the input theory is already built)
+- M. Rohaninezhad, S. Mohd Arif, S. A. Mohd Noah, *A grounder for SPINdle
+  defeasible logic reasoner*, Expert Systems with Applications 42(20), 2015.
+  (grounding retrofitted onto SPINdle for stratified theories using dlv and
+  gringo techniques. States §5.2's premise as a complexity result —
+  inference is linear, but bottom-up instantiation of the ground predicate
+  set is NP-complete — and identifies the fork: backward-chaining defeasible
+  reasoners support the first-order form, forward-chaining ones take the
+  propositional form. §5.1's choice of forward chaining therefore fixes the
+  propositional core and makes §5.2's grounding discipline load-bearing
+  rather than hygienic. Its own answer is Herbrand instantiation up front,
+  which §5.2 item 4 refuses: a tick loop joins against live facts instead,
+  paying per match rather than per possible ground instance)
 - C. Martens, *Ceptre: A Language for Modeling Generative Interactive
   Systems*, AIIDE 2015.
 - M. Gelfond, V. Lifschitz, *Action Languages*, ETAI 1998.
