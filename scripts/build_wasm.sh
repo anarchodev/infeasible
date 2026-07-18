@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # Build the core + wasm shim to an ES module for the Node/browser loop driver.
-# Requires emcc on PATH (source emsdk_env.sh first). No raylib, no display.
+# Self-contained: bootstraps a repo-local pinned emsdk on first run, then uses
+# it. No system emsdk needed. No raylib, no display.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
 out="$here/build-wasm"
 mkdir -p "$out"
+
+# ensure + activate the repo-local toolchain
+"$here/scripts/bootstrap_emsdk.sh"
+# shellcheck disable=SC1091
+source "$here/.emsdk/emsdk_env.sh" 2>/dev/null
 
 emcc -O2 -I"$here/src" \
   "$here/src/core/arena.c" \
