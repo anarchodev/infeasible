@@ -362,7 +362,7 @@ override locally without contesting the world and without naming a rule it
 does not own (the §6.2 asymmetry would otherwise cross the scope boundary):
 the inner rule beats its own import, and `world:can_force_door` is untouched.
 The construction is Bikakis & Antoniou's **Contextual Defeasible Logic**
-(§13): local theories, defeasible mappings,
+(§14): local theories, defeasible mappings,
 contexts ranked for the conflicts that survive.
 
 **This applies to the scope axis only.** Extending a module (§6) shares
@@ -383,7 +383,7 @@ and "summon" loads an instance — the vocabulary arrives whole,
 arena-allocated, and despawn is teardown. Dynamic creation without dynamic
 vocabulary. Instantiating a template more than once raises an
 entity-identity question (two wolves from one template need distinct ids) —
-open, §12.
+open, §13.
 
 **Unloading is a reachability optimization, and it is provably invisible.**
 §5.4's argument — dependency is monotonic, scopes are dependency-closed —
@@ -822,7 +822,7 @@ corruption. Four mechanisms, chosen by what kind of thing spawns:
 2. **Scope instantiation — encounter-lifetime spawning** (§5.5). A summon
    loads an instance of a template scope; the vocabulary arrives whole,
    grounding happens at the load boundary (never mid-fixpoint), and
-   despawn is arena teardown. Template identity is the §12 question.
+   despawn is arena teardown. Template identity is the §13 question.
 3. **Counts — fungible items are not entities.** Identity is the expensive
    thing; grant it only when a rule must track *this one* rather than *how
    many*. Loot is `causes potions(X) += 1` on a numeric fluent (§5.8);
@@ -989,9 +989,9 @@ applicable rule on the other side, so an explicit edge against mod A does
 nothing about mod B. **A declared tier is the only defence against an unknown
 attacker, and the only thing that can arbitrate two mods that have never
 heard of each other** — hence §6.4's rule that `extend` requires a band.
-Grosof's courteous LP (§13) hit the same wall building for rule-base merging
+Grosof's courteous LP (§14) hit the same wall building for rule-base merging
 and also concluded that priorities must be declared; DeLP's answer (compute
-specificity, declare nothing) is the real alternative, and §13 says why it is
+specificity, declare nothing) is the real alternative, and §14 says why it is
 refused.
 
 **Rule labels are optional, because superiority is the only rule-addressed
@@ -1079,7 +1079,7 @@ changes when bodies *or facts* change — its criterion is context-sensitive,
 rules wins can differ **between two game states**, with no edit at all). The
 last is unfixable by authoring discipline, and its honest trace reads "A beat
 B *this time*" — strictly worse to hand a designer than "beaten by
-`@immunity` over `@condition`". §13 records the DeLP fork in full.
+`@immunity` over `@condition`". §14 records the DeLP fork in full.
 
 ```
 bands stat_stack: base < condition < feat < immunity
@@ -1305,7 +1305,7 @@ scope instantiation); each live instance is its own vocabulary —
 `cellar_fight#1:wolf_hp` and `cellar_fight#2:wolf_hp` are different atoms
 because they are different scope instances. Two wolves from one template get
 distinct identity from the same mechanism that generates the imports, with
-no separate id scheme (§12).
+no separate id scheme (§13).
 
 ## 7. Runtime (C)
 
@@ -1446,7 +1446,90 @@ recovery at declaration boundaries so one error doesn't cascade.
    narrative layer is the honest test of whether rules alone carry story
    state.
 
-## 12. Open questions
+## 12. Distribution: web target and content artifacts
+
+The shipped product is a browser platform for a remix community: many authors
+making scenarios, subclasses, spells, items, and total conversions on a shared
+5e chassis, with nothing to install. This is a distribution and packaging
+concern layered on the kernel (§4.2); it adds no engine semantics.
+
+**The web target.** The logic core compiles to WASM as a library. Presentation
+is a swappable client (§4.2): native raylib for development, web-native
+(Canvas2D or Pixi + DOM) for the shipped product. The core re-solves per
+action, not per frame, so the JS↔WASM boundary is crossed rarely and carries a
+subscription delta (§11 M2), not per-frame traffic — the inspector's reactive
+channel and the WASM marshalling seam are the same `world_subscribe` payload.
+
+**Compiler as a library over an IR.** Parsing and semantic analysis are
+separate stages: the parser emits a declaration IR; the analysis and grounding
+passes (§5.2, §5.8) consume that IR and never depend on the tokenizer. The
+analyzer therefore runs at native build time *or* in-browser at load — the
+property that keeps in-browser authoring (no build step) possible.
+**Compilation is deterministic** — I4 extends to the compile step — so two
+peers grounding the same source obtain the identical theory. That is a
+lockstep-multiplayer correctness requirement, not merely cache hygiene.
+
+**Source is authoritative; the compiled theory is a cache.** Every artifact
+ships `.story` source, always, so anyone can inspect and adapt it — the remix
+community depends on it. The grounded/compiled theory is a regenerable *local*
+cache keyed by `hash(source + engine version)` — the `.el`/`.elc` model: a miss
+recompiles (slower), never breaks, and content-hash keying is never stale by
+construction. Compiled-only artifacts are never distributed.
+
+**Artifacts: reference the shared substrate, embed only at a self-sufficient
+leaf.** Three layers:
+
+- **Engine** (WASM): shared, hash-identified, optionally signed for provenance.
+- **Game / content pack**: `.story` source + assets + a manifest (id, author,
+  version, `requires`), shipped as one container and referencing the engine by
+  hash. Mods and total conversions are one artifact at different sizes (§6.4):
+  packs `extend` or `scene … in`-import a *layered* 5e (a content-blind core
+  plus separate spell/item/subclass files) and compose à la carte, with
+  `requires` naming an *interface* (the exported heads) rather than a specific
+  file, so alternative implementations substitute. Load order is irrelevant (a
+  theory is a set; a genuine clash is a conflictable-pair error, never silent
+  last-writer-wins).
+- **Save**: `(engine-hash, game-hash, action-log)`, embedding nothing. The save
+  is an action log, not a state snapshot (I4) — which yields shareable
+  playthroughs, branching, and time travel for free. A base-fact snapshot
+  (never judgments — I1) is an optional load-time cache:
+  nearest-checkpoint-plus-replay-the-tail.
+
+**Late join and state sync.** Determinism makes multiplayer *lockstep*: peers
+broadcast actions (§4.2 driver), everyone replays, and consistency is
+structural — no authority or consensus, since every peer holds the bit-identical
+state, and any peer can serve a joiner. A joining client reaches the live state
+either by replaying the action log from genesis (simplest; sufficient while
+sessions are short) or, as a long-session optimization, by importing a
+tick-stamped base-fact snapshot (never judgments — I1; re-derived via `dl_solve`)
+plus the action tail after it. The live-join dance — subscribe-and-buffer the
+action stream *before* requesting the snapshot, discard buffered actions at or
+before the snapshot's tick, apply the snapshot, drain the rest through the normal
+`world_step` path (I2), then go live — is transport orchestration and lives in
+the outer engine, not the core. The core exposes only primitives: export/restore
+a base-fact snapshot at a tick, deterministic step-apply, and an optional
+per-tick state-hash for desync detection (RTS "sync checks"). The join-snapshot
+is the same base-fact checkpoint the save model already needs; it is not a
+separate netcode state.
+
+**Trust is containment, not credentials.** Untrusted content runs in a
+WASM + sandboxed-iframe cage with a minimal import surface; that is the whole
+security posture. The real safety property is that content is declarative data
+run through a vetted interpreter, not arbitrary code. Engine signing is
+optional provenance/UX (a verified-creator badge, unknown signers warned by
+fingerprint), never the containment mechanism, and never gates play.
+
+**Inspector (§9).** A client above `world_*` that fuses fact-store truth with
+the host's presentation and spatial state (§5.6) through a binding table
+`{logic id ↔ host id}` the host owns; the engine exposes the hooks, the outer
+engine builds the GUI. The hooks: a structured `dl_explain` (the `why?`
+proof/defeat DAG as data — the text trace is one renderer over it), an
+entity→literals reverse index (which requires grounding to retain provenance —
+an M1 constraint), and `world_subscribe` deltas (§11 M2). Point-and-click
+`why?` over an entity's propositions, and explaining a *transition* (a step's
+primed-atom trace) rather than only static state, are the target.
+
+## 13. Open questions
 
 - **Effect-operator set and domain-declaration surface** (§5.8): the numeric
   semantics are fixed, but the exact operator set (`:=`, `+=`, `-=`, …) and
@@ -1467,7 +1550,7 @@ recovery at declaration boundaries so one error doesn't cascade.
   scope-qualification does not obviously carry across. Decide with M4's
   module system.
 
-## 13. References
+## 14. References
 
 - M. Maher, *Propositional Defeasible Logic has Linear Complexity*, TPLP 1(6), 2001.
 - G. Antoniou, D. Billington, G. Governatori, M. Maher, *Representation
