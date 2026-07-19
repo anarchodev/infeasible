@@ -127,6 +127,30 @@ Two tiers, one semantics:
   Storage and *triggering* are Osiris-shaped: rules subscribe to atoms; a
   base-fact change wakes only the rules in its static dependency cone, which is
   then recomputed defeasibly.
+- **Wake-ups fire only into the demand cone.** Subscriptions
+  (`world_subscribe`, §11 M2) define a *demand cone*: the backward closure,
+  over the same static dependency graph as §5.4's wake-ups, from every
+  subscribed literal, every step-rule body literal, and every scope-interface
+  literal — closed under attack (a demanded literal drags in its complement's
+  rules and the superiority edges among them; defeat is adversarial, so
+  relevance must be too, and expect this closure to be bigger than intuition
+  suggests — the large-cone subscription warning of §11 M2 covers it). A
+  base-fact change then recomputes only conclusions that are both *reachable*
+  (forward cone of the change) **and** *demanded*: an unwatched judgment cone
+  is never grounded or maintained, no matter how often its inputs flip. This
+  laziness is licensed by I1 and applies to judgments only — derived
+  conclusions are never stored and never feed state, so skipping one is
+  unobservable. The **step-relevant cone is always live**: causal rules,
+  ramifications, inertia, and every judgment feeding a step-rule body run for
+  the whole scope every step, because state evolution is observer-independent
+  (the dead guard drops the torch whether or not any client subscribed to
+  `on_floor`), and because §12 lockstep needs per-peer-identical step theories
+  while subscriptions are per-client. Storage is likewise never demand-trimmed:
+  base facts are the state (I4); what goes lazy is derivation and rule
+  matching, never the fact store. `world_query` on an undemanded literal stays
+  legal as the slow path — ground and solve its cone on demand — because the
+  `why?` debugger, the editor, and §5.3's dry-run query are ad hoc by nature.
+  Declared interest buys the incremental path; it does not gate the ask.
 
 This split is an optimization, not a second semantics — see §5.4.
 
@@ -1413,8 +1437,11 @@ examples/  .story surface-language files
   the linear pass is tens of microseconds; turn-based action boundaries give
   ~ms budgets. Full recompute per action, always.
 - Global tier: hundreds of thousands of facts; event-driven wake-ups cost ∝
-  changes, not database size. Never maintain non-monotonic conclusions
-  incrementally — scope the recompute instead.
+  changes intersected with the demand cone (§4.1), not database size —
+  unwatched judgment cones are never maintained. Never maintain non-monotonic
+  conclusions incrementally — scope the recompute instead. (The scene tier
+  deliberately skips demand tracking: full recompute is already tens of
+  microseconds; bookkeeping would cost more than it saves.)
 - Crowds/presentation entities stay renderer-side; promotion into the fact
   store is an explicit design act. The precise boundary: **assets stay out,
   references may come in.** The store never holds pixels or geometry, but
@@ -1514,9 +1541,11 @@ recovery at declaration boundaries so one error doesn't cascade.
 4. **M3 — engine hardening**: Maher linear algorithm + transformation
    pipeline behind the same API; tick-time join matcher for variables/typed
    entities (until then: ground rules per entity by hand/codegen).
-5. **M4 — scale spine**: global tier (subscriptions, dependency cones),
-   scene partitions, **nested scopes with lifetime/visibility (§5.5)**,
-   serialization, hot reload.
+5. **M4 — scale spine**: global tier (subscriptions, dependency cones —
+   wake-ups recompute only the reachable ∩ demanded set, per §4.1; the demand
+   cone is the attack-closed backward reachability from subscriptions and
+   step-rule bodies over the same static graph), scene partitions, **nested
+   scopes with lifetime/visibility (§5.5)**, serialization, hot reload.
 6. **M5 — proof-of-thesis demo**: one region, ~20 NPCs, a 5e-ish combat slice
    where conditions/feats interact through superiority, one multi-step quest,
    `why?` in the UI — all driven by host code against the generated header
