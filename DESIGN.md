@@ -470,6 +470,38 @@ while a world fluent set true from inside the encounter (via a declared
 escalating action) **does** persist after teardown — and an inner rule reading
 an outer fact produces the same verdict whether evaluated scoped or whole.
 
+**Stress test: sectors (MMO/open-world scale).** Recorded not as new
+mechanism but as evidence the constructs compose — three classic large-world
+problems reduce to what is already on this page:
+
+- *Sectors are sibling `area` scopes.* "Process only active sectors" is scope
+  loading; a sector at rest is its interface facts.
+- *Crossing is a handoff, not a move.* An entity's sector-local fluents live
+  in the sector's vocabulary, so migration is an escalation action carrying
+  the survivable facts outward (rule 5), the source sector freeing its pool
+  slot, and the target sector's spawn action (§5.9's complete-effect-list
+  reset) instantiating them — two actions in two logs, replay-exact,
+  `why?`-traceable, no reference ever dangling across a boundary. The
+  identity that survives the hop is §13's cross-scope-identity question in
+  MMO clothes, and this case argues for its shape: durable id owned by the
+  outer tier, sector-local state keyed by pool slot.
+- *The border problem dissolves into co-scoping.* Combat straddling a sector
+  line is a classic headache because interaction is ambient in most engines.
+  Here two entities contest conclusions only inside a shared scope, so a
+  cross-border fight *forces* an encounter scope spanning members of both
+  sectors: sectors are the storage/paging partition, encounters are the
+  interaction partition, and they may disagree. Overlap zones and handoff
+  hysteresis are replaced by the partition checker — reaching across an
+  interface is a compile error, not a ghost-entity bug.
+- *Sibling scopes may step concurrently.* Siblings share no vocabulary; their
+  only common dependency is the outer tier, pinned during their passes
+  (rule 3) and mutated only through escalation actions. Dependency closure
+  *is* the isolation proof, so sector steps parallelize lock-free. The one
+  new obligation is I4's: escalations arriving at the outer tier from
+  concurrently-stepping siblings need a **canonical merge order** (e.g.
+  sector id, then log position — never arrival time) so replay is
+  independent of scheduling. Open, §13; decide with M4.
+
 ### 5.6 Space and movement
 
 A grid or hex battlefield is the canonical *dense computed relation* §5.2
@@ -765,7 +797,34 @@ so the hatches are shaped for strangers:
    judgment values (`incoming_damage(X)` through the ordinary defeasible
    layer, bands arbitrating modifiers) committed by a *single* effect — the
    MTG move of writing CR 613 as rules. Costs no engine feature; `why?`
-   traces every stage because every stage is a rule.
+   traces every stage because every stage is a rule. Worked example —
+   **typed damage**, the 5e/BG3 shape: damage types are a small closed
+   sort, so the pipeline is one judgment per type. Attack rules conclude
+   base values into `incoming_fire(X)`, `incoming_acid(X)`, …; resistance,
+   immunity, and vulnerability are ordinary defeasible rules whose
+   rewritten value beats the base conclusion (bands/superiority); one
+   commit effect sums the types into `hp(X) -=`. Every stage being a rule,
+   the trace reads "fire 8 → 4 (`tiefling_resistance` beats
+   `base_fire_damage`)" — richer than the tooltip it imitates, and each
+   roll is §5.10-site-keyed, so the receipt can show the dice.
+
+**The receipt is structured data, not only a rendering.** BG3-style floating
+combat text — every hit displaying its source and damage type — is a *view of
+the commit receipt*. The commit already computes the multiset of undefeated
+contributions in order to sum them, so each step's subscription delta (§11
+M2) carries them as data: per changed value, the winning base, then each
+contribution with its ground source rule (provenance retains bindings — the
+M1 constraint), its type/stage tags, and its pre-defeat value where a
+modifier rewrote it. This keeps the renderer a pure query client (§8); the
+alternative — re-asking `why?` after each step and parsing the trace — would
+make the trace load-bearing as a *string format*, the wrong coupling.
+Cross-step tallies (a multi-attack sequence's running total) are
+renderer-side arithmetic over successive receipts and touch no semantics.
+And the tempting alternative is deliberately rejected: an accumulating
+damage *buffer* that rules append to and a later phase drains is mutable
+intermediate state with an ordering — the Osiris disease wearing a queue
+costume. The "list of damage to apply" is a projection of one fixpoint's
+winners, never a store.
 
 Deliberately not offered: per-rule stage reordering (recreates the conflict
 one level up), timestamps in any costume, and a content-configurable global
@@ -799,6 +858,31 @@ mutable only through actions (destructible walls with inertia, exact
 replay, and `why?` traces), read directly by the renderer as its tilemap —
 live in the world model without ceremony, while sprite *pixels* stay out
 (§8).
+
+**A third backing: columnar evaluation of homogeneous families (speculative,
+post-M3).** ECS is relational algebra — components are columns, entities are
+rows — and grounding already produces the correspondence: a judgment over a
+sort (`near(X, player) & ~asleep(X) => alerted(X)`, `X : actor`) grounds to N
+structurally identical rule instances differing only in the entity index.
+When a family is *homogeneous* — one rule-graph shape, same attackers, same
+superiority edges, only the fact bits differing per instance — the fixpoint
+can run set-at-a-time instead of tuple-at-a-time (semi-naive Datalog's move):
+lift the M3 counters to vectors indexed by entity id, pack boolean fluents
+over the sort into bitvectors, and a propagation round over the family
+becomes word-wide AND/OR/NOT over proved⁺/proved⁻/undecided masks — 64
+entities per instruction, the RTS-crowd regime, on the entity-indexed arrays
+this section already mandates. Heterogeneity (a rule naming `goblin_3`, a
+per-instance superiority override) partitions the family exactly as
+default-plus-exceptions partitions storage: the bulk goes columnar,
+exceptions fall back to scalar propagation; cross-entity joins stay provider
+territory (sparse pairs scattered into the columns). Whole-family recompute
+tensions with sparse wake-ups the same way scene-tier full recompute tensions
+with demand tracking (§8), and resolves the same way: at large homogeneous N
+the branchless sweep beats the bookkeeping, and the compiler picks per
+family, invisibly (§6.1's cross-cutting rule). `why?` survives because
+judgments are pure — one instance re-derives scalar-style on demand.
+Semantics untouched: one more backing, pinned by the same golden tests that
+keep the M3 swap honest.
 
 The store also generalizes §5.7's implementation: exactly-one-value fluents
 admit two faithful backings of the same semantics. *Logic-backed* — one atom
@@ -1435,7 +1519,10 @@ examples/  .story surface-language files
 
 - Scene tier: thousands of ground rule instances, tens of thousands of facts →
   the linear pass is tens of microseconds; turn-based action boundaries give
-  ~ms budgets. Full recompute per action, always.
+  ~ms budgets. Full recompute per action, always. Homogeneous rule families
+  at RTS-crowd scale may additionally evaluate columnar (§5.8's third
+  backing): bitvector fixpoint rounds over entity-indexed arrays, 64
+  instances per op.
 - Global tier: hundreds of thousands of facts; event-driven wake-ups cost ∝
   changes intersected with the demand cone (§4.1), not database size —
   unwatched judgment cones are never maintained. Never maintain non-monotonic
@@ -1532,7 +1619,10 @@ recovery at declaration boundaries so one error doesn't cascade.
    call is identical either way, and a subscribe to a large-cone judgment is a
    cardinality-style warning, not a different primitive. Subscription names
    *conclusions*, so a fluent refactored into a judgment (or back) never
-   touches a client call site. Playable cellar in raylib
+   touches a client call site. Deltas for numeric fluents carry the §5.8
+   commit receipt as structured data — each changed value's undefeated
+   contributions with ground-rule provenance — so attributed combat text is
+   a projection of the delta, never a parsed `why?` string. Playable cellar in raylib
    driven entirely by host code against the generated header. A trivial
    second client in tests pins the no-private-APIs claim (§4.2) the way
    golden tests pin semantics — with no reference client, this test is the
@@ -1669,7 +1759,13 @@ primed-atom trace) rather than only static state, are the target.
   specific instance — `dead(wolf)` at world scope, not just a
   `wolves_killed` counter — the identity has to survive a boundary that
   scope-qualification does not obviously carry across. Decide with M4's
-  module system.
+  module system. The sector handoff (§5.5's stress test) is the same
+  question at MMO scale and suggests the shape: durable id owned by the
+  outer tier, sector-local state keyed by pool slot.
+- **Escalation merge order under concurrent sibling steps** (§5.5): sibling
+  scopes may step in parallel, but I4 needs escalations arriving at the
+  shared outer tier to merge in a canonical order (sector id then log
+  position — never arrival time). Small, load-bearing; decide with M4.
 
 ## 14. References
 
