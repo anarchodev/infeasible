@@ -71,6 +71,29 @@ ad-hoc flag system can offer.
 - **Defeasible logic** (Nute; Billington; Antoniou, Billington, Governatori,
   Maher) — the inference core, chosen for its linear-time complexity and
   explicit superiority relation.
+- **Set-at-a-time evaluation (Datalog)** — semi-naive evaluation, bddbddb's
+  BDD-encoded relations, Soufflé's specialized relation structures: operate
+  on the set of tuples, not the tuple. §5.8's columnar backing is this move
+  applied to defeasible proof statuses. The defeasible implementation line
+  (Delores, SPINdle) never took it — tuple-at-a-time throughout — because
+  its workloads (law, business rules) are single heterogeneous theories with
+  no homogeneous family to vectorize over; that shape is what an
+  entity-populated game world produces and a statute book does not. Both
+  ingredients are prior art; the composition (set-at-a-time × team
+  defeat/superiority × `why?`) appears to be ours.
+- **Demand-driven evaluation** — one recurring idea across five literatures:
+  magic sets (demand as program transformation), tabling/XSB (the top-down
+  memoized dual; Deimos is defeasible logic's own query-driven half), lazy
+  ASP grounding (rules ungrounded until relevant — the grounding bottleneck
+  is §5.2's premise), demand-driven incremental computation (Adapton's
+  dirty ∩ demanded is §4.1's wake-up rule as a calculus), and
+  subscription-maintained views (differential dataflow; LARS for the
+  nonmonotonic-streams case). §4.1's demand cone stands on all of these.
+  Two of their lessons are load-bearing: demand under negation must close
+  over attackers (naive magic-sets-with-negation was unsound — the reason
+  §4.1's cone drags in complements and superiority competitors), and demand
+  bookkeeping is not always a win (the reason §8 makes sweep-vs-track a
+  per-family compiler choice rather than a global strategy).
 - **D&D 5e** — "specific beats general" is the PHB's stated rules-interaction
   principle; the 5e condition/feat/immunity stack is a defeasible theory in
   prose. A 5e-ish combat slice is a milestone acceptance test. Note what 5e
@@ -1894,7 +1917,10 @@ primed-atom trace) rather than only static state, are the target.
 - G. Antoniou, D. Billington, G. Governatori, M. Maher, *Representation
   Results for Defeasible Logic*, ACM TOCL 2(2), 2001.
 - M. Maher, A. Rock, G. Antoniou, D. Billington, T. Miller, *Efficient
-  Defeasible Reasoning Systems*, IJAIT 10(4), 2001. (Delores.)
+  Defeasible Reasoning Systems*, IJAIT 10(4), 2001. (Delores and Deimos:
+  the forward-chaining counter/occurrence-list engine and the query-driven
+  memoized engine — the field's own instance of the sweep-vs-demand fork
+  that §4.1 and §8 navigate)
 - H.-P. Lam, G. Governatori, *The Making of SPINdle*, RuleML 2009, LNCS 5858,
   pp. 315–322. (the closest implementation to M3's target: the TOCL
   transformations as a theory normalizer in front of a linear propositional
@@ -1997,6 +2023,53 @@ primed-atom trace) rather than only static state, are the target.
 - Wizards of the Coast, *Magic: The Gathering Comprehensive Rules*, §613
   ("Interaction of Continuous Effects"). (fixed set-before-add pipeline for
   simultaneous effects; its timestamp system is the cautionary half)
+- F. Bancilhon, D. Maier, Y. Sagiv, J. Ullman, *Magic Sets and Other Strange
+  Ways to Implement Logic Programs*, PODS 1986; C. Beeri, R. Ramakrishnan,
+  *On the Power of Magic*, J. Logic Programming 10, 1991; K. T. Tekle,
+  Y. A. Liu, *More Efficient Datalog Queries: Subsumptive Tabling Beats
+  Magic Sets*, SIGMOD 2011. (demand as program transformation: bottom-up
+  evaluation restricted to the query's cone — §4.1's demand cone in
+  database clothing. Its two hard-won lessons transfer: extending demand
+  through negation was unsound until done carefully — cf. D. Kemp,
+  D. Srivastava, P. Stuckey on well-founded bottom-up evaluation, TCS 146,
+  1995 — which in defeasible terms is why the cone must close over
+  attackers and superiority competitors; and the transformation is not
+  always a win, the bookkeeping-vs-sweep trade §8 resolves per family)
+- W. Chen, D. S. Warren, *Tabled Evaluation with Delaying for General Logic
+  Programs*, JACM 43(1), 1996. (SLG resolution / XSB: the top-down dual —
+  compute what the query demands, memoize subgoals, terminate. Deimos
+  (IJAIT 2001, above) is this strategy inside defeasible logic; what the
+  line lacks is standing demand — subscriptions — and incremental
+  maintenance between queries)
+- C. Lefèvre, P. Nicolas, *A First Order Forward Chaining Approach for
+  Answer Set Computing*, LPNMR 2009 (ASPeRiX); A. Weinzierl, *Blending Lazy
+  Grounding and CDNL Search for Stable-Model Solving*, LPNMR 2017 (Alpha).
+  (lazy grounding: rule instances created only when their bodies become
+  relevant, against ASP's ground-everything-first bottleneck — the
+  literature that keeps judgments *ungrounded*, not merely unevaluated,
+  outside the demanded set)
+- M. Hammer, K. Phang, M. Hicks, J. Foster, *Adapton: Composable,
+  Demand-Driven Incremental Computation*, PLDI 2014; A. Mokhov,
+  N. Mitchell, S. Peyton Jones, *Build Systems à la Carte*, ICFP 2018.
+  (dirty ∩ demanded as a formal calculus, and the design-space taxonomy —
+  eager vs. suspending, dirty-bit vs. trace — that locates §4.1's wake-up
+  rule and §8's choices as points in a mapped space)
+- F. McSherry, D. Murray, R. Isaacs, M. Isard, *Differential Dataflow*,
+  CIDR 2013. (subscription-maintained incremental views: deltas propagate
+  only through demanded dataflows — the systems-world shape of
+  `world_subscribe`'s delta stream, §4.1/§12)
+- H. Beck, M. Dao-Tran, T. Eiter, *LARS: A Logic-based Framework for
+  Analytic Reasoning over Streams*, AIJ 261, 2018. (standing continuous
+  queries over a changing fact base with nonmonotonic semantics, evaluated
+  incrementally — the community that treats subscriptions + nonmonotonicity
+  as one problem, though ASP-flavored rather than defeasible)
+- J. Whaley, M. Lam, *Cloning-Based Context-Sensitive Pointer Alias
+  Analysis Using Binary Decision Diagrams*, PLDI 2004 (bddbddb); H. Jordan,
+  B. Scholz, P. Subotić, *Soufflé: On Synthesis of Program Analyzers*,
+  CAV 2016. (set-at-a-time Datalog engineering: relations as bulk data
+  structures, evaluation as whole-relation operations — the lineage §5.8's
+  columnar backing extends to defeasible proof statuses; see §3 for why the
+  defeasible implementation line never met it)
 - Larian's Osiris: DOS2/BG3 modding documentation (community wiki).
 - E. Ruskin, *AI-driven Dynamic Dialog through Fuzzy Pattern Matching*,
   GDC 2012. (Left 4 Dead response rules: most-specific-match dialogue
