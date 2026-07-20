@@ -1757,6 +1757,52 @@ per-tick state-hash for desync detection (RTS "sync checks"). The join-snapshot
 is the same base-fact checkpoint the save model already needs; it is not a
 separate netcode state.
 
+**Server-authoritative deployment: the other trust topology, same kernel.**
+Lockstep (above) and server-authoritative are not two engines but two *trust
+deployments* of one kernel. Lockstep is free and serverless, and right when
+peers are trusted (co-op, hotseat, shareable playthroughs) — but every peer
+holds bit-identical full state, so hidden information is structurally
+unprotectable (the RTS maphack: the whole map is in the cheater's RAM) and
+every §5.10 roll is predictable from the shared seed. When information must
+be hidden or peers cannot be trusted, run the driver and kernel server-side
+and make each client a §4.2 presentation client whose state *is* its
+subscribed cone:
+
+- **A thin client is a subscriber over the wire.** "Which facts does this
+  client hold" is a subscription set; "which conclusions can it see" is a
+  demand cone (§4.1). The client receives its `world_subscribe` delta
+  stream and proposes actions through the do-port — the two-port kernel API
+  is already a client-server protocol shape, and the network seam is the
+  same payload as the WASM marshalling seam and the inspector channel
+  (above): one seam, three consumers. MMO interest management /
+  area-of-interest is, in this vocabulary, a demand cone whose visibility
+  predicate is fed by a spatial provider.
+- **Visibility is judgments, not a replication config.** `visible_to(P, …)`
+  is an ordinary derived judgment — fog of war, invisibility, darkness,
+  disguise as defeasible rules — and the server filters each client's delta
+  stream through it. Payoffs no replication layer gets: `why?` answers "why
+  can't I see the goblin" with a proof trace, and cheating is structurally
+  impossible rather than policed — the hidden fact never crosses the wire,
+  instead of arriving masked. This is §8's disguise principle (one fact,
+  every reader) extended to *which peer* is reading.
+- **Prediction soundness is statically checkable.** A client may run a
+  partial replica over its visible facts for responsiveness, but a
+  conclusion over a partial EDB is trustworthy only when the rule's whole
+  cone lies inside the visible set — a static property of the dependency
+  graph against the visibility interface. The compiler classifies every
+  judgment client-predictable (cone ⊆ subscribed interface) or server-only;
+  the generated header can type them differently. "What feels instant vs.
+  what waits for the server" becomes a compile-time report, not a QA
+  discovery. The §5.3 dry-run query is the evaluation primitive prediction
+  needs.
+- **The seed is server-only.** Under hidden information, §5.10's seed must
+  not replicate — clients receive outcomes as facts, or every roll is
+  predictable (the roll-hack is the maphack's sibling). The one place
+  "server-only" is a hard requirement rather than a subscription choice.
+- **Sectors compose** (§5.5 stress test): the server steps sibling sectors
+  concurrently; a client's subscription follows its avatar's sector;
+  handoff is a resubscribe.
+
 **Trust is containment, not credentials.** Untrusted content runs in a
 WASM + sandboxed-iframe cage with a minimal import surface; that is the whole
 security posture. The real safety property is that content is declarative data
@@ -1818,6 +1864,12 @@ primed-atom trace) rather than only static state, are the target.
   migration vs. an authored cull predicate choosing survivors), and a
   fluent moving between scopes/tiers is the migration face of the
   cross-scope-identity question above — decide them together.
+- **Server-authoritative riders** (§12): reconciliation semantics when a
+  client-predicted judgment is contradicted by the authoritative delta
+  (presentation-side rollback — but the boundary needs stating);
+  whether `visible_to` filtering is per-subscription or per-scope
+  (per-scope is coarser but composes with §5.5 for free); and how the
+  server-only seed interacts with replay of a client's local log.
 
 ## 14. References
 
