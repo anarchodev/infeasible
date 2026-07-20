@@ -32,10 +32,12 @@ dlcol *dlcol_new(int natoms, int nentities);
 void   dlcol_free(dlcol *f);
 
 /* Schema construction — mirrors dl_add_rule / dl_add_sup over family-local
- * atom ids. Returns a rule id usable in dlcol_add_sup. */
-int  dlcol_add_rule(dlcol *f, dl_rule_kind kind,
+ * atom ids. Returns a rule id usable in dlcol_add_sup. Names are cold data
+ * for dlcol_why (copied; NULL becomes "?"). */
+int  dlcol_add_rule(dlcol *f, const char *name, dl_rule_kind kind,
                     dl_lit head, const dl_lit *body, int nbody);
 void dlcol_add_sup(dlcol *f, int winner, int loser);
+void dlcol_set_atom_name(dlcol *f, uint32_t atom, const char *name);
 
 /* Fact columns. A row is ceil(nentities/64) words; the host may write words
  * directly (bits >= nentities are ignored). dlcol_add_fact sets one bit. */
@@ -49,5 +51,12 @@ void dlcol_solve(dlcol *f);
 
 dl_verdict dlcol_definite(const dlcol *f, dl_lit q, int entity);   /* +/-Delta */
 dl_verdict dlcol_defeasible(const dlcol *f, dl_lit q, int entity); /* +/-d    */
+
+/* Proof/defeat trace for one entity's instance of q — dl_why's format with
+ * atoms and rules rendered as name[entity]. A pure read of the solved
+ * columns (no scalar re-derivation): verdicts, fact bits, applicability,
+ * and superiority all come from the fixpoint state. Call after dlcol_solve.
+ * Pinned byte-for-byte against dl_why by tests/test_col.c. */
+void dlcol_why(const dlcol *f, dl_lit q, int entity, FILE *out);
 
 #endif

@@ -18,6 +18,7 @@ typedef struct {
     uint8_t kind;
     int32_t head;         /* literal index: atom*2 + neg */
     int32_t body_off;     /* into body[] */
+    char   *name;         /* cold; dlcol_why only */
 } crule;
 
 struct dlcol {
@@ -28,6 +29,7 @@ struct dlcol {
     crule  *rules; int nrules, caprules;
     int32_t *body; int nbody, capbody;         /* flattened bodies (lit idx) */
     struct { int winner, loser; } *sups; int nsups, capsups;
+    char  **aname;                             /* [natoms] cold; why only */
 
     /* Compiled at solve time (schema is tiny; rebuilt on demand). */
     bool     dirty;
@@ -54,6 +56,14 @@ struct dlcol {
 
 static int lit_idx(dl_lit l) { return (int)l.atom * 2 + (l.neg ? 1 : 0); }
 
+static char *xstrdup(const char *s)
+{
+    size_t n = strlen(s) + 1;
+    char *d = malloc(n);
+    memcpy(d, s, n);
+    return d;
+}
+
 static uint64_t *row(uint64_t *base, const dlcol *f, int lit)
 {
     return base + (size_t)lit * (size_t)f->W;
@@ -74,12 +84,18 @@ dlcol *dlcol_new(int natoms, int nentities)
     f->part_t  = calloc((size_t)f->nlits * f->W, sizeof *f->part_t);
     f->part_f  = calloc((size_t)f->nlits * f->W, sizeof *f->part_f);
     f->scratch = calloc((size_t)8 * f->W, sizeof *f->scratch);
+    f->aname = calloc((size_t)(natoms ? natoms : 1), sizeof *f->aname);
     f->dirty = true;
     return f;
 }
 
 void dlcol_free(dlcol *f)
 {
+    for (int r = 0; r < f->nrules; r++)
+        free(f->rules[r].name);
+    for (int a = 0; a < f->natoms; a++)
+        free(f->aname[a]);
+    free(f->aname);
     free(f->rules); free(f->body); free(f->sups);
     free(f->head_off); free(f->head_rule);
     free(f->beat_off); free(f->beat_by);
@@ -91,11 +107,12 @@ void dlcol_free(dlcol *f)
     free(f);
 }
 
-int dlcol_add_rule(dlcol *f, dl_rule_kind kind,
+int dlcol_add_rule(dlcol *f, const char *name, dl_rule_kind kind,
                    dl_lit head, const dl_lit *body, int nbody)
 {
     GROW(f->rules, f->nrules, f->caprules);
     crule *r = &f->rules[f->nrules];
+    r->name = xstrdup(name ? name : "?");
     r->kind = (uint8_t)kind;
     r->head = (int32_t)lit_idx(head);
     r->body_off = f->nbody;
@@ -116,6 +133,14 @@ void dlcol_add_sup(dlcol *f, int winner, int loser)
     f->dirty = true;
 }
 
+void dlcol_set_atom_name(dlcol *f, uint32_t atom, const char *name)
+{
+    if ((int)atom >= f->natoms)
+        return;
+    free(f->aname[atom]);
+    f->aname[atom] = xstrdup(name);
+}
+
 uint64_t *dlcol_fact_row(dlcol *f, dl_lit l)
 {
     return row(f->fact, f, lit_idx(l));
@@ -129,7 +154,7 @@ void dlcol_add_fact(dlcol *f, dl_lit l, int entity)
 int dlcol_row_words(const dlcol *f) { return f->W; }
 
 /* body slice of rule r: [body_off, body_end(r)) */
-static int body_end(const dlcol *f, int r)
+static int body_end_c(const dlcol *f, int r)
 {
     return r + 1 < f->nrules ? f->rules[r + 1].body_off : f->nbody;
 }
@@ -194,7 +219,7 @@ static void solve_delta(dlcol *f)
                     continue;
                 memset(conj_t, 0xff, (size_t)W * sizeof *conj_t);
                 memset(dead, 0, (size_t)W * sizeof *dead);
-                for (int i = f->rules[r].body_off; i < body_end(f, r); i++) {
+                for (int i = f->rules[r].body_off; i < body_end_c(f, r); i++) {
                     const uint64_t *bt = row(f->delta_t, f, f->body[i]);
                     const uint64_t *bf = row(f->delta_f, f, f->body[i]);
                     for (int w = 0; w < W; w++) {
@@ -234,7 +259,7 @@ static void refresh_applicability(dlcol *f)
         uint64_t *at = f->app_t + (size_t)r * W, *af = f->app_f + (size_t)r * W;
         memset(at, 0xff, (size_t)W * sizeof *at);
         memset(af, 0, (size_t)W * sizeof *af);
-        for (int i = f->rules[r].body_off; i < body_end(f, r); i++) {
+        for (int i = f->rules[r].body_off; i < body_end_c(f, r); i++) {
             const uint64_t *pt = row(f->part_t, f, f->body[i]);
             const uint64_t *pf = row(f->part_f, f, f->body[i]);
             for (int w = 0; w < W; w++) {
@@ -378,4 +403,116 @@ dl_verdict dlcol_defeasible(const dlcol *f, dl_lit q, int entity)
         return DL_UNDECIDED;
     return verdict_at(f, row((uint64_t *)f->part_t, f, qi),
                       row((uint64_t *)f->part_f, f, qi), entity);
+}
+
+/* ---- why-trace: dl_why's format, read straight off the solved columns ---- */
+
+static dl_verdict col_part_verdict(const dlcol *f, int lit, int entity)
+{
+    return verdict_at(f, row((uint64_t *)f->part_t, f, lit),
+                      row((uint64_t *)f->part_f, f, lit), entity);
+}
+
+static const char *col_verdict_str(dl_verdict v)
+{
+    switch (v) {
+    case DL_PROVED:  return "PROVED";
+    case DL_REFUTED: return "REFUTED";
+    default:         return "UNDECIDED";
+    }
+}
+
+static void col_print_lit(const dlcol *f, int lit, int entity, FILE *out)
+{
+    const char *n = f->aname[lit >> 1];
+    if (n)
+        fprintf(out, "%s%s[%d]", (lit & 1) ? "~" : "", n, entity);
+    else
+        fprintf(out, "%sa%d[%d]", (lit & 1) ? "~" : "", lit >> 1, entity);
+}
+
+/* Tri-valued applicability of rule ri for one entity — dl.c's ts_applicable
+ * evaluated on this entity's bits of the part columns. */
+static int col_applicable(const dlcol *f, int ri, int entity)
+{
+    uint64_t bit = 1ull << (entity % 64);
+    int w = entity / 64, acc = 1;
+    for (int i = f->rules[ri].body_off; i < body_end_c(f, ri); i++) {
+        int b = f->body[i];
+        if (row((uint64_t *)f->part_f, f, b)[w] & bit)
+            return -1;
+        if (!(row((uint64_t *)f->part_t, f, b)[w] & bit))
+            acc = 0;
+    }
+    return acc;
+}
+
+static bool col_beats(const dlcol *f, int winner, int loser)
+{
+    for (int k = f->beat_off[loser]; k < f->beat_off[loser + 1]; k++)
+        if (f->beat_by[k] == winner)
+            return true;
+    return false;
+}
+
+static void col_print_rule_line(const dlcol *f, int ri, int entity,
+                                int indent, FILE *out)
+{
+    static const char *kinds[] = { "strict", "defeasible", "defeater" };
+    fprintf(out, "%*s%s[%d] (%s): ", indent, "", f->rules[ri].name, entity,
+            kinds[f->rules[ri].kind]);
+    int b0 = f->rules[ri].body_off, b1 = body_end_c(f, ri);
+    if (b1 == b0)
+        fprintf(out, "(no conditions)");
+    for (int i = b0; i < b1; i++) {
+        if (i != b0)
+            fprintf(out, ", ");
+        col_print_lit(f, f->body[i], entity, out);
+        fprintf(out, "[%s]",
+                col_verdict_str(col_part_verdict(f, f->body[i], entity)));
+    }
+    int app = col_applicable(f, ri, entity);
+    fprintf(out, "  -- %s\n",
+            app == 1 ? "applicable" : app == -1 ? "inapplicable" : "undecided");
+}
+
+void dlcol_why(const dlcol *f, dl_lit q, int entity, FILE *out)
+{
+    int qi = lit_idx(q), nqi = qi ^ 1;
+    fprintf(out, "why ");
+    col_print_lit(f, qi, entity, out);
+    fprintf(out, "?\n  definite: %s   defeasible: %s\n",
+            col_verdict_str(dlcol_definite(f, q, entity)),
+            col_verdict_str(dlcol_defeasible(f, q, entity)));
+    if (entity >= 0 && entity < f->nents &&
+        (row((uint64_t *)f->fact, f, qi)[entity / 64] >> (entity % 64)) & 1)
+        fprintf(out, "  it is a base fact\n");
+    if (f->dirty || !f->head_off) {
+        fprintf(out, "  (family not solved)\n");
+        return;
+    }
+
+    if (f->head_off[qi] < f->head_off[qi + 1]) {
+        fprintf(out, "  rules for it:\n");
+        for (int k = f->head_off[qi]; k < f->head_off[qi + 1]; k++)
+            col_print_rule_line(f, f->head_rule[k], entity, 4, out);
+    }
+    if (f->head_off[nqi] < f->head_off[nqi + 1]) {
+        fprintf(out, "  rules against it:\n");
+        for (int k = f->head_off[nqi]; k < f->head_off[nqi + 1]; k++) {
+            int si = f->head_rule[k];
+            col_print_rule_line(f, si, entity, 4, out);
+            for (int j = f->head_off[qi]; j < f->head_off[qi + 1]; j++) {
+                int ti = f->head_rule[j];
+                if (f->rules[ti].kind != DL_DEFEATER && col_beats(f, ti, si))
+                    fprintf(out, "      (beaten by %s[%d] if applicable)\n",
+                            f->rules[ti].name, entity);
+                if (col_beats(f, si, ti))
+                    fprintf(out, "      (superior to %s[%d]: %s[%d] > %s[%d])\n",
+                            f->rules[ti].name, entity,
+                            f->rules[si].name, entity,
+                            f->rules[ti].name, entity);
+            }
+        }
+    }
 }

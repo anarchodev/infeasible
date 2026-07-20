@@ -106,7 +106,8 @@ static int bench_one(int nents)
         dl_lit body[2];
         for (int i = 0; i < s->nb; i++)
             body[i] = mk((uint32_t)s->b_atom[i], s->b_neg[i]);
-        cid[r] = dlcol_add_rule(fam, s->kind, mk((uint32_t)s->head_atom, s->head_neg),
+        cid[r] = dlcol_add_rule(fam, NULL, s->kind,
+                                mk((uint32_t)s->head_atom, s->head_neg),
                                 body, s->nb);
     }
     for (int r = 0; r < NRULES; r++)

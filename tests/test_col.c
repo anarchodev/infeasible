@@ -14,6 +14,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define CHECK(c) \
     do { \
@@ -99,8 +100,7 @@ static void build_schema(builder *b)
 static int col_rule(void *ctx, const char *name, dl_rule_kind kind,
                     dl_lit head, const dl_lit *body, int nbody)
 {
-    (void)name;
-    return dlcol_add_rule(ctx, kind, head, body, nbody);
+    return dlcol_add_rule(ctx, name, kind, head, body, nbody);
 }
 static void col_sup(void *ctx, int w, int l) { dlcol_add_sup(ctx, w, l); }
 static dl_lit col_lit(void *ctx, int atom, bool neg)
@@ -121,7 +121,7 @@ static dl_lit ground_lit(void *ctx, int atom, bool neg)
 {
     ground_ctx *g = ctx;
     char buf[32];
-    snprintf(buf, sizeof buf, "a%d_%d", atom, g->entity);
+    snprintf(buf, sizeof buf, "a%d[%d]", atom, g->entity);
     dl_lit l = { intern_id(g->sy, buf), neg };
     return l;
 }
@@ -130,7 +130,7 @@ static int ground_rule(void *ctx, const char *name, dl_rule_kind kind,
 {
     ground_ctx *g = ctx;
     char buf[48];
-    snprintf(buf, sizeof buf, "%s_%d", name, g->entity);
+    snprintf(buf, sizeof buf, "%s[%d]", name, g->entity);
     return dl_add_rule(g->t, buf, kind, head, body, nbody);
 }
 static void ground_sup(void *ctx, int w, int l)
@@ -182,6 +182,78 @@ static int run_round(const uint8_t bits[NENTS][4])
                             dlcol_defeasible(fam, cq, e));
                     bad++;
                 }
+            }
+    }
+
+    dl_result_free(res);
+    dl_theory_free(t);
+    intern_free(sy);
+    dlcol_free(fam);
+    return bad;
+}
+
+/* The trace must be one backing too: dlcol_why reads verdicts, fact bits,
+ * applicability, and superiority straight off the solved columns, and must
+ * print byte-for-byte what dl_why prints for the grounded instance. Scalar
+ * atoms/rules are interned as "name[entity]" — exactly dlcol_why's
+ * rendering — so the outputs are directly comparable strings. */
+static int test_why(void)
+{
+    uint8_t bits[NENTS][4];
+    for (int e = 0; e < NENTS; e++)
+        for (int a = 0; a < 4; a++)
+            bits[e][a] = (uint8_t)(xrand() & 1);
+
+    dlcol *fam = dlcol_new(NATOMS, NENTS);
+    char buf[16];
+    for (int a = 0; a < NATOMS; a++) {
+        snprintf(buf, sizeof buf, "a%d", a);
+        dlcol_set_atom_name(fam, (uint32_t)a, buf);
+    }
+    builder cb = { fam, col_rule, col_sup, col_lit };
+    build_schema(&cb);
+    for (int e = 0; e < NENTS; e++)
+        for (int a = 0; a < 4; a++) {
+            dl_lit l = { (uint32_t)a, !bits[e][a] };
+            dlcol_add_fact(fam, l, e);
+        }
+    dlcol_solve(fam);
+
+    intern *sy = intern_new();
+    dl_theory *t = dl_theory_new(sy);
+    ground_ctx g = { t, sy, 0 };
+    builder gb = { &g, ground_rule, ground_sup, ground_lit };
+    for (int e = 0; e < NENTS; e++) {
+        g.entity = e;
+        build_schema(&gb);
+        for (int a = 0; a < 4; a++)
+            dl_add_fact(t, ground_lit(&g, a, !bits[e][a]));
+    }
+    dl_result *res = dl_solve(t);
+
+    int bad = 0;
+    for (int e = 0; e < NENTS && bad < 3; e++) {
+        g.entity = e;
+        for (int a = 0; a < NATOMS && bad < 3; a++)
+            for (int neg = 0; neg < 2; neg++) {
+                char *s1 = NULL, *s2 = NULL;
+                size_t n1 = 0, n2 = 0;
+                FILE *m1 = open_memstream(&s1, &n1);
+                dl_why(t, res, ground_lit(&g, a, neg), m1);
+                fclose(m1);
+                FILE *m2 = open_memstream(&s2, &n2);
+                dl_lit cq = { (uint32_t)a, neg != 0 };
+                dlcol_why(fam, cq, e, m2);
+                fclose(m2);
+                if (strcmp(s1, s2) != 0) {
+                    fprintf(stderr,
+                            "trace mismatch entity %d atom %d neg %d\n"
+                            "--- scalar ---\n%s--- columnar ---\n%s",
+                            e, a, neg, s1, s2);
+                    bad++;
+                }
+                free(s1);
+                free(s2);
             }
     }
 
@@ -266,6 +338,8 @@ int main(void)
         intern_free(sy);
         dlcol_free(fam);
     }
+
+    CHECK(test_why() == 0);
 
     printf("test_col: all passed\n");
     return 0;

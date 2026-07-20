@@ -889,6 +889,11 @@ algebra lifted to Kleene 3-valued AND/OR on (true, false) mask pairs.
 `tests/test_col.c` pins it differentially: a schema exercising strict
 chains, team defeat, defeaters, unresolved conflict, and negative body
 literals must match `dl_solve` bit-for-bit per entity, tail words included.
+The trace is a backing too: `dlcol_why` reads verdicts, fact bits,
+applicability, and superiority straight off the solved columns — no scalar
+re-derivation — and the same test pins its output byte-for-byte against
+`dl_why` on the grounded instance (atoms and rules render as
+`name[entity]`).
 `bench_col` (Release, per-unit AI family of 10 rules): full-family
 recompute at 10k units 0.06 ms, 100k units 0.6 ms, 1M units 8.2 ms —
 vs 5 ms / 65 ms / 667 ms for the same workload grounded into the scalar
