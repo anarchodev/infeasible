@@ -14,6 +14,7 @@ add_library(infeasible_core STATIC
   src/core/arena.c
   src/core/intern.c
   src/logic/dl.c
+  src/logic/dl_col.c
   src/state/world.c
 )
 target_include_directories(infeasible_core PUBLIC src)
@@ -22,7 +23,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 enable_testing()
-foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn)
+foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col)
   add_executable(${t} tests/${t}.c)
   target_link_libraries(${t} PRIVATE infeasible_core)
   add_test(NAME ${t} COMMAND ${t})
@@ -33,6 +34,12 @@ endforeach()
 add_executable(bench_dl tests/bench_dl.c)
 target_link_libraries(bench_dl PRIVATE infeasible_core)
 target_compile_options(bench_dl PRIVATE -O2)
+
+# Columnar-vs-scalar family benchmark (DESIGN.md 5.8): build Release for
+# meaningful numbers — the core library follows CMAKE_BUILD_TYPE.
+add_executable(bench_col tests/bench_col.c)
+target_link_libraries(bench_col PRIVATE infeasible_core)
+target_compile_options(bench_col PRIVATE -O2)
 
 if(INFEASIBLE_BUILD_APP)
   include(FetchContent)

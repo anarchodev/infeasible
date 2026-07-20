@@ -883,6 +883,18 @@ family, invisibly (§6.1's cross-cutting rule). `why?` survives because
 judgments are pure — one instance re-derives scalar-style on demand.
 Semantics untouched: one more backing, pinned by the same golden tests that
 keep the M3 swap honest.
+*Status*: prototyped in `src/logic/dl_col.c` — the tri-valued fixpoint with
+statuses lifted to entity-indexed bitvector columns and the ts_min/ts_max
+algebra lifted to Kleene 3-valued AND/OR on (true, false) mask pairs.
+`tests/test_col.c` pins it differentially: a schema exercising strict
+chains, team defeat, defeaters, unresolved conflict, and negative body
+literals must match `dl_solve` bit-for-bit per entity, tail words included.
+`bench_col` (Release, per-unit AI family of 10 rules): full-family
+recompute at 10k units 0.06 ms, 100k units 0.6 ms, 1M units 8.2 ms —
+vs 5 ms / 65 ms / 667 ms for the same workload grounded into the scalar
+solver (~80–110×), putting RTS-crowd judgment eval well inside a frame
+budget. Heterogeneous partitioning, store-fluent guards, and the world-tier
+step integration remain open.
 
 The store also generalizes §5.7's implementation: exactly-one-value fluents
 admit two faithful backings of the same semantics. *Logic-backed* — one atom
