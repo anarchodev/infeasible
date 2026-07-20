@@ -57,7 +57,7 @@ A `world` = base facts (the **only** mutable state, closed-world) + judgment rul
 - **Fluents** are ground boolean atoms; `world_declare_fluent` then `world_set`. Closed-world: each evaluation asserts `f` or `~f` for every declared fluent.
 - **Judgment rules** (`world_add_rule`) derive conclusions from current state. These are queried via `world_query` / `world_why` and are **never stored back** as facts (invariant I1).
 - **Step rules** (`world_add_step_rule`) are the *only* way facts change (I2). An `action` atom triggers the rule; `action == INTERN_NONE` makes it a **ramification** (fires in any step whose state matches — indirect effects like a dead guard dropping a torch). Body `step_cond`s may reference the *next* state via `primed=true`; effects are always about the next state.
-- `world_step(actions…)` builds a primed-atom theory with auto-generated inertia rules (`f => f'`, causal rules beat inertia), runs one defeasible pass, and commits the next state. Returns `-1` **without mutating** if a fluent's next value is contested/undecided (conflict = authoring error), writing the fluent name into `err`.
+- `world_step(actions…)` evaluates a primed-atom theory with auto-generated inertia rules (`f => f'`, causal rules beat inertia) and commits the next state. The theory's structure is compiled once into a cached columnar schema (`src/logic/dl_col.h`, an N=1 family) and invalidated when rules/fluents are added; each step only rewrites fact columns and re-solves. Returns `-1` **without mutating** if a fluent's next value is contested/undecided (conflict = authoring error), writing the fluent name into `err`.
 
 ### Core (`src/core/`)
 

@@ -41,6 +41,12 @@ add_executable(bench_col tests/bench_col.c)
 target_link_libraries(bench_col PRIVATE infeasible_core)
 target_compile_options(bench_col PRIVATE -O2)
 
+# Vertical-slice RTS tick loop: provider + columnar judge + columnar step,
+# deterministic (replay-hash checked). Build Release for meaningful numbers.
+add_executable(bench_slice tests/bench_slice.c)
+target_link_libraries(bench_slice PRIVATE infeasible_core)
+target_compile_options(bench_slice PRIVATE -O2)
+
 if(INFEASIBLE_BUILD_APP)
   include(FetchContent)
   set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)

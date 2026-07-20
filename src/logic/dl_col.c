@@ -78,11 +78,12 @@ dlcol *dlcol_new(int natoms, int nentities)
     f->W = nentities > 0 ? (nentities + 63) / 64 : 1;
     int r = nentities % 64;
     f->tail = (nentities > 0 && r != 0) ? (~0ull >> (64 - r)) : ~0ull;
-    f->fact = calloc((size_t)f->nlits * f->W, sizeof *f->fact);
-    f->delta_t = calloc((size_t)f->nlits * f->W, sizeof *f->delta_t);
-    f->delta_f = calloc((size_t)f->nlits * f->W, sizeof *f->delta_f);
-    f->part_t  = calloc((size_t)f->nlits * f->W, sizeof *f->part_t);
-    f->part_f  = calloc((size_t)f->nlits * f->W, sizeof *f->part_f);
+    size_t nm = f->nlits ? (size_t)f->nlits * f->W : 1;   /* natoms==0 ok */
+    f->fact = calloc(nm, sizeof *f->fact);
+    f->delta_t = calloc(nm, sizeof *f->delta_t);
+    f->delta_f = calloc(nm, sizeof *f->delta_f);
+    f->part_t  = calloc(nm, sizeof *f->part_t);
+    f->part_f  = calloc(nm, sizeof *f->part_f);
     f->scratch = calloc((size_t)8 * f->W, sizeof *f->scratch);
     f->aname = calloc((size_t)(natoms ? natoms : 1), sizeof *f->aname);
     f->dirty = true;
@@ -151,6 +152,11 @@ void dlcol_add_fact(dlcol *f, dl_lit l, int entity)
     row(f->fact, f, lit_idx(l))[entity / 64] |= 1ull << (entity % 64);
 }
 
+void dlcol_clear_facts(dlcol *f)
+{
+    memset(f->fact, 0, (size_t)f->nlits * f->W * sizeof(uint64_t));
+}
+
 int dlcol_row_words(const dlcol *f) { return f->W; }
 
 /* body slice of rule r: [body_off, body_end(r)) */
@@ -211,6 +217,15 @@ static void solve_delta(dlcol *f)
         changed = false;
         for (int q = 0; q < f->nlits; q++) {
             uint64_t *dt = row(f->delta_t, f, q), *df = row(f->delta_f, f, q);
+            /* skip literals decided for every entity — statuses are
+             * monotone, so nothing here can change (the columnar analog of
+             * the scalar sweep's decided-skip; at small W the branchless
+             * recompute would otherwise dominate). */
+            uint64_t undec = 0;
+            for (int w = 0; w < W; w++)
+                undec |= ~(dt[w] | df[w]) & ((w == W - 1) ? f->tail : ~0ull);
+            if (!undec)
+                continue;
             memcpy(prove, row(f->fact, f, q), (size_t)W * sizeof *prove);
             memset(alldead, 0xff, (size_t)W * sizeof *alldead);
             for (int k = f->head_off[q]; k < f->head_off[q + 1]; k++) {
@@ -257,6 +272,13 @@ static void refresh_applicability(dlcol *f)
     const int W = f->W;
     for (int r = 0; r < f->nrules; r++) {
         uint64_t *at = f->app_t + (size_t)r * W, *af = f->app_f + (size_t)r * W;
+        /* a rule whose applicability is decided everywhere can't change:
+         * per entity, app_t and app_f are exclusive and monotone */
+        uint64_t undec = 0;
+        for (int w = 0; w < W; w++)
+            undec |= ~(at[w] | af[w]) & ((w == W - 1) ? f->tail : ~0ull);
+        if (!undec)
+            continue;
         memset(at, 0xff, (size_t)W * sizeof *at);
         memset(af, 0, (size_t)W * sizeof *af);
         for (int i = f->rules[r].body_off; i < body_end_c(f, r); i++) {
@@ -287,6 +309,12 @@ static void solve_part(dlcol *f)
         for (int q = 0; q < f->nlits; q++) {
             int nq = q ^ 1;
             uint64_t *pt = row(f->part_t, f, q), *pf = row(f->part_f, f, q);
+            /* decided-everywhere literals can't move; skip (see solve_delta) */
+            uint64_t undec = 0;
+            for (int w = 0; w < W; w++)
+                undec |= ~(pt[w] | pf[w]) & ((w == W - 1) ? f->tail : ~0ull);
+            if (!undec)
+                continue;
 
             /* supported(q): OR of applicable over strict/defeasible rules
              * for q; empty set -> (false, true). sup_f doubles as
@@ -370,6 +398,11 @@ void dlcol_solve(dlcol *f)
     memset(f->delta_f, 0, bytes);
     memset(f->part_t, 0, bytes);
     memset(f->part_f, 0, bytes);
+    /* app rows must not survive a solve: refresh_applicability skips rules
+     * whose rows look decided, so stale rows would be trusted */
+    size_t rbytes = (size_t)(f->nrules ? f->nrules : 1) * f->W * sizeof(uint64_t);
+    memset(f->app_t, 0, rbytes);
+    memset(f->app_f, 0, rbytes);
     solve_delta(f);
     solve_part(f);
 }
@@ -403,6 +436,14 @@ dl_verdict dlcol_defeasible(const dlcol *f, dl_lit q, int entity)
         return DL_UNDECIDED;
     return verdict_at(f, row((uint64_t *)f->part_t, f, qi),
                       row((uint64_t *)f->part_f, f, qi), entity);
+}
+
+const uint64_t *dlcol_proved_row(const dlcol *f, dl_lit l)
+{
+    int qi = lit_idx(l);
+    if (qi >= f->nlits)
+        return NULL;
+    return row((uint64_t *)f->part_t, f, qi);
 }
 
 /* ---- why-trace: dl_why's format, read straight off the solved columns ---- */

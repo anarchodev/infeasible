@@ -1,5 +1,6 @@
 #include "state/world.h"
 #include "core/arena.h"
+#include "logic/dl_col.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,18 @@ struct world {
     jrule *jrules; int njr, capjr;
     jsup *jsups; int njs, capjs;
     srule *srules; int nsr, capsr;
+
+    /* Cached columnar step schema (an N=1 family — DESIGN.md 5.8: single
+     * derive is multiderive at N=1). The step theory's structure — judgment
+     * rules, generated inertia, causal rules, superiority — is fixed
+     * between steps; only the fact bits change. Rebuilt lazily when rules
+     * or fluents are added; each world_step then just rewrites fact
+     * columns and re-solves, paying no theory rebuild or compile. */
+    dlcol *fam;
+    bool fam_dirty;
+    uint32_t *loc_of;             /* intern atom -> schema atom, ~0u = absent */
+    uint32_t loc_cap;
+    uint32_t *fl_loc, *pr_loc;    /* per fluent: schema ids of f and f' */
 };
 
 #define GROW(arr, n, cap) \
@@ -51,6 +64,11 @@ world *world_new(intern *syms)
 
 void world_free(world *w)
 {
+    if (w->fam)
+        dlcol_free(w->fam);
+    free(w->loc_of);
+    free(w->fl_loc);
+    free(w->pr_loc);
     arena_release(&w->a);
     free(w->fluents);
     free(w->vals);
@@ -86,6 +104,7 @@ void world_declare_fluent(world *w, uint32_t atom)
     w->vals[w->nfl] = false;
     w->primed[w->nfl] = intern_id(w->syms, buf);
     w->nfl++;
+    w->fam_dirty = true;
 }
 
 void world_set(world *w, uint32_t atom, bool value)
@@ -113,6 +132,7 @@ int world_add_rule(world *w, const char *name, dl_rule_kind kind,
     r->body = arena_alloc(&w->a, (size_t)(nbody ? nbody : 1) * sizeof(dl_lit));
     if (nbody)
         memcpy(r->body, body, (size_t)nbody * sizeof(dl_lit));
+    w->fam_dirty = true;
     return w->njr++;
 }
 
@@ -122,6 +142,7 @@ void world_add_sup(world *w, int winner, int loser)
     w->jsups[w->njs].winner = winner;
     w->jsups[w->njs].loser = loser;
     w->njs++;
+    w->fam_dirty = true;
 }
 
 void world_add_step_rule(world *w, const char *name, uint32_t action,
@@ -141,6 +162,7 @@ void world_add_step_rule(world *w, const char *name, uint32_t action,
     if (neffects)
         memcpy(r->effects, effects, (size_t)neffects * sizeof(dl_lit));
     w->nsr++;
+    w->fam_dirty = true;
 }
 
 /* Closed-world base facts + judgment rules; jrule handle i maps to dl rule
@@ -187,67 +209,171 @@ static dl_lit primed_lit(const world *w, dl_lit l)
     return p;
 }
 
-int world_step(world *w, const uint32_t *actions, int nactions,
-               char *err, size_t errsz)
+/* ---- the columnar step schema ----
+ *
+ * The theory world_step used to rebuild per call, built once into an N=1
+ * dlcol family: judgment rules, generated inertia (f => f', ~f => ~f'),
+ * causal rules each superior to the inertia rule they conflict with.
+ * Semantics identical to the scalar construction below (the golden world
+ * tests pin it); only the per-step cost changes. */
+
+#define LOC_NONE (~0u)
+
+static uint32_t assign_loc(world *w, uint32_t atom, uint32_t *n)
 {
-    dl_theory *th = dl_theory_new(w->syms);
-    add_state_and_judgments(w, th);
-    for (int i = 0; i < nactions; i++)
-        dl_add_fact(th, dl_pos(actions[i]));
+    if (w->loc_of[atom] == LOC_NONE)
+        w->loc_of[atom] = (*n)++;
+    return w->loc_of[atom];
+}
 
-    /* Generated inertia: f => f' and ~f => ~f', one pair per fluent.
-     * inertia rule ids recorded so causal rules can be made superior. */
-    int *inertia_pos = malloc((size_t)w->nfl * sizeof *inertia_pos);
-    int *inertia_neg = malloc((size_t)w->nfl * sizeof *inertia_neg);
-    char buf[300];
+static dl_lit loc_lit(const world *w, dl_lit l)
+{
+    dl_lit m = { w->loc_of[l.atom], l.neg };
+    return m;
+}
+
+static void build_step_family(world *w)
+{
+    if (w->fam)
+        dlcol_free(w->fam);
+
+    /* pass 1: assign dense schema ids to every atom the step theory touches */
+    uint32_t na = intern_count(w->syms);
+    w->loc_of = realloc(w->loc_of, (size_t)na * sizeof *w->loc_of);
+    memset(w->loc_of, 0xff, (size_t)na * sizeof *w->loc_of);
+    w->loc_cap = na;
+    uint32_t n = 0;
+    w->fl_loc = realloc(w->fl_loc, (size_t)(w->nfl ? w->nfl : 1) * sizeof *w->fl_loc);
+    w->pr_loc = realloc(w->pr_loc, (size_t)(w->nfl ? w->nfl : 1) * sizeof *w->pr_loc);
     for (int i = 0; i < w->nfl; i++) {
-        const char *fname = intern_name(w->syms, w->fluents[i]);
-        dl_lit now = dl_pos(w->fluents[i]);
-        dl_lit nxt = dl_pos(w->primed[i]);
-
-        snprintf(buf, sizeof buf, "inertia+%s", fname);
-        inertia_pos[i] = dl_add_rule(th, buf, DL_DEFEASIBLE, nxt, &now, 1);
-
-        dl_lit nnow = dl_complement(now), nnxt = dl_complement(nxt);
-        snprintf(buf, sizeof buf, "inertia-%s", fname);
-        inertia_neg[i] = dl_add_rule(th, buf, DL_DEFEASIBLE, nnxt, &nnow, 1);
+        w->fl_loc[i] = assign_loc(w, w->fluents[i], &n);
+        w->pr_loc[i] = assign_loc(w, w->primed[i], &n);
+    }
+    for (int j = 0; j < w->njr; j++) {
+        assign_loc(w, w->jrules[j].head.atom, &n);
+        for (int i = 0; i < w->jrules[j].nbody; i++)
+            assign_loc(w, w->jrules[j].body[i].atom, &n);
+    }
+    for (int s = 0; s < w->nsr; s++) {
+        const srule *r = &w->srules[s];
+        if (r->action != INTERN_NONE)
+            assign_loc(w, r->action, &n);
+        for (int i = 0; i < r->nbody; i++)
+            assign_loc(w, r->body[i].primed
+                              ? primed_lit(w, r->body[i].lit).atom
+                              : r->body[i].lit.atom, &n);
+        /* effect heads are primed fluents — already assigned */
     }
 
-    /* Causal rules and ramifications, one dl rule per effect, each superior
-     * to the inertia rule it conflicts with. */
+    /* pass 2: emit the schema */
+    dlcol *f = dlcol_new((int)n, 1);
+    for (uint32_t a = 0; a < na; a++)
+        if (w->loc_of[a] != LOC_NONE)
+            dlcol_set_atom_name(f, w->loc_of[a], intern_name(w->syms, a));
+
+    dl_lit lbuf[64];
+    dl_lit *body = lbuf;
+    int bodycap = 64;
+    char buf[300];
+
+    /* judgments first: jsup handles equal schema rule ids */
+    for (int j = 0; j < w->njr; j++) {
+        const jrule *r = &w->jrules[j];
+        if (r->nbody > bodycap) {
+            body = malloc((size_t)r->nbody * sizeof *body);
+            bodycap = r->nbody;
+        }
+        for (int i = 0; i < r->nbody; i++)
+            body[i] = loc_lit(w, r->body[i]);
+        dlcol_add_rule(f, r->name, r->kind, loc_lit(w, r->head), body, r->nbody);
+    }
+    for (int j = 0; j < w->njs; j++)
+        dlcol_add_sup(f, w->jsups[j].winner, w->jsups[j].loser);
+
+    /* generated inertia, ids recorded for causal superiority */
+    int *inertia_pos = malloc((size_t)(w->nfl ? w->nfl : 1) * sizeof *inertia_pos);
+    int *inertia_neg = malloc((size_t)(w->nfl ? w->nfl : 1) * sizeof *inertia_neg);
+    for (int i = 0; i < w->nfl; i++) {
+        const char *fname = intern_name(w->syms, w->fluents[i]);
+        dl_lit now = { w->fl_loc[i], false }, nxt = { w->pr_loc[i], false };
+        snprintf(buf, sizeof buf, "inertia+%s", fname);
+        inertia_pos[i] = dlcol_add_rule(f, buf, DL_DEFEASIBLE, nxt, &now, 1);
+        dl_lit nnow = dl_complement(now), nnxt = dl_complement(nxt);
+        snprintf(buf, sizeof buf, "inertia-%s", fname);
+        inertia_neg[i] = dlcol_add_rule(f, buf, DL_DEFEASIBLE, nnxt, &nnow, 1);
+    }
+
+    /* causal rules and ramifications, one rule per effect, each superior to
+     * the inertia rule it conflicts with */
     for (int s = 0; s < w->nsr; s++) {
         const srule *r = &w->srules[s];
         int nbody = r->nbody + (r->action != INTERN_NONE ? 1 : 0);
-        dl_lit *body = malloc((size_t)(nbody ? nbody : 1) * sizeof *body);
+        if (nbody > bodycap) {
+            if (body != lbuf)
+                free(body);
+            body = malloc((size_t)nbody * sizeof *body);
+            bodycap = nbody;
+        }
         int bi = 0;
         for (int i = 0; i < r->nbody; i++)
-            body[bi++] = r->body[i].primed ? primed_lit(w, r->body[i].lit)
-                                           : r->body[i].lit;
-        if (r->action != INTERN_NONE)
-            body[bi++] = dl_pos(r->action);
-
+            body[bi++] = loc_lit(w, r->body[i].primed
+                                        ? primed_lit(w, r->body[i].lit)
+                                        : r->body[i].lit);
+        if (r->action != INTERN_NONE) {
+            dl_lit act = { r->action, false };
+            body[bi++] = loc_lit(w, act);
+        }
         for (int e = 0; e < r->neffects; e++) {
             dl_lit eff = r->effects[e];
             int fi = fluent_index(w, eff.atom);
-            dl_lit head = primed_lit(w, eff);
+            dl_lit head = { w->pr_loc[fi], eff.neg };
             snprintf(buf, sizeof buf, "%s/%s%s", r->name,
                      eff.neg ? "~" : "", intern_name(w->syms, eff.atom));
-            int rid = dl_add_rule(th, buf, DL_DEFEASIBLE, head, body, nbody);
-            /* effect f'  conflicts with inertia-f ; effect ~f' with inertia+f */
-            dl_add_sup(th, rid, eff.neg ? inertia_pos[fi] : inertia_neg[fi]);
+            int rid = dlcol_add_rule(f, buf, DL_DEFEASIBLE, head, body, nbody);
+            /* effect f' conflicts with inertia-f ; effect ~f' with inertia+f */
+            dlcol_add_sup(f, rid, eff.neg ? inertia_pos[fi] : inertia_neg[fi]);
         }
+    }
+    if (body != lbuf)
         free(body);
+    free(inertia_pos);
+    free(inertia_neg);
+
+    w->fam = f;
+    w->fam_dirty = false;
+}
+
+int world_step(world *w, const uint32_t *actions, int nactions,
+               char *err, size_t errsz)
+{
+    if (!w->fam || w->fam_dirty)
+        build_step_family(w);
+    dlcol *f = w->fam;
+
+    /* fact columns: current state closed-world, plus occurring actions.
+     * An action atom no rule mentions is semantically inert; skip it. */
+    dlcol_clear_facts(f);
+    for (int i = 0; i < w->nfl; i++) {
+        dl_lit l = { w->fl_loc[i], !w->vals[i] };
+        dlcol_add_fact(f, l, 0);
+    }
+    for (int i = 0; i < nactions; i++) {
+        uint32_t a = actions[i];
+        if (a < w->loc_cap && w->loc_of[a] != LOC_NONE) {
+            dl_lit l = { w->loc_of[a], false };
+            dlcol_add_fact(f, l, 0);
+        }
     }
 
-    dl_result *res = dl_solve(th);
+    dlcol_solve(f);
 
     int rc = 0;
-    bool *next = malloc((size_t)w->nfl * sizeof *next);
+    bool *next = malloc((size_t)(w->nfl ? w->nfl : 1) * sizeof *next);
     for (int i = 0; i < w->nfl; i++) {
-        dl_lit p = dl_pos(w->primed[i]);
-        if (dl_defeasible(res, p) == DL_PROVED) {
+        dl_lit p = { w->pr_loc[i], false };
+        if (dlcol_defeasible(f, p, 0) == DL_PROVED) {
             next[i] = true;
-        } else if (dl_defeasible(res, dl_complement(p)) == DL_PROVED) {
+        } else if (dlcol_defeasible(f, dl_complement(p), 0) == DL_PROVED) {
             next[i] = false;
         } else {
             if (err)
@@ -262,9 +388,5 @@ int world_step(world *w, const uint32_t *actions, int nactions,
         memcpy(w->vals, next, (size_t)w->nfl * sizeof *next);
 
     free(next);
-    free(inertia_pos);
-    free(inertia_neg);
-    dl_result_free(res);
-    dl_theory_free(th);
     return rc;
 }

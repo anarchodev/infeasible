@@ -918,11 +918,29 @@ re-derivation — and the same test pins its output byte-for-byte against
 `dl_why` on the grounded instance (atoms and rules render as
 `name[entity]`).
 `bench_col` (Release, per-unit AI family of 10 rules): full-family
-recompute at 10k units 0.06 ms, 100k units 0.6 ms, 1M units 8.2 ms —
-vs 5 ms / 65 ms / 667 ms for the same workload grounded into the scalar
-solver (~80–110×), putting RTS-crowd judgment eval well inside a frame
-budget. Heterogeneous partitioning, store-fluent guards, and the world-tier
-step integration remain open.
+recompute at 10k units 0.04 ms, 100k units 0.4 ms, 1M units 5.8 ms —
+vs 5 ms / 65 ms / 660 ms for the same workload grounded into the scalar
+solver (~85–165×), putting RTS-crowd judgment eval well inside a frame
+budget. The sweeps carry a decided-skip (a literal or rule-applicability
+row decided for every entity is monotone-frozen and skipped), which is
+what makes the backing competitive at *small* W too — that plus the
+cached schema is how `world_step` now runs: the step theory (judgments,
+generated inertia, causal rules beating inertia) compiles once into an
+N=1 family, and each step rewrites fact columns and re-solves — no
+per-step theory rebuild, no allocation, modestly faster than the scalar
+path at every world size (2.4 vs 2.7 µs/step at 10 fluents, 218 vs
+276 µs at 1000) with the world golden tests (Yale, ramification,
+conflict rejection) pinning the swap. `bench_slice` closes the loop end-to-end: a deterministic two-army
+battle (toy spatial provider filling fact columns → columnar judge →
+hosts acting on verdict columns via `dlcol_proved_row` → column-wise step
+commit with summed damage, threshold guards, and word-wide inertia
+`alive' = alive & ~died`), replay-hash-verified (I4), at 10k units
+0.3 ms/tick median and 100k units 2.5 ms/tick median — the judge+step
+share is ~0.1 ms and ~1.2 ms of that; the toy provider dominates, which
+is the intended shape (spatial cost lives behind the §5.6 wall in any
+engine). Heterogeneous partitioning, store-fluent guards, and the per-entity
+family world tier (action columns, per-entity conflict reporting — the
+M1 sorts/keyed-fluent API) remain open.
 
 The store also generalizes §5.7's implementation: exactly-one-value fluents
 admit two faithful backings of the same semantics. *Logic-backed* — one atom

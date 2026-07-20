@@ -40,9 +40,11 @@ void dlcol_add_sup(dlcol *f, int winner, int loser);
 void dlcol_set_atom_name(dlcol *f, uint32_t atom, const char *name);
 
 /* Fact columns. A row is ceil(nentities/64) words; the host may write words
- * directly (bits >= nentities are ignored). dlcol_add_fact sets one bit. */
+ * directly (bits >= nentities are ignored). dlcol_add_fact sets one bit;
+ * dlcol_clear_facts zeroes every fact column (start of a fresh assembly). */
 uint64_t *dlcol_fact_row(dlcol *f, dl_lit l);
 void      dlcol_add_fact(dlcol *f, dl_lit l, int entity);
+void      dlcol_clear_facts(dlcol *f);
 int       dlcol_row_words(const dlcol *f);
 
 /* Full family recompute from the current fact columns (clears previous
@@ -51,6 +53,12 @@ void dlcol_solve(dlcol *f);
 
 dl_verdict dlcol_definite(const dlcol *f, dl_lit q, int entity);   /* +/-Delta */
 dl_verdict dlcol_defeasible(const dlcol *f, dl_lit q, int entity); /* +/-d    */
+
+/* Read-only verdict column of the last solve: bit e set iff +d holds for
+ * l at entity e. The ECS reading in the other direction — hosts consume
+ * judgment columns the way they write fact columns (a movement system
+ * reading `engage` bits as a component array). NULL before first solve. */
+const uint64_t *dlcol_proved_row(const dlcol *f, dl_lit l);
 
 /* Proof/defeat trace for one entity's instance of q — dl_why's format with
  * atoms and rules rendered as name[entity]. A pure read of the solved

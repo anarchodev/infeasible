@@ -178,12 +178,56 @@ static int test_cellar(void)
     return 0;
 }
 
+/* The cached step schema must rebuild when the world grows mid-game: step,
+ * then add a new fluent and step rule, step again — the new rule fires, the
+ * old fluent's state and inertia survive the rebuild, and an action atom
+ * interned after the schema was built is safely inert. */
+static int test_grow_mid_game(void)
+{
+    intern *sy = intern_new();
+    uint32_t lamp = intern_id(sy, "lamp"),
+             a_on = intern_id(sy, "act_on");
+
+    world *w = world_new(sy);
+    world_declare_fluent(w, lamp);
+    dl_lit effs[1];
+    effs[0] = dl_pos(lamp);
+    world_add_step_rule(w, "switch_on", a_on, NULL, 0, effs, 1);
+
+    uint32_t acts[2];
+    acts[0] = a_on;
+    CHECK(world_step(w, acts, 1, NULL, 0) == 0);
+    CHECK(world_get(w, lamp));
+
+    /* grow: a second fluent + rule, plus an action no rule mentions */
+    uint32_t door = intern_id(sy, "door_open"),
+             a_open = intern_id(sy, "act_open"),
+             a_noop = intern_id(sy, "act_dance");
+    world_declare_fluent(w, door);
+    effs[0] = dl_pos(door);
+    world_add_step_rule(w, "open_door", a_open, NULL, 0, effs, 1);
+
+    acts[0] = a_open;
+    acts[1] = a_noop;
+    CHECK(world_step(w, acts, 2, NULL, 0) == 0);
+    CHECK(world_get(w, door));
+    CHECK(world_get(w, lamp));      /* inertia across the rebuild */
+
+    CHECK(world_step(w, NULL, 0, NULL, 0) == 0);   /* pure inertia step */
+    CHECK(world_get(w, door) && world_get(w, lamp));
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
 int main(void)
 {
     if (test_yale_shooting()) return 1;
     if (test_ramification()) return 1;
     if (test_conflict_detection()) return 1;
     if (test_cellar()) return 1;
+    if (test_grow_mid_game()) return 1;
     printf("test_world: all passed\n");
     return 0;
 }
