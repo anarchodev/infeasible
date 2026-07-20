@@ -1692,6 +1692,54 @@ leaf.** Three layers:
   (never judgments — I1) is an optional load-time cache:
   nearest-checkpoint-plus-replay-the-tail.
 
+**Save compatibility: loading old saves is schema migration, and most
+patches need none.** A production game patches content under players' feet;
+the save's exposure to that splits three ways, in increasing difficulty:
+
+1. *Rule changes are free — and that is most patches.* Nothing derived is
+   stored (I1), so a save loads under changed judgments, superiority, bands,
+   or a rewritten damage pipeline and the conclusions simply recompute — the
+   same property that makes hot reload sound (§9), applied across versions.
+   The conventional killer — cached derived state going stale against new
+   code — is a bug class that cannot exist here.
+2. *Schema changes are checked, declarative migrations.* What can break is
+   the EDB schema: fluents added/removed/renamed, pools resized, domains
+   changed, scopes restructured. But the save is a relational database with
+   a declared, machine-readable schema — the interface artifact (§6.3) — so
+   the compiler diffs old against new and classifies every change.
+   **Additive is automatic**: a fluent absent from an old save takes its
+   declared default/init — closed-world "absent means default" (§5.8)
+   wearing migration clothes — and grown pool slots arrive inactive.
+   Everything else must be covered by a versioned `migrate` block in
+   `.story`: renames, value maps for domain changes, expressions computing
+   new fluents from old state (`grudge(X) := old.hostility(X) > 5`) — run
+   once at load, a pure data transformation over the old EDB, with
+   provenance on every mapped fact. **Exhaustiveness is enforced**: an
+   unmapped removal, rename, or domain change is a compile error naming the
+   fluent — the partition-violation posture — so silent data loss is
+   impossible, which is the difference from every ad-hoc save converter
+   ever shipped. Because old content is regenerable from authoritative
+   source (above), a migration expression may reference old *judgments*,
+   not only old facts: instantiate the old theory once at load and ask it —
+   the case where a v1 derived judgment becomes a v2 base fluent. Chains
+   compose (v1→v2→v3) and the compiler verifies the composition, not just
+   each hop.
+3. *Replay never crosses versions — by decision, not limitation.* Replaying
+   a v1 action log under v2 rules produces a different story; the player
+   chose against v1's judgments (event-sourcing's log upcasters are the
+   cautionary tale). Logs are segments tagged `(engine-hash, game-hash)`
+   (§9's content hash, made structural); migration operates on the
+   base-fact snapshot the save model already keeps as its checkpoint,
+   records itself as a lineage event, and opens a fresh segment. I4's
+   replay, time travel, and fact-diff hold *within* a segment, and `why?`
+   spans the boundary through the migration provenance.
+
+Prior art: Datomic's grow-only schema (why additive-is-free is the design
+center), event-sourcing upcasters (what item 3 refuses), Paradox's
+cross-version save converters (the ad-hoc practice the exhaustiveness check
+replaces). Open riders in §13: pool shrink policy; fluents moving between
+scopes.
+
 **Late join and state sync.** Determinism makes multiplayer *lockstep*: peers
 broadcast actions (§4.2 driver), everyone replays, and consistency is
 structural — no authority or consensus, since every peer holds the bit-identical
@@ -1766,6 +1814,10 @@ primed-atom trace) rather than only static state, are the target.
   scopes may step in parallel, but I4 needs escalations arriving at the
   shared outer tier to merge in a canonical order (sector id then log
   position — never arrival time). Small, load-bearing; decide with M4.
+- **Migration riders** (§12): pool *shrink* needs a policy (reject the
+  migration vs. an authored cull predicate choosing survivors), and a
+  fluent moving between scopes/tiers is the migration face of the
+  cross-scope-identity question above — decide them together.
 
 ## 14. References
 
