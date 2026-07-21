@@ -2,8 +2,8 @@
 
 *A narrative game engine in C where the world is a logic database: defeasible
 rules for judgments, defeasible inertia for change, and host code driving it
-through a generated, vocabulary-checked API. raylib for presentation, CMake
-for builds.*
+through a generated, vocabulary-checked API. A hand-written Canvas2D web
+renderer for presentation, CMake + WASM for builds.*
 
 *A narrative/dialogue layer is deliberately **out of scope** (§2). Everything
 below is the rules engine.*
@@ -38,12 +38,15 @@ ad-hoc flag system can offer.
 - Deterministic, serializable, replayable: a save is base facts + action log.
 - Author tooling as a first-class deliverable: `why?` proof traces,
   compile-time conflict detection, grounding-cardinality warnings.
-- C11, CMake, raylib. Renderer-agnostic logic core (pure functions over fact
-  stores; raylib touches nothing below `app/`).
+- C11 + CMake for the engine; the shipped presentation is JS + a hand-written
+  Canvas2D renderer over a WASM build of the core. Renderer-agnostic logic core
+  (pure functions over fact stores; the presentation client touches nothing
+  below the frozen presentation interface, §12).
 
 **Non-goals**
 
-- AAA presentation. raylib caps us at indie visuals; the logic core doesn't care.
+- AAA presentation. Canvas2D at the StarCraft-1 ceiling caps us at indie
+  visuals; the logic core doesn't care.
 - General-purpose logic programming. The language is game-shaped; escape
   hatches go through C providers, not logic-side Turing-completeness.
 - GOAP-style planning (defeasible action theories make planning research-grade;
@@ -734,7 +737,7 @@ lookup where the solver would be:
   reassociation, libm variance) breaks exact replay, and threshold comparison
   is a divergence *amplifier*: one ulp of drift flips a guard atom, which
   flips a verdict, and the replay is a different story. Floats live on the
-  renderer side of the I4 wall, which is the same line as the raylib wall.
+  renderer side of the I4 wall, which is the same line as the presentation-client wall.
 - **The compiler may solve; the engine only evaluates.** Build-time
   diagnostics (conflictable-pair witnesses §6.1 item 4, vacuous guards) are
   satisfiability queries — cheap and decidable over finite interval
@@ -1559,10 +1562,14 @@ src/
   logic/   defeasible engine: theories, solve, why  (deps: core)
   state/   fact store, step function, inertia gen   (deps: core, logic)
   lang/    lexer, recursive-descent parser, compiler (later; deps: all above)
-  app/     raylib shell, demo scenes                (the only raylib user)
 tests/     golden semantic tests (ctest)
 examples/  .story surface-language files
 ```
+
+There is **no renderer tier in the C tree**: presentation is a JS + Canvas2D
+web client over a WASM build of `core`/`logic`/`state` (§12), so nothing native
+draws. The C source builds native only for tests, benchmarks, and the optional
+preservation-time native player (§13).
 
 - **Memory**: bump arenas per theory/world; strings interned once to `uint32`
   atom ids; solve results are flat arrays indexed by literal id. No hidden
@@ -1650,8 +1657,10 @@ recovery at declaration boundaries so one error doesn't cascade.
 
 1. **M0 — this scaffold**: core (arena/intern), defeasible engine with
    query + why, step function with inertia/ramifications/conflict detection,
-   golden tests (Yale shooting, cellar, torch ramification, conflict), raylib
-   app shell with an interactive cellar demo.
+   golden tests (Yale shooting, cellar, torch ramification, conflict). (No
+   native renderer: the interactive cellar demo lands as the Canvas2D web shell
+   in M2 — the earlier native raylib demo was dropped when Canvas2D became the
+   single renderer, 2026-07-21.)
 2. **M1 — language front half**: lexer + recursive-descent parser for
    declarations/rules/actions; semantic checks; fluent syntax implements
    §5.7–5.8 (domains, threshold harvesting, effect operators, guard
@@ -1680,8 +1689,9 @@ recovery at declaration boundaries so one error doesn't cascade.
    touches a client call site. Deltas for numeric fluents carry the §5.8
    commit receipt as structured data — each changed value's undefeated
    contributions with ground-rule provenance — so attributed combat text is
-   a projection of the delta, never a parsed `why?` string. Playable cellar in raylib
-   driven entirely by host code against the generated header. A trivial
+   a projection of the delta, never a parsed `why?` string. Playable cellar in the
+   browser (WASM core + Canvas2D) driven entirely by host code (JS) against the
+   generated bindings. A trivial
    second client in tests pins the no-private-APIs claim (§4.2) the way
    golden tests pin semantics — with no reference client, this test is the
    *only* thing keeping the client boundary honest, so it is a hard
@@ -1701,6 +1711,48 @@ recovery at declaration boundaries so one error doesn't cascade.
    narrative layer is the honest test of whether rules alone carry story
    state.
 
+**The customer is a D&D 5e game** (decided 2026-07-20; `examples/combat5e.story`
+and `srd_probe*.story` are its seed). Customer in the strict sense: the game
+whose needs *settle design arguments*. Where a tradeoff is genuinely contested,
+resolve it in 5e's favour; where 5e does not need a feature, that is evidence
+against building it. It earns the role because it is the engine's origin case
+and close to an ideal showcase — advantage/disadvantage, conditions,
+resistances, immunities and exceptions-to-exceptions are exactly what a
+superiority relation is for, and rules arguments at the table are `why?` demand
+in its natural habitat.
+
+Distinguish that from the three supporting roles, which have **no design
+authority**: the RTS vertical slice is the **performance canary** (it may
+falsify — "this is too slow", "this corrupts" — but it may not request
+features), the fighting game is the **flex** (§12), a post-M3 stress test
+that must never shape the kernel, and the SMAC-like 4X is the **showcase**
+(below).
+
+**The showcase is a Sid-Meier's-Alpha-Centauri-like 4X** (decided
+2026-07-21). Its job is to *demonstrate* the killer feature to an audience,
+not to settle design arguments — so like the canary and the flex it has **no
+design authority** (the 5e customer still wins contested tradeoffs). It earns
+the role because a 4X's feel is deeply-stacked, famously opaque modifier
+stacks — morale × terrain × facilities × faction × social-engineering all
+silently compounding — which is `why?` demand at its most acute: the trace
+(§5.1, §9) turns the genre's signature frustration ("why did I *lose* that
+combat?") into the flagship feature. It is turn-based, so it exercises the
+same conditional-step semantics the 5e customer does (§12's update → resolve
+→ draw) rather than the canary's real-time perf regime, and its complexity
+lives in **rules the engine generates and explains, not authored prose** — so
+one person can finish it without the writing-team cost a CRPG showcase would
+carry. It ships on the frozen web stack (Canvas2D renderer + WASM engine
+coprocessor + JS host loop, all decided 2026-07-21, §12); the 5e *remix
+platform* remains the product vision and runs alongside it.
+
+**Peer-engine context.** `infeasible` is one of three peers (see
+`../stiff/DESIGN.md` §11 and `../cfl/DESIGN.md` §11). Their customers form a
+strictly increasing chain through the dependency lattice — D&D 5e uses
+infeasible alone; Contra adds `stiff`; Scorched Earth adds `cfl` on top of
+both. Each game introduces exactly one engine, so a regression localizes to the
+engine just added. This is the first link in that chain and therefore the one
+with no cross-engine concerns at all: **build no cross-engine glue here.**
+
 ## 12. Distribution: web target and content artifacts
 
 The shipped product is a browser platform for a remix community: many authors
@@ -1709,8 +1761,11 @@ making scenarios, subclasses, spells, items, and total conversions on a shared
 concern layered on the kernel (§4.2); it adds no engine semantics.
 
 **The web target.** The logic core compiles to WASM as a library. Presentation
-is a swappable client (§4.2): native raylib for development, web-native
-(Canvas2D or Pixi + DOM) for the shipped product. The core re-solves per
+is a swappable client (§4.2): a single **hand-written Canvas2D renderer** for
+both development and the shipped product, behind the frozen PICO-8-sized
+presentation interface (below). No native (raylib) backend and no WebGL (Pixi)
+backend — Canvas2D alone, which the arithmetic below shows is ample at the
+StarCraft-1 ceiling (decided 2026-07-21). The core re-solves per
 action, not per frame, so the JS↔WASM boundary is crossed rarely and carries a
 subscription delta (§11 M2), not per-frame traffic — the inspector's reactive
 channel and the WASM marshalling seam are the same `world_subscribe` payload.
@@ -1749,6 +1804,108 @@ leaf.** Three layers:
   playthroughs, branching, and time travel for free. A base-fact snapshot
   (never judgments — I1) is an optional load-time cache:
   nearest-checkpoint-plus-replay-the-tail.
+
+**The durability line.** The target artifact property is the 90s one: a
+shipped game that still runs and is still remixable in ten years. What
+actually survived that era — Doom WADs, Z-machine story files, the SCUMM
+catalog — survived as *data plus a small re-implementable interpreter*:
+every original runtime died, and communities rewrote the interpreter
+against the data format (source ports, Frotz, ScummVM). The kernel already
+has this shape: content is declarative data through a vetted interpreter
+(above), the save is `(engine-hash, game-hash, action-log)`, and I4 replay
+is the Doom-demo property — a playthrough reproduces exactly on any
+conforming engine. What rots on the web, ranked worst-first:
+
+1. **Anything fetched at runtime** — CDNs, servers, load-time packages —
+   dies in years. The one-container artifact already forbids it: vendor
+   everything, no exceptions.
+2. **Build toolchains** — the remixability killer; a ten-year-old
+   dependency tree does not install. Discipline: **nothing in the artifact
+   requires a build step**. Content is already buildless (in-browser
+   analysis, above); host code's shipped, authoritative form is plain ES
+   modules that run as-is. Typed generated bindings (§6.3) and any
+   transpiled authoring layer are dev-time *views*, never required to run
+   or remix — the source-authoritative rule applied to the host layer.
+3. **Browser API deprecation** — low; the web's compat promise is the
+   strongest in computing. Canvas2D is effectively frozen; WebGL is
+   low-but-nonzero (the WebGPU transition); WASM is a small spec'd ISA
+   with multiple independent implementations, and the engine's C source
+   ships regardless, so the interpreter is rebuildable — the ScummVM
+   escape hatch, held open on purpose.
+4. **Library abandonment** — smallest, and commonly misranked first. A
+   vendored library is inert; it cannot rot on its own, only break when a
+   platform API shifts beneath it (item 3). Abandonment prices the
+   eventual port, nothing else. (Pixi v8 dropping its Canvas2D backend is
+   the in-genre exhibit: a backend is the upstream's to remove, and what
+   you vendored is what you keep.)
+
+The line itself: **below** it, durable by construction — the WASM engine
+(plus its C source), `.story` source and the interface artifact with their
+versioned serializations, the save format, buildless host JS against
+`world_*`, and the presentation interface (next). **Above** it,
+acknowledged mortal and cheaply replaceable — renderer implementations,
+DOM chrome, the platform site. The rule: the mortal layer reaches the
+durable one only through spec'd surfaces, so a platform break is a port of
+one thin implementation, never per-game surgery. Both disciplines are
+cheap now and unretrofittable in year eight.
+
+**The presentation interface: PICO-8-sized, and frozen.** §4.2 makes
+presentation a swappable client; this fixes the *size* of the swap
+surface. PICO-8's lesson is that its utility comes not from rendering
+power but from a tiny frozen API (`spr`, `map`, `print`, `pal`, `rect` —
+and that is the whole world). The counterpart here: a fixed internal
+resolution chosen **per game in the manifest** from the blessed
+1080-divisor set — 320×180, 480×270, 640×360, 960×540 — so every choice
+integer-scales cleanly to 1080p and 4K forever. 640×360 is the reference
+default: SC1's density in 16:9, ×3 to 1080p (and roughly SC1's own map
+viewport — its console ate the bottom quarter of 480; widescreen UIs
+corner-cluster instead of spanning). Everything else is frozen
+engine-wide: nearest-neighbor integer upscale with letterboxing (a wider
+window must never reveal more map — under lockstep that is a fairness
+rule, not taste), and roughly a dozen ops — atlas tile blit, sprite draw
+(flip + alpha), text, primitives, one composite op for fog/vision —
+frozen the way the kernel's two ports are frozen. Genre breadth costs
+the durability line nothing here: resolution is a per-game *choice
+within* the frozen contract, never a widening of it. UI text
+renders at internal resolution like everything else, or the aesthetic
+splits into game pixels and suspiciously sharp text. The
+graphics ceiling is **StarCraft 1** (decided): 640×480-class palettized
+sprites at RTS scale. Nothing in the surface may assume more.
+
+- **The reference renderer is hand-written Canvas2D** — a few hundred
+  dependency-free lines, below the line. The arithmetic is ample even at
+  the ceiling: SC1 is a tile layer plus a few hundred animated sprites per
+  frame, software-rendered on 1998 CPUs; GPU-backed Canvas2D has orders of
+  magnitude more headroom. The sprite layer repaints per frame (movement
+  interpolation is presentation state); the tile layer pre-renders to an
+  offscreen canvas and repaints only when a subscription delta touches it
+  — for the static world, the delta stream is the repaint schedule. SC1's
+  signature effects need no shaders: player colors are pre-baked recolored
+  atlas variants (an asset-pipeline product, not a renderer op — the op
+  set stays small), cloaking is the alpha op, fog of war is the composite
+  op over dithered overlay tiles. What Canvas2D cannot do (per-pixel
+  lighting, shaders, thousands of blended particles) is above the ceiling
+  by decision: the constraint and the art direction agree.
+- **Canvas2D is the only renderer** (decided 2026-07-21) — no WebGL/Pixi
+  backend and no native raylib backend. Pixi would be a *vendored dependency
+  above* the durability line bought to gain performance the arithmetic here
+  says we do not need at the SC1 ceiling; a native renderer would be a second
+  platform to keep alive. One dependency-free renderer below the line is both
+  the more durable choice and the smaller surface to freeze.
+- **What keeps the interface honest without a second renderer.** The old
+  argument was that two live renderers prove the interface is small (the role
+  M2's trivial second client plays for `world_*`, §4.2). With one renderer that
+  proof falls to two other things: the op-set is frozen small *by construction*
+  (a dozen ops), and the eventual optional **native player** (§13) — a
+  preservation/offline runtime implementing those same ops over the same cart —
+  is the second backend that demonstrates portability if and when it is built.
+  Day-one honesty is the discipline of the frozen op-set, and the
+  weekend-rewritability of the Canvas2D renderer is still the evidence that the
+  op-set is small enough to port.
+- **Learnability is the same property.** A PICO-8-sized draw model is
+  learnable in an afternoon, which is what the remix community needs from
+  presentation — the utility target and the durability target are one
+  decision.
 
 **Save compatibility: loading old saves is schema migration, and most
 patches need none.** A production game patches content under players' feet;
@@ -1815,6 +1972,30 @@ per-tick state-hash for desync detection (RTS "sync checks"). The join-snapshot
 is the same base-fact checkpoint the save model already needs; it is not a
 separate netcode state.
 
+**Rollback is a third recomposition of the same primitives — and the
+fighting game is the stress test.** A fighting game looks continuous but
+is the most discrete of genres: named states, frame-data tables,
+fixed-point positions, one input per player per 60Hz tick — inside the
+thesis boundary (discrete facts changed by discrete actions), unlike the
+physics platformer, whose truth is per-frame continuous simulation.
+GGPO-style rollback is snapshot-at-confirmed-frame, restore on a late
+remote input, deterministic resimulation — exactly the late-join
+primitives above, composed by a different driver; fighting-game replays
+have always been input logs, which is to say this save format. And hit
+arbitration is defeasible logic natively: "the hit lands — unless
+blocking — unless a throw, which beats block — unless airborne — unless
+armor — unless an armor-breaker" is a stacked superiority diamond that
+shipping games resolve with hand-ordered if-chains, and `why?` in
+training mode ("your invincibility ended frame 5; the hit landed frame
+6") is a feature the genre has never had. This is a *post-M3* stress
+test, not a design target: 60 solves/sec with rollback resimulating ~8
+frames inside one means ~1ms worst-case solves and snapshot/restore on
+the hot path — maximal exercise of exactly what the other genres
+exercise least (§8's worst-case budget; I4 as netcode) — while most of
+the content lives in providers (per-frame hitbox tables are asset data,
+like tilemaps; the rules arbitrate interactions). The kernel must not
+bend toward it. It is the flex, not the customer.
+
 **Server-authoritative deployment: the other trust topology, same kernel.**
 Lockstep (above) and server-authoritative are not two engines but two *trust
 deployments* of one kernel. Lockstep is free and serverless, and right when
@@ -1878,6 +2059,112 @@ an M1 constraint), and `world_subscribe` deltas (§11 M2). Point-and-click
 `why?` over an entity's propositions, and explaining a *transition* (a step's
 primed-atom trace) rather than only static state, are the target.
 
+**Coprocessors, carts, and the client surface (provisional sketch, 2026-07-21).**
+A consolidation of a design session, recorded provisionally; it refines the
+artifact model above and the client model of §4.2 without changing kernel
+semantics. Names are working names.
+
+- *The coprocessor reading.* The three peers (§11) are native, optimized
+  **coprocessors** — fixed "silicon" the platform embeds; a **cart** is *data*:
+  `.story` world source (§6) compiled under frozen semantics, plus buildless
+  host glue, assets, and a manifest. The durability line above already argues
+  this shape (data + a small re-implementable interpreter); the coprocessor
+  framing just names the interpreters and makes explicit that the RTS/family
+  work (§4.1) is one coprocessor reaching N-entity scale *inside itself*, while
+  cross-coprocessor composition stays the deferred, host-owned concern (§11:
+  build no cross-engine glue here). infeasible-alone (the D&D 5e customer) is a
+  complete single-coprocessor console; a multi-coprocessor console is a later,
+  conscious commitment.
+- *Save is a per-coprocessor dump the host frames.* Extends the save model above
+  to the multi-engine case, honoring the dependency direction (no OS below
+  `app/`): each coprocessor serializes *only its own* mutable state to a
+  caller-provided buffer — for infeasible that is exactly the base facts (I1/I2
+  make derived state non-state; load restores facts and re-solves, never
+  trusting a stored judgment). The dump is **name-keyed** (interned ids are
+  unstable across builds) and carries a **schema fingerprint** (validated
+  against the cart vocabulary, §6.3); `world_dump`/`world_restore` touch a
+  buffer, never a file. The *host* owns the envelope — `{cart id+version,
+  per-coprocessor blobs, optional action log, meta}` — and all disk/compression/
+  sync. Two shapes, both live: the per-coprocessor **snapshot** (decoupled load,
+  no replay) and the host-level **action log** (exact I4 replay, undo,
+  time-travel, reproducible bug reports; replay is cross-coprocessor, hence
+  host-owned). The host dumps every coprocessor at a **tick boundary** (after
+  resolve, before the next update) so the combined save is consistent.
+- *The client reads reactive tables, not queries.* Fleshes out the
+  `world_subscribe` channel (§11 M2) into an author-facing surface. Judgments
+  are exposed to host code as **reactive tables** the engine keeps current: a
+  **level** table (`judgment[entity]`, current verdict) and **edge** tables
+  (`rose`/`fell`, entities whose verdict changed this tick — the `btnp` to
+  level's `btn`). The loop **decides from these cached tables, never by
+  re-querying** — safe because state is constant within a tick (I2); `query`/
+  `why` demote to one-shot reads and diagnostics. Across the WASM/JS split the
+  engine cannot poke a JS object in place, so a judgment table is a **typed-array
+  view over WASM linear memory**: the engine solves and writes its own memory, JS
+  reads through a zero-copy view (genuinely in place — one buffer), and edges
+  arrive as a compact delta buffer the engine writes and JS reads once, crossing
+  the boundary **once per step**, not per entry (the `world_subscribe` delta
+  seam). Internals stay packed bitvectors for the solve; exposed columns unpack
+  to byte columns for cheap reads (`memory.grow` detaches views, so JS rebuilds
+  them after a grow). The frame is
+  **update → resolve → draw**: read tables and submit actions in update, resolve
+  (a step) yields the next tick, draw renders it — so the player sees the
+  consequence the same frame, and the displayed tick is exactly what the next
+  update decides against. Turn-based games step **conditionally** (no action →
+  no step → same tick); real-time steps every frame. Tables are read-only views;
+  the only write path is an action — command/query separation made physical.
+- *Authoring language ≠ loop language.* The world is authored in `.story` (§6),
+  a language built for rules; the loop is plain buildless host code. Deliberately
+  **not** a fluent DSL embedded in the host language: an internal DSL borrows
+  host syntax but not host semantics (a comparison that is not a boolean, a
+  "rule" that declares rather than runs), misleading exactly the junior/remix
+  audience the durability+learnability target serves. Keeping authoring in
+  `.story` also keeps the host surface small — the same size argument as the
+  presentation interface above. The host language is **JS/ES modules** (decided
+  2026-07-21 with browser-primary, below); the session's PICO-8/Lua framing was
+  inspiration for the *shape* (small API, buildless, learnable), which is
+  language-neutral and ported unchanged. JS is not self-limiting the way Lua
+  was, so the minimalism is imposed by a deliberately small host API, not the
+  language.
+- *Non-goal: speculative solve as a decision mechanism.* A "what-if future"
+  query (run a step without committing, to decide from a predicted state) is
+  rejected as a core primitive: it invites authors to move behavior out of rules
+  (declarative, inspectable, `why?`-able) into procedural lookahead, undercutting
+  the thesis. Behavior that reacts to a situation is a rule. Legitimate residues:
+  the **present counterfactual** (evaluate current judgments with a fact patched
+  — the §5.3 dry-run, no time step) and **exact undo via the action log**.
+  Genuine adversarial lookahead is out-of-scope host-side planning on a minimal
+  pure-step primitive (the narrative-front-end rule: substrate, not kernel), not
+  needed by the customer.
+- *Runtime and distribution (decided 2026-07-21).* **Browser-primary.** The
+  platform is a website — zero-friction discovery, instant play, in-place fork,
+  share-by-URL — which is what a remix community (§12) runs on; the web is also
+  the strongest durability substrate (§12). A **cart is a self-contained,
+  downloadable, forkable artifact** (the §12 one-container HTML), so the
+  retro-collectible identity survives *inside* the browser model with no install.
+  The engine ships as **WASM with SIMD128** (Baseline in every major browser
+  since Safari 16.4, 2023); the solver's integer `v128.and/or/xor` are
+  deterministic across engines, so browser SIMD never threatens I4 — WASM-SIMD,
+  scalar, and native-AVX builds compute bit-identical results (pinned by the
+  golden tests and the `test_col` differential fuzz oracle). The core speed is
+  SWAR (64 entities per `i64` word), fully preserved; SIMD128 recovers 128-bit
+  vectorization; only the *wider* native AVX-256/512 is browser-unavailable — a
+  bounded 2–4× on the vectorizable loops that matters only at large N. A **native
+  player is an optional later runtime over the same cart format** (the
+  ScummVM/source-port shape §12 blesses), where AVX returns for the RTS ceiling,
+  preservation, or offline. Same cart, two runtimes, two perf envelopes; results
+  identical by construction.
+- *Presentation is a frozen op-set, not Canvas.* Carts draw against the
+  **PICO-8-sized frozen presentation interface** (§12: ~a dozen ops — atlas/tile
+  blit, sprite with flip+alpha, text, primitives, one composite for fog/vision),
+  **never raw Canvas2D**. Canvas2D is the reference (and only shipped) *backend*;
+  the eventual optional native player (below) would be a second backend with
+  its own renderer — not raylib, and not a second shipped web renderer. A native app therefore does **not** reimplement the Canvas API — it
+  implements the dozen ops, which §12 already banks on being weekend-sized (the
+  smallness *is* the durability proof). Corollary of the JS host: the native
+  player must **embed a JS engine** (e.g. QuickJS) to run cart glue — the mirror
+  of "a Lua cart would need a Lua VM in the browser"; deferred with the native
+  player, cheap for an embeddable engine.
+
 ## 13. Open questions
 
 - **Effect-operator set and domain-declaration surface** (§5.8): the numeric
@@ -1922,6 +2209,10 @@ primed-atom trace) rather than only static state, are the target.
   migration vs. an authored cull predicate choosing survivors), and a
   fluent moving between scopes/tiers is the migration face of the
   cross-scope-identity question above — decide them together.
+- **Presentation-interface op set** (§12): the frozen surface's exact op
+  list (tile blit, sprite, text, primitives, composite op) is an M2
+  decision, frozen with the client contract. Freezing late is fine;
+  unfreezing is not.
 - **Server-authoritative riders** (§12): reconciliation semantics when a
   client-predicted judgment is contradicted by the authoritative delta
   (presentation-side rollback — but the boundary needs stating);
@@ -2097,3 +2388,10 @@ primed-atom trace) rather than only static state, are the target.
   layer should one be built as a client (§2); its growth of variables,
   functions, and arithmetic is the cautionary half — computation belongs in
   rules or providers, not a dialogue layer)
+- Lexaloffle, *PICO-8* — https://www.pico-8.com (fantasy console: its
+  utility comes from a tiny frozen API, not rendering power — the size
+  model for §12's presentation interface)
+- ScummVM — https://www.scummvm.org; Infocom's Z-machine and its
+  interpreters (Frotz); the Doom source-port lineage. (what game
+  preservation actually looks like: data plus a small re-implementable
+  interpreter outlives every original runtime — §12's durability line)

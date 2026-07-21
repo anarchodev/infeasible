@@ -4,43 +4,39 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`infeasible` is a narrative game engine in C where **the world is a logic database**. One non-monotonic logic (propositional *defeasible logic*) serves as the single semantics for both *what is true* (stats, judgments) and *what happens next* (state transitions via defeasible inertia). Games are built as host code against a generated, vocabulary-checked C API; raylib handles presentation.
+`infeasible` is a narrative game engine in C where **the world is a logic database**. One non-monotonic logic (propositional *defeasible logic*) serves as the single semantics for both *what is true* (stats, judgments) and *what happens next* (state transitions via defeasible inertia). Games are built as host code against a generated, vocabulary-checked C API; a hand-written Canvas2D web renderer (WASM engine + JS host) handles presentation.
 
 **A narrative/dialogue layer is out of scope** (DESIGN.md §2). Games are built as host code against the generated, vocabulary-checked C header (§6.3). Do not add narrative concepts — knots, choices, diverts, a dialogue VM — to the design or code; a narrative front end, if ever built, is a client above the `world_*` surface, not part of the engine.
 
-**Read `DESIGN.md` before non-trivial work** — it is the source of truth for semantics, invariants, and the milestone plan. The current tree is **M0 (scaffold)**: core + logic engine + step function + golden tests + raylib shell. The `.story` language and its parser do **not exist yet** (M1). `examples/cellar.story` is a sketch of the *future* surface syntax, not something that compiles today — worlds are built via the C API.
+**Read `DESIGN.md` before non-trivial work** — it is the source of truth for semantics, invariants, and the milestone plan. The current tree is **M0 (scaffold)**: core + logic engine + step function + golden tests (no renderer — the Canvas2D web shell is M2). The `.story` language and its parser do **not exist yet** (M1). `examples/cellar.story` is a sketch of the *future* surface syntax, not something that compiles today — worlds are built via the C API.
 
 ## Build & test
 
 ```sh
-# Core + tests only — no raylib, no display needed. Use this for logic/engine work.
-cmake -B build -DINFEASIBLE_BUILD_APP=OFF
+# Core + tests — no display needed. This is the whole native build (no renderer).
+cmake -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
 
 # A single test target:
 ctest --test-dir build -R test_dl --output-on-failure
 ./build/test_dl          # or run the binary directly; it prints "test_dl: all passed"
-
-# Full build with the raylib demo (fetches raylib 5.5; needs X11/Wayland dev packages):
-cmake -B build && cmake --build build && ./build/infeasible
 ```
 
-Default build type is `Debug`; core compiles with `-Wall -Wextra`. Prefer `-DINFEASIBLE_BUILD_APP=OFF` when iterating — it skips the raylib fetch/compile entirely.
+Default build type is `Debug`; core compiles with `-Wall -Wextra`. There is **no native renderer**: presentation is a JS + Canvas2D web client over a WASM build of the core (DESIGN.md §12), not built by this CMake project yet.
 
 ## Architecture
 
-Three tiers, one semantics (see `DESIGN.md` §4). Strict dependency direction — **raylib touches nothing below `app/`**:
+Three tiers, one semantics (see `DESIGN.md` §4). Strict dependency direction — the presentation client (JS + Canvas2D over WASM) touches nothing below the frozen presentation interface (§12):
 
 ```
 src/core/    arena allocator, string interning        (no deps)
 src/logic/   defeasible engine: theory, solve, why     (deps: core)
 src/state/   fact store, step function, inertia gen    (deps: core, logic)
-src/app/     raylib shell + demo scene                 (only raylib user)
 tests/       golden semantic tests (ctest)
 ```
 
-Everything links into one static lib `infeasible_core`; tests and the app link against it.
+Everything links into one static lib `infeasible_core`; tests link against it. There is no native renderer tier — the shipped presentation is a web client over a WASM build (raylib was dropped 2026-07-21 when Canvas2D became the single renderer).
 
 ### The logic engine (`src/logic/dl.h`)
 

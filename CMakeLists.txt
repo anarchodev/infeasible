@@ -4,7 +4,10 @@ project(infeasible C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-option(INFEASIBLE_BUILD_APP "Build the raylib demo app" ON)
+# No native renderer: presentation is a JS + Canvas2D web client over a WASM
+# build of the core (DESIGN.md §12). This project builds the engine, tests, and
+# benchmarks only. raylib was dropped 2026-07-21 when Canvas2D became the single
+# renderer.
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Debug)
@@ -46,18 +49,3 @@ target_compile_options(bench_col PRIVATE -O2)
 add_executable(bench_slice tests/bench_slice.c)
 target_link_libraries(bench_slice PRIVATE infeasible_core)
 target_compile_options(bench_slice PRIVATE -O2)
-
-if(INFEASIBLE_BUILD_APP)
-  include(FetchContent)
-  set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-  set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
-  FetchContent_Declare(raylib
-    GIT_REPOSITORY https://github.com/raysan5/raylib.git
-    GIT_TAG 5.5
-    GIT_SHALLOW TRUE
-  )
-  FetchContent_MakeAvailable(raylib)
-
-  add_executable(infeasible src/app/main.c)
-  target_link_libraries(infeasible PRIVATE infeasible_core raylib)
-endif()
