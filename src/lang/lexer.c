@@ -106,9 +106,10 @@ token lexer_next(lexer *lx)
     case ':': if (*lx->p == '=') { adv(lx); t.kind = TK_ASSIGN; }
               else                 t.kind = TK_COLON;
               break;
-    case ',': t.kind = TK_COMMA;  break;
-    case '&': t.kind = TK_AMP;    break;
-    case '*': t.kind = TK_STAR;   break;
+    case ',':  t.kind = TK_COMMA; break;
+    case '&':  t.kind = TK_AMP;   break;
+    case '*':  t.kind = TK_STAR;  break;
+    case '\'': t.kind = TK_PRIME; break;   /* postfix next-state mark (§5.4) */
     case '.': if (*lx->p == '.') { adv(lx); t.kind = TK_DOTDOT; }
               else                 t.kind = TK_ERROR;
               break;
@@ -181,6 +182,7 @@ const char *tok_kind_name(tok_kind k)
     case TK_PLUS:     return "'+'";
     case TK_STAR:     return "'*'";
     case TK_DOTDOT:   return "'..'";
+    case TK_PRIME:    return "'''";
     }
     return "?";
 }

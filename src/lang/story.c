@@ -37,6 +37,8 @@ typedef struct { uint32_t name; int line, col; } ast_arg;
 typedef struct {
     uint32_t  pred;
     bool      neg;
+    bool      primed;         /* postfix `'`: read in the next state (§5.4);
+                               * legal only in a ramification body */
     int       nargs;
     ast_arg   args[MAX_ARGS];
     uint32_t  value;          /* MV value symbol, else 0 */
@@ -89,6 +91,9 @@ typedef struct {
 typedef struct {
     char      name[MAX_NAME];
     int       line, col;
+    bool      is_ramif;           /* a `rule … causes` ramification: no action
+                                   * trigger (act = INTERN_NONE), `requires`
+                                   * holds the match condition (§5.4, §11 M1) */
     var_bind  vars[MAX_ARGS];
     int       nvars;
     ast_atom  requires[MAX_BODY];
@@ -525,6 +530,11 @@ static bool parse_atom(parser *p, ast_atom *out)
         }
         if (!expect(p, TK_RPAREN)) return false;
     }
+    /* Postfix `'`: read this atom in the next state (§5.4). Parsed anywhere;
+     * the semantic pass confines it to ramification bodies (and to boolean /
+     * multi-valued fluents — primed numeric guards and judgments are the §5.8
+     * stratification case, not yet supported). */
+    if (p->cur.kind == TK_PRIME) { out->primed = true; advance(p); }
     /* A comparison operator makes this a numeric guard `f <op> n`; a `=` is
      * overloaded — `f = value` (multi-valued) vs `f = 12` (numeric equality),
      * disambiguated by whether an identifier or an integer follows. */
@@ -760,7 +770,10 @@ static bool parse_params(parser *p, var_bind *vars, int *nvars)
     return expect(p, TK_RPAREN);
 }
 
-/* rule := 'rule' IDENT [ params ] ':' conj OP atom [ 'unless' conj ] */
+/* rule := 'rule' IDENT [ params ] ':' conj ( OP atom [ 'unless' conj ]
+ *                                          | 'causes' conj )
+ * A `causes` clause (in place of a rule arrow) makes it a ramification: a step
+ * rule with no action trigger, its body the match condition (§5.4, §11 M1). */
 static void parse_rule(parser *p)
 {
     advance(p);                                    /* 'rule' */
@@ -787,6 +800,32 @@ static void parse_rule(parser *p)
     if (nb < 0) return;
     r->nbody = nb;
 
+    /* `causes` instead of an arrow: this `rule` is a ramification. Re-home the
+     * label, params, and body into the actions array (a trigger-less step
+     * rule); the judgment-rule slot `r` stays scratch (nrules not bumped). */
+    if (p->cur.kind == TK_CAUSES) {
+        if (p->nactions >= MAX_ACTIONS) {
+            fail(p, r->line, r->col, "too many actions (max %d)", MAX_ACTIONS);
+            return;
+        }
+        ast_action *a = &p->actions[p->nactions];
+        memset(a, 0, sizeof *a);
+        memcpy(a->name, r->label, MAX_NAME);
+        a->line = r->line;
+        a->col = r->col;
+        a->is_ramif = true;
+        a->nvars = r->nvars;
+        for (int i = 0; i < r->nvars; i++) a->vars[i] = r->vars[i];
+        a->nreq = r->nbody;
+        for (int b = 0; b < r->nbody; b++) a->requires[b] = r->body[b];
+        advance(p);                                /* 'causes' */
+        int ne = parse_conj(p, a->effects, MAX_BODY);
+        if (ne < 0) return;
+        a->neff = ne;
+        p->nactions++;
+        return;
+    }
+
     switch (p->cur.kind) {
     case TK_ARROW:    r->kind = DL_STRICT;     break;
     case TK_FATARROW: r->kind = DL_DEFEASIBLE; break;
@@ -794,7 +833,8 @@ static void parse_rule(parser *p)
     default: {
         char d[64]; tok_desc(p->cur, d, sizeof d);
         fail(p, p->cur.line, p->cur.col,
-             "expected a rule arrow ('->', '=>', or '~>'), found %s", d);
+             "expected a rule arrow ('->', '=>', '~>') or 'causes' "
+             "(a ramification), found %s", d);
         return;
     }
     }
@@ -1128,11 +1168,40 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
  * every argument is a bound variable or a declared entity (with a sort check
  * for fluent atoms). `note` records condition refs for orphan analysis;
  * `in_effect` is true only for atoms in a `causes` clause, where numeric
- * effect operators (`:=`/`+=`/`-=`) are legal. */
+ * effect operators (`:=`/`+=`/`-=`) are legal. `allow_prime` is true only in a
+ * ramification body, the one context where a postfix `'` (next-state, §5.4) is
+ * meaningful. */
 static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
-                       bool note, bool in_effect, const char *ctx)
+                       bool note, bool in_effect, bool allow_prime, const char *ctx)
 {
     if (note) note_ref(p, at->pred, at->line, at->col);
+    if (at->primed) {
+        if (!allow_prime) {
+            serr(p, at->line, at->col,
+                 "the next-state mark `'` is only allowed in a ramification "
+                 "body (a `rule … causes …`), not in %s", ctx);
+            return;
+        }
+        /* Deferred §5.8 stratification case: a primed numeric guard or a primed
+         * judgment needs next-state arithmetic/derivation mid-fixpoint. Only a
+         * boolean or multi-valued fluent read may prime for now. */
+        if (at->is_guard) {
+            serr(p, at->line, at->col,
+                 "a primed numeric guard (`%s … '`) is not supported yet — it "
+                 "needs the §5.8 primed-guard stratification; test the current "
+                 "value instead", intern_name(p->syms, at->pred));
+            return;
+        }
+        pred_info *pf = find_pred(p, at->pred);
+        if (!pf || !pf->is_fluent) {
+            serr(p, at->line, at->col,
+                 "`%s'` primes a judgment (a derived conclusion in the next "
+                 "state), not supported yet — it needs §5.8 stratification; "
+                 "prime the fluents it is concluded from instead",
+                 intern_name(p->syms, at->pred));
+            return;
+        }
+    }
     pred_info *pi = find_pred(p, at->pred);
     if (pi && pi->arity != at->nargs) {
         serr(p, at->line, at->col,
@@ -1240,8 +1309,8 @@ static void semantic_pass(parser *p)
         ast_rule *r = &p->rules[i];
         resolve_vars(p, r->vars, r->nvars, "a rule");
         for (int b = 0; b < r->nbody; b++)
-            check_atom(p, &r->body[b], r->vars, r->nvars, true, false, "a rule body");
-        check_atom(p, &r->head, r->vars, r->nvars, false, false, "a rule head");
+            check_atom(p, &r->body[b], r->vars, r->nvars, true, false, false, "a rule body");
+        check_atom(p, &r->head, r->vars, r->nvars, false, false, false, "a rule head");
         if (r->head.value != INTERN_NONE)
             serr(p, r->head.line, r->head.col,
                  "concluding a multi-valued value ('%s = %s') from a judgment "
@@ -1254,7 +1323,7 @@ static void semantic_pass(parser *p)
                  "a rule cannot conclude a numeric comparison — guards are "
                  "read-only inputs derived from the value store (§5.8)");
         for (int b = 0; b < r->nguard; b++)
-            check_atom(p, &r->guard[b], r->vars, r->nvars, true, false, "an `unless` guard");
+            check_atom(p, &r->guard[b], r->vars, r->nvars, true, false, false, "an `unless` guard");
         check_safety(p, r);
         for (int j = i + 1; j < p->nrules; j++)
             if (strcmp(r->label, p->rules[j].label) == 0)
@@ -1264,11 +1333,12 @@ static void semantic_pass(parser *p)
 
     for (int i = 0; i < p->nactions; i++) {
         ast_action *a = &p->actions[i];
-        resolve_vars(p, a->vars, a->nvars, "an action");
+        resolve_vars(p, a->vars, a->nvars, a->is_ramif ? "a ramification" : "an action");
+        const char *bctx = a->is_ramif ? "a ramification body" : "a `requires` clause";
         for (int b = 0; b < a->nreq; b++)
-            check_atom(p, &a->requires[b], a->vars, a->nvars, true, false, "a `requires` clause");
+            check_atom(p, &a->requires[b], a->vars, a->nvars, true, false, a->is_ramif, bctx);
         for (int b = 0; b < a->neff; b++) {
-            check_atom(p, &a->effects[b], a->vars, a->nvars, false, true, "a `causes` clause");
+            check_atom(p, &a->effects[b], a->vars, a->nvars, false, true, false, "a `causes` clause");
             if (a->effects[b].value != INTERN_NONE && a->effects[b].neg)
                 serr(p, a->effects[b].line, a->effects[b].col,
                      "a negative multi-valued effect ('~(%s = %s)') is not "
@@ -1288,7 +1358,7 @@ static void semantic_pass(parser *p)
                  intern_name(p->syms, a->pred));
             continue;
         }
-        check_atom(p, a, NULL, 0, false, false, "an init fact");
+        check_atom(p, a, NULL, 0, false, false, false, "an init fact");
         if (a->is_guard && a->cmp != WORLD_CMP_EQ)
             serr(p, a->line, a->col,
                  "init sets a numeric fluent's value with `=` (e.g. `%s = 10`), "
@@ -1586,8 +1656,8 @@ static void ground_action(parser *p, ast_action *a)
     bool of = false;
     long total = instance_count(p, a->vars, a->nvars, &of);
     if (of) {
-        warn(p, a->line, a->col,
-             "action '%s' grounds to more than %d instances", a->name, MAX_INSTANCES);
+        warn(p, a->line, a->col, "%s '%s' grounds to more than %d instances",
+             a->is_ramif ? "ramification" : "action", a->name, MAX_INSTANCES);
         return;
     }
     if (total == 0) return;
@@ -1595,21 +1665,25 @@ static void ground_action(parser *p, ast_action *a)
     uint32_t binding[MAX_ARGS];
     for (long idx = 0; idx < total; idx++) {
         decode_binding(p, a->vars, a->nvars, idx, binding);
-        /* the action trigger atom is the ground action term itself */
-        uint32_t actargs[MAX_ARGS];
-        for (int k = 0; k < a->nvars; k++) actargs[k] = binding[k];
         char aname[MAX_GROUND];
         inst_name(p, aname, sizeof aname, a->name, a->vars, a->nvars, binding);
-        uint32_t act;
-        {
-            /* action atom: "name(e1,..)" over the ground params, bare at arity 0 */
+        /* A ramification has no trigger (act = INTERN_NONE): it fires in any
+         * step whose state matches its body. An action's trigger atom is the
+         * ground action term "name(e1,..)" (bare at arity 0). */
+        uint32_t act = INTERN_NONE;
+        if (!a->is_ramif) {
+            uint32_t actargs[MAX_ARGS];
+            for (int k = 0; k < a->nvars; k++) actargs[k] = binding[k];
             uint32_t nameatom = intern_id(p->syms, a->name);
             act = ground_pred(p, nameatom, actargs, a->nvars);
         }
         step_cond conds[MAX_BODY];
         for (int b = 0; b < a->nreq; b++) {
             conds[b].lit = ground_lit(p, &a->requires[b], a->vars, a->nvars, binding);
-            conds[b].primed = false;               /* current-state guards */
+            /* Bare atom = current state; a postfix `'` (ramification bodies
+             * only) reads the next state (§5.4). Action `requires` are always
+             * current-state — the parser forbids `'` there. */
+            conds[b].primed = a->requires[b].primed;
         }
         /* A multi-valued assignment `f = v` expands to the whole family: the
          * chosen value plus a negation of every sibling, so exactly one value

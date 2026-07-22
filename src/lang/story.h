@@ -16,8 +16,15 @@
  * tick-time join matcher is M3, §11). Multi-valued fluents (`: { … }`, §5.7)
  * and numeric fluents (`: int [ in lo..hi ]`, comparison guards, and the write
  * side — `:=`/`+=`/`-=` effects over an expression VM, §5.8) are handled too.
- * Still out: ramifications, and MV judgment-rule heads / negative MV effects
- * (they need the §5.7 family reification), each rejected with a located error.
+ * Ramifications are a `rule … causes …` (a bare `causes`, no arrow): a step
+ * rule with no action trigger, firing in any step whose state matches (§5.4).
+ * Its body is current-state by default; a postfix `'` (`~alive(X)'`) reads the
+ * next state, so an indirect effect cascades in the same step. The prime is
+ * legal only in a ramification body and only on a boolean or multi-valued
+ * fluent read — a primed numeric guard or judgment (`hp' <= 0`, `dead'`) is the
+ * §5.8 stratification case, rejected with a located error.
+ * Still out: MV judgment-rule heads / negative MV effects (they need the §5.7
+ * family reification), each rejected with a located error.
  * The variable-free fragment is the degenerate arity-0 case: cellar_prop.story
  * still compiles to the same world.
  *
@@ -34,7 +41,9 @@
  *            | ':' '{' IDENT (',' IDENT)* '}'           -- multi-valued domain
  *   init    := 'init'   ( iatom | '(' iatom* ')' )      -- ground
  *   iatom   := atom | IDENT '=' (IDENT | INT)           -- MV / numeric init
- *   rule    := 'rule' IDENT [ params ] ':' conj OP atom [ 'unless' conj ]
+ *   rule    := 'rule' IDENT [ params ] ':' conj                 -- judgment
+ *                ( OP atom [ 'unless' conj ]
+ *                | 'causes' conj )                              -- ramification
  *   action  := 'action' IDENT [ params ] ':' [ 'requires' conj ] 'causes' conj
  *   params  := '(' vbind (',' vbind)* ')'
  *   vbind   := IDENT ':' IDENT                          -- var : sort
@@ -48,8 +57,9 @@
  *   term    := factor ('*' factor)*
  *   factor  := '-' factor | INT | ('min'|'max') '(' expr ',' expr ')'
  *            | IDENT [ '(' arg (',' arg)* ')' ] | '(' expr ')'
- *   atom    := [ '~' ] IDENT [ '(' arg (',' arg)* ')' ]
+ *   atom    := [ '~' ] IDENT [ '(' arg (',' arg)* ')' ] [ "'" ]
  *   arg     := IDENT                                    -- a var or an entity
+ *   -- postfix "'" = next-state; ramification bodies only (§5.4)
  *
  * Atoms are interned into `syms`; ground atoms intern as "pred(e1,e2)" (the
  * bare name at arity 0), so a host querying the equivalent ground atom sees

@@ -37,7 +37,8 @@ typedef enum {
     TK_MINUSEQ,    /* -=  additive effect */
     TK_PLUS,       /* +                   */
     TK_STAR,       /* *                   */
-    TK_DOTDOT      /* ..  range           */
+    TK_DOTDOT,     /* ..  range           */
+    TK_PRIME       /* '   next-state mark (ramification bodies, §5.4) */
 } tok_kind;
 
 typedef struct {
