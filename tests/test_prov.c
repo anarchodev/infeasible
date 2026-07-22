@@ -32,6 +32,16 @@ static char *why_str(world *w, dl_lit q)
     return buf;
 }
 
+static char *step_why_str(world *w, dl_lit q, bool next)
+{
+    char *buf = NULL;
+    size_t n = 0;
+    FILE *m = open_memstream(&buf, &n);
+    world_step_why(w, q, next, m);
+    fclose(m);
+    return buf;
+}
+
 /* line 1: sort actor
  * line 2: entity guard : actor
  * line 3: state (poisoned(actor) weak(actor) safe(actor))
@@ -78,10 +88,48 @@ static int test_null_srcname(void)
     return 0;
 }
 
+/* line 1: sort actor
+ * line 2: entity guard : actor
+ * line 3: state lit(actor)
+ * line 4: action douse(X: actor): causes ~lit(X)
+ * line 5: init lit(guard) */
+static const char *STEP_SRC =
+    "sort actor\n"
+    "entity guard : actor\n"
+    "state lit(actor)\n"
+    "action douse(X: actor): causes ~lit(X)\n"
+    "init lit(guard)\n";
+
+/* The step trace reaches the generated machinery — inertia and the causal rule
+ * — and both render in source terms (§6.3): inertia points at the fluent's
+ * declaration (line 3), the causal rule at the action (line 4). */
+static int test_step_trace(void)
+{
+    intern *sy = intern_new();
+    world *w = story_compile(STEP_SRC, "cellar.story", sy, NULL);
+    CHECK(w != NULL);
+
+    char err[128];
+    uint32_t a_douse = intern_id(sy, "douse(guard)");
+    CHECK(world_step(w, &a_douse, 1, err, sizeof err) == 0);
+
+    /* why ~lit(guard) next: the douse action beat inertia */
+    char *t = step_why_str(w, dl_neg(intern_id(sy, "lit(guard)")), true);
+    CHECK(strstr(t, "inertia on lit(guard)") != NULL);
+    CHECK(strstr(t, "generated; declared cellar.story:3)") != NULL);
+    CHECK(strstr(t, "cellar.story:4)") != NULL);        /* the causal rule */
+    free(t);
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
 int main(void)
 {
     if (test_authored_span()) return 1;
     if (test_null_srcname()) return 1;
+    if (test_step_trace()) return 1;
     printf("test_prov: all passed\n");
     return 0;
 }

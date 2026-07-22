@@ -24,6 +24,9 @@ world *world_new(intern *syms);
 void   world_free(world *w);
 
 void world_declare_fluent(world *w, uint32_t atom);
+/* Where a fluent was declared (a "srcname:line" span, §6.3), attached to its
+ * generated inertia rules' provenance. Copied; NULL clears it. */
+void world_set_fluent_prov(world *w, uint32_t atom, const char *at);
 void world_set(world *w, uint32_t atom, bool value);   /* initial state / loading */
 bool world_get(const world *w, uint32_t atom);
 
@@ -101,6 +104,13 @@ void world_add_num_effect(world *w, int rule, uint32_t num_atom,
 /* Query the current state (facts + judgment rules). */
 dl_verdict world_query(world *w, dl_lit q);
 void       world_why(world *w, dl_lit q, FILE *out);
+
+/* Trace how a fluent reached its value in the *last* step (causal rules,
+ * ramifications, generated inertia). `next` true reads q's atom in the next
+ * state (its primed form — the usual "why did it end up this way?"), false the
+ * current-state value the step saw. Valid only after a successful world_step,
+ * until the next step or a rule/fluent edit. */
+void world_step_why(world *w, dl_lit q, bool next, FILE *out);
 
 /* Advance one step given occurring action atoms. Returns 0 on success and
  * commits the new state; returns -1 and leaves the state untouched if some

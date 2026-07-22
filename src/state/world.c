@@ -46,6 +46,7 @@ struct world {
     arena a;
     intern *syms;
     uint32_t *fluents; bool *vals; uint32_t *primed;
+    const char **fl_prov;         /* decl span per fluent (§6.3), or NULL */
     int nfl, capfl;
     jrule *jrules; int njr, capjr;
     jsup *jsups; int njs, capjs;
@@ -103,6 +104,7 @@ void world_free(world *w)
     free(w->fluents);
     free(w->vals);
     free(w->primed);
+    free(w->fl_prov);
     free(w->jrules);
     free(w->jsups);
     free(w->srules);
@@ -133,6 +135,7 @@ void world_declare_fluent(world *w, uint32_t atom)
     if (w->capfl != oldcap) {
         w->vals = realloc(w->vals, (size_t)w->capfl * sizeof *w->vals);
         w->primed = realloc(w->primed, (size_t)w->capfl * sizeof *w->primed);
+        w->fl_prov = realloc(w->fl_prov, (size_t)w->capfl * sizeof *w->fl_prov);
     }
 
     char buf[256];
@@ -140,8 +143,18 @@ void world_declare_fluent(world *w, uint32_t atom)
     w->fluents[w->nfl] = atom;
     w->vals[w->nfl] = false;
     w->primed[w->nfl] = intern_id(w->syms, buf);
+    w->fl_prov[w->nfl] = NULL;
     w->nfl++;
     w->fam_dirty = true;
+}
+
+/* Where a fluent was declared (§6.3), for its generated inertia rules'
+ * provenance. `at` is a "srcname:line" span; copied, NULL clears it. */
+void world_set_fluent_prov(world *w, uint32_t atom, const char *at)
+{
+    int i = fluent_index(w, atom);
+    if (i >= 0)
+        w->fl_prov[i] = at ? arena_strdup(&w->a, at) : NULL;
 }
 
 void world_set(world *w, uint32_t atom, bool value)
@@ -328,6 +341,8 @@ static void add_state_and_judgments(const world *w, dl_theory *th)
     }
 }
 
+#define LOC_NONE (~0u)   /* schema location for an atom absent from the family */
+
 dl_verdict world_query(world *w, dl_lit q)
 {
     dl_theory *th = dl_theory_new(w->syms);
@@ -349,6 +364,31 @@ void world_why(world *w, dl_lit q, FILE *out)
     dl_theory_free(th);
 }
 
+/* Trace how a fluent got its value in the last step: the step theory (causal
+ * rules, ramifications, generated inertia) as solved by the most recent
+ * world_step. With `next` true, `q`'s atom is read in the next state (its primed
+ * form) — the usual question, "why did `door` end up open?"; with `next` false,
+ * the current-state value the step saw. Valid only after a world_step (the
+ * family holds that transition's solution until the next step or edit). */
+void world_step_why(world *w, dl_lit q, bool next, FILE *out)
+{
+    uint32_t atom = q.atom;
+    if (next) {
+        int i = fluent_index(w, atom);
+        if (i >= 0)
+            atom = w->primed[i];
+    }
+    if (!w->fam || w->fam_dirty ||
+        atom >= w->loc_cap || w->loc_of[atom] == LOC_NONE) {
+        fprintf(out, "why %s%s? not in the step theory%s\n",
+                q.neg ? "~" : "", intern_name(w->syms, atom),
+                w->fam_dirty ? " (no step taken since the last edit)" : "");
+        return;
+    }
+    dl_lit loc = { w->loc_of[atom], q.neg };
+    dlcol_why(w->fam, loc, 0, out);
+}
+
 static dl_lit primed_lit(const world *w, dl_lit l)
 {
     int i = fluent_index(w, l.atom);
@@ -363,8 +403,6 @@ static dl_lit primed_lit(const world *w, dl_lit l)
  * causal rules each superior to the inertia rule they conflict with.
  * Semantics identical to the scalar construction below (the golden world
  * tests pin it); only the per-step cost changes. */
-
-#define LOC_NONE (~0u)
 
 static uint32_t assign_loc(world *w, uint32_t atom, uint32_t *n)
 {
@@ -446,11 +484,19 @@ static void build_step_family(world *w)
     for (int i = 0; i < w->nfl; i++) {
         const char *fname = intern_name(w->syms, w->fluents[i]);
         dl_lit now = { w->fl_loc[i], false }, nxt = { w->pr_loc[i], false };
-        snprintf(buf, sizeof buf, "inertia+%s", fname);
+        /* generated inertia reads in source terms (§6.3): a name the author
+         * recognizes, and a provenance pointing at the fluent's declaration. */
+        char prov[320];
+        if (w->fl_prov[i])
+            snprintf(prov, sizeof prov, "generated; declared %s", w->fl_prov[i]);
+        else
+            snprintf(prov, sizeof prov, "generated");
+        snprintf(buf, sizeof buf, "inertia on %s", fname);
         inertia_pos[i] = dlcol_add_rule(f, buf, DL_DEFEASIBLE, nxt, &now, 1);
+        dlcol_set_prov(f, inertia_pos[i], prov);
         dl_lit nnow = dl_complement(now), nnxt = dl_complement(nxt);
-        snprintf(buf, sizeof buf, "inertia-%s", fname);
         inertia_neg[i] = dlcol_add_rule(f, buf, DL_DEFEASIBLE, nnxt, &nnow, 1);
+        dlcol_set_prov(f, inertia_neg[i], prov);
     }
 
     /* causal rules and ramifications, one rule per effect, each superior to

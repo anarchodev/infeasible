@@ -1563,6 +1563,14 @@ static void decode_binding(parser *p, var_bind *vars, int nvars, long idx,
     }
 }
 
+/* "srcname:line" — the provenance suffix rendered in a why-trace (§6.3), so an
+ * author can jump from a generated rule to the source construct it came from. */
+static const char *prov_str(parser *p, int line, char *buf, size_t n)
+{
+    snprintf(buf, n, "%s:%d", p->srcname ? p->srcname : "<story>", line);
+    return buf;
+}
+
 static void declare_ground_fluents(parser *p)
 {
     for (int i = 0; i < p->nfluents; i++) {
@@ -1575,17 +1583,25 @@ static void declare_ground_fluents(parser *p)
         bool of = false;
         long total = instance_count(p, vb, f->nargs, &of);
         uint32_t binding[MAX_ARGS];
+        char pbuf[MAX_NAME + 24];
+        const char *decl = prov_str(p, f->line, pbuf, sizeof pbuf);
         for (long idx = 0; idx < total; idx++) {
             decode_binding(p, vb, f->nargs, idx, binding);
             if (f->is_num)                         /* value-store slot, not an atom */
                 world_declare_num(p->w, ground_pred(p, f->pred, binding, f->nargs),
                                   f->rmin, f->rmax, f->has_range);
-            else if (f->is_mv)                     /* one boolean atom per value */
-                for (int v = 0; v < f->nvalues; v++)
-                    world_declare_fluent(p->w, ground_mv_atom(p, f->pred, binding,
-                                                              f->nargs, f->values[v]));
-            else
-                world_declare_fluent(p->w, ground_pred(p, f->pred, binding, f->nargs));
+            else if (f->is_mv) {                   /* one boolean atom per value */
+                for (int v = 0; v < f->nvalues; v++) {
+                    uint32_t a = ground_mv_atom(p, f->pred, binding, f->nargs,
+                                                f->values[v]);
+                    world_declare_fluent(p->w, a);
+                    world_set_fluent_prov(p->w, a, decl);
+                }
+            } else {
+                uint32_t a = ground_pred(p, f->pred, binding, f->nargs);
+                world_declare_fluent(p->w, a);
+                world_set_fluent_prov(p->w, a, decl);
+            }
         }
     }
 }
@@ -1605,14 +1621,6 @@ static void ground_inits(parser *p)
             : ground_pred(p, a->pred, args, a->nargs);
         world_set(p->w, atom, true);               /* siblings stay closed-world false */
     }
-}
-
-/* "srcname:line" — the provenance suffix rendered in a why-trace (§6.3), so an
- * author can jump from a generated rule to the source construct it came from. */
-static const char *prov_str(parser *p, int line, char *buf, size_t n)
-{
-    snprintf(buf, n, "%s:%d", p->srcname ? p->srcname : "<story>", line);
-    return buf;
 }
 
 static void ground_rule(parser *p, ast_rule *r)
