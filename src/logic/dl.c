@@ -13,6 +13,7 @@
 
 typedef struct {
     const char *name;
+    const char *prov;    /* provenance suffix (§6.3), or NULL */
     dl_rule_kind kind;
     dl_lit head;
     dl_lit *body;
@@ -50,6 +51,7 @@ struct dl_result {
     int32_t     *rbody_off;  /* [nrules+1]   slices into body[]             */
     int32_t     *body;       /* [total_body] precomputed lit indices        */
     const char **rname;      /* [nrules]     cold                           */
+    const char **rprov;      /* [nrules]     cold; provenance suffix or NULL */
     int32_t     *head_off;   /* [nlits+1]    ranges into the permuted rules */
 
     /* Superiority as a reverse index: beat_by[beat_off[s]..beat_off[s+1]) are
@@ -97,6 +99,7 @@ int dl_add_rule(dl_theory *t, const char *name, dl_rule_kind kind,
     GROW(t->rules, t->nrules, t->caprules);
     rule *r = &t->rules[t->nrules];
     r->name = arena_strdup(&t->a, name ? name : "?");
+    r->prov = NULL;
     r->kind = kind;
     r->head = head;
     r->nbody = nbody;
@@ -104,6 +107,12 @@ int dl_add_rule(dl_theory *t, const char *name, dl_rule_kind kind,
     if (nbody)
         memcpy(r->body, body, (size_t)nbody * sizeof(dl_lit));
     return t->nrules++;
+}
+
+void dl_set_prov(dl_theory *t, int rule_id, const char *prov)
+{
+    if (rule_id >= 0 && rule_id < t->nrules)
+        t->rules[rule_id].prov = prov ? arena_strdup(&t->a, prov) : NULL;
 }
 
 void dl_add_sup(dl_theory *t, int winner, int loser)
@@ -389,6 +398,7 @@ static void compile(const dl_theory *t, dl_result *res)
     res->rkind     = malloc((size_t)(nrules ? nrules : 1) * sizeof *res->rkind);
     res->rhead     = malloc((size_t)(nrules ? nrules : 1) * sizeof *res->rhead);
     res->rname     = malloc((size_t)(nrules ? nrules : 1) * sizeof *res->rname);
+    res->rprov     = malloc((size_t)(nrules ? nrules : 1) * sizeof *res->rprov);
     res->rbody_off = malloc(((size_t)nrules + 1) * sizeof *res->rbody_off);
 
     int total_body = 0;
@@ -409,6 +419,7 @@ static void compile(const dl_theory *t, dl_result *res)
         res->rkind[n] = (uint8_t)src->kind;
         res->rhead[n] = (int32_t)lit_idx(src->head);
         res->rname[n] = src->name;
+        res->rprov[n] = src->prov;
         int32_t off = res->rbody_off[n];
         for (int i = 0; i < src->nbody; i++)
             res->body[off + i] = (int32_t)lit_idx(src->body[i]);
@@ -508,6 +519,7 @@ void dl_result_free(dl_result *r)
     free(r->rbody_off);
     free(r->body);
     free(r->rname);
+    free(r->rprov);
     free(r->head_off);
     free(r->beat_off);
     free(r->beat_by);
@@ -587,6 +599,8 @@ static int sc_applicable(void *ctx, int r)
 { return ts_applicable(((const scalar_trace *)ctx)->res, r); }
 static bool sc_beats(void *ctx, int w, int l)
 { return beats_c(((const scalar_trace *)ctx)->res, w, l); }
+static const char *sc_rule_prov(void *ctx, int r)
+{ return ((const scalar_trace *)ctx)->res->rprov[r]; }
 
 static const dl_trace_vtbl scalar_vtbl = {
     .put_lit = sc_put_lit, .put_rule = sc_put_rule,
@@ -595,7 +609,7 @@ static const dl_trace_vtbl scalar_vtbl = {
     .nhead = sc_nhead, .head_at = sc_head_at,
     .rule_kind = sc_rule_kind, .nbody = sc_nbody, .body_at = sc_body_at,
     .applicable = sc_applicable, .beats = sc_beats,
-    .rule_prov = NULL,           /* provenance not wired yet (§6.3) */
+    .rule_prov = sc_rule_prov,
 };
 
 void dl_why(const dl_theory *t, const dl_result *res, dl_lit q, FILE *out)

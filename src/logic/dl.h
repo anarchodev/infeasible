@@ -48,6 +48,10 @@ void       dl_theory_free(dl_theory *t);
 /* Returns a rule id usable in dl_add_sup. Name and body are copied. */
 int  dl_add_rule(dl_theory *t, const char *name, dl_rule_kind kind,
                  dl_lit head, const dl_lit *body, int nbody);
+/* Attach a provenance suffix (source span + generation reason, §6.3) to a rule
+ * by its dl_add_rule handle; rendered by dl_why after the rule's kind. Copied;
+ * NULL clears it. */
+void dl_set_prov(dl_theory *t, int rule_id, const char *prov);
 void dl_add_sup(dl_theory *t, int winner, int loser);
 void dl_add_fact(dl_theory *t, dl_lit fact);
 

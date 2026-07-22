@@ -20,6 +20,7 @@ typedef struct {
     int32_t head;         /* literal index: atom*2 + neg */
     int32_t body_off;     /* into body[] */
     char   *name;         /* cold; dlcol_why only */
+    char   *prov;         /* cold; provenance suffix (§6.3) or NULL */
 } crule;
 
 struct dlcol {
@@ -94,8 +95,10 @@ dlcol *dlcol_new(int natoms, int nentities)
 
 void dlcol_free(dlcol *f)
 {
-    for (int r = 0; r < f->nrules; r++)
+    for (int r = 0; r < f->nrules; r++) {
         free(f->rules[r].name);
+        free(f->rules[r].prov);
+    }
     for (int a = 0; a < f->natoms; a++)
         free(f->aname[a]);
     free(f->aname);
@@ -116,6 +119,7 @@ int dlcol_add_rule(dlcol *f, const char *name, dl_rule_kind kind,
     GROW(f->rules, f->nrules, f->caprules);
     crule *r = &f->rules[f->nrules];
     r->name = xstrdup(name ? name : "?");
+    r->prov = NULL;
     r->kind = (uint8_t)kind;
     r->head = (int32_t)lit_idx(head);
     r->body_off = f->nbody;
@@ -134,6 +138,14 @@ void dlcol_add_sup(dlcol *f, int winner, int loser)
     f->sups[f->nsups].loser = loser;
     f->nsups++;
     f->dirty = true;
+}
+
+void dlcol_set_prov(dlcol *f, int rule_id, const char *prov)
+{
+    if (rule_id < 0 || rule_id >= f->nrules)
+        return;
+    free(f->rules[rule_id].prov);
+    f->rules[rule_id].prov = prov ? xstrdup(prov) : NULL;
 }
 
 void dlcol_set_atom_name(dlcol *f, uint32_t atom, const char *name)
@@ -543,6 +555,8 @@ static int cc_applicable(void *ctx, int r)
 { const col_trace *c = ctx; return col_applicable(c->f, r, c->entity); }
 static bool cc_beats(void *ctx, int w, int l)
 { return col_beats(((const col_trace *)ctx)->f, w, l); }
+static const char *cc_rule_prov(void *ctx, int r)
+{ return ((const col_trace *)ctx)->f->rules[r].prov; }
 
 static const dl_trace_vtbl col_vtbl = {
     .put_lit = cc_put_lit, .put_rule = cc_put_rule,
@@ -551,7 +565,7 @@ static const dl_trace_vtbl col_vtbl = {
     .nhead = cc_nhead, .head_at = cc_head_at,
     .rule_kind = cc_rule_kind, .nbody = cc_nbody, .body_at = cc_body_at,
     .applicable = cc_applicable, .beats = cc_beats,
-    .rule_prov = NULL,           /* provenance not wired yet (§6.3) */
+    .rule_prov = cc_rule_prov,
 };
 
 void dlcol_why(const dlcol *f, dl_lit q, int entity, FILE *out)

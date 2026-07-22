@@ -7,6 +7,7 @@
 
 typedef struct {
     const char *name;
+    const char *prov;     /* provenance suffix (§6.3), or NULL */
     dl_rule_kind kind;
     dl_lit head;
     dl_lit *body;
@@ -24,6 +25,7 @@ typedef struct {
 
 typedef struct {
     const char *name;
+    const char *prov;     /* provenance suffix (§6.3), or NULL */
     uint32_t action;      /* INTERN_NONE = ramification */
     step_cond *body;
     int nbody;
@@ -221,6 +223,7 @@ int world_add_rule(world *w, const char *name, dl_rule_kind kind,
     GROW(w->jrules, w->njr, w->capjr);
     jrule *r = &w->jrules[w->njr];
     r->name = arena_strdup(&w->a, name);
+    r->prov = NULL;
     r->kind = kind;
     r->head = head;
     r->nbody = nbody;
@@ -247,6 +250,7 @@ int world_add_step_rule(world *w, const char *name, uint32_t action,
     GROW(w->srules, w->nsr, w->capsr);
     srule *r = &w->srules[w->nsr];
     r->name = arena_strdup(&w->a, name);
+    r->prov = NULL;
     r->action = action;
     r->nbody = nbody;
     r->body = arena_alloc(&w->a, (size_t)(nbody ? nbody : 1) * sizeof(step_cond));
@@ -260,6 +264,20 @@ int world_add_step_rule(world *w, const char *name, uint32_t action,
     r->nneff = r->capneff = 0;
     w->fam_dirty = true;
     return w->nsr++;
+}
+
+void world_set_rule_prov(world *w, int rule, const char *prov)
+{
+    if (rule >= 0 && rule < w->njr)
+        w->jrules[rule].prov = prov ? arena_strdup(&w->a, prov) : NULL;
+}
+
+void world_set_step_prov(world *w, int rule, const char *prov)
+{
+    if (rule >= 0 && rule < w->nsr) {
+        w->srules[rule].prov = prov ? arena_strdup(&w->a, prov) : NULL;
+        w->fam_dirty = true;
+    }
 }
 
 void world_add_num_effect(world *w, int rule, uint32_t num_atom,
@@ -293,7 +311,9 @@ static void add_state_and_judgments(const world *w, dl_theory *th)
 {
     for (int j = 0; j < w->njr; j++) {
         const jrule *r = &w->jrules[j];
-        dl_add_rule(th, r->name, r->kind, r->head, r->body, r->nbody);
+        int h = dl_add_rule(th, r->name, r->kind, r->head, r->body, r->nbody);
+        if (r->prov)
+            dl_set_prov(th, h, r->prov);
     }
     for (int j = 0; j < w->njs; j++)
         dl_add_sup(th, w->jsups[j].winner, w->jsups[j].loser);
@@ -412,7 +432,10 @@ static void build_step_family(world *w)
         }
         for (int i = 0; i < r->nbody; i++)
             body[i] = loc_lit(w, r->body[i]);
-        dlcol_add_rule(f, r->name, r->kind, loc_lit(w, r->head), body, r->nbody);
+        int h = dlcol_add_rule(f, r->name, r->kind, loc_lit(w, r->head),
+                               body, r->nbody);
+        if (r->prov)
+            dlcol_set_prov(f, h, r->prov);
     }
     for (int j = 0; j < w->njs; j++)
         dlcol_add_sup(f, w->jsups[j].winner, w->jsups[j].loser);
@@ -457,6 +480,10 @@ static void build_step_family(world *w)
             snprintf(buf, sizeof buf, "%s/%s%s", r->name,
                      eff.neg ? "~" : "", intern_name(w->syms, eff.atom));
             int rid = dlcol_add_rule(f, buf, DL_DEFEASIBLE, head, body, nbody);
+            /* the causal rule is this authored step rule's effect — carry its
+             * source span (generated inertia's own provenance is a later slice) */
+            if (r->prov)
+                dlcol_set_prov(f, rid, r->prov);
             /* effect f' conflicts with inertia-f ; effect ~f' with inertia+f */
             dlcol_add_sup(f, rid, eff.neg ? inertia_pos[fi] : inertia_neg[fi]);
         }

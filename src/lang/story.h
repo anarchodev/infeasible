@@ -93,6 +93,11 @@ typedef struct {
     int         nerrors;
 } story_diags;
 
-world *story_compile(const char *src, intern *syms, story_diags *diags);
+/* `srcname` is the source file name (e.g. "cellar.story"), used only to render
+ * provenance in why-traces (§6.3) as `srcname:line`; NULL falls back to
+ * "<story>". It is borrowed — the caller must keep it alive as long as the
+ * returned world (provenance strings copy from it at compile time). */
+world *story_compile(const char *src, const char *srcname, intern *syms,
+                     story_diags *diags);
 
 #endif

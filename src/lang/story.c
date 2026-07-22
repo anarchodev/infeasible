@@ -135,6 +135,7 @@ typedef struct {
     lexer        lx;
     token        cur;
     intern      *syms;
+    const char  *srcname;         /* source file name, for provenance (§6.3) */
     world       *w;
     story_diags *diags;
     int          nerrors;
@@ -1606,6 +1607,14 @@ static void ground_inits(parser *p)
     }
 }
 
+/* "srcname:line" — the provenance suffix rendered in a why-trace (§6.3), so an
+ * author can jump from a generated rule to the source construct it came from. */
+static const char *prov_str(parser *p, int line, char *buf, size_t n)
+{
+    snprintf(buf, n, "%s:%d", p->srcname ? p->srcname : "<story>", line);
+    return buf;
+}
+
 static void ground_rule(parser *p, ast_rule *r)
 {
     bool of = false;
@@ -1636,6 +1645,9 @@ static void ground_rule(parser *p, ast_rule *r)
             body[b] = ground_lit(p, &r->body[b], r->vars, r->nvars, binding);
         inst_name(p, name, sizeof name, r->label, r->vars, r->nvars, binding);
         r->insts[idx].handle = world_add_rule(p->w, name, r->kind, head, body, r->nbody);
+        char pbuf[MAX_NAME + 24];
+        world_set_rule_prov(p->w, r->insts[idx].handle,
+                            prov_str(p, r->line, pbuf, sizeof pbuf));
 
         /* `unless G` sugars to a defeater blocking this instance's head:
          * G ~> ~head (DESIGN.md §6), reinstated whenever the guard fails. */
@@ -1645,8 +1657,9 @@ static void ground_rule(parser *p, ast_rule *r)
                 guard[b] = ground_lit(p, &r->guard[b], r->vars, r->nvars, binding);
             char gname[MAX_GROUND + 8];
             snprintf(gname, sizeof gname, "%s.unless", name);
-            world_add_rule(p->w, gname, DL_DEFEATER, dl_complement(head),
-                           guard, r->nguard);
+            int gh = world_add_rule(p->w, gname, DL_DEFEATER, dl_complement(head),
+                                    guard, r->nguard);
+            world_set_rule_prov(p->w, gh, prov_str(p, r->line, pbuf, sizeof pbuf));
         }
     }
 }
@@ -1710,6 +1723,8 @@ static void ground_action(parser *p, ast_action *a)
                                                       pi->values[v]));
         }
         int h = world_add_step_rule(p->w, aname, act, conds, a->nreq, eff, ne);
+        char pbuf[MAX_NAME + 24];
+        world_set_step_prov(p->w, h, prov_str(p, a->line, pbuf, sizeof pbuf));
 
         /* numeric effects (§5.8): ground the target value-store atom and
          * compile the RHS expression to VM bytecode for this instance. */
@@ -1831,7 +1846,8 @@ static void synchronize(parser *p)
     }
 }
 
-world *story_compile(const char *src, intern *syms, story_diags *diags)
+world *story_compile(const char *src, const char *srcname, intern *syms,
+                     story_diags *diags)
 {
     parser *p = calloc(1, sizeof *p);
     p->rules = calloc(MAX_RULES, sizeof *p->rules);
@@ -1839,6 +1855,7 @@ world *story_compile(const char *src, intern *syms, story_diags *diags)
     p->exprs = calloc(MAX_EXPRS, sizeof *p->exprs);
     lexer_init(&p->lx, src);
     p->syms = syms;
+    p->srcname = srcname;
     p->w = world_new(syms);
     p->diags = diags;
     if (diags) { diags->count = 0; diags->nerrors = 0; }

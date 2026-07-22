@@ -74,6 +74,12 @@ int  world_add_rule(world *w, const char *name, dl_rule_kind kind,
                     dl_lit head, const dl_lit *body, int nbody);
 void world_add_sup(world *w, int winner, int loser);
 
+/* Attach a provenance suffix (source span + generation reason, §6.3) to a rule
+ * by its world_add_rule / world_add_step_rule handle; rendered by world_why /
+ * the step trace after the rule kind. Copied; NULL clears it. */
+void world_set_rule_prov(world *w, int rule, const char *prov);
+void world_set_step_prov(world *w, int rule, const char *prov);
+
 /* Step rules: fire when `action` occurs (INTERN_NONE = ramification, fires
  * in every step whose state matches). Body literals may reference the next
  * state via primed=true; effects are always about the next state. */

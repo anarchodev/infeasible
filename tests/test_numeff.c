@@ -49,7 +49,7 @@ static int test_combat(void)
     intern *sy = intern_new();
     story_diag ditems[16];
     story_diags diags = { ditems, 16, 0, 0 };
-    world *w = story_compile(src, sy, &diags);
+    world *w = story_compile(src, NULL, sy, &diags);
     if (!w) {
         fprintf(stderr, "FAIL compile: %s\n",
                 diags.count ? diags.items[0].msg : "(no message)");

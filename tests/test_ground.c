@@ -52,7 +52,7 @@ static int test_cellar_ground(void)
     intern *sy = intern_new();
     story_diag ditems[16];
     story_diags diags = { ditems, 16, 0, 0 };
-    world *w = story_compile(src, sy, &diags);
+    world *w = story_compile(src, NULL, sy, &diags);
     if (!w) {
         fprintf(stderr, "FAIL compile: %s\n",
                 diags.count ? diags.items[0].msg : "(no message)");
@@ -104,7 +104,7 @@ static int expect_error(const char *src, const char *needle)
     intern *sy = intern_new();
     story_diag ditems[8];
     story_diags diags = { ditems, 8, 0, 0 };
-    world *w = story_compile(src, sy, &diags);
+    world *w = story_compile(src, NULL, sy, &diags);
     int ok = (w == NULL) && (diags.nerrors >= 1) &&
              (diags.items[0].sev == STORY_ERROR);
     if (ok && needle && diags.count)
@@ -143,7 +143,7 @@ static int test_empty_sort(void)
     /* sort actor is declared but has no entities: holding grounds to nothing */
     world *w = story_compile(
         "sort actor\nstate alive(actor)\nrule r(X: actor): alive(X) => up(X)",
-        sy, &d);
+        NULL, sy, &d);
     CHECK(w != NULL);
     CHECK(d.nerrors == 0);
     world_free(w);

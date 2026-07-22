@@ -79,7 +79,7 @@ static int test_cellar_from_story(void)
     intern *sy = intern_new();
     story_diag ditems[8];
     story_diags diags = { ditems, 8, 0, 0 };
-    world *w = story_compile(src, sy, &diags);
+    world *w = story_compile(src, NULL, sy, &diags);
     if (!w) {
         fprintf(stderr, "FAIL compile: %s\n",
                 diags.count ? diags.items[0].msg : "(no message)");
@@ -128,7 +128,7 @@ static int expect_error(const char *src)
     intern *sy = intern_new();
     story_diag ditems[8];
     story_diags diags = { ditems, 8, 0, 0 };
-    world *w = story_compile(src, sy, &diags);
+    world *w = story_compile(src, NULL, sy, &diags);
     int ok = (w == NULL) && (diags.nerrors >= 1) &&
              (diags.items[0].sev == STORY_ERROR) && (diags.items[0].line >= 1);
     if (!ok)
@@ -162,7 +162,7 @@ static int test_orphan(void)
         story_diag di[8];
         story_diags d = { di, 8, 0, 0 };
         world *wl = story_compile("state holding\nrule r: hodling => weak",
-                                  sy, &d);
+                                  NULL, sy, &d);
         CHECK(wl != NULL);
         CHECK(d.nerrors == 0);
         CHECK(d.count == 1);
@@ -177,7 +177,7 @@ static int test_orphan(void)
         story_diag di[8];
         story_diags d = { di, 8, 0, 0 };
         world *wl = story_compile(
-            "state y\nrule a: derived => x\nrule b: y => derived", sy, &d);
+            "state y\nrule a: derived => x\nrule b: y => derived", NULL, sy, &d);
         CHECK(wl != NULL);
         if (d.count) fprintf(stderr, "unexpected diagnostic: %s\n", d.items[0].msg);
         CHECK(d.count == 0);
@@ -201,7 +201,7 @@ static int test_recovery(void)
     intern *sy = intern_new();
     story_diag di[8];
     story_diags d = { di, 8, 0, 0 };
-    world *w = story_compile(src, sy, &d);
+    world *w = story_compile(src, NULL, sy, &d);
 
     CHECK(w == NULL);                    /* errors present -> no world  */
     CHECK(d.nerrors == 2);               /* both, not just the first    */

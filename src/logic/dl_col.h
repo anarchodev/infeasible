@@ -38,6 +38,9 @@ int  dlcol_add_rule(dlcol *f, const char *name, dl_rule_kind kind,
                     dl_lit head, const dl_lit *body, int nbody);
 void dlcol_add_sup(dlcol *f, int winner, int loser);
 void dlcol_set_atom_name(dlcol *f, uint32_t atom, const char *name);
+/* Provenance suffix (§6.3) for a rule by its dlcol_add_rule handle; rendered by
+ * dlcol_why after the rule kind. Copied; NULL clears it. */
+void dlcol_set_prov(dlcol *f, int rule_id, const char *prov);
 
 /* Fact columns. A row is ceil(nentities/64) words; the host may write words
  * directly (bits >= nentities are ignored). dlcol_add_fact sets one bit;
