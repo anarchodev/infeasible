@@ -10,7 +10,8 @@
 
 #define MAX_NAME       64      /* labels, sort/var identifiers */
 #define MAX_ARGS       6       /* args per atom / vars per rule */
-#define MAX_BODY       32      /* atoms per conjunction */
+#define MAX_BODY       32      /* atoms per conjunction (post-family expansion) */
+#define MAX_DOMAIN     32      /* values in a multi-valued fluent domain */
 #define MAX_SORTS      32
 #define MAX_ENTS       512
 #define MAX_FLUENTS    256     /* fluent *predicate* schemas */
@@ -27,11 +28,16 @@
 
 typedef struct { uint32_t name; int line, col; } ast_arg;
 
+/* An atom is either boolean (`p`, `p(a)`) or a multi-valued reference/assignment
+ * (`f = v`, `f(a) = v`): `value` is 0 for boolean, else the interned value
+ * symbol. Multi-valued atoms erase at ground time to a boolean value-atom
+ * "f(a)=v" (§5.7); in a `causes` effect they expand to the whole family. */
 typedef struct {
     uint32_t pred;
     bool     neg;
     int      nargs;
     ast_arg  args[MAX_ARGS];
+    uint32_t value;
     int      line, col;
 } ast_atom;
 
@@ -69,6 +75,9 @@ typedef struct {
     uint32_t pred;
     int      nargs;
     uint32_t argsort[MAX_ARGS];   /* declared sort name atoms, resolved later */
+    bool     is_mv;               /* declared with a `: { … }` value domain */
+    uint32_t values[MAX_DOMAIN];  /* the domain's value symbols, in order */
+    int      nvalues;
     int      line, col;
 } ast_fluent;
 
@@ -82,6 +91,9 @@ typedef struct {
     bool     is_fluent;
     bool     is_head;
     int      argsort[MAX_ARGS];   /* sort indices; valid when is_fluent */
+    bool     is_mv;               /* a multi-valued fluent */
+    uint32_t values[MAX_DOMAIN];  /* its domain, for value-in-domain checks */
+    int      nvalues;
 } pred_info;
 
 typedef struct {
@@ -325,6 +337,17 @@ static bool parse_atom(parser *p, ast_atom *out)
         }
         if (!expect(p, TK_RPAREN)) return false;
     }
+    /* a `= value` suffix makes this a multi-valued reference/assignment */
+    if (p->cur.kind == TK_EQ) {
+        advance(p);
+        if (p->cur.kind != TK_IDENT) {
+            char d[64]; tok_desc(p->cur, d, sizeof d);
+            fail(p, p->cur.line, p->cur.col, "expected a value name, found %s", d);
+            return false;
+        }
+        out->value = intern_tok(p, p->cur);
+        advance(p);
+    }
     return true;
 }
 
@@ -379,10 +402,38 @@ static bool parse_fdecl(parser *p, ast_fluent *f)
         if (!expect(p, TK_RPAREN)) return false;
     }
     if (p->cur.kind == TK_COLON) {
-        fail(p, p->cur.line, p->cur.col,
-             "numeric and multi-valued fluents are not supported in this slice "
-             "(booleans only; §5.7/5.8 domains land later in M1)");
-        return false;
+        advance(p);
+        if (p->cur.kind != TK_LBRACE) {
+            /* `: int`, `: cell`, `: int in 0..60` — numeric/functional, slice c */
+            fail(p, p->cur.line, p->cur.col,
+                 "numeric and entity-domain fluents are not supported yet "
+                 "(write `: { v1, v2, … }` for a value domain; §5.8 numerics land later)");
+            return false;
+        }
+        advance(p);                                /* '{' */
+        f->is_mv = true;
+        for (;;) {
+            if (p->cur.kind != TK_IDENT) {
+                char d[64]; tok_desc(p->cur, d, sizeof d);
+                fail(p, p->cur.line, p->cur.col, "expected a value name, found %s", d);
+                return false;
+            }
+            if (f->nvalues >= MAX_DOMAIN) {
+                fail(p, p->cur.line, p->cur.col,
+                     "too many domain values (max %d)", MAX_DOMAIN);
+                return false;
+            }
+            f->values[f->nvalues++] = intern_tok(p, p->cur);
+            advance(p);
+            if (p->cur.kind == TK_COMMA) { advance(p); continue; }
+            break;
+        }
+        if (!expect(p, TK_RBRACE)) return false;
+        if (f->nvalues < 2) {
+            fail(p, f->line, f->col,
+                 "a value domain needs at least two values");
+            return false;
+        }
     }
     return true;
 }
@@ -726,6 +777,17 @@ static void build_pred_registry(parser *p)
         for (int k = 0; k < f->nargs; k++)
             pi->argsort[k] = decode_sort(p, -(int)f->argsort[k] - 2,
                                          f->line, f->col, "a fluent declaration");
+        pi->is_mv = f->is_mv;
+        pi->nvalues = f->nvalues;
+        for (int k = 0; k < f->nvalues; k++) {
+            pi->values[k] = f->values[k];
+            for (int j = 0; j < k; j++)
+                if (f->values[j] == f->values[k])
+                    serr(p, f->line, f->col,
+                         "duplicate value '%s' in the domain of '%s'",
+                         intern_name(p->syms, f->values[k]),
+                         intern_name(p->syms, f->pred));
+        }
     }
 
     /* rule heads register the conclusion predicates (arity from the head). */
@@ -774,6 +836,29 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
              intern_name(p->syms, at->pred), pi->arity,
              pi->arity == 1 ? "" : "s", at->nargs);
         return;
+    }
+    /* multi-valued discipline: an MV fluent must be written `f = v`, a boolean
+     * one must not; a value must belong to the declared domain. */
+    if (pi && pi->is_mv && at->value == INTERN_NONE) {
+        serr(p, at->line, at->col,
+             "'%s' is multi-valued — write `%s = <value>`, not a bare atom",
+             intern_name(p->syms, at->pred), intern_name(p->syms, at->pred));
+        return;
+    }
+    if (at->value != INTERN_NONE) {
+        if (!pi || !pi->is_fluent || !pi->is_mv) {
+            serr(p, at->line, at->col,
+                 "'%s = …' but '%s' is not a declared multi-valued fluent",
+                 intern_name(p->syms, at->pred), intern_name(p->syms, at->pred));
+            return;
+        }
+        bool in_domain = false;
+        for (int i = 0; i < pi->nvalues; i++)
+            if (pi->values[i] == at->value) { in_domain = true; break; }
+        if (!in_domain)
+            serr(p, at->line, at->col,
+                 "'%s' is not a value of '%s'",
+                 intern_name(p->syms, at->value), intern_name(p->syms, at->pred));
     }
     for (int k = 0; k < at->nargs; k++) {
         ast_arg *arg = &at->args[k];
@@ -827,6 +912,13 @@ static void semantic_pass(parser *p)
         for (int b = 0; b < r->nbody; b++)
             check_atom(p, &r->body[b], r->vars, r->nvars, true, "a rule body");
         check_atom(p, &r->head, r->vars, r->nvars, false, "a rule head");
+        if (r->head.value != INTERN_NONE)
+            serr(p, r->head.line, r->head.col,
+                 "concluding a multi-valued value ('%s = %s') from a judgment "
+                 "rule is not supported yet — it needs the §5.7 family "
+                 "reification; set the value with an `action … causes` instead",
+                 intern_name(p->syms, r->head.pred),
+                 intern_name(p->syms, r->head.value));
         for (int b = 0; b < r->nguard; b++)
             check_atom(p, &r->guard[b], r->vars, r->nvars, true, "an `unless` guard");
         check_safety(p, r);
@@ -841,8 +933,16 @@ static void semantic_pass(parser *p)
         resolve_vars(p, a->vars, a->nvars, "an action");
         for (int b = 0; b < a->nreq; b++)
             check_atom(p, &a->requires[b], a->vars, a->nvars, true, "a `requires` clause");
-        for (int b = 0; b < a->neff; b++)
+        for (int b = 0; b < a->neff; b++) {
             check_atom(p, &a->effects[b], a->vars, a->nvars, false, "a `causes` clause");
+            if (a->effects[b].value != INTERN_NONE && a->effects[b].neg)
+                serr(p, a->effects[b].line, a->effects[b].col,
+                     "a negative multi-valued effect ('~(%s = %s)') is not "
+                     "supported yet — it needs the §5.7 family reification; "
+                     "assign the intended value instead",
+                     intern_name(p->syms, a->effects[b].pred),
+                     intern_name(p->syms, a->effects[b].value));
+        }
     }
 
     /* init facts: predicate is a declared fluent, args are ground entities. */
@@ -865,16 +965,39 @@ static void semantic_pass(parser *p)
 
 /* ---- grounding: emit ground rules into world_* ---------------------- */
 
+/* Write the ground term "pred(e1,e2)" (bare "pred" at arity 0) into buf. */
+static int build_term(parser *p, uint32_t pred, const uint32_t *args, int n,
+                      char *buf, size_t cap)
+{
+    int off = snprintf(buf, cap, "%s", intern_name(p->syms, pred));
+    if (n == 0) return off;
+    off += snprintf(buf + off, cap - (size_t)off, "(");
+    for (int i = 0; i < n && off < (int)cap; i++)
+        off += snprintf(buf + off, cap - (size_t)off, "%s%s",
+                        i ? "," : "", intern_name(p->syms, args[i]));
+    if (off < (int)cap) off += snprintf(buf + off, cap - (size_t)off, ")");
+    return off;
+}
+
 /* Build the interned ground atom "pred(e1,e2)" (bare "pred" at arity 0). */
 static uint32_t ground_pred(parser *p, uint32_t pred, const uint32_t *args, int n)
 {
     if (n == 0) return pred;
     char buf[MAX_GROUND];
-    int off = snprintf(buf, sizeof buf, "%s(", intern_name(p->syms, pred));
-    for (int i = 0; i < n && off < (int)sizeof buf; i++)
-        off += snprintf(buf + off, sizeof buf - (size_t)off, "%s%s",
-                        i ? "," : "", intern_name(p->syms, args[i]));
-    if (off < (int)sizeof buf) snprintf(buf + off, sizeof buf - (size_t)off, ")");
+    build_term(p, pred, args, n, buf, sizeof buf);
+    return intern_id(p->syms, buf);
+}
+
+/* Build the interned value-atom "pred(e1,e2)=v" — a multi-valued fluent's
+ * value erases to this boolean atom (§5.7). */
+static uint32_t ground_mv_atom(parser *p, uint32_t pred, const uint32_t *args,
+                               int n, uint32_t value)
+{
+    char buf[MAX_GROUND];
+    int off = build_term(p, pred, args, n, buf, sizeof buf);
+    if (off < (int)sizeof buf)
+        snprintf(buf + off, sizeof buf - (size_t)off, "=%s",
+                 intern_name(p->syms, value));
     return intern_id(p->syms, buf);
 }
 
@@ -894,7 +1017,9 @@ static dl_lit ground_lit(parser *p, ast_atom *at, var_bind *vars, int nvars,
     uint32_t args[MAX_ARGS];
     for (int k = 0; k < at->nargs; k++)
         args[k] = resolve_arg(vars, nvars, binding, at->args[k]);
-    uint32_t g = ground_pred(p, at->pred, args, at->nargs);
+    uint32_t g = at->value != INTERN_NONE
+        ? ground_mv_atom(p, at->pred, args, at->nargs, at->value)
+        : ground_pred(p, at->pred, args, at->nargs);
     return at->neg ? dl_neg(g) : dl_pos(g);
 }
 
@@ -951,7 +1076,12 @@ static void declare_ground_fluents(parser *p)
         uint32_t binding[MAX_ARGS];
         for (long idx = 0; idx < total; idx++) {
             decode_binding(p, vb, f->nargs, idx, binding);
-            world_declare_fluent(p->w, ground_pred(p, f->pred, binding, f->nargs));
+            if (f->is_mv)                          /* one boolean atom per value */
+                for (int v = 0; v < f->nvalues; v++)
+                    world_declare_fluent(p->w, ground_mv_atom(p, f->pred, binding,
+                                                              f->nargs, f->values[v]));
+            else
+                world_declare_fluent(p->w, ground_pred(p, f->pred, binding, f->nargs));
         }
     }
 }
@@ -962,7 +1092,10 @@ static void ground_inits(parser *p)
         ast_atom *a = &p->inits[i];
         uint32_t args[MAX_ARGS];
         for (int k = 0; k < a->nargs; k++) args[k] = a->args[k].name;
-        world_set(p->w, ground_pred(p, a->pred, args, a->nargs), true);
+        uint32_t atom = a->value != INTERN_NONE
+            ? ground_mv_atom(p, a->pred, args, a->nargs, a->value)
+            : ground_pred(p, a->pred, args, a->nargs);
+        world_set(p->w, atom, true);               /* siblings stay closed-world false */
     }
 }
 
@@ -1041,10 +1174,29 @@ static void ground_action(parser *p, ast_action *a)
             conds[b].lit = ground_lit(p, &a->requires[b], a->vars, a->nvars, binding);
             conds[b].primed = false;               /* current-state guards */
         }
+        /* A multi-valued assignment `f = v` expands to the whole family: the
+         * chosen value plus a negation of every sibling, so exactly one value
+         * holds next tick and a flip-flop against a sibling is a contested step
+         * (§5.7). A boolean effect is a single literal. */
         dl_lit eff[MAX_BODY];
-        for (int b = 0; b < a->neff; b++)
-            eff[b] = ground_lit(p, &a->effects[b], a->vars, a->nvars, binding);
-        world_add_step_rule(p->w, aname, act, conds, a->nreq, eff, a->neff);
+        int ne = 0;
+        for (int b = 0; b < a->neff && ne < MAX_BODY; b++) {
+            ast_atom *e = &a->effects[b];
+            if (e->value == INTERN_NONE) {         /* boolean effect */
+                eff[ne++] = ground_lit(p, e, a->vars, a->nvars, binding);
+                continue;
+            }
+            uint32_t args[MAX_ARGS];
+            for (int k = 0; k < e->nargs; k++)
+                args[k] = resolve_arg(a->vars, a->nvars, binding, e->args[k]);
+            pred_info *pi = find_pred(p, e->pred);
+            eff[ne++] = dl_pos(ground_mv_atom(p, e->pred, args, e->nargs, e->value));
+            for (int v = 0; v < pi->nvalues && ne < MAX_BODY; v++)
+                if (pi->values[v] != e->value)
+                    eff[ne++] = dl_neg(ground_mv_atom(p, e->pred, args, e->nargs,
+                                                      pi->values[v]));
+        }
+        world_add_step_rule(p->w, aname, act, conds, a->nreq, eff, ne);
     }
 }
 
