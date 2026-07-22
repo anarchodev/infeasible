@@ -6,28 +6,43 @@
 #include "core/intern.h"
 #include "state/world.h"
 
-/* Front half of the .story compiler (DESIGN.md §11 M1), first slice: the
- * variable-free / boolean-fluent fragment that maps directly onto the current
- * engine API. Enough to build the propositional cellar (examples/cellar_prop
- * .story) that tests/test_world.c builds by hand — no typed variables, no
- * multi-valued domains, no numeric guards, no ramifications yet (those need
- * the M1 grounder and the §5.7/5.8 fluent compilation).
+/* Front half of the .story compiler (DESIGN.md §11 M1). Two passes over an
+ * arena AST (§10): recursive-descent parse, then a semantic + build-time
+ * grounding pass that emits ground rules into the `world_*` API.
+ *
+ * This slice adds the M1 grounder over the propositional first slice: typed
+ * variables (`X : actor`) and boolean predicate atoms (`holding(actor,item)`),
+ * grounded up front over declared finite sorts (DESIGN.md §5.2 item 2 —
+ * typed vars bound every domain; the tick-time join matcher is M3, §11). Still
+ * out of this slice: multi-valued domains (`: { … }`) and numeric fluents
+ * (`: int`, `<=`/`>=` guards) — §5.7/5.8, rejected with a located error — and
+ * ramifications. The variable-free fragment is the degenerate arity-0 case:
+ * examples/cellar_prop.story still compiles to the same world.
  *
  * Grammar handled by this slice:
  *
  *   file    := decl*
- *   decl    := state | init | rule | action | sup
- *   state   := 'state' ( '(' IDENT* ')' | IDENT )      -- boolean fluents
- *   init    := 'init'  ( '(' IDENT* ')' | IDENT )      -- set those fluents true
- *   rule    := 'rule' IDENT ':' conj OP lit [ 'unless' conj ]
+ *   decl    := sort | entity | state | init | rule | action | sup
+ *   sort    := 'sort'   ( IDENT | '(' IDENT (','? IDENT)* ')' )
+ *   entity  := 'entity' ( ebind | '(' ebind* ')' )
+ *   ebind   := IDENT (',' IDENT)* ':' IDENT            -- names : sort
+ *   state   := 'state'  ( fdecl | '(' fdecl* ')' )     -- boolean fluents
+ *   fdecl   := IDENT [ '(' IDENT (',' IDENT)* ')' ]    -- pred over sorts
+ *   init    := 'init'   ( atom | '(' atom* ')' )       -- ground; set true
+ *   rule    := 'rule' IDENT [ params ] ':' conj OP atom [ 'unless' conj ]
+ *   action  := 'action' IDENT [ params ] ':' [ 'requires' conj ] 'causes' conj
+ *   params  := '(' vbind (',' vbind)* ')'
+ *   vbind   := IDENT ':' IDENT                          -- var : sort
  *   OP      := '->' | '=>' | '~>'
- *   action  := 'action' IDENT ':' [ 'requires' conj ] 'causes' conj
  *   sup     := IDENT '>' IDENT                          -- label > label
- *   conj    := lit ( '&' lit )*
- *   lit     := [ '~' ] IDENT
+ *   conj    := atom ( '&' atom )*
+ *   atom    := [ '~' ] IDENT [ '(' arg (',' arg)* ')' ]
+ *   arg     := IDENT                                    -- a var or an entity
  *
- * Atoms are interned into `syms`; conclusions (rule heads) need no declaration.
- * The returned world borrows `syms`, which must outlive it.
+ * Atoms are interned into `syms`; ground atoms intern as "pred(e1,e2)" (the
+ * bare name at arity 0), so a host querying the equivalent ground atom sees
+ * the same id. Conclusions (rule heads) need no declaration. The returned
+ * world borrows `syms`, which must outlive it.
  *
  * Diagnostics (errors and warnings) collect into a caller-supplied sink; the
  * parser recovers at declaration boundaries (panic mode, §10) so one bad

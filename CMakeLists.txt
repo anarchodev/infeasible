@@ -28,14 +28,16 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 enable_testing()
-foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse)
+foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse test_ground)
   add_executable(${t} tests/${t}.c)
   target_link_libraries(${t} PRIVATE infeasible_core)
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
 
-# test_parse compiles a real .story file from the source tree; hand it the path.
+# These compile real .story files from the source tree; hand them the path.
 target_compile_definitions(test_parse PRIVATE
+  STORY_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples")
+target_compile_definitions(test_ground PRIVATE
   STORY_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples")
 
 # Solver micro-benchmark (not a test). Built -O2 regardless of build type so
