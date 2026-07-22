@@ -18,6 +18,7 @@ add_library(infeasible_core STATIC
   src/core/intern.c
   src/logic/dl.c
   src/logic/dl_col.c
+  src/logic/dl_trace.c
   src/state/world.c
   src/lang/lexer.c
   src/lang/story.c

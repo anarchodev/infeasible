@@ -1,4 +1,5 @@
 #include "logic/dl_col.h"
+#include "logic/dl_trace.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +56,7 @@ struct dlcol {
     } while (0)
 
 static int lit_idx(dl_lit l) { return (int)l.atom * 2 + (l.neg ? 1 : 0); }
+static dl_lit lit_from_idx(int i) { dl_lit l = { (uint32_t)(i >> 1), (i & 1) != 0 }; return l; }
 
 static char *xstrdup(const char *s)
 {
@@ -446,22 +448,14 @@ const uint64_t *dlcol_proved_row(const dlcol *f, dl_lit l)
     return row((uint64_t *)f->part_t, f, qi);
 }
 
-/* ---- why-trace: dl_why's format, read straight off the solved columns ---- */
-
-static dl_verdict col_part_verdict(const dlcol *f, int lit, int entity)
-{
-    return verdict_at(f, row((uint64_t *)f->part_t, f, lit),
-                      row((uint64_t *)f->part_f, f, lit), entity);
-}
-
-static const char *col_verdict_str(dl_verdict v)
-{
-    switch (v) {
-    case DL_PROVED:  return "PROVED";
-    case DL_REFUTED: return "REFUTED";
-    default:         return "UNDECIDED";
-    }
-}
+/* ---- why-trace: an adapter over the shared renderer (dl_trace.h) ----
+ *
+ * Read straight off the solved columns, one entity's slice. dl_lit here is in
+ * the family's *location* space (atom = loc); the renderer only round-trips it
+ * back through these accessors, never inspecting it, so that stays transparent.
+ * A trace "rule handle" is a family rule id. Names carry an entity tag — that,
+ * plus reading columns instead of the permuted arrays, is the only difference
+ * from the scalar backing; the format itself lives once in dl_trace.c. */
 
 static void col_print_lit(const dlcol *f, int lit, int entity, FILE *out)
 {
@@ -496,64 +490,72 @@ static bool col_beats(const dlcol *f, int winner, int loser)
     return false;
 }
 
-static void col_print_rule_line(const dlcol *f, int ri, int entity,
-                                int indent, FILE *out)
+typedef struct { const dlcol *f; int entity; } col_trace;
+
+static void cc_put_lit(void *ctx, dl_lit l, FILE *out)
 {
-    static const char *kinds[] = { "strict", "defeasible", "defeater" };
-    fprintf(out, "%*s%s[%d] (%s): ", indent, "", f->rules[ri].name, entity,
-            kinds[f->rules[ri].kind]);
-    int b0 = f->rules[ri].body_off, b1 = body_end_c(f, ri);
-    if (b1 == b0)
-        fprintf(out, "(no conditions)");
-    for (int i = b0; i < b1; i++) {
-        if (i != b0)
-            fprintf(out, ", ");
-        col_print_lit(f, f->body[i], entity, out);
-        fprintf(out, "[%s]",
-                col_verdict_str(col_part_verdict(f, f->body[i], entity)));
-    }
-    int app = col_applicable(f, ri, entity);
-    fprintf(out, "  -- %s\n",
-            app == 1 ? "applicable" : app == -1 ? "inapplicable" : "undecided");
+    const col_trace *c = ctx;
+    col_print_lit(c->f, lit_idx(l), c->entity, out);
 }
+static void cc_put_rule(void *ctx, int r, FILE *out)
+{
+    const col_trace *c = ctx;
+    fprintf(out, "%s[%d]", c->f->rules[r].name, c->entity);
+}
+static dl_verdict cc_definite(void *ctx, dl_lit l)
+{ const col_trace *c = ctx; return dlcol_definite(c->f, l, c->entity); }
+static dl_verdict cc_defeasible(void *ctx, dl_lit l)
+{ const col_trace *c = ctx; return dlcol_defeasible(c->f, l, c->entity); }
+static bool cc_is_fact(void *ctx, dl_lit l)
+{
+    const col_trace *c = ctx;
+    const dlcol *f = c->f;
+    int e = c->entity, qi = lit_idx(l);
+    return e >= 0 && e < f->nents &&
+        ((row((uint64_t *)f->fact, f, qi)[e / 64] >> (e % 64)) & 1);
+}
+static bool cc_solved(void *ctx)
+{ const col_trace *c = ctx; return !(c->f->dirty || !c->f->head_off); }
+static int cc_nhead(void *ctx, dl_lit l)
+{
+    const dlcol *f = ((const col_trace *)ctx)->f;
+    int qi = lit_idx(l);
+    return f->head_off ? f->head_off[qi + 1] - f->head_off[qi] : 0;
+}
+static int cc_head_at(void *ctx, dl_lit l, int i)
+{
+    const dlcol *f = ((const col_trace *)ctx)->f;
+    return f->head_rule[f->head_off[lit_idx(l)] + i];
+}
+static dl_rule_kind cc_rule_kind(void *ctx, int r)
+{ return ((const col_trace *)ctx)->f->rules[r].kind; }
+static int cc_nbody(void *ctx, int r)
+{
+    const dlcol *f = ((const col_trace *)ctx)->f;
+    return body_end_c(f, r) - f->rules[r].body_off;
+}
+static dl_lit cc_body_at(void *ctx, int r, int i)
+{
+    const dlcol *f = ((const col_trace *)ctx)->f;
+    return lit_from_idx(f->body[f->rules[r].body_off + i]);
+}
+static int cc_applicable(void *ctx, int r)
+{ const col_trace *c = ctx; return col_applicable(c->f, r, c->entity); }
+static bool cc_beats(void *ctx, int w, int l)
+{ return col_beats(((const col_trace *)ctx)->f, w, l); }
+
+static const dl_trace_vtbl col_vtbl = {
+    .put_lit = cc_put_lit, .put_rule = cc_put_rule,
+    .definite = cc_definite, .defeasible = cc_defeasible,
+    .is_fact = cc_is_fact, .solved = cc_solved,
+    .nhead = cc_nhead, .head_at = cc_head_at,
+    .rule_kind = cc_rule_kind, .nbody = cc_nbody, .body_at = cc_body_at,
+    .applicable = cc_applicable, .beats = cc_beats,
+    .rule_prov = NULL,           /* provenance not wired yet (§6.3) */
+};
 
 void dlcol_why(const dlcol *f, dl_lit q, int entity, FILE *out)
 {
-    int qi = lit_idx(q), nqi = qi ^ 1;
-    fprintf(out, "why ");
-    col_print_lit(f, qi, entity, out);
-    fprintf(out, "?\n  definite: %s   defeasible: %s\n",
-            col_verdict_str(dlcol_definite(f, q, entity)),
-            col_verdict_str(dlcol_defeasible(f, q, entity)));
-    if (entity >= 0 && entity < f->nents &&
-        (row((uint64_t *)f->fact, f, qi)[entity / 64] >> (entity % 64)) & 1)
-        fprintf(out, "  it is a base fact\n");
-    if (f->dirty || !f->head_off) {
-        fprintf(out, "  (family not solved)\n");
-        return;
-    }
-
-    if (f->head_off[qi] < f->head_off[qi + 1]) {
-        fprintf(out, "  rules for it:\n");
-        for (int k = f->head_off[qi]; k < f->head_off[qi + 1]; k++)
-            col_print_rule_line(f, f->head_rule[k], entity, 4, out);
-    }
-    if (f->head_off[nqi] < f->head_off[nqi + 1]) {
-        fprintf(out, "  rules against it:\n");
-        for (int k = f->head_off[nqi]; k < f->head_off[nqi + 1]; k++) {
-            int si = f->head_rule[k];
-            col_print_rule_line(f, si, entity, 4, out);
-            for (int j = f->head_off[qi]; j < f->head_off[qi + 1]; j++) {
-                int ti = f->head_rule[j];
-                if (f->rules[ti].kind != DL_DEFEATER && col_beats(f, ti, si))
-                    fprintf(out, "      (beaten by %s[%d] if applicable)\n",
-                            f->rules[ti].name, entity);
-                if (col_beats(f, si, ti))
-                    fprintf(out, "      (superior to %s[%d]: %s[%d] > %s[%d])\n",
-                            f->rules[ti].name, entity,
-                            f->rules[si].name, entity,
-                            f->rules[ti].name, entity);
-            }
-        }
-    }
+    col_trace ctx = { f, entity };
+    dl_trace_render(&col_vtbl, &ctx, q, out);
 }

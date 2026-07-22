@@ -1,4 +1,5 @@
 #include "logic/dl.h"
+#include "logic/dl_trace.h"
 #include "core/arena.h"
 
 #include <stdlib.h>
@@ -537,71 +538,68 @@ static bool beats_c(const dl_result *res, int winner, int loser)
     return false;
 }
 
-static const char *verdict_str(dl_verdict v)
-{
-    switch (v) {
-    case DL_PROVED:  return "PROVED";
-    case DL_REFUTED: return "REFUTED";
-    default:         return "UNDECIDED";
-    }
-}
+/* ---- why trace: an adapter over the shared renderer (dl_trace.h) ----
+ *
+ * The scalar result addresses head rules by their permuted index (head_off[qi]
+ * .. head_off[qi+1] index the rule arrays directly), so a trace "rule handle" is
+ * just that index. The columnar backing supplies the same vtable over its
+ * columns; the format is shared, so the two stay identical by construction. */
 
-static void print_lit(const dl_theory *t, dl_lit l, FILE *out)
-{
-    fprintf(out, "%s%s", l.neg ? "~" : "", intern_name(t->syms, l.atom));
-}
+typedef struct { const dl_theory *t; const dl_result *res; } scalar_trace;
 
-static void print_rule_line(const dl_theory *t, const dl_result *res, int ri,
-                            int indent, FILE *out)
+static void sc_put_lit(void *ctx, dl_lit l, FILE *out)
 {
-    static const char *kinds[] = { "strict", "defeasible", "defeater" };
-    fprintf(out, "%*s%s (%s): ", indent, "", res->rname[ri], kinds[res->rkind[ri]]);
-    int nb = res->rbody_off[ri + 1] - res->rbody_off[ri];
-    if (nb == 0)
-        fprintf(out, "(no conditions)");
-    for (int i = res->rbody_off[ri]; i < res->rbody_off[ri + 1]; i++) {
-        if (i != res->rbody_off[ri])
-            fprintf(out, ", ");
-        dl_lit bl = lit_from_idx(res->body[i]);
-        print_lit(t, bl, out);
-        fprintf(out, "[%s]", verdict_str(dl_defeasible(res, bl)));
-    }
-    int app = ts_applicable(res, ri);
-    fprintf(out, "  -- %s\n",
-            app == 1 ? "applicable" : app == -1 ? "inapplicable" : "undecided");
+    const scalar_trace *s = ctx;
+    fprintf(out, "%s%s", l.neg ? "~" : "", intern_name(s->t->syms, l.atom));
 }
+static void sc_put_rule(void *ctx, int r, FILE *out)
+{
+    fprintf(out, "%s", ((const scalar_trace *)ctx)->res->rname[r]);
+}
+static dl_verdict sc_definite(void *ctx, dl_lit l)
+{ return dl_definite(((const scalar_trace *)ctx)->res, l); }
+static dl_verdict sc_defeasible(void *ctx, dl_lit l)
+{ return dl_defeasible(((const scalar_trace *)ctx)->res, l); }
+static bool sc_is_fact(void *ctx, dl_lit l)
+{ return ((const scalar_trace *)ctx)->res->is_fact[lit_idx(l)]; }
+static bool sc_solved(void *ctx) { (void)ctx; return true; }
+static int sc_nhead(void *ctx, dl_lit l)
+{
+    const dl_result *res = ((const scalar_trace *)ctx)->res;
+    int qi = lit_idx(l);
+    return res->head_off[qi + 1] - res->head_off[qi];
+}
+static int sc_head_at(void *ctx, dl_lit l, int i)
+{ return ((const scalar_trace *)ctx)->res->head_off[lit_idx(l)] + i; }
+static dl_rule_kind sc_rule_kind(void *ctx, int r)
+{ return (dl_rule_kind)((const scalar_trace *)ctx)->res->rkind[r]; }
+static int sc_nbody(void *ctx, int r)
+{
+    const dl_result *res = ((const scalar_trace *)ctx)->res;
+    return res->rbody_off[r + 1] - res->rbody_off[r];
+}
+static dl_lit sc_body_at(void *ctx, int r, int i)
+{
+    const dl_result *res = ((const scalar_trace *)ctx)->res;
+    return lit_from_idx(res->body[res->rbody_off[r] + i]);
+}
+static int sc_applicable(void *ctx, int r)
+{ return ts_applicable(((const scalar_trace *)ctx)->res, r); }
+static bool sc_beats(void *ctx, int w, int l)
+{ return beats_c(((const scalar_trace *)ctx)->res, w, l); }
+
+static const dl_trace_vtbl scalar_vtbl = {
+    .put_lit = sc_put_lit, .put_rule = sc_put_rule,
+    .definite = sc_definite, .defeasible = sc_defeasible,
+    .is_fact = sc_is_fact, .solved = sc_solved,
+    .nhead = sc_nhead, .head_at = sc_head_at,
+    .rule_kind = sc_rule_kind, .nbody = sc_nbody, .body_at = sc_body_at,
+    .applicable = sc_applicable, .beats = sc_beats,
+    .rule_prov = NULL,           /* provenance not wired yet (§6.3) */
+};
 
 void dl_why(const dl_theory *t, const dl_result *res, dl_lit q, FILE *out)
 {
-    int qi = lit_idx(q), nqi = qi ^ 1;
-    fprintf(out, "why ");
-    print_lit(t, q, out);
-    fprintf(out, "?\n  definite: %s   defeasible: %s\n",
-            verdict_str(dl_definite(res, q)),
-            verdict_str(dl_defeasible(res, q)));
-    if (res->is_fact[qi])
-        fprintf(out, "  it is a base fact\n");
-
-    if (res->head_off[qi] < res->head_off[qi + 1]) {
-        fprintf(out, "  rules for it:\n");
-        int ri;
-        FOR_HEAD_RULES(res, qi, ri)
-            print_rule_line(t, res, ri, 4, out);
-    }
-    if (res->head_off[nqi] < res->head_off[nqi + 1]) {
-        fprintf(out, "  rules against it:\n");
-        int si;
-        FOR_HEAD_RULES(res, nqi, si) {
-            print_rule_line(t, res, si, 4, out);
-            int ti;
-            FOR_HEAD_RULES(res, qi, ti) {
-                if (res->rkind[ti] != DL_DEFEATER && beats_c(res, ti, si))
-                    fprintf(out, "      (beaten by %s if applicable)\n",
-                            res->rname[ti]);
-                if (beats_c(res, si, ti))
-                    fprintf(out, "      (superior to %s: %s > %s)\n",
-                            res->rname[ti], res->rname[si], res->rname[ti]);
-            }
-        }
-    }
+    scalar_trace ctx = { t, res };
+    dl_trace_render(&scalar_vtbl, &ctx, q, out);
 }
