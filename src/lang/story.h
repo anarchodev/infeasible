@@ -31,6 +31,22 @@
  * written into `err` (fail-fast; panic-mode recovery is a follow-up). The
  * returned world borrows `syms`, which must outlive it. */
 
-world *story_compile(const char *src, intern *syms, char *err, size_t errsz);
+/* Non-fatal diagnostics (DESIGN.md §6.1 Tier-1: orphan/typo detection).
+ * Caller supplies `items`/`cap`; `count` reports how many warnings were
+ * produced and may exceed `cap`, in which case only the first `cap` are
+ * stored. Pass NULL to `warnings` to skip the analysis entirely. */
+typedef struct {
+    int  line, col;
+    char msg[192];
+} story_warning;
+
+typedef struct {
+    story_warning *items;
+    int            cap;
+    int            count;
+} story_warnings;
+
+world *story_compile(const char *src, intern *syms, char *err, size_t errsz,
+                     story_warnings *warnings);
 
 #endif

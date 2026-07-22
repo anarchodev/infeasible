@@ -11,6 +11,7 @@
 #define MAX_FLUENTS   512
 #define MAX_LABELS    512
 #define MAX_LABEL_LEN 64
+#define MAX_ATOMS     1024
 
 typedef struct {
     lexer    lx;
@@ -26,6 +27,17 @@ typedef struct {
 
     struct { char name[MAX_LABEL_LEN]; int handle; } labels[MAX_LABELS];
     int      nlabels;
+
+    /* orphan/typo analysis (§6.1): concludable atoms are declared fluents plus
+     * rule heads; a body/guard/requires atom that is neither is silently
+     * always-false — the Osiris typo bug. Both dedup to distinct atoms; refs
+     * keep the first source location for the diagnostic. Collected across the
+     * whole file (heads may be declared after their uses) and checked once at
+     * the end. Best-effort: on overflow we stop collecting. */
+    uint32_t heads[MAX_ATOMS];
+    int      nheads;
+    struct { uint32_t atom; int line, col; } refs[MAX_ATOMS];
+    int      nrefs;
 } parser;
 
 /* ---- diagnostics ---------------------------------------------------- */
@@ -96,6 +108,64 @@ static void declare_fluent(parser *p, uint32_t atom, int line, int col)
     world_declare_fluent(p->w, atom);
 }
 
+/* ---- orphan/typo analysis ------------------------------------------- */
+
+static void note_head(parser *p, uint32_t atom)
+{
+    for (int i = 0; i < p->nheads; i++)
+        if (p->heads[i] == atom) return;
+    if (p->nheads < MAX_ATOMS) p->heads[p->nheads++] = atom;
+}
+
+static bool is_head(parser *p, uint32_t atom)
+{
+    for (int i = 0; i < p->nheads; i++)
+        if (p->heads[i] == atom) return true;
+    return false;
+}
+
+static void note_ref(parser *p, uint32_t atom, int line, int col)
+{
+    for (int i = 0; i < p->nrefs; i++)
+        if (p->refs[i].atom == atom) return;          /* keep first location */
+    if (p->nrefs < MAX_ATOMS) {
+        p->refs[p->nrefs].atom = atom;
+        p->refs[p->nrefs].line = line;
+        p->refs[p->nrefs].col = col;
+        p->nrefs++;
+    }
+}
+
+static void emit_warning(story_warnings *w, int line, int col,
+                         const char *fmt, ...)
+{
+    int idx = w->count++;
+    if (w->items && idx < w->cap) {
+        story_warning *d = &w->items[idx];
+        d->line = line;
+        d->col = col;
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(d->msg, sizeof d->msg, fmt, ap);
+        va_end(ap);
+    }
+}
+
+/* Any atom used in a condition that is neither a declared fluent nor concluded
+ * by some rule can never be true — flag it as a probable typo or a missing
+ * declaration. */
+static void check_orphans(parser *p, story_warnings *warn)
+{
+    for (int i = 0; i < p->nrefs; i++) {
+        uint32_t a = p->refs[i].atom;
+        if (is_declared_fluent(p, a) || is_head(p, a)) continue;
+        emit_warning(warn, p->refs[i].line, p->refs[i].col,
+                     "'%s' is used as a condition but is never a declared "
+                     "fluent or concluded by any rule — typo, or a missing "
+                     "declaration?", intern_name(p->syms, a));
+    }
+}
+
 static int find_label(parser *p, token t)
 {
     for (int i = 0; i < p->nlabels; i++)
@@ -129,8 +199,9 @@ static bool add_label(parser *p, token t, int handle)
 
 /* ---- literals and conjunctions -------------------------------------- */
 
-/* lit := [ '~' ] IDENT */
-static bool parse_lit(parser *p, dl_lit *out)
+/* lit := [ '~' ] IDENT.  When `id_out` is non-NULL it receives the atom's
+ * identifier token, so callers can record its source location. */
+static bool parse_lit(parser *p, dl_lit *out, token *id_out)
 {
     bool neg = false;
     if (p->cur.kind == TK_TILDE) { neg = true; advance(p); }
@@ -141,6 +212,7 @@ static bool parse_lit(parser *p, dl_lit *out)
         return false;
     }
     token id = p->cur;
+    if (id_out) *id_out = id;
     advance(p);
     if (p->cur.kind == TK_LPAREN) {
         fail(p, p->cur.line, p->cur.col,
@@ -155,10 +227,13 @@ static bool parse_lit(parser *p, dl_lit *out)
 
 /* conj := lit ( '&' lit )*  — greedy; a bare name with no leading '&'
  * belongs to the next construct, which is what lets rule/action/superiority
- * parse without newline sensitivity. */
-static int parse_conj(parser *p, dl_lit *out, int cap)
+ * parse without newline sensitivity. `note_body` records each literal as a
+ * condition reference for the orphan analysis (heads/effects pass false). */
+static int parse_conj(parser *p, dl_lit *out, int cap, bool note_body)
 {
-    if (!parse_lit(p, &out[0])) return -1;
+    token id;
+    if (!parse_lit(p, &out[0], &id)) return -1;
+    if (note_body) note_ref(p, out[0].atom, id.line, id.col);
     int n = 1;
     while (p->cur.kind == TK_AMP) {
         advance(p);
@@ -167,7 +242,8 @@ static int parse_conj(parser *p, dl_lit *out, int cap)
                  "conjunction too long (max %d literals)", cap);
             return -1;
         }
-        if (!parse_lit(p, &out[n])) return -1;
+        if (!parse_lit(p, &out[n], &id)) return -1;
+        if (note_body) note_ref(p, out[n].atom, id.line, id.col);
         n++;
     }
     return n;
@@ -231,7 +307,7 @@ static void parse_rule(parser *p)
     if (!expect(p, TK_COLON)) return;
 
     dl_lit body[MAX_CONJ];
-    int nb = parse_conj(p, body, MAX_CONJ);
+    int nb = parse_conj(p, body, MAX_CONJ, true);
     if (nb < 0) return;
 
     dl_rule_kind kind;
@@ -250,7 +326,8 @@ static void parse_rule(parser *p)
     advance(p);
 
     dl_lit head;
-    if (!parse_lit(p, &head)) return;
+    if (!parse_lit(p, &head, NULL)) return;
+    note_head(p, head.atom);
 
     char name[MAX_LABEL_LEN];
     int hn = label.len < MAX_LABEL_LEN - 1 ? label.len : MAX_LABEL_LEN - 1;
@@ -265,7 +342,7 @@ static void parse_rule(parser *p)
     if (p->cur.kind == TK_UNLESS) {
         advance(p);
         dl_lit guard[MAX_CONJ];
-        int ng = parse_conj(p, guard, MAX_CONJ);
+        int ng = parse_conj(p, guard, MAX_CONJ, true);
         if (ng < 0) return;
         char gname[MAX_LABEL_LEN + 8];
         snprintf(gname, sizeof gname, "%s.unless", name);
@@ -292,7 +369,7 @@ static void parse_action(parser *p)
     if (p->cur.kind == TK_REQUIRES) {
         advance(p);
         dl_lit body[MAX_CONJ];
-        int nb = parse_conj(p, body, MAX_CONJ);
+        int nb = parse_conj(p, body, MAX_CONJ, true);
         if (nb < 0) return;
         for (int i = 0; i < nb; i++) {
             conds[i].lit = body[i];
@@ -303,7 +380,7 @@ static void parse_action(parser *p)
 
     if (!expect(p, TK_CAUSES)) return;
     dl_lit effects[MAX_CONJ];
-    int ne = parse_conj(p, effects, MAX_CONJ);
+    int ne = parse_conj(p, effects, MAX_CONJ, false);
     if (ne < 0) return;
 
     char nm[MAX_LABEL_LEN];
@@ -348,7 +425,8 @@ static void parse_sup(parser *p)
 
 /* ---- entry ---------------------------------------------------------- */
 
-world *story_compile(const char *src, intern *syms, char *err, size_t errsz)
+world *story_compile(const char *src, intern *syms, char *err, size_t errsz,
+                     story_warnings *warnings)
 {
     parser p;
     memset(&p, 0, sizeof p);
@@ -382,5 +460,8 @@ world *story_compile(const char *src, intern *syms, char *err, size_t errsz)
         world_free(p.w);
         return NULL;
     }
+
+    /* Non-fatal analysis runs only on a well-formed parse. */
+    if (warnings) check_orphans(&p, warnings);
     return p.w;
 }

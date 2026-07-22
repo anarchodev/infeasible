@@ -78,13 +78,19 @@ static int test_cellar_from_story(void)
 
     intern *sy = intern_new();
     char err[256] = "";
-    world *w = story_compile(src, sy, err, sizeof err);
+    story_warning witems[8];
+    story_warnings warn = { witems, 8, 0 };
+    world *w = story_compile(src, sy, err, sizeof err, &warn);
     if (!w) {
         fprintf(stderr, "FAIL compile: %s\n", err);
         free(src);
         intern_free(sy);
         return 1;
     }
+    /* the reference cellar is clean: no orphan atoms */
+    if (warn.count != 0)
+        fprintf(stderr, "unexpected warning: %s\n", warn.items[0].msg);
+    CHECK(warn.count == 0);
 
     uint32_t weakened  = intern_id(sy, "weakened"),
              can_force = intern_id(sy, "can_force_door"),
@@ -121,7 +127,7 @@ static int expect_error(const char *src)
 {
     intern *sy = intern_new();
     char err[256] = "";
-    world *w = story_compile(src, sy, err, sizeof err);
+    world *w = story_compile(src, sy, err, sizeof err, NULL);
     int ok = (w == NULL) && (err[0] != '\0');
     if (!ok)
         fprintf(stderr, "FAIL expected error for <<%s>> (err=\"%s\")\n", src, err);
@@ -142,11 +148,49 @@ static int test_errors(void)
     return 0;
 }
 
+/* Orphan/typo detection (§6.1 Tier-1): a condition atom that is neither a
+ * declared fluent nor concluded anywhere is a non-fatal warning, not an error;
+ * a head concluded later in the file is not a false positive. */
+static int test_orphan(void)
+{
+    /* a typo'd condition atom is flagged (and compilation still succeeds) */
+    {
+        intern *sy = intern_new();
+        char err[256] = "";
+        story_warning wi[8];
+        story_warnings wn = { wi, 8, 0 };
+        world *wl = story_compile("state holding\nrule r: hodling => weak",
+                                  sy, err, sizeof err, &wn);
+        CHECK(wl != NULL);
+        CHECK(wn.count == 1);
+        CHECK(strstr(wn.items[0].msg, "hodling") != NULL);
+        world_free(wl);
+        intern_free(sy);
+    }
+    /* a head concluded later in the file must not be reported as an orphan */
+    {
+        intern *sy = intern_new();
+        char err[256] = "";
+        story_warning wi[8];
+        story_warnings wn = { wi, 8, 0 };
+        world *wl = story_compile(
+            "state y\nrule a: derived => x\nrule b: y => derived",
+            sy, err, sizeof err, &wn);
+        CHECK(wl != NULL);
+        if (wn.count) fprintf(stderr, "unexpected warning: %s\n", wn.items[0].msg);
+        CHECK(wn.count == 0);
+        world_free(wl);
+        intern_free(sy);
+    }
+    return 0;
+}
+
 int main(void)
 {
     if (test_lexer())             return 1;
     if (test_cellar_from_story()) return 1;
     if (test_errors())            return 1;
+    if (test_orphan())            return 1;
     printf("test_parse: all passed\n");
     return 0;
 }
