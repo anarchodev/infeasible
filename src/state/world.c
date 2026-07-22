@@ -42,6 +42,17 @@ typedef struct {
     int n, cap;
 } num_receipt;
 
+/* A per-sort N-lane family (the DoD thesis): one homogeneous dl_col schema over
+ * `nent` entities. `ground[a*nent + e]` is the named ground atom equivalent to
+ * predicate-local `a` at lane `e` (for facts and the differential check);
+ * `is_fluent[a]` flags locals that take base facts. */
+typedef struct {
+    dlcol   *fam;
+    int      natoms, nent;
+    uint32_t *ground;             /* [natoms*nent] */
+    bool    *is_fluent;           /* [natoms] */
+} lane_family;
+
 struct world {
     arena a;
     intern *syms;
@@ -79,6 +90,9 @@ struct world {
     uint32_t *loc_of;             /* intern atom -> schema atom, ~0u = absent    */
     uint32_t loc_cap, nloc;       /* loc_of size; # assigned schema locations    */
     uint32_t *fl_loc, *pr_loc;    /* per fluent: schema ids of f and f'          */
+
+    lane_family *lanes;           /* per-sort N-lane families (DoD thesis)       */
+    int nlanes, caplanes;
 };
 
 #define GROW(arr, n, cap) \
@@ -103,6 +117,12 @@ void world_free(world *w)
         dlcol_free(w->fam);
     if (w->jfam)
         dlcol_free(w->jfam);
+    for (int i = 0; i < w->nlanes; i++) {
+        dlcol_free(w->lanes[i].fam);
+        free(w->lanes[i].ground);
+        free(w->lanes[i].is_fluent);
+    }
+    free(w->lanes);
     free(w->loc_of);
     free(w->fl_loc);
     free(w->pr_loc);
@@ -360,6 +380,58 @@ void world_why(world *w, dl_lit q, FILE *out)
     }
     dl_lit loc = { w->loc_of[q.atom], q.neg };
     dlcol_why(w->jfam, loc, 0, out);
+}
+
+/* ---- lane families (DoD thesis) ---- */
+
+void world_add_lane_family(world *w, dlcol *fam, int natoms, int nent,
+                           const uint32_t *ground, const bool *is_fluent)
+{
+    GROW(w->lanes, w->nlanes, w->caplanes);
+    lane_family *lf = &w->lanes[w->nlanes++];
+    lf->fam = fam;
+    lf->natoms = natoms;
+    lf->nent = nent;
+    size_t g = (size_t)natoms * (size_t)nent;
+    lf->ground = malloc((g ? g : 1) * sizeof *lf->ground);
+    memcpy(lf->ground, ground, (g ? g : 1) * sizeof *lf->ground);
+    lf->is_fluent = malloc((size_t)(natoms ? natoms : 1) * sizeof *lf->is_fluent);
+    memcpy(lf->is_fluent, is_fluent, (size_t)(natoms ? natoms : 1) * sizeof *lf->is_fluent);
+}
+
+int world_lane_family_count(const world *w) { return w->nlanes; }
+
+int world_lanes_check(world *w, bool *ok)
+{
+    int checks = 0;
+    if (ok) *ok = true;
+    for (int i = 0; i < w->nlanes; i++) {
+        lane_family *lf = &w->lanes[i];
+        /* load current state: each base-fluent local's column, one bit per lane */
+        dlcol_clear_facts(lf->fam);
+        for (int a = 0; a < lf->natoms; a++) {
+            if (!lf->is_fluent[a]) continue;
+            for (int e = 0; e < lf->nent; e++) {
+                bool v = world_get(w, lf->ground[(size_t)a * lf->nent + e]);
+                dl_lit l = { (uint32_t)a, !v };    /* a if true, ~a if false */
+                dlcol_add_fact(lf->fam, l, e);
+            }
+        }
+        dlcol_solve(lf->fam);
+        /* every (predicate, entity) verdict must match the N=1 query path */
+        for (int a = 0; a < lf->natoms; a++)
+            for (int e = 0; e < lf->nent; e++) {
+                uint32_t g = lf->ground[(size_t)a * lf->nent + e];
+                for (int neg = 0; neg < 2; neg++) {
+                    dl_lit la = { (uint32_t)a, neg != 0 };
+                    dl_lit gq = { g, neg != 0 };
+                    if (dlcol_defeasible(lf->fam, la, e) != world_query(w, gq))
+                        if (ok) *ok = false;
+                    checks++;
+                }
+            }
+    }
+    return checks;
 }
 
 /* Trace how a fluent got its value in the last step: the step theory (causal

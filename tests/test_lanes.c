@@ -1,0 +1,105 @@
+/* Golden test for lane grounding (the DoD thesis, increment 2a). When the whole
+ * judgment program is homogeneous over one sort, the grounder emits it as an
+ * N-lane dl_col family — entities as bit-parallel lanes, the rule schema shared
+ * rather than grounded per entity. This pins that the lane family's per-entity
+ * verdicts are IDENTICAL to the proven N=1 query path (world_lanes_check), the
+ * same differential-oracle discipline test_col applies to dl vs dl_col. It also
+ * checks a non-homogeneous program produces NO lane family (the conservative
+ * bail), so the fallback stays honest. */
+
+#include "lang/story.h"
+#include "state/world.h"
+#include "core/intern.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define CHECK(c) \
+    do { \
+        if (!(c)) { \
+            fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); \
+            return 1; \
+        } \
+    } while (0)
+
+/* A per-actor conditions program: single sort, all unary, superiority between
+ * two lane rules (blessed beats poisoned), one global input in a body. Every
+ * atom is over `actor` — the homogeneous case. thug is both poisoned and
+ * blessed, so the superiority edge must resolve, in lanes. */
+static const char *HOMO =
+    "sort actor\n"
+    "entity (guard, thug, mage, priest : actor)\n"
+    "state (poisoned(actor) blessed(actor) alert(actor) danger)\n"
+    "rule weakens(X: actor):  poisoned(X)          => weak(X)\n"
+    "rule holds_up(X: actor): blessed(X)           => ~weak(X)\n"
+    "holds_up > weakens\n"
+    "rule engages(X: actor):  alert(X) & danger    => acts(X)\n"
+    "init (poisoned(guard) poisoned(thug) blessed(thug) blessed(priest)"
+    "      alert(mage) alert(guard) danger)\n";
+
+static int test_homogeneous_agrees(void)
+{
+    intern *sy = intern_new();
+    story_diag di[16];
+    story_diags d = { di, 16, 0, 0 };
+    world *w = story_compile(HOMO, "conds.story", sy, &d);
+    if (!w) {
+        fprintf(stderr, "FAIL compile: %s\n", d.count ? d.items[0].msg : "?");
+        intern_free(sy);
+        return 1;
+    }
+    CHECK(d.nerrors == 0);
+
+    /* the whole program is homogeneous over `actor`: exactly one lane family */
+    CHECK(world_lane_family_count(w) == 1);
+
+    /* every (predicate, entity) verdict in the lane family matches world_query
+     * on the equivalent named ground atom — the N=1 path is the oracle */
+    bool ok = false;
+    int checks = world_lanes_check(w, &ok);
+    CHECK(checks > 0);
+    CHECK(ok);
+
+    /* spot-check the semantics the lanes had to reproduce: thug is poisoned AND
+     * blessed, and holds_up > weakens, so ~weak(thug) wins */
+    CHECK(world_query(w, dl_neg(intern_id(sy, "weak(thug)"))) == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "weak(guard)"))) == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "acts(mage)")))  == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "acts(guard)"))) == DL_PROVED);
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
+/* A numeric guard makes the program non-homogeneous, so no lane family forms —
+ * the N=1 path still handles it. (Same for MV, 2+ vars, step rules.) */
+static const char *MIXED =
+    "sort actor\n"
+    "entity guard : actor\n"
+    "state (poisoned(actor) hp(actor) : int in 0..20)\n"
+    "rule weakens(X: actor): poisoned(X) => weak(X)\n"
+    "rule dying(X: actor):   hp(X) <= 0  -> dead(X)\n"
+    "init poisoned(guard)\n";
+
+static int test_mixed_bails(void)
+{
+    intern *sy = intern_new();
+    world *w = story_compile(MIXED, "mixed.story", sy, NULL);
+    CHECK(w != NULL);
+    CHECK(world_lane_family_count(w) == 0);        /* conservative bail */
+    /* the N=1 path still works */
+    CHECK(world_query(w, dl_pos(intern_id(sy, "weak(guard)"))) == DL_PROVED);
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
+int main(void)
+{
+    if (test_homogeneous_agrees()) return 1;
+    if (test_mixed_bails()) return 1;
+    printf("test_lanes: all passed\n");
+    return 0;
+}

@@ -7,6 +7,7 @@
 
 #include "core/intern.h"
 #include "logic/dl.h"
+#include "logic/dl_col.h"    /* lane families are dl_col N-entity schemas */
 
 /* World = base facts (the only mutable state) + rules.
  *
@@ -104,6 +105,25 @@ void world_add_num_effect(world *w, int rule, uint32_t num_atom,
 /* Query the current state (facts + judgment rules). */
 dl_verdict world_query(world *w, dl_lit q);
 void       world_why(world *w, dl_lit q, FILE *out);
+
+/* Lane families (the DoD thesis: entities as bit-parallel lanes, not named
+ * atoms). A per-sort N-lane dl_col family for the homogeneous single-variable
+ * judgment rules over that sort — the same rules run once across 64 entities per
+ * word instead of grounded per entity into distinct atoms. The grounder emits
+ * them; they are validated against the N=1 query path but not yet routed to (the
+ * dl_col-was-prototyped-before-adopted playbook). `ground` is a flat
+ * natoms*nent array of the equivalent named ground atom for each
+ * (predicate-local-id, lane); `is_fluent` flags which locals take base facts.
+ * The world copies both and takes ownership of `fam`. */
+void world_add_lane_family(world *w, dlcol *fam, int natoms, int nent,
+                           const uint32_t *ground, const bool *is_fluent);
+int  world_lane_family_count(const world *w);
+
+/* Differential pin (mirrors test_col's dl-vs-dl_col): load current state into
+ * every lane family, solve, and compare each (predicate, entity) verdict to
+ * world_query on the equivalent ground atom. Returns the number of comparisons;
+ * sets *ok false on any mismatch (both polarities checked). */
+int  world_lanes_check(world *w, bool *ok);
 
 /* Trace how a fluent reached its value in the *last* step (causal rules,
  * ramifications, generated inertia). `next` true reads q's atom in the next

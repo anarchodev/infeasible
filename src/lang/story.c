@@ -1854,6 +1854,132 @@ static void synchronize(parser *p)
     }
 }
 
+/* ---- lane grounding (the DoD thesis, increment 2a) ----
+ *
+ * If the whole judgment program is homogeneous over ONE sort S — every rule
+ * single-variable over S, every atom a unary predicate over S (arg = the
+ * quantified variable) or an arity-0 global — emit it as ONE N-lane dl_col
+ * family: entities become bit-parallel lanes (64 per word), the rule schema is
+ * shared, and NOT grounded per entity. Conservative first cut: bail (leaving
+ * only the N=1 grounding) on anything mixed — guards, MV, numeric, 2+ vars,
+ * cross-sort, constant-entity args, or any step rules. The lane family is
+ * validated against the N=1 path (world_lanes_check), not yet queried through
+ * (the dl_col-prototyped-before-adopted playbook). Per-sort axis, forced: a
+ * single variable has exactly one lane axis, so there is nothing to plan and no
+ * cost model — the plan is a pure local function of each rule's text. */
+
+static bool lane_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var,
+                         bool is_head)
+{
+    if (a->value != INTERN_NONE || a->is_guard || a->is_num_effect)
+        return false;                              /* MV / numeric: out */
+    pred_info *pi = find_pred(p, a->pred);
+    if (!pi || pi->is_mv || pi->is_num)
+        return false;
+    if (pi->arity == 0)
+        return !is_head;                           /* globals: broadcast body only */
+    if (pi->arity != 1 || pi->argsort[0] != S)
+        return false;
+    return a->nargs == 1 && a->args[0].name == var; /* arg is the quantified var */
+}
+
+static int rule_index(parser *p, const char *label)
+{
+    for (int i = 0; i < p->nrules; i++)
+        if (strcmp(p->rules[i].label, label) == 0) return i;
+    return -1;
+}
+
+static void build_lane_families(parser *p)
+{
+    if (p->nrules == 0 || p->nactions > 0)         /* judgment-only for 2a */
+        return;
+    if (p->rules[0].nvars != 1)
+        return;
+    int S = p->rules[0].vars[0].sort;
+
+    for (int i = 0; i < p->nrules; i++) {
+        ast_rule *r = &p->rules[i];
+        if (r->nvars != 1 || r->vars[0].sort != S || r->has_guard)
+            return;
+        uint32_t var = r->vars[0].name;
+        if (!lane_atom_ok(p, &r->head, S, var, true))
+            return;
+        for (int b = 0; b < r->nbody; b++)
+            if (!lane_atom_ok(p, &r->body[b], S, var, false))
+                return;
+    }
+
+    int nent = domain_size(p, S);
+    if (nent == 0)
+        return;
+
+    /* collect the distinct predicates (head + bodies) as family-local atoms */
+    uint32_t preds[MAX_PREDS];
+    bool pf[MAX_PREDS];
+    int npred = 0;
+    for (int i = 0; i < p->nrules; i++) {
+        ast_rule *r = &p->rules[i];
+        const ast_atom *atoms[1 + MAX_BODY];
+        int na = 0;
+        atoms[na++] = &r->head;
+        for (int b = 0; b < r->nbody; b++) atoms[na++] = &r->body[b];
+        for (int k = 0; k < na; k++) {
+            uint32_t pr = atoms[k]->pred;
+            int found = -1;
+            for (int j = 0; j < npred; j++) if (preds[j] == pr) { found = j; break; }
+            if (found < 0) {
+                if (npred >= MAX_PREDS) return;
+                preds[npred] = pr;
+                pf[npred] = find_pred(p, pr)->is_fluent;
+                npred++;
+            }
+        }
+    }
+
+    dlcol *f = dlcol_new(npred, nent);
+    for (int a = 0; a < npred; a++)
+        dlcol_set_atom_name(f, (uint32_t)a, intern_name(p->syms, preds[a]));
+
+    int schema_id[MAX_RULES];
+    for (int i = 0; i < p->nrules; i++) {
+        ast_rule *r = &p->rules[i];
+        int hl = -1;
+        for (int j = 0; j < npred; j++) if (preds[j] == r->head.pred) { hl = j; break; }
+        dl_lit head = { (uint32_t)hl, r->head.neg };
+        dl_lit body[MAX_BODY];
+        for (int b = 0; b < r->nbody; b++) {
+            int bl = -1;
+            for (int j = 0; j < npred; j++)
+                if (preds[j] == r->body[b].pred) { bl = j; break; }
+            body[b] = (dl_lit){ (uint32_t)bl, r->body[b].neg };
+        }
+        int h = dlcol_add_rule(f, r->label, r->kind, head, body, r->nbody);
+        char pbuf[MAX_NAME + 24];
+        dlcol_set_prov(f, h, prov_str(p, r->line, pbuf, sizeof pbuf));
+        schema_id[i] = h;
+    }
+    for (int s = 0; s < p->nsups; s++) {
+        int wi = rule_index(p, p->sups[s].a), li = rule_index(p, p->sups[s].b);
+        if (wi >= 0 && li >= 0)
+            dlcol_add_sup(f, schema_id[wi], schema_id[li]);
+    }
+
+    /* the (predicate-local, lane) -> named ground atom map, for facts + the
+     * differential check against the N=1 path */
+    uint32_t *ground = malloc((size_t)npred * (size_t)nent * sizeof *ground);
+    for (int a = 0; a < npred; a++) {
+        pred_info *pi = find_pred(p, preds[a]);
+        for (int e = 0; e < nent; e++) {
+            uint32_t ent = domain_at(p, S, e);
+            ground[(size_t)a * nent + e] =
+                pi->arity == 0 ? preds[a] : ground_pred(p, preds[a], &ent, 1);
+        }
+    }
+    world_add_lane_family(p->w, f, npred, nent, ground, pf);
+    free(ground);
+}
+
 world *story_compile(const char *src, const char *srcname, intern *syms,
                      story_diags *diags)
 {
@@ -1902,6 +2028,7 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
             for (int i = 0; i < p->nactions; i++) ground_action(p, &p->actions[i]);
             for (int i = 0; i < p->nsups; i++)    ground_sup(p, &p->sups[i]);
             check_orphans(p);
+            if (p->nerrors == 0) build_lane_families(p);   /* the DoD thesis, 2a */
         }
     }
 
