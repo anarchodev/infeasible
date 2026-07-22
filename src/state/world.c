@@ -51,7 +51,12 @@ typedef struct {
     int      natoms, nent;
     uint32_t *ground;             /* [natoms*nent] */
     bool    *is_fluent;           /* [natoms] */
+    bool     solved;              /* holds the current state's verdicts */
 } lane_family;
+
+/* reverse map: a named ground atom -> its (family, predicate-local, lane), so
+ * world_query can route to the lane family. fam < 0 = not a lane atom. */
+typedef struct { int fam, a, e; } lane_ref;
 
 struct world {
     arena a;
@@ -93,6 +98,9 @@ struct world {
 
     lane_family *lanes;           /* per-sort N-lane families (DoD thesis)       */
     int nlanes, caplanes;
+    lane_ref *lane_map;           /* ground atom -> (family, local, lane)        */
+    uint32_t lane_map_cap;
+    bool lanes_ok;                /* lane families reflect the current structure */
 };
 
 #define GROW(arr, n, cap) \
@@ -111,6 +119,14 @@ world *world_new(intern *syms)
     return w;
 }
 
+/* A base-fact edit: the judgment family and every lane family must re-solve. */
+static void invalidate_state_solved(world *w)
+{
+    w->jfam_solved = false;
+    for (int i = 0; i < w->nlanes; i++)
+        w->lanes[i].solved = false;
+}
+
 void world_free(world *w)
 {
     if (w->fam)
@@ -123,6 +139,7 @@ void world_free(world *w)
         free(w->lanes[i].is_fluent);
     }
     free(w->lanes);
+    free(w->lane_map);
     free(w->loc_of);
     free(w->fl_loc);
     free(w->pr_loc);
@@ -172,6 +189,7 @@ void world_declare_fluent(world *w, uint32_t atom)
     w->fl_prov[w->nfl] = NULL;
     w->nfl++;
     w->fam_dirty = true;
+    w->lanes_ok = false;          /* a structural edit stales the lane families */
 }
 
 /* Where a fluent was declared (§6.3), for its generated inertia rules'
@@ -188,7 +206,7 @@ void world_set(world *w, uint32_t atom, bool value)
     int i = fluent_index(w, atom);
     if (i >= 0) {
         w->vals[i] = value;
-        w->jfam_solved = false;                    /* judgments now stale */
+        invalidate_state_solved(w);                /* judgments now stale */
     }
 }
 
@@ -224,7 +242,7 @@ void world_set_num(world *w, uint32_t atom, long value)
     int i = num_index(w, atom);
     if (i >= 0) {
         w->nums[i].value = value;
-        w->jfam_solved = false;                    /* guard truth may change */
+        invalidate_state_solved(w);                /* guard truth may change */
     }
 }
 
@@ -275,6 +293,7 @@ int world_add_rule(world *w, const char *name, dl_rule_kind kind,
     if (nbody)
         memcpy(r->body, body, (size_t)nbody * sizeof(dl_lit));
     w->fam_dirty = true;
+    w->lanes_ok = false;          /* a structural edit stales the lane families */
     return w->njr++;
 }
 
@@ -285,6 +304,7 @@ void world_add_sup(world *w, int winner, int loser)
     w->jsups[w->njs].loser = loser;
     w->njs++;
     w->fam_dirty = true;
+    w->lanes_ok = false;          /* a structural edit stales the lane families */
 }
 
 int world_add_step_rule(world *w, const char *name, uint32_t action,
@@ -307,6 +327,7 @@ int world_add_step_rule(world *w, const char *name, uint32_t action,
     r->neffs = NULL;
     r->nneff = r->capneff = 0;
     w->fam_dirty = true;
+    w->lanes_ok = false;          /* a structural edit stales the lane families */
     return w->nsr++;
 }
 
@@ -321,6 +342,7 @@ void world_set_step_prov(world *w, int rule, const char *prov)
     if (rule >= 0 && rule < w->nsr) {
         w->srules[rule].prov = prov ? arena_strdup(&w->a, prov) : NULL;
         w->fam_dirty = true;
+    w->lanes_ok = false;          /* a structural edit stales the lane families */
     }
 }
 
@@ -356,8 +378,11 @@ void world_add_num_effect(world *w, int rule, uint32_t num_atom,
  * engine, the scalar dl kept only as test_col's differential oracle). */
 static void ensure_families(world *w);
 static void solve_judgment_family(world *w);
+static void solve_lane_family(world *w, lane_family *lf);
 
-dl_verdict world_query(world *w, dl_lit q)
+/* The N=1 judgment path: the proven route, and the oracle world_lanes_check
+ * measures the lane families against. */
+static dl_verdict query_jfam(world *w, dl_lit q)
 {
     ensure_families(w);
     if (!w->jfam_solved)
@@ -366,6 +391,22 @@ dl_verdict world_query(world *w, dl_lit q)
         return DL_UNDECIDED;                       /* absent: unmentioned atom */
     dl_lit loc = { w->loc_of[q.atom], q.neg };
     return dlcol_defeasible(w->jfam, loc, 0);
+}
+
+dl_verdict world_query(world *w, dl_lit q)
+{
+    ensure_families(w);
+    /* the hot path: if this atom is a lane cell, answer from the bit-parallel
+     * family (all entities solved at once) instead of the N=1 judgment family */
+    if (w->lanes_ok && q.atom < w->lane_map_cap && w->lane_map[q.atom].fam >= 0) {
+        lane_ref r = w->lane_map[q.atom];
+        lane_family *lf = &w->lanes[r.fam];
+        if (!lf->solved)
+            solve_lane_family(w, lf);
+        dl_lit la = { (uint32_t)r.a, q.neg };
+        return dlcol_defeasible(lf->fam, la, r.e);
+    }
+    return query_jfam(w, q);
 }
 
 void world_why(world *w, dl_lit q, FILE *out)
@@ -388,18 +429,51 @@ void world_add_lane_family(world *w, dlcol *fam, int natoms, int nent,
                            const uint32_t *ground, const bool *is_fluent)
 {
     GROW(w->lanes, w->nlanes, w->caplanes);
+    int fi = w->nlanes;
     lane_family *lf = &w->lanes[w->nlanes++];
     lf->fam = fam;
     lf->natoms = natoms;
     lf->nent = nent;
+    lf->solved = false;
     size_t g = (size_t)natoms * (size_t)nent;
     lf->ground = malloc((g ? g : 1) * sizeof *lf->ground);
     memcpy(lf->ground, ground, (g ? g : 1) * sizeof *lf->ground);
     lf->is_fluent = malloc((size_t)(natoms ? natoms : 1) * sizeof *lf->is_fluent);
     memcpy(lf->is_fluent, is_fluent, (size_t)(natoms ? natoms : 1) * sizeof *lf->is_fluent);
+
+    /* index every ground atom back to its lane cell, so world_query can route */
+    for (int a = 0; a < natoms; a++)
+        for (int e = 0; e < nent; e++) {
+            uint32_t at = ground[(size_t)a * nent + e];
+            if (at >= w->lane_map_cap) {
+                uint32_t nc = at + 1;
+                w->lane_map = realloc(w->lane_map, (size_t)nc * sizeof *w->lane_map);
+                for (uint32_t k = w->lane_map_cap; k < nc; k++) w->lane_map[k].fam = -1;
+                w->lane_map_cap = nc;
+            }
+            w->lane_map[at] = (lane_ref){ fi, a, e };
+        }
+    w->lanes_ok = true;
 }
 
 int world_lane_family_count(const world *w) { return w->nlanes; }
+
+/* Load current-state facts into a lane family and solve it (all lanes at once),
+ * cached behind lf->solved until a state edit. */
+static void solve_lane_family(world *w, lane_family *lf)
+{
+    dlcol_clear_facts(lf->fam);
+    for (int a = 0; a < lf->natoms; a++) {
+        if (!lf->is_fluent[a]) continue;
+        for (int e = 0; e < lf->nent; e++) {
+            bool v = world_get(w, lf->ground[(size_t)a * lf->nent + e]);
+            dl_lit l = { (uint32_t)a, !v };        /* a if true, ~a if false */
+            dlcol_add_fact(lf->fam, l, e);
+        }
+    }
+    dlcol_solve(lf->fam);
+    lf->solved = true;
+}
 
 int world_lanes_check(world *w, bool *ok)
 {
@@ -407,17 +481,7 @@ int world_lanes_check(world *w, bool *ok)
     if (ok) *ok = true;
     for (int i = 0; i < w->nlanes; i++) {
         lane_family *lf = &w->lanes[i];
-        /* load current state: each base-fluent local's column, one bit per lane */
-        dlcol_clear_facts(lf->fam);
-        for (int a = 0; a < lf->natoms; a++) {
-            if (!lf->is_fluent[a]) continue;
-            for (int e = 0; e < lf->nent; e++) {
-                bool v = world_get(w, lf->ground[(size_t)a * lf->nent + e]);
-                dl_lit l = { (uint32_t)a, !v };    /* a if true, ~a if false */
-                dlcol_add_fact(lf->fam, l, e);
-            }
-        }
-        dlcol_solve(lf->fam);
+        solve_lane_family(w, lf);
         /* every (predicate, entity) verdict must match the N=1 query path */
         for (int a = 0; a < lf->natoms; a++)
             for (int e = 0; e < lf->nent; e++) {
@@ -425,7 +489,9 @@ int world_lanes_check(world *w, bool *ok)
                 for (int neg = 0; neg < 2; neg++) {
                     dl_lit la = { (uint32_t)a, neg != 0 };
                     dl_lit gq = { g, neg != 0 };
-                    if (dlcol_defeasible(lf->fam, la, e) != world_query(w, gq))
+                    /* compare against the N=1 path directly, not world_query —
+                     * which now routes back to lanes and would be circular */
+                    if (dlcol_defeasible(lf->fam, la, e) != query_jfam(w, gq))
                         if (ok) *ok = false;
                     checks++;
                 }
@@ -872,7 +938,7 @@ int world_step(world *w, const uint32_t *actions, int nactions,
             memcpy(w->vals, next, (size_t)w->nfl * sizeof *next);
         for (int i = 0; i < w->nnum; i++)
             w->nums[i].value = nextnum[i];
-        w->jfam_solved = false;                    /* new state: judgments stale */
+        invalidate_state_solved(w);                /* new state: judgments stale */
     }
 
     free(next);

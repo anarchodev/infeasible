@@ -68,6 +68,16 @@ static int test_homogeneous_agrees(void)
     CHECK(world_query(w, dl_pos(intern_id(sy, "acts(mage)")))  == DL_PROVED);
     CHECK(world_query(w, dl_pos(intern_id(sy, "acts(guard)"))) == DL_PROVED);
 
+    /* a state edit must invalidate the lane solve-cache: un-poison guard, and
+     * weak(guard) — routed through the lane family — must stop being proved,
+     * while the differential against the N=1 path still holds at the new state */
+    world_set(w, intern_id(sy, "poisoned(guard)"), false);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "weak(guard)"))) != DL_PROVED);
+    CHECK(world_query(w, dl_neg(intern_id(sy, "weak(thug)"))) == DL_PROVED);
+    bool ok2 = false;
+    CHECK(world_lanes_check(w, &ok2) > 0);
+    CHECK(ok2);
+
     world_free(w);
     intern_free(sy);
     return 0;
