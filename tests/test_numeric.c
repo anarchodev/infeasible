@@ -130,8 +130,8 @@ static int test_numeric_errors(void)
     /* a comparison against a non-numeric fluent */
     if (expect_error("state p\nrule r: p <= 5 => q", "not a declared numeric fluent"))
         return 1;
-    /* numeric effects are deferred to the write-side slice */
-    if (expect_error("state h : int\naction a: causes h = 5", "not supported yet"))
+    /* a numeric fluent is *written* in a `causes` clause, never compared */
+    if (expect_error("state h : int\naction a: causes h = 5", "effect operator"))
         return 1;
     /* init uses `=`, not a comparison */
     if (expect_error("state h : int\ninit h <= 5", "sets a numeric fluent"))
@@ -139,8 +139,8 @@ static int test_numeric_errors(void)
     /* a rule cannot conclude a comparison */
     if (expect_error("state h : int\nrule r: q -> h <= 0", "cannot conclude"))
         return 1;
-    /* declared numeric ranges are deferred */
-    if (expect_error("state h : int in 0", "ranges")) return 1;
+    /* a declared range with hi below lo is empty */
+    if (expect_error("state h : int in 5..2", "range is empty")) return 1;
     return 0;
 }
 

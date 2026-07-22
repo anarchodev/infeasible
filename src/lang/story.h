@@ -10,14 +10,16 @@
  * arena AST (§10): recursive-descent parse, then a semantic + build-time
  * grounding pass that emits ground rules into the `world_*` API.
  *
- * This slice adds the M1 grounder over the propositional first slice: typed
- * variables (`X : actor`) and boolean predicate atoms (`holding(actor,item)`),
- * grounded up front over declared finite sorts (DESIGN.md §5.2 item 2 —
- * typed vars bound every domain; the tick-time join matcher is M3, §11). Still
- * out of this slice: multi-valued domains (`: { … }`) and numeric fluents
- * (`: int`, `<=`/`>=` guards) — §5.7/5.8, rejected with a located error — and
- * ramifications. The variable-free fragment is the degenerate arity-0 case:
- * examples/cellar_prop.story still compiles to the same world.
+ * Grounder over the propositional first slice: typed variables (`X : actor`)
+ * and predicate atoms (`holding(actor,item)`), grounded up front over declared
+ * finite sorts (DESIGN.md §5.2 item 2 — typed vars bound every domain; the
+ * tick-time join matcher is M3, §11). Multi-valued fluents (`: { … }`, §5.7)
+ * and numeric fluents (`: int [ in lo..hi ]`, comparison guards, and the write
+ * side — `:=`/`+=`/`-=` effects over an expression VM, §5.8) are handled too.
+ * Still out: ramifications, and MV judgment-rule heads / negative MV effects
+ * (they need the §5.7 family reification), each rejected with a located error.
+ * The variable-free fragment is the degenerate arity-0 case: cellar_prop.story
+ * still compiles to the same world.
  *
  * Grammar handled by this slice:
  *
@@ -26,16 +28,26 @@
  *   sort    := 'sort'   ( IDENT | '(' IDENT (','? IDENT)* ')' )
  *   entity  := 'entity' ( ebind | '(' ebind* ')' )
  *   ebind   := IDENT (',' IDENT)* ':' IDENT            -- names : sort
- *   state   := 'state'  ( fdecl | '(' fdecl* ')' )     -- boolean fluents
- *   fdecl   := IDENT [ '(' IDENT (',' IDENT)* ')' ]    -- pred over sorts
- *   init    := 'init'   ( atom | '(' atom* ')' )       -- ground; set true
+ *   state   := 'state'  ( fdecl | '(' fdecl* ')' )
+ *   fdecl   := IDENT [ '(' IDENT (',' IDENT)* ')' ] [ ftype ]
+ *   ftype   := ':' 'int' [ 'in' INT '..' INT ]         -- numeric + clamp range
+ *            | ':' '{' IDENT (',' IDENT)* '}'           -- multi-valued domain
+ *   init    := 'init'   ( iatom | '(' iatom* ')' )      -- ground
+ *   iatom   := atom | IDENT '=' (IDENT | INT)           -- MV / numeric init
  *   rule    := 'rule' IDENT [ params ] ':' conj OP atom [ 'unless' conj ]
  *   action  := 'action' IDENT [ params ] ':' [ 'requires' conj ] 'causes' conj
  *   params  := '(' vbind (',' vbind)* ')'
  *   vbind   := IDENT ':' IDENT                          -- var : sort
  *   OP      := '->' | '=>' | '~>'
  *   sup     := IDENT '>' IDENT                          -- label > label
- *   conj    := atom ( '&' atom )*
+ *   conj    := eatom ( '&' eatom )*
+ *   eatom   := atom [ cmp INT | '=' IDENT | numop expr ] -- guard / MV / effect
+ *   cmp     := '<=' | '<' | '>=' | '>' | '='
+ *   numop   := ':=' | '+=' | '-='                        -- numeric effect (§5.8)
+ *   expr    := term (('+'|'-') term)*                    -- effect RHS, int-only
+ *   term    := factor ('*' factor)*
+ *   factor  := '-' factor | INT | ('min'|'max') '(' expr ',' expr ')'
+ *            | IDENT [ '(' arg (',' arg)* ')' ] | '(' expr ')'
  *   atom    := [ '~' ] IDENT [ '(' arg (',' arg)* ')' ]
  *   arg     := IDENT                                    -- a var or an entity
  *

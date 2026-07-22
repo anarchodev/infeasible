@@ -21,6 +21,8 @@
 #define MAX_SUPS       256
 #define MAX_INITS      256
 #define MAX_GROUND     256     /* ground atom name buffer */
+#define MAX_EXPRS      4096    /* effect-expression AST node pool */
+#define MAX_CODE       64      /* VM bytecode per ground effect */
 #define MAX_INSTANCES  (1 << 20)   /* per-rule grounding blow-up guard */
 #define CARD_WARN      100000      /* cross-product cardinality warning (§5.2) */
 
@@ -41,8 +43,29 @@ typedef struct {
     bool      is_guard;       /* numeric comparison `f <op> n` */
     world_cmp cmp;
     long      threshold;
+    bool        is_num_effect; /* numeric write `f := / += / -= expr` (§5.8) */
+    world_numop numop;
+    int         expr_root;     /* index into parser.exprs, when is_num_effect */
     int       line, col;
 } ast_atom;
+
+/* Effect-RHS expression tree (§5.8), interned into a parser-owned node pool.
+ * A leaf is a constant (`4`) or a numeric-fluent read (`hp`, `hp(X)`); interior
+ * nodes are the closed arithmetic set. Grounding walks the tree per instance,
+ * folding constant subtrees and emitting VM bytecode for the rest. */
+typedef enum {
+    EX_CONST, EX_LOAD, EX_ADD, EX_SUB, EX_MUL, EX_NEG, EX_MIN, EX_MAX
+} ex_kind;
+
+typedef struct {
+    ex_kind  kind;
+    long     konst;           /* EX_CONST */
+    uint32_t pred;            /* EX_LOAD: numeric fluent */
+    int      nargs;
+    ast_arg  args[MAX_ARGS];  /* EX_LOAD */
+    int      lhs, rhs;        /* child node indices (rhs unused for CONST/LOAD/NEG) */
+    int      line, col;
+} ex_node;
 
 typedef struct { uint32_t name; int sort; int line, col; } var_bind;
 
@@ -82,6 +105,8 @@ typedef struct {
     uint32_t values[MAX_DOMAIN];  /* the domain's value symbols, in order */
     int      nvalues;
     bool     is_num;              /* declared `: int` (§5.8) */
+    bool     has_range;           /* declared `in lo..hi` — the clamp range */
+    long     rmin, rmax;
     int      line, col;
 } ast_fluent;
 
@@ -124,6 +149,9 @@ typedef struct {
     int nsups;
     ast_atom    inits[MAX_INITS];
     int ninits;
+
+    ex_node    *exprs;            /* heap; MAX_EXPRS effect-expression nodes */
+    int nexprs;
 
     pred_info   preds[MAX_PREDS];
     int npreds;
@@ -324,6 +352,140 @@ static void parse_entity(parser *p)
     if (grouped && !expect(p, TK_RPAREN)) return;
 }
 
+/* ---- effect-expression parser (§5.8) --------------------------------
+ *
+ *   expr   := term (('+'|'-') term)*
+ *   term   := factor ('*' factor)*
+ *   factor := '-' factor | INT | ('min'|'max') '(' expr ',' expr ')'
+ *           | IDENT [ '(' arg (',' arg)* ')' ]        -- a numeric fluent read
+ *           | '(' expr ')'
+ * Returns a node index into p->exprs, or -1 on error. */
+
+static int alloc_expr(parser *p, ex_kind k, int line, int col)
+{
+    if (p->nexprs >= MAX_EXPRS) {
+        fail(p, line, col, "effect expression too complex (max %d nodes)", MAX_EXPRS);
+        return -1;
+    }
+    int i = p->nexprs++;
+    memset(&p->exprs[i], 0, sizeof p->exprs[i]);
+    p->exprs[i].kind = k;
+    p->exprs[i].lhs = p->exprs[i].rhs = -1;
+    p->exprs[i].line = line;
+    p->exprs[i].col = col;
+    return i;
+}
+
+static int parse_expr(parser *p);
+
+static int parse_factor(parser *p)
+{
+    if (p->cur.kind == TK_MINUS) {
+        token m = p->cur; advance(p);
+        int c = parse_factor(p);
+        if (c < 0) return -1;
+        int n = alloc_expr(p, EX_NEG, m.line, m.col);
+        if (n < 0) return -1;
+        p->exprs[n].lhs = c;
+        return n;
+    }
+    if (p->cur.kind == TK_INT) {
+        int n = alloc_expr(p, EX_CONST, p->cur.line, p->cur.col);
+        if (n < 0) return -1;
+        p->exprs[n].konst = p->cur.ival;
+        advance(p);
+        return n;
+    }
+    if (p->cur.kind == TK_LPAREN) {
+        advance(p);
+        int e = parse_expr(p);
+        if (e < 0) return -1;
+        if (!expect(p, TK_RPAREN)) return -1;
+        return e;
+    }
+    if (p->cur.kind == TK_IDENT) {
+        token id = p->cur;
+        bool ismin = ident_is(id, "min"), ismax = ident_is(id, "max");
+        advance(p);
+        if ((ismin || ismax) && p->cur.kind == TK_LPAREN) {   /* min/max(a, b) */
+            advance(p);
+            int a = parse_expr(p);
+            if (a < 0) return -1;
+            if (!expect(p, TK_COMMA)) return -1;
+            int b = parse_expr(p);
+            if (b < 0) return -1;
+            if (!expect(p, TK_RPAREN)) return -1;
+            int n = alloc_expr(p, ismin ? EX_MIN : EX_MAX, id.line, id.col);
+            if (n < 0) return -1;
+            p->exprs[n].lhs = a;
+            p->exprs[n].rhs = b;
+            return n;
+        }
+        int n = alloc_expr(p, EX_LOAD, id.line, id.col);        /* fluent read */
+        if (n < 0) return -1;
+        p->exprs[n].pred = intern_tok(p, id);
+        if (p->cur.kind == TK_LPAREN) {
+            advance(p);
+            for (;;) {
+                if (p->cur.kind != TK_IDENT) {
+                    char d[64]; tok_desc(p->cur, d, sizeof d);
+                    fail(p, p->cur.line, p->cur.col,
+                         "expected an argument name, found %s", d);
+                    return -1;
+                }
+                if (p->exprs[n].nargs >= MAX_ARGS) {
+                    fail(p, p->cur.line, p->cur.col, "too many arguments (max %d)", MAX_ARGS);
+                    return -1;
+                }
+                p->exprs[n].args[p->exprs[n].nargs].name = intern_tok(p, p->cur);
+                p->exprs[n].args[p->exprs[n].nargs].line = p->cur.line;
+                p->exprs[n].args[p->exprs[n].nargs].col = p->cur.col;
+                p->exprs[n].nargs++;
+                advance(p);
+                if (p->cur.kind == TK_COMMA) { advance(p); continue; }
+                break;
+            }
+            if (!expect(p, TK_RPAREN)) return -1;
+        }
+        return n;
+    }
+    char d[64]; tok_desc(p->cur, d, sizeof d);
+    fail(p, p->cur.line, p->cur.col,
+         "expected a number, fluent, or '(' in an effect expression, found %s", d);
+    return -1;
+}
+
+static int parse_term(parser *p)
+{
+    int l = parse_factor(p);
+    if (l < 0) return -1;
+    while (p->cur.kind == TK_STAR) {
+        token o = p->cur; advance(p);
+        int r = parse_factor(p);
+        if (r < 0) return -1;
+        int n = alloc_expr(p, EX_MUL, o.line, o.col);
+        if (n < 0) return -1;
+        p->exprs[n].lhs = l; p->exprs[n].rhs = r; l = n;
+    }
+    return l;
+}
+
+static int parse_expr(parser *p)
+{
+    int l = parse_term(p);
+    if (l < 0) return -1;
+    while (p->cur.kind == TK_PLUS || p->cur.kind == TK_MINUS) {
+        ex_kind k = p->cur.kind == TK_PLUS ? EX_ADD : EX_SUB;
+        token o = p->cur; advance(p);
+        int r = parse_term(p);
+        if (r < 0) return -1;
+        int n = alloc_expr(p, k, o.line, o.col);
+        if (n < 0) return -1;
+        p->exprs[n].lhs = l; p->exprs[n].rhs = r; l = n;
+    }
+    return l;
+}
+
 /* atom := [ '~' ] IDENT [ '(' arg (',' arg)* ')' ] */
 static bool parse_atom(parser *p, ast_atom *out)
 {
@@ -390,6 +552,16 @@ static bool parse_atom(parser *p, ast_atom *out)
             out->is_guard = true;
             out->cmp = WORLD_CMP_EQ;
         }
+    } else if (p->cur.kind == TK_ASSIGN || p->cur.kind == TK_PLUSEQ ||
+               p->cur.kind == TK_MINUSEQ) {    /* numeric effect (§5.8) */
+        out->numop = p->cur.kind == TK_ASSIGN ? WORLD_OP_ASSIGN
+                   : p->cur.kind == TK_PLUSEQ ? WORLD_OP_ADD
+                                              : WORLD_OP_SUB;
+        advance(p);
+        int e = parse_expr(p);
+        if (e < 0) return false;
+        out->is_num_effect = true;
+        out->expr_root = e;
     }
     return true;
 }
@@ -448,11 +620,18 @@ static bool parse_fdecl(parser *p, ast_fluent *f)
         advance(p);
         if (ident_is(p->cur, "int")) {             /* `: int` numeric fluent */
             advance(p);
-            if (p->cur.kind == TK_IN) {
-                fail(p, p->cur.line, p->cur.col,
-                     "numeric ranges (`in lo..hi`) are not supported yet — the "
-                     "declared-range clamp lands with numeric effects (§5.8)");
-                return false;
+            if (p->cur.kind == TK_IN) {            /* `in lo..hi` clamp range */
+                advance(p);
+                if (!parse_int(p, &f->rmin)) return false;
+                if (!expect(p, TK_DOTDOT)) return false;
+                if (!parse_int(p, &f->rmax)) return false;
+                if (f->rmax < f->rmin) {
+                    fail(p, f->line, f->col,
+                         "numeric range is empty: hi (%ld) is below lo (%ld)",
+                         f->rmax, f->rmin);
+                    return false;
+                }
+                f->has_range = true;
             }
             f->is_num = true;
             return true;
@@ -877,11 +1056,81 @@ static int var_index(var_bind *vars, int nvars, uint32_t name)
     return -1;
 }
 
+/* Every argument is a bound variable or a declared entity, with a sort check
+ * against the fluent schema. Shared by atoms, effect targets, and fluent reads
+ * inside effect expressions. */
+static void check_pred_args(parser *p, uint32_t pred, pred_info *pi,
+                            const ast_arg *args, int nargs,
+                            var_bind *vars, int nvars, const char *ctx)
+{
+    for (int k = 0; k < nargs; k++) {
+        const ast_arg *arg = &args[k];
+        int vi = var_index(vars, nvars, arg->name);
+        int ei = find_entity(p, arg->name);
+        if (vi < 0 && ei < 0) {
+            serr(p, arg->line, arg->col,
+                 "'%s' in %s is neither a bound variable nor a declared entity",
+                 intern_name(p->syms, arg->name), ctx);
+            continue;
+        }
+        if (pi && pi->is_fluent) {              /* sort-check against schema */
+            int want = pi->argsort[k];
+            int got = vi >= 0 ? vars[vi].sort : p->ents[ei].sort;
+            if (want >= 0 && got >= 0 && want != got)
+                serr(p, arg->line, arg->col,
+                     "argument %d of '%s' expects sort '%s' but got '%s'",
+                     k + 1, intern_name(p->syms, pred),
+                     p->sorts[want].name, p->sorts[got].name);
+        }
+    }
+}
+
+/* Validate an effect-RHS expression tree (§5.8): every fluent read resolves to
+ * a declared numeric fluent of matching arity with in-scope args. */
+static void check_expr(parser *p, int e, var_bind *vars, int nvars)
+{
+    if (e < 0) return;
+    ex_node *n = &p->exprs[e];
+    switch (n->kind) {
+    case EX_CONST:
+        return;
+    case EX_LOAD: {
+        note_ref(p, n->pred, n->line, n->col);
+        pred_info *pi = find_pred(p, n->pred);
+        if (!pi || !pi->is_fluent || !pi->is_num) {
+            serr(p, n->line, n->col,
+                 "'%s' is read in an effect expression but is not a declared "
+                 "numeric fluent (`%s : int`)",
+                 intern_name(p->syms, n->pred), intern_name(p->syms, n->pred));
+            return;
+        }
+        if (pi->arity != n->nargs) {
+            serr(p, n->line, n->col, "'%s' takes %d argument%s but %d given",
+                 intern_name(p->syms, n->pred), pi->arity,
+                 pi->arity == 1 ? "" : "s", n->nargs);
+            return;
+        }
+        check_pred_args(p, n->pred, pi, n->args, n->nargs, vars, nvars,
+                        "an effect expression");
+        return;
+    }
+    case EX_NEG:
+        check_expr(p, n->lhs, vars, nvars);
+        return;
+    default:
+        check_expr(p, n->lhs, vars, nvars);
+        check_expr(p, n->rhs, vars, nvars);
+        return;
+    }
+}
+
 /* Validate one atom against the schema: predicate known, arity matches, and
  * every argument is a bound variable or a declared entity (with a sort check
- * for fluent atoms). `note` records condition refs for orphan analysis. */
+ * for fluent atoms). `note` records condition refs for orphan analysis;
+ * `in_effect` is true only for atoms in a `causes` clause, where numeric
+ * effect operators (`:=`/`+=`/`-=`) are legal. */
 static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
-                       bool note, const char *ctx)
+                       bool note, bool in_effect, const char *ctx)
 {
     if (note) note_ref(p, at->pred, at->line, at->col);
     pred_info *pi = find_pred(p, at->pred);
@@ -890,6 +1139,35 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
              "'%s' takes %d argument%s but %d given",
              intern_name(p->syms, at->pred), pi->arity,
              pi->arity == 1 ? "" : "s", at->nargs);
+        return;
+    }
+    /* numeric write discipline (§5.8): an effect operator assigns a numeric
+     * fluent and is legal only in a `causes` clause. */
+    if (at->is_num_effect) {
+        if (!in_effect) {
+            serr(p, at->line, at->col,
+                 "an effect operator (`:=`/`+=`/`-=`) can only appear in a "
+                 "`causes` clause");
+            return;
+        }
+        if (!pi || !pi->is_fluent || !pi->is_num) {
+            serr(p, at->line, at->col,
+                 "'%s' is assigned numerically but is not a declared numeric "
+                 "fluent (`%s : int`)",
+                 intern_name(p->syms, at->pred), intern_name(p->syms, at->pred));
+            return;
+        }
+        check_pred_args(p, at->pred, pi, at->args, at->nargs, vars, nvars, ctx);
+        check_expr(p, at->expr_root, vars, nvars);
+        return;
+    }
+    /* in a `causes` clause a numeric fluent is *written*, never compared:
+     * `hp = 5`, `hp <= 0`, or a bare `hp` are all read-forms, not effects. */
+    if (in_effect && (at->is_guard || (pi && pi->is_num))) {
+        serr(p, at->line, at->col,
+             "to change '%s' in a `causes` clause use an effect operator "
+             "(`%s := …`, `+=`, `-=`), not a comparison",
+             intern_name(p->syms, at->pred), intern_name(p->syms, at->pred));
         return;
     }
     /* numeric discipline: a guard needs a numeric fluent; a numeric fluent
@@ -931,26 +1209,7 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
                  "'%s' is not a value of '%s'",
                  intern_name(p->syms, at->value), intern_name(p->syms, at->pred));
     }
-    for (int k = 0; k < at->nargs; k++) {
-        ast_arg *arg = &at->args[k];
-        int vi = var_index(vars, nvars, arg->name);
-        int ei = find_entity(p, arg->name);
-        if (vi < 0 && ei < 0) {
-            serr(p, arg->line, arg->col,
-                 "'%s' in %s is neither a bound variable nor a declared entity",
-                 intern_name(p->syms, arg->name), ctx);
-            continue;
-        }
-        if (pi && pi->is_fluent) {              /* sort-check against schema */
-            int want = pi->argsort[k];
-            int got = vi >= 0 ? vars[vi].sort : p->ents[ei].sort;
-            if (want >= 0 && got >= 0 && want != got)
-                serr(p, arg->line, arg->col,
-                     "argument %d of '%s' expects sort '%s' but got '%s'",
-                     k + 1, intern_name(p->syms, at->pred),
-                     p->sorts[want].name, p->sorts[got].name);
-        }
-    }
+    check_pred_args(p, at->pred, pi, at->args, at->nargs, vars, nvars, ctx);
 }
 
 /* Every rule variable must occur in the body — the safety / range-restriction
@@ -981,8 +1240,8 @@ static void semantic_pass(parser *p)
         ast_rule *r = &p->rules[i];
         resolve_vars(p, r->vars, r->nvars, "a rule");
         for (int b = 0; b < r->nbody; b++)
-            check_atom(p, &r->body[b], r->vars, r->nvars, true, "a rule body");
-        check_atom(p, &r->head, r->vars, r->nvars, false, "a rule head");
+            check_atom(p, &r->body[b], r->vars, r->nvars, true, false, "a rule body");
+        check_atom(p, &r->head, r->vars, r->nvars, false, false, "a rule head");
         if (r->head.value != INTERN_NONE)
             serr(p, r->head.line, r->head.col,
                  "concluding a multi-valued value ('%s = %s') from a judgment "
@@ -995,7 +1254,7 @@ static void semantic_pass(parser *p)
                  "a rule cannot conclude a numeric comparison — guards are "
                  "read-only inputs derived from the value store (§5.8)");
         for (int b = 0; b < r->nguard; b++)
-            check_atom(p, &r->guard[b], r->vars, r->nvars, true, "an `unless` guard");
+            check_atom(p, &r->guard[b], r->vars, r->nvars, true, false, "an `unless` guard");
         check_safety(p, r);
         for (int j = i + 1; j < p->nrules; j++)
             if (strcmp(r->label, p->rules[j].label) == 0)
@@ -1007,15 +1266,9 @@ static void semantic_pass(parser *p)
         ast_action *a = &p->actions[i];
         resolve_vars(p, a->vars, a->nvars, "an action");
         for (int b = 0; b < a->nreq; b++)
-            check_atom(p, &a->requires[b], a->vars, a->nvars, true, "a `requires` clause");
+            check_atom(p, &a->requires[b], a->vars, a->nvars, true, false, "a `requires` clause");
         for (int b = 0; b < a->neff; b++) {
-            check_atom(p, &a->effects[b], a->vars, a->nvars, false, "a `causes` clause");
-            pred_info *ep = find_pred(p, a->effects[b].pred);
-            if (a->effects[b].is_guard || (ep && ep->is_num))
-                serr(p, a->effects[b].line, a->effects[b].col,
-                     "numeric effects (`:=`, `+=`, `-=`) are not supported yet — "
-                     "the value store's write side and commit pipeline are the "
-                     "next slice (§5.8)");
+            check_atom(p, &a->effects[b], a->vars, a->nvars, false, true, "a `causes` clause");
             if (a->effects[b].value != INTERN_NONE && a->effects[b].neg)
                 serr(p, a->effects[b].line, a->effects[b].col,
                      "a negative multi-valued effect ('~(%s = %s)') is not "
@@ -1035,7 +1288,7 @@ static void semantic_pass(parser *p)
                  intern_name(p->syms, a->pred));
             continue;
         }
-        check_atom(p, a, NULL, 0, false, "an init fact");
+        check_atom(p, a, NULL, 0, false, false, "an init fact");
         if (a->is_guard && a->cmp != WORLD_CMP_EQ)
             serr(p, a->line, a->col,
                  "init sets a numeric fluent's value with `=` (e.g. `%s = 10`), "
@@ -1122,6 +1375,65 @@ static uint32_t resolve_arg(var_bind *vars, int nvars,
     return arg.name;                               /* a declared entity */
 }
 
+/* Fold a fully-constant expression subtree to its value; false if it reads a
+ * fluent (EX_LOAD), which must stay dynamic (§5.8: "constant folding, then
+ * bytecode"). */
+static bool expr_fold(parser *p, int e, long *out)
+{
+    ex_node *n = &p->exprs[e];
+    long a, b;
+    switch (n->kind) {
+    case EX_CONST: *out = n->konst; return true;
+    case EX_LOAD:  return false;
+    case EX_NEG:
+        if (!expr_fold(p, n->lhs, &a)) return false;
+        *out = -a; return true;
+    default:
+        if (!expr_fold(p, n->lhs, &a) || !expr_fold(p, n->rhs, &b)) return false;
+        switch (n->kind) {
+        case EX_ADD: *out = a + b; break;
+        case EX_SUB: *out = a - b; break;
+        case EX_MUL: *out = a * b; break;
+        case EX_MIN: *out = a < b ? a : b; break;
+        case EX_MAX: *out = a > b ? a : b; break;
+        default: return false;
+        }
+        return true;
+    }
+}
+
+/* Emit RPN bytecode for expr node `e` under `binding`, folding constant
+ * subtrees and resolving fluent reads to their ground value-store atom. */
+static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
+                      const uint32_t *binding, expr_ins *code, int *pos)
+{
+    long cv;
+    if (expr_fold(p, e, &cv)) {
+        if (*pos < MAX_CODE) { code[*pos].op = EXPR_CONST; code[(*pos)++].arg = cv; }
+        return;
+    }
+    ex_node *n = &p->exprs[e];
+    if (n->kind == EX_LOAD) {
+        uint32_t args[MAX_ARGS];
+        for (int k = 0; k < n->nargs; k++)
+            args[k] = resolve_arg(vars, nvars, binding, n->args[k]);
+        uint32_t g = ground_pred(p, n->pred, args, n->nargs);
+        if (*pos < MAX_CODE) { code[*pos].op = EXPR_LOAD; code[(*pos)++].arg = (long)g; }
+        return;
+    }
+    if (n->kind == EX_NEG) {
+        emit_expr(p, n->lhs, vars, nvars, binding, code, pos);
+        if (*pos < MAX_CODE) { code[*pos].op = EXPR_NEG; code[(*pos)++].arg = 0; }
+        return;
+    }
+    emit_expr(p, n->lhs, vars, nvars, binding, code, pos);
+    emit_expr(p, n->rhs, vars, nvars, binding, code, pos);
+    expr_op op = n->kind == EX_ADD ? EXPR_ADD : n->kind == EX_SUB ? EXPR_SUB
+               : n->kind == EX_MUL ? EXPR_MUL : n->kind == EX_MIN ? EXPR_MIN
+                                                                  : EXPR_MAX;
+    if (*pos < MAX_CODE) { code[*pos].op = op; code[(*pos)++].arg = 0; }
+}
+
 static dl_lit ground_lit(parser *p, ast_atom *at, var_bind *vars, int nvars,
                          const uint32_t *binding)
 {
@@ -1196,7 +1508,7 @@ static void declare_ground_fluents(parser *p)
             decode_binding(p, vb, f->nargs, idx, binding);
             if (f->is_num)                         /* value-store slot, not an atom */
                 world_declare_num(p->w, ground_pred(p, f->pred, binding, f->nargs),
-                                  0, 0, false);
+                                  f->rmin, f->rmax, f->has_range);
             else if (f->is_mv)                     /* one boolean atom per value */
                 for (int v = 0; v < f->nvalues; v++)
                     world_declare_fluent(p->w, ground_mv_atom(p, f->pred, binding,
@@ -1307,6 +1619,8 @@ static void ground_action(parser *p, ast_action *a)
         int ne = 0;
         for (int b = 0; b < a->neff && ne < MAX_BODY; b++) {
             ast_atom *e = &a->effects[b];
+            if (e->is_num_effect)                  /* numeric: emitted below */
+                continue;
             if (e->value == INTERN_NONE) {         /* boolean effect */
                 eff[ne++] = ground_lit(p, e, a->vars, a->nvars, binding);
                 continue;
@@ -1321,7 +1635,22 @@ static void ground_action(parser *p, ast_action *a)
                     eff[ne++] = dl_neg(ground_mv_atom(p, e->pred, args, e->nargs,
                                                       pi->values[v]));
         }
-        world_add_step_rule(p->w, aname, act, conds, a->nreq, eff, ne);
+        int h = world_add_step_rule(p->w, aname, act, conds, a->nreq, eff, ne);
+
+        /* numeric effects (§5.8): ground the target value-store atom and
+         * compile the RHS expression to VM bytecode for this instance. */
+        for (int b = 0; b < a->neff; b++) {
+            ast_atom *e = &a->effects[b];
+            if (!e->is_num_effect) continue;
+            uint32_t nargs[MAX_ARGS];
+            for (int k = 0; k < e->nargs; k++)
+                nargs[k] = resolve_arg(a->vars, a->nvars, binding, e->args[k]);
+            uint32_t num = ground_pred(p, e->pred, nargs, e->nargs);
+            expr_ins code[MAX_CODE];
+            int nc = 0;
+            emit_expr(p, e->expr_root, a->vars, a->nvars, binding, code, &nc);
+            world_add_num_effect(p->w, h, num, e->numop, code, nc);
+        }
     }
 }
 
@@ -1433,6 +1762,7 @@ world *story_compile(const char *src, intern *syms, story_diags *diags)
     parser *p = calloc(1, sizeof *p);
     p->rules = calloc(MAX_RULES, sizeof *p->rules);
     p->actions = calloc(MAX_ACTIONS, sizeof *p->actions);
+    p->exprs = calloc(MAX_EXPRS, sizeof *p->exprs);
     lexer_init(&p->lx, src);
     p->syms = syms;
     p->w = world_new(syms);
@@ -1482,6 +1812,7 @@ world *story_compile(const char *src, intern *syms, story_diags *diags)
     for (int i = 0; i < p->nrules; i++) free(p->rules[i].insts);
     free(p->rules);
     free(p->actions);
+    free(p->exprs);
     free(p);
     return result;
 }

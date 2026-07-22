@@ -103,14 +103,24 @@ token lexer_next(lexer *lx)
     case ')': t.kind = TK_RPAREN; break;
     case '{': t.kind = TK_LBRACE; break;
     case '}': t.kind = TK_RBRACE; break;
-    case ':': t.kind = TK_COLON;  break;
+    case ':': if (*lx->p == '=') { adv(lx); t.kind = TK_ASSIGN; }
+              else                 t.kind = TK_COLON;
+              break;
     case ',': t.kind = TK_COMMA;  break;
     case '&': t.kind = TK_AMP;    break;
+    case '*': t.kind = TK_STAR;   break;
+    case '.': if (*lx->p == '.') { adv(lx); t.kind = TK_DOTDOT; }
+              else                 t.kind = TK_ERROR;
+              break;
     case '~': if (*lx->p == '>') { adv(lx); t.kind = TK_SQARROW; }
               else                 t.kind = TK_TILDE;
               break;
-    case '-': if (*lx->p == '>') { adv(lx); t.kind = TK_ARROW; }
-              else                 t.kind = TK_MINUS;
+    case '+': if (*lx->p == '=') { adv(lx); t.kind = TK_PLUSEQ; }
+              else                 t.kind = TK_PLUS;
+              break;
+    case '-': if      (*lx->p == '>') { adv(lx); t.kind = TK_ARROW; }
+              else if (*lx->p == '=') { adv(lx); t.kind = TK_MINUSEQ; }
+              else                      t.kind = TK_MINUS;
               break;
     case '=': if (*lx->p == '>') { adv(lx); t.kind = TK_FATARROW; }
               else                 t.kind = TK_EQ;
@@ -165,6 +175,12 @@ const char *tok_kind_name(tok_kind k)
     case TK_LE:       return "'<='";
     case TK_EQ:       return "'='";
     case TK_MINUS:    return "'-'";
+    case TK_ASSIGN:   return "':='";
+    case TK_PLUSEQ:   return "'+='";
+    case TK_MINUSEQ:  return "'-='";
+    case TK_PLUS:     return "'+'";
+    case TK_STAR:     return "'*'";
+    case TK_DOTDOT:   return "'..'";
     }
     return "?";
 }

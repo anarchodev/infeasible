@@ -29,7 +29,15 @@ typedef enum {
     TK_GE,         /* >=                  */
     TK_LE,         /* <=                  */
     TK_EQ,         /* =                   */
-    TK_MINUS       /* -                   */
+    TK_MINUS,      /* -                   */
+
+    /* numeric effects and expressions (§5.8 write side) */
+    TK_ASSIGN,     /* :=  absolute effect */
+    TK_PLUSEQ,     /* +=  additive effect */
+    TK_MINUSEQ,    /* -=  additive effect */
+    TK_PLUS,       /* +                   */
+    TK_STAR,       /* *                   */
+    TK_DOTDOT      /* ..  range           */
 } tok_kind;
 
 typedef struct {
