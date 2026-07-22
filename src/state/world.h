@@ -27,6 +27,26 @@ void world_declare_fluent(world *w, uint32_t atom);
 void world_set(world *w, uint32_t atom, bool value);   /* initial state / loading */
 bool world_get(const world *w, uint32_t atom);
 
+/* Numeric fluents (DESIGN.md §5.8): an integer value store, kept separate from
+ * the boolean closed-world fluents — scalars never become atoms. Values are
+ * read only through comparison *guard atoms* (`hp<=0`), which the world asserts
+ * closed-world from the stored value on every evaluation (strict inputs, never
+ * UNDECIDED, never concluded by a rule). Effects (`:=`/`+=`/`-=`) and the
+ * commit pipeline are a later slice; here values change only via world_set_num.
+ * `min`/`max` are the declared clamp range (stored for that later slice). */
+typedef enum {
+    WORLD_CMP_LE, WORLD_CMP_LT, WORLD_CMP_GE, WORLD_CMP_GT, WORLD_CMP_EQ
+} world_cmp;
+
+void world_declare_num(world *w, uint32_t atom, long min, long max, bool has_range);
+void world_set_num(world *w, uint32_t atom, long value);
+long world_get_num(const world *w, uint32_t atom);
+
+/* Register a guard atom: `guard` is proved exactly when the numeric fluent
+ * `num` satisfies `<op> threshold` for its current value. */
+void world_add_guard(world *w, uint32_t guard, uint32_t num,
+                     world_cmp op, long threshold);
+
 /* Judgment rules (query layer). Returns rule handle for world_add_sup. */
 int  world_add_rule(world *w, const char *name, dl_rule_kind kind,
                     dl_lit head, const dl_lit *body, int nbody);

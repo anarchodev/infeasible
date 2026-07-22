@@ -142,8 +142,8 @@ static int expect_error(const char *src)
 static int test_errors(void)
 {
     if (expect_error("rule r: a =>"))                 return 1; /* missing head */
-    if (expect_error("state ( hp(actor) )"))          return 1; /* args unsupported */
-    if (expect_error("state ( hp : int )"))           return 1; /* typed unsupported */
+    if (expect_error("state ( hp(actor) )"))          return 1; /* undeclared sort */
+    if (expect_error("state ( terrain : tile )"))     return 1; /* entity-domain type */
     if (expect_error("init undeclared"))              return 1; /* not a fluent */
     if (expect_error("rule r: a => b\n r > ghost"))   return 1; /* unknown label */
     if (expect_error("rule r a => b"))                return 1; /* missing colon */

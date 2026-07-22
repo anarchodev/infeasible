@@ -33,6 +33,12 @@ struct world {
     jsup *jsups; int njs, capjs;
     srule *srules; int nsr, capsr;
 
+    /* numeric value store + comparison guards (§5.8, read side) */
+    struct { uint32_t atom; long value, min, max; bool has_range; } *nums;
+    int nnum, capnum;
+    struct { uint32_t guard, num; world_cmp op; long threshold; } *guards;
+    int ng, capg;
+
     /* Cached columnar step schema (an N=1 family — DESIGN.md 5.8: single
      * derive is multiderive at N=1). The step theory's structure — judgment
      * rules, generated inertia, causal rules, superiority — is fixed
@@ -76,6 +82,8 @@ void world_free(world *w)
     free(w->jrules);
     free(w->jsups);
     free(w->srules);
+    free(w->nums);
+    free(w->guards);
     free(w);
 }
 
@@ -118,6 +126,66 @@ bool world_get(const world *w, uint32_t atom)
 {
     int i = fluent_index(w, atom);
     return i >= 0 && w->vals[i];
+}
+
+/* ---- numeric value store & guards (§5.8, read side) ---------------- */
+
+static int num_index(const world *w, uint32_t atom)
+{
+    for (int i = 0; i < w->nnum; i++)
+        if (w->nums[i].atom == atom) return i;
+    return -1;
+}
+
+void world_declare_num(world *w, uint32_t atom, long min, long max, bool has_range)
+{
+    if (num_index(w, atom) >= 0) return;
+    GROW(w->nums, w->nnum, w->capnum);
+    w->nums[w->nnum].atom = atom;
+    w->nums[w->nnum].value = 0;
+    w->nums[w->nnum].min = min;
+    w->nums[w->nnum].max = max;
+    w->nums[w->nnum].has_range = has_range;
+    w->nnum++;
+}
+
+void world_set_num(world *w, uint32_t atom, long value)
+{
+    int i = num_index(w, atom);
+    if (i >= 0) w->nums[i].value = value;
+}
+
+long world_get_num(const world *w, uint32_t atom)
+{
+    int i = num_index(w, atom);
+    return i >= 0 ? w->nums[i].value : 0;
+}
+
+void world_add_guard(world *w, uint32_t guard, uint32_t num,
+                     world_cmp op, long threshold)
+{
+    for (int i = 0; i < w->ng; i++)          /* dedup: one atom per (fluent,op,thr) */
+        if (w->guards[i].guard == guard) return;
+    GROW(w->guards, w->ng, w->capg);
+    w->guards[w->ng].guard = guard;
+    w->guards[w->ng].num = num;
+    w->guards[w->ng].op = op;
+    w->guards[w->ng].threshold = threshold;
+    w->ng++;
+}
+
+/* Does guard g hold for the current value of its numeric fluent? */
+static bool guard_holds(const world *w, int g)
+{
+    long v = world_get_num(w, w->guards[g].num), t = w->guards[g].threshold;
+    switch (w->guards[g].op) {
+    case WORLD_CMP_LE: return v <= t;
+    case WORLD_CMP_LT: return v <  t;
+    case WORLD_CMP_GE: return v >= t;
+    case WORLD_CMP_GT: return v >  t;
+    case WORLD_CMP_EQ: return v == t;
+    }
+    return false;
 }
 
 int world_add_rule(world *w, const char *name, dl_rule_kind kind,
@@ -178,6 +246,11 @@ static void add_state_and_judgments(const world *w, dl_theory *th)
     for (int i = 0; i < w->nfl; i++) {
         dl_lit f = dl_pos(w->fluents[i]);
         dl_add_fact(th, w->vals[i] ? f : dl_complement(f));
+    }
+    /* numeric guard atoms: closed-world from the value store, both polarities */
+    for (int g = 0; g < w->ng; g++) {
+        dl_lit gl = dl_pos(w->guards[g].guard);
+        dl_add_fact(th, guard_holds(w, g) ? gl : dl_complement(gl));
     }
 }
 
@@ -361,6 +434,14 @@ int world_step(world *w, const uint32_t *actions, int nactions,
         uint32_t a = actions[i];
         if (a < w->loc_cap && w->loc_of[a] != LOC_NONE) {
             dl_lit l = { w->loc_of[a], false };
+            dlcol_add_fact(f, l, 0);
+        }
+    }
+    /* numeric guard atoms feed judgment rules inside the step theory too */
+    for (int g = 0; g < w->ng; g++) {
+        uint32_t ga = w->guards[g].guard;
+        if (ga < w->loc_cap && w->loc_of[ga] != LOC_NONE) {
+            dl_lit l = { w->loc_of[ga], !guard_holds(w, g) };
             dlcol_add_fact(f, l, 0);
         }
     }

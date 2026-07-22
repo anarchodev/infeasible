@@ -33,12 +33,15 @@ typedef struct { uint32_t name; int line, col; } ast_arg;
  * symbol. Multi-valued atoms erase at ground time to a boolean value-atom
  * "f(a)=v" (§5.7); in a `causes` effect they expand to the whole family. */
 typedef struct {
-    uint32_t pred;
-    bool     neg;
-    int      nargs;
-    ast_arg  args[MAX_ARGS];
-    uint32_t value;
-    int      line, col;
+    uint32_t  pred;
+    bool      neg;
+    int       nargs;
+    ast_arg   args[MAX_ARGS];
+    uint32_t  value;          /* MV value symbol, else 0 */
+    bool      is_guard;       /* numeric comparison `f <op> n` */
+    world_cmp cmp;
+    long      threshold;
+    int       line, col;
 } ast_atom;
 
 typedef struct { uint32_t name; int sort; int line, col; } var_bind;
@@ -78,6 +81,7 @@ typedef struct {
     bool     is_mv;               /* declared with a `: { … }` value domain */
     uint32_t values[MAX_DOMAIN];  /* the domain's value symbols, in order */
     int      nvalues;
+    bool     is_num;              /* declared `: int` (§5.8) */
     int      line, col;
 } ast_fluent;
 
@@ -94,6 +98,7 @@ typedef struct {
     bool     is_mv;               /* a multi-valued fluent */
     uint32_t values[MAX_DOMAIN];  /* its domain, for value-in-domain checks */
     int      nvalues;
+    bool     is_num;              /* a numeric fluent (§5.8) */
 } pred_info;
 
 typedef struct {
@@ -217,6 +222,27 @@ static void copy_ident(char *dst, size_t cap, token t)
     dst[n] = '\0';
 }
 
+static bool ident_is(token t, const char *word)
+{
+    return t.kind == TK_IDENT && (int)strlen(word) == t.len &&
+           memcmp(t.start, word, (size_t)t.len) == 0;
+}
+
+/* Parse an integer literal with an optional leading minus. */
+static bool parse_int(parser *p, long *out)
+{
+    bool neg = false;
+    if (p->cur.kind == TK_MINUS) { neg = true; advance(p); }
+    if (p->cur.kind != TK_INT) {
+        char d[64]; tok_desc(p->cur, d, sizeof d);
+        fail(p, p->cur.line, p->cur.col, "expected an integer, found %s", d);
+        return false;
+    }
+    *out = neg ? -p->cur.ival : p->cur.ival;
+    advance(p);
+    return true;
+}
+
 /* ---- declaration parsing -------------------------------------------- */
 
 /* sort := 'sort' ( IDENT | '(' (','? IDENT)* ')' ) */
@@ -337,16 +363,33 @@ static bool parse_atom(parser *p, ast_atom *out)
         }
         if (!expect(p, TK_RPAREN)) return false;
     }
-    /* a `= value` suffix makes this a multi-valued reference/assignment */
-    if (p->cur.kind == TK_EQ) {
+    /* A comparison operator makes this a numeric guard `f <op> n`; a `=` is
+     * overloaded — `f = value` (multi-valued) vs `f = 12` (numeric equality),
+     * disambiguated by whether an identifier or an integer follows. */
+    world_cmp op = WORLD_CMP_EQ;
+    bool cmp = true;
+    switch (p->cur.kind) {
+    case TK_LE: op = WORLD_CMP_LE; break;
+    case TK_LT: op = WORLD_CMP_LT; break;
+    case TK_GE: op = WORLD_CMP_GE; break;
+    case TK_GT: op = WORLD_CMP_GT; break;
+    default:    cmp = false; break;
+    }
+    if (cmp) {
         advance(p);
-        if (p->cur.kind != TK_IDENT) {
-            char d[64]; tok_desc(p->cur, d, sizeof d);
-            fail(p, p->cur.line, p->cur.col, "expected a value name, found %s", d);
-            return false;
+        if (!parse_int(p, &out->threshold)) return false;
+        out->is_guard = true;
+        out->cmp = op;
+    } else if (p->cur.kind == TK_EQ) {
+        advance(p);
+        if (p->cur.kind == TK_IDENT) {         /* multi-valued: f = value */
+            out->value = intern_tok(p, p->cur);
+            advance(p);
+        } else {                               /* numeric equality: f = 12 */
+            if (!parse_int(p, &out->threshold)) return false;
+            out->is_guard = true;
+            out->cmp = WORLD_CMP_EQ;
         }
-        out->value = intern_tok(p, p->cur);
-        advance(p);
     }
     return true;
 }
@@ -403,11 +446,22 @@ static bool parse_fdecl(parser *p, ast_fluent *f)
     }
     if (p->cur.kind == TK_COLON) {
         advance(p);
+        if (ident_is(p->cur, "int")) {             /* `: int` numeric fluent */
+            advance(p);
+            if (p->cur.kind == TK_IN) {
+                fail(p, p->cur.line, p->cur.col,
+                     "numeric ranges (`in lo..hi`) are not supported yet — the "
+                     "declared-range clamp lands with numeric effects (§5.8)");
+                return false;
+            }
+            f->is_num = true;
+            return true;
+        }
         if (p->cur.kind != TK_LBRACE) {
-            /* `: int`, `: cell`, `: int in 0..60` — numeric/functional, slice c */
+            /* `: cell`, `: tile default …` — entity-domain/functional, later */
             fail(p, p->cur.line, p->cur.col,
-                 "numeric and entity-domain fluents are not supported yet "
-                 "(write `: { v1, v2, … }` for a value domain; §5.8 numerics land later)");
+                 "only `: int` and `: { v1, v2, … }` fluent domains are "
+                 "supported (entity-domain fluents land later)");
             return false;
         }
         advance(p);                                /* '{' */
@@ -777,6 +831,7 @@ static void build_pred_registry(parser *p)
         for (int k = 0; k < f->nargs; k++)
             pi->argsort[k] = decode_sort(p, -(int)f->argsort[k] - 2,
                                          f->line, f->col, "a fluent declaration");
+        pi->is_num = f->is_num;
         pi->is_mv = f->is_mv;
         pi->nvalues = f->nvalues;
         for (int k = 0; k < f->nvalues; k++) {
@@ -835,6 +890,22 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
              "'%s' takes %d argument%s but %d given",
              intern_name(p->syms, at->pred), pi->arity,
              pi->arity == 1 ? "" : "s", at->nargs);
+        return;
+    }
+    /* numeric discipline: a guard needs a numeric fluent; a numeric fluent
+     * must be read through a comparison, never as a bare or boolean atom. */
+    if (at->is_guard) {
+        if (!pi || !pi->is_fluent || !pi->is_num)
+            serr(p, at->line, at->col,
+                 "'%s' is compared numerically but is not a declared numeric "
+                 "fluent (`%s : int`)",
+                 intern_name(p->syms, at->pred), intern_name(p->syms, at->pred));
+        return;
+    }
+    if (pi && pi->is_num) {
+        serr(p, at->line, at->col,
+             "'%s' is numeric — read it with a comparison (e.g. `%s <= 0`)",
+             intern_name(p->syms, at->pred), intern_name(p->syms, at->pred));
         return;
     }
     /* multi-valued discipline: an MV fluent must be written `f = v`, a boolean
@@ -919,6 +990,10 @@ static void semantic_pass(parser *p)
                  "reification; set the value with an `action … causes` instead",
                  intern_name(p->syms, r->head.pred),
                  intern_name(p->syms, r->head.value));
+        if (r->head.is_guard)
+            serr(p, r->head.line, r->head.col,
+                 "a rule cannot conclude a numeric comparison — guards are "
+                 "read-only inputs derived from the value store (§5.8)");
         for (int b = 0; b < r->nguard; b++)
             check_atom(p, &r->guard[b], r->vars, r->nvars, true, "an `unless` guard");
         check_safety(p, r);
@@ -935,6 +1010,12 @@ static void semantic_pass(parser *p)
             check_atom(p, &a->requires[b], a->vars, a->nvars, true, "a `requires` clause");
         for (int b = 0; b < a->neff; b++) {
             check_atom(p, &a->effects[b], a->vars, a->nvars, false, "a `causes` clause");
+            pred_info *ep = find_pred(p, a->effects[b].pred);
+            if (a->effects[b].is_guard || (ep && ep->is_num))
+                serr(p, a->effects[b].line, a->effects[b].col,
+                     "numeric effects (`:=`, `+=`, `-=`) are not supported yet — "
+                     "the value store's write side and commit pipeline are the "
+                     "next slice (§5.8)");
             if (a->effects[b].value != INTERN_NONE && a->effects[b].neg)
                 serr(p, a->effects[b].line, a->effects[b].col,
                      "a negative multi-valued effect ('~(%s = %s)') is not "
@@ -955,6 +1036,10 @@ static void semantic_pass(parser *p)
             continue;
         }
         check_atom(p, a, NULL, 0, false, "an init fact");
+        if (a->is_guard && a->cmp != WORLD_CMP_EQ)
+            serr(p, a->line, a->col,
+                 "init sets a numeric fluent's value with `=` (e.g. `%s = 10`), "
+                 "not a comparison", intern_name(p->syms, a->pred));
         for (int k = 0; k < a->nargs; k++)
             if (find_entity(p, a->args[k].name) < 0)
                 serr(p, a->args[k].line, a->args[k].col,
@@ -1001,6 +1086,32 @@ static uint32_t ground_mv_atom(parser *p, uint32_t pred, const uint32_t *args,
     return intern_id(p->syms, buf);
 }
 
+static const char *cmp_spelling(world_cmp op)
+{
+    switch (op) {
+    case WORLD_CMP_LE: return "<=";
+    case WORLD_CMP_LT: return "<";
+    case WORLD_CMP_GE: return ">=";
+    case WORLD_CMP_GT: return ">";
+    case WORLD_CMP_EQ: return "=";
+    }
+    return "?";
+}
+
+/* Build the interned guard atom "pred(e1,e2)<op>n" — a numeric comparison
+ * erases to this boolean landmark atom, asserted closed-world from the value
+ * store each evaluation (§5.8). */
+static uint32_t ground_guard_atom(parser *p, uint32_t pred, const uint32_t *args,
+                                  int n, world_cmp op, long threshold)
+{
+    char buf[MAX_GROUND];
+    int off = build_term(p, pred, args, n, buf, sizeof buf);
+    if (off < (int)sizeof buf)
+        snprintf(buf + off, sizeof buf - (size_t)off, "%s%ld",
+                 cmp_spelling(op), threshold);
+    return intern_id(p->syms, buf);
+}
+
 /* Resolve an argument name to a concrete entity atom under `binding`
  * (binding[i] is the entity chosen for vars[i]). */
 static uint32_t resolve_arg(var_bind *vars, int nvars,
@@ -1017,9 +1128,16 @@ static dl_lit ground_lit(parser *p, ast_atom *at, var_bind *vars, int nvars,
     uint32_t args[MAX_ARGS];
     for (int k = 0; k < at->nargs; k++)
         args[k] = resolve_arg(vars, nvars, binding, at->args[k]);
-    uint32_t g = at->value != INTERN_NONE
-        ? ground_mv_atom(p, at->pred, args, at->nargs, at->value)
-        : ground_pred(p, at->pred, args, at->nargs);
+    uint32_t g;
+    if (at->is_guard) {                            /* numeric landmark guard */
+        uint32_t term = ground_pred(p, at->pred, args, at->nargs);
+        g = ground_guard_atom(p, at->pred, args, at->nargs, at->cmp, at->threshold);
+        world_add_guard(p->w, g, term, at->cmp, at->threshold);
+    } else if (at->value != INTERN_NONE) {
+        g = ground_mv_atom(p, at->pred, args, at->nargs, at->value);
+    } else {
+        g = ground_pred(p, at->pred, args, at->nargs);
+    }
     return at->neg ? dl_neg(g) : dl_pos(g);
 }
 
@@ -1076,7 +1194,10 @@ static void declare_ground_fluents(parser *p)
         uint32_t binding[MAX_ARGS];
         for (long idx = 0; idx < total; idx++) {
             decode_binding(p, vb, f->nargs, idx, binding);
-            if (f->is_mv)                          /* one boolean atom per value */
+            if (f->is_num)                         /* value-store slot, not an atom */
+                world_declare_num(p->w, ground_pred(p, f->pred, binding, f->nargs),
+                                  0, 0, false);
+            else if (f->is_mv)                     /* one boolean atom per value */
                 for (int v = 0; v < f->nvalues; v++)
                     world_declare_fluent(p->w, ground_mv_atom(p, f->pred, binding,
                                                               f->nargs, f->values[v]));
@@ -1092,6 +1213,10 @@ static void ground_inits(parser *p)
         ast_atom *a = &p->inits[i];
         uint32_t args[MAX_ARGS];
         for (int k = 0; k < a->nargs; k++) args[k] = a->args[k].name;
+        if (a->is_guard) {                         /* numeric: `f = n` sets the store */
+            world_set_num(p->w, ground_pred(p, a->pred, args, a->nargs), a->threshold);
+            continue;
+        }
         uint32_t atom = a->value != INTERN_NONE
             ? ground_mv_atom(p, a->pred, args, a->nargs, a->value)
             : ground_pred(p, a->pred, args, a->nargs);
