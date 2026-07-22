@@ -19,6 +19,8 @@ add_library(infeasible_core STATIC
   src/logic/dl.c
   src/logic/dl_col.c
   src/state/world.c
+  src/lang/lexer.c
+  src/lang/story.c
 )
 target_include_directories(infeasible_core PUBLIC src)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
@@ -26,11 +28,15 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 enable_testing()
-foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col)
+foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse)
   add_executable(${t} tests/${t}.c)
   target_link_libraries(${t} PRIVATE infeasible_core)
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
+
+# test_parse compiles a real .story file from the source tree; hand it the path.
+target_compile_definitions(test_parse PRIVATE
+  STORY_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples")
 
 # Solver micro-benchmark (not a test). Built -O2 regardless of build type so
 # the numbers reflect release codegen: `./build/bench_dl [natoms] [fanin] [iters]`.
