@@ -28,7 +28,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 enable_testing()
-foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse test_ground test_mv test_numeric)
+foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse test_ground test_mv test_numeric test_numpipe)
   add_executable(${t} tests/${t}.c)
   target_link_libraries(${t} PRIVATE infeasible_core)
   add_test(NAME ${t} COMMAND ${t})
