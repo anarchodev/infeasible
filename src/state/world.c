@@ -70,11 +70,15 @@ struct world {
      * between steps; only the fact bits change. Rebuilt lazily when rules
      * or fluents are added; each world_step then just rewrites fact
      * columns and re-solves, paying no theory rebuild or compile. */
-    dlcol *fam;
-    bool fam_dirty;
-    uint32_t *loc_of;             /* intern atom -> schema atom, ~0u = absent */
-    uint32_t loc_cap;
-    uint32_t *fl_loc, *pr_loc;    /* per fluent: schema ids of f and f' */
+    dlcol *fam;                   /* step family: judgments + inertia + causal  */
+    dlcol *jfam;                  /* judgment family: judgments only (the query
+                                   * layer — DESIGN.md §6.3, one columnar engine
+                                   * for both "what's true" and "what happens") */
+    bool fam_dirty;               /* structure stale: rebuild both families      */
+    bool jfam_solved;             /* jfam holds the current state's judgments     */
+    uint32_t *loc_of;             /* intern atom -> schema atom, ~0u = absent    */
+    uint32_t loc_cap, nloc;       /* loc_of size; # assigned schema locations    */
+    uint32_t *fl_loc, *pr_loc;    /* per fluent: schema ids of f and f'          */
 };
 
 #define GROW(arr, n, cap) \
@@ -97,6 +101,8 @@ void world_free(world *w)
 {
     if (w->fam)
         dlcol_free(w->fam);
+    if (w->jfam)
+        dlcol_free(w->jfam);
     free(w->loc_of);
     free(w->fl_loc);
     free(w->pr_loc);
@@ -160,8 +166,10 @@ void world_set_fluent_prov(world *w, uint32_t atom, const char *at)
 void world_set(world *w, uint32_t atom, bool value)
 {
     int i = fluent_index(w, atom);
-    if (i >= 0)
+    if (i >= 0) {
         w->vals[i] = value;
+        w->jfam_solved = false;                    /* judgments now stale */
+    }
 }
 
 bool world_get(const world *w, uint32_t atom)
@@ -194,7 +202,10 @@ void world_declare_num(world *w, uint32_t atom, long min, long max, bool has_ran
 void world_set_num(world *w, uint32_t atom, long value)
 {
     int i = num_index(w, atom);
-    if (i >= 0) w->nums[i].value = value;
+    if (i >= 0) {
+        w->nums[i].value = value;
+        w->jfam_solved = false;                    /* guard truth may change */
+    }
 }
 
 long world_get_num(const world *w, uint32_t atom)
@@ -318,50 +329,37 @@ void world_add_num_effect(world *w, int rule, uint32_t num_atom,
      * boolean family is unaffected, so no fam_dirty here. */
 }
 
-/* Closed-world base facts + judgment rules; jrule handle i maps to dl rule
- * id i because they are added first and in order. */
-static void add_state_and_judgments(const world *w, dl_theory *th)
-{
-    for (int j = 0; j < w->njr; j++) {
-        const jrule *r = &w->jrules[j];
-        int h = dl_add_rule(th, r->name, r->kind, r->head, r->body, r->nbody);
-        if (r->prov)
-            dl_set_prov(th, h, r->prov);
-    }
-    for (int j = 0; j < w->njs; j++)
-        dl_add_sup(th, w->jsups[j].winner, w->jsups[j].loser);
-    for (int i = 0; i < w->nfl; i++) {
-        dl_lit f = dl_pos(w->fluents[i]);
-        dl_add_fact(th, w->vals[i] ? f : dl_complement(f));
-    }
-    /* numeric guard atoms: closed-world from the value store, both polarities */
-    for (int g = 0; g < w->ng; g++) {
-        dl_lit gl = dl_pos(w->guards[g].guard);
-        dl_add_fact(th, guard_holds(w, g) ? gl : dl_complement(gl));
-    }
-}
-
 #define LOC_NONE (~0u)   /* schema location for an atom absent from the family */
+
+/* Both families (step + judgment) are built from one location map; the query
+ * layer runs on the columnar engine too (DESIGN.md §6.3 — one production
+ * engine, the scalar dl kept only as test_col's differential oracle). */
+static void ensure_families(world *w);
+static void solve_judgment_family(world *w);
 
 dl_verdict world_query(world *w, dl_lit q)
 {
-    dl_theory *th = dl_theory_new(w->syms);
-    add_state_and_judgments(w, th);
-    dl_result *res = dl_solve(th);
-    dl_verdict v = dl_defeasible(res, q);
-    dl_result_free(res);
-    dl_theory_free(th);
-    return v;
+    ensure_families(w);
+    if (!w->jfam_solved)
+        solve_judgment_family(w);
+    if (q.atom >= w->loc_cap || w->loc_of[q.atom] == LOC_NONE)
+        return DL_UNDECIDED;                       /* absent: unmentioned atom */
+    dl_lit loc = { w->loc_of[q.atom], q.neg };
+    return dlcol_defeasible(w->jfam, loc, 0);
 }
 
 void world_why(world *w, dl_lit q, FILE *out)
 {
-    dl_theory *th = dl_theory_new(w->syms);
-    add_state_and_judgments(w, th);
-    dl_result *res = dl_solve(th);
-    dl_why(th, res, q, out);
-    dl_result_free(res);
-    dl_theory_free(th);
+    ensure_families(w);
+    if (!w->jfam_solved)
+        solve_judgment_family(w);
+    if (q.atom >= w->loc_cap || w->loc_of[q.atom] == LOC_NONE) {
+        fprintf(out, "why %s%s?\n  (not in the theory — no rule or fact)\n",
+                q.neg ? "~" : "", intern_name(w->syms, q.atom));
+        return;
+    }
+    dl_lit loc = { w->loc_of[q.atom], q.neg };
+    dlcol_why(w->jfam, loc, 0, out);
 }
 
 /* Trace how a fluent got its value in the last step: the step theory (causal
@@ -396,13 +394,19 @@ static dl_lit primed_lit(const world *w, dl_lit l)
     return p;
 }
 
-/* ---- the columnar step schema ----
+/* ---- the columnar schemas ----
  *
- * The theory world_step used to rebuild per call, built once into an N=1
- * dlcol family: judgment rules, generated inertia (f => f', ~f => ~f'),
- * causal rules each superior to the inertia rule they conflict with.
- * Semantics identical to the scalar construction below (the golden world
- * tests pin it); only the per-step cost changes. */
+ * Both "what's true" (judgments, the query layer) and "what happens next"
+ * (inertia + causal, the step) run on the columnar engine — one production
+ * engine, the scalar dl kept only as test_col's differential oracle (§6.3).
+ * Two N=1 dlcol families share one location map: `jfam` is the judgment rules
+ * over current-state facts; `fam` adds generated inertia (f => f', ~f => ~f')
+ * and causal rules, each superior to the inertia rule it conflicts with. The
+ * structure is fixed between edits, so a step or query just rewrites fact
+ * columns and re-solves. The scalar tests pin that the semantics are identical;
+ * both families are N=1 today (entities are baked into atom names), so this is
+ * columnar-in-structure — the per-entity *lanes* that make it fast are the M3
+ * join matcher, a later change on this same family API. */
 
 static uint32_t assign_loc(world *w, uint32_t atom, uint32_t *n)
 {
@@ -417,12 +421,11 @@ static dl_lit loc_lit(const world *w, dl_lit l)
     return m;
 }
 
-static void build_step_family(world *w)
+/* pass 1, shared: assign dense schema ids to every atom either family touches
+ * (both are sized to the same location space; the judgment family simply leaves
+ * the primed/action columns unused). Sets w->nloc. */
+static void assign_locs(world *w)
 {
-    if (w->fam)
-        dlcol_free(w->fam);
-
-    /* pass 1: assign dense schema ids to every atom the step theory touches */
     uint32_t na = intern_count(w->syms);
     w->loc_of = realloc(w->loc_of, (size_t)na * sizeof *w->loc_of);
     memset(w->loc_of, 0xff, (size_t)na * sizeof *w->loc_of);
@@ -449,22 +452,27 @@ static void build_step_family(world *w)
                               : r->body[i].lit.atom, &n);
         /* effect heads are primed fluents — already assigned */
     }
+    w->nloc = n;
+}
 
-    /* pass 2: emit the schema */
-    dlcol *f = dlcol_new((int)n, 1);
-    for (uint32_t a = 0; a < na; a++)
+static void emit_atom_names(dlcol *f, const world *w)
+{
+    for (uint32_t a = 0; a < w->loc_cap; a++)
         if (w->loc_of[a] != LOC_NONE)
             dlcol_set_atom_name(f, w->loc_of[a], intern_name(w->syms, a));
+}
 
+/* Judgment rules + their superiority — the whole judgment family, and the
+ * leading slice of the step family (primed bodies may read these conclusions). */
+static void emit_judgment_rules(dlcol *f, const world *w)
+{
     dl_lit lbuf[64];
     dl_lit *body = lbuf;
     int bodycap = 64;
-    char buf[300];
-
-    /* judgments first: jsup handles equal schema rule ids */
     for (int j = 0; j < w->njr; j++) {
         const jrule *r = &w->jrules[j];
         if (r->nbody > bodycap) {
+            if (body != lbuf) free(body);
             body = malloc((size_t)r->nbody * sizeof *body);
             bodycap = r->nbody;
         }
@@ -475,8 +483,38 @@ static void build_step_family(world *w)
         if (r->prov)
             dlcol_set_prov(f, h, r->prov);
     }
+    if (body != lbuf)
+        free(body);
     for (int j = 0; j < w->njs; j++)
         dlcol_add_sup(f, w->jsups[j].winner, w->jsups[j].loser);
+}
+
+/* The judgment (query-layer) family: judgment rules only, over current-state
+ * facts. Same location space as the step family, just without inertia/causal. */
+static void emit_judgment_family(world *w)
+{
+    if (w->jfam)
+        dlcol_free(w->jfam);
+    dlcol *f = dlcol_new((int)w->nloc, 1);
+    emit_atom_names(f, w);
+    emit_judgment_rules(f, w);
+    w->jfam = f;
+    w->jfam_solved = false;
+}
+
+/* The step family: judgments + generated inertia + causal rules/ramifications. */
+static void emit_step_family(world *w)
+{
+    if (w->fam)
+        dlcol_free(w->fam);
+    dlcol *f = dlcol_new((int)w->nloc, 1);
+    emit_atom_names(f, w);
+    emit_judgment_rules(f, w);
+
+    dl_lit lbuf[64];
+    dl_lit *body = lbuf;
+    int bodycap = 64;
+    char buf[300];
 
     /* generated inertia, ids recorded for causal superiority */
     int *inertia_pos = malloc((size_t)(w->nfl ? w->nfl : 1) * sizeof *inertia_pos);
@@ -540,7 +578,41 @@ static void build_step_family(world *w)
     free(inertia_neg);
 
     w->fam = f;
+}
+
+/* Rebuild both families when the theory structure is stale (a rule or fluent
+ * was added). Facts are set later — per step for `fam`, per query for `jfam`. */
+static void ensure_families(world *w)
+{
+    if (w->fam && w->jfam && !w->fam_dirty)
+        return;
+    assign_locs(w);
+    emit_step_family(w);
+    emit_judgment_family(w);
     w->fam_dirty = false;
+    w->jfam_solved = false;
+}
+
+/* Load current-state facts (closed-world fluents + numeric guard atoms) into the
+ * judgment family and solve it — the columnar analog of the scalar theory
+ * world_query used to rebuild per call. Cached until a state edit (jfam_solved). */
+static void solve_judgment_family(world *w)
+{
+    dlcol *f = w->jfam;
+    dlcol_clear_facts(f);
+    for (int i = 0; i < w->nfl; i++) {
+        dl_lit l = { w->fl_loc[i], !w->vals[i] };   /* f if true, ~f if false */
+        dlcol_add_fact(f, l, 0);
+    }
+    for (int g = 0; g < w->ng; g++) {
+        uint32_t ga = w->guards[g].guard;
+        if (ga < w->loc_cap && w->loc_of[ga] != LOC_NONE) {
+            dl_lit l = { w->loc_of[ga], !guard_holds(w, g) };
+            dlcol_add_fact(f, l, 0);
+        }
+    }
+    dlcol_solve(f);
+    w->jfam_solved = true;
 }
 
 /* ---- numeric write side: expression VM + commit pipeline (§5.8) ---- */
@@ -609,8 +681,7 @@ static void rcpt_push(num_receipt *rc, const char *rule, world_numop op, long am
 int world_step(world *w, const uint32_t *actions, int nactions,
                char *err, size_t errsz)
 {
-    if (!w->fam || w->fam_dirty)
-        build_step_family(w);
+    ensure_families(w);
     dlcol *f = w->fam;
 
     /* fact columns: current state closed-world, plus occurring actions.
@@ -729,6 +800,7 @@ int world_step(world *w, const uint32_t *actions, int nactions,
             memcpy(w->vals, next, (size_t)w->nfl * sizeof *next);
         for (int i = 0; i < w->nnum; i++)
             w->nums[i].value = nextnum[i];
+        w->jfam_solved = false;                    /* new state: judgments stale */
     }
 
     free(next);

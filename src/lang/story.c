@@ -1524,7 +1524,7 @@ static dl_lit ground_lit(parser *p, ast_atom *at, var_bind *vars, int nvars,
     return at->neg ? dl_neg(g) : dl_pos(g);
 }
 
-/* Readable instance name for `dl_why` traces: "label[X=hero,Y=key]". */
+/* Readable instance name for why-traces: "label[X=hero,Y=key]". */
 static void inst_name(parser *p, char *buf, size_t n, const char *label,
                       var_bind *vars, int nvars, const uint32_t *binding)
 {
