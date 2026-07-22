@@ -52,7 +52,7 @@ ad-hoc flag system can offer.
 - GOAP-style planning (defeasible action theories make planning research-grade;
   revisit only if NPC planning becomes core).
 - A narrative/dialogue layer. Games are built as host code against the
-  generated header (§6.3); a knot/choice/divert front end would be a client
+  interface artifact and its typed binding (§6.3); a knot/choice/divert front end would be a client
   above that surface, and is out of scope. If one is ever added it enters as
   a front end on the interface artifact, keeps computation in rules or
   providers (not the dialogue layer), and re-opens §6.3's total-erasure rule
@@ -1443,19 +1443,37 @@ against it.
   library for the same reason, so guards mean the same thing wherever they
   are written.
 
-**The interface artifact also compiles to a generated C header.** Host
-code is a client too, and the intern table gives C the exact silent
-failure mode the orphan pass exists to kill:
+**The interface artifact is the primary client surface, and it compiles to
+a typed host binding.** Host code is a client too, and the intern table
+gives every host the silent failure mode the orphan pass exists to kill:
 `world_query(w, lit(intern(syms, "can_atack_goblin")))` interns a fresh,
 always-false atom. Codegen closes it, protobuf-style — typed atom/action
-constants and arity-typed helpers (`q_can_parley(w, who)`,
-`do_unlock(&acts, who)`) — so renaming a fluent in `.story` breaks the
-host build instead of silently never firing. A combat loop (initiative,
+constants and arity-typed helpers (`q_can_parley(view, who)`,
+`do_unlock(acts, who)`) — so renaming a fluent in `.story` breaks the host
+build instead of silently never firing. A combat loop (initiative,
 targeting UI, NPC turns) is then ordinary host code driven by the outer
-engine, with full vocabulary checking. **This header is the primary client
-surface** — the way a game is expected to be built on the engine, and an
-M1/M2 hard deliverable rather than a convenience. Any future front end (§2)
-targets the same artifact and gets no privileges the header lacks.
+engine, with full vocabulary checking.
+
+**The shipped host is JavaScript over the WASM core (§12), so the binding
+is plain ES-module JS, typed buildlessly.** The generated artifact is a
+`.js` wrapper over the WASM exports that runs as-is; its types ship as
+JSDoc annotations (or a `.d.ts` sidecar) that `tsc --checkJs` and any
+editor consume with **no build step** — so a rename in `.story` breaks the
+author's typecheck while the shipped module still runs untouched. This is
+the §12 buildless rule applied to the host layer: TypeScript-the-language
+would reintroduce the build step §12 forbids, so the type-checking is a
+dev-time view over the same JS that ships, never a compile of a separate
+source. There is **no generated C header** (decided 2026-07-21): the only C clients
+are the golden tests and the eventual native player (§13), and they build
+against `world.h` + the intern table by hand — the hand-built test worlds
+already *are* that client, and §4.2's second-client test pins the boundary
+without needing codegen. Vocabulary-checking is a property of the interface
+artifact, not of any one language projection; the typed JS binding is the first
+(and, for now, only) backend, and any future front end (§2) or additional
+host language targets the same artifact and gets no privileges the binding
+lacks. The binding is a **dev-time view** (§12): typed authoring convenience,
+never required to run or remix — the shipped, authoritative host form is
+plain ES modules against `world_*`.
 
 **Erasure is a rule, not an accident:** no surface construct may require
 runtime representation beyond engine structures. Bands erase to pairwise
@@ -1666,13 +1684,14 @@ recovery at declaration boundaries so one error doesn't cascade.
    §5.7–5.8 (domains, threshold harvesting, effect operators, guard
    stratification); `cellar.story` compiles and replaces the hand-built test
    worlds; provenance carried on every generated construct, rendered by
-   `dl_why` in source terms (§6.3); interface artifact and generated C
-   header emitted (§6.3).
+   `dl_why` in source terms (§6.3); interface artifact emitted (§6.3; the
+   typed JS host binding is an M2 concern, once there is a JS host).
 3. **M2 — client contract + host API**: define the public client contract —
    the `world_*` API plus the externalized-state pattern (§4.2) — and make
-   the generated C header (§6.3) the way games are actually written against
-   it: typed atom/action constants, arity-typed query and action helpers,
-   a rename in `.story` breaking the host build. **Queries carry a scope**
+   the generated typed JS binding (§6.3) the way games are actually written against
+   it from the JS host: typed atom/action constants, arity-typed query and
+   action helpers over the WASM exports, a rename in `.story` breaking the
+   host typecheck. **Queries carry a scope**
    (§5.5, §6.4): with private per-scope vocabulary, bare
    `world_query(w, can_force_door)` is ill-formed — there are two atoms.
    Either a scope parameter or a scoped view handle (`world_view_in(w, enc)`)
@@ -1706,8 +1725,8 @@ recovery at declaration boundaries so one error doesn't cascade.
    scopes with lifetime/visibility (§5.5)**, serialization, hot reload.
 6. **M5 — proof-of-thesis demo**: one region, ~20 NPCs, a 5e-ish combat slice
    where conditions/feats interact through superiority, one multi-step quest,
-   `why?` in the UI — all driven by host code against the generated header
-   (§6.3). The quest is the interesting half: a multi-step quest with no
+   `why?` in the UI — all driven by JS host code against the generated typed
+   JS binding (§6.3). The quest is the interesting half: a multi-step quest with no
    narrative layer is the honest test of whether rules alone carry story
    state.
 
@@ -2030,7 +2049,7 @@ subscribed cone:
   cone lies inside the visible set — a static property of the dependency
   graph against the visibility interface. The compiler classifies every
   judgment client-predictable (cone ⊆ subscribed interface) or server-only;
-  the generated header can type them differently. "What feels instant vs.
+  the generated typed JS binding can type them differently. "What feels instant vs.
   what waits for the server" becomes a compile-time report, not a QA
   discovery. The §5.3 dry-run query is the evaluation primitive prediction
   needs.
