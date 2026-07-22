@@ -77,20 +77,20 @@ static int test_cellar_from_story(void)
     CHECK(src != NULL);
 
     intern *sy = intern_new();
-    char err[256] = "";
-    story_warning witems[8];
-    story_warnings warn = { witems, 8, 0 };
-    world *w = story_compile(src, sy, err, sizeof err, &warn);
+    story_diag ditems[8];
+    story_diags diags = { ditems, 8, 0, 0 };
+    world *w = story_compile(src, sy, &diags);
     if (!w) {
-        fprintf(stderr, "FAIL compile: %s\n", err);
+        fprintf(stderr, "FAIL compile: %s\n",
+                diags.count ? diags.items[0].msg : "(no message)");
         free(src);
         intern_free(sy);
         return 1;
     }
-    /* the reference cellar is clean: no orphan atoms */
-    if (warn.count != 0)
-        fprintf(stderr, "unexpected warning: %s\n", warn.items[0].msg);
-    CHECK(warn.count == 0);
+    /* the reference cellar is clean: no diagnostics at all */
+    if (diags.count != 0)
+        fprintf(stderr, "unexpected diagnostic: %s\n", diags.items[0].msg);
+    CHECK(diags.count == 0);
 
     uint32_t weakened  = intern_id(sy, "weakened"),
              can_force = intern_id(sy, "can_force_door"),
@@ -122,15 +122,18 @@ static int test_cellar_from_story(void)
     return 0;
 }
 
-/* Bad inputs fail fast with a located, non-empty message and no world. */
+/* Bad inputs produce at least one error, a located message, and no world. */
 static int expect_error(const char *src)
 {
     intern *sy = intern_new();
-    char err[256] = "";
-    world *w = story_compile(src, sy, err, sizeof err, NULL);
-    int ok = (w == NULL) && (err[0] != '\0');
+    story_diag ditems[8];
+    story_diags diags = { ditems, 8, 0, 0 };
+    world *w = story_compile(src, sy, &diags);
+    int ok = (w == NULL) && (diags.nerrors >= 1) &&
+             (diags.items[0].sev == STORY_ERROR) && (diags.items[0].line >= 1);
     if (!ok)
-        fprintf(stderr, "FAIL expected error for <<%s>> (err=\"%s\")\n", src, err);
+        fprintf(stderr, "FAIL expected error for <<%s>> (nerrors=%d)\n",
+                src, diags.nerrors);
     if (w) world_free(w);
     intern_free(sy);
     return ok ? 0 : 1;
@@ -156,32 +159,57 @@ static int test_orphan(void)
     /* a typo'd condition atom is flagged (and compilation still succeeds) */
     {
         intern *sy = intern_new();
-        char err[256] = "";
-        story_warning wi[8];
-        story_warnings wn = { wi, 8, 0 };
+        story_diag di[8];
+        story_diags d = { di, 8, 0, 0 };
         world *wl = story_compile("state holding\nrule r: hodling => weak",
-                                  sy, err, sizeof err, &wn);
+                                  sy, &d);
         CHECK(wl != NULL);
-        CHECK(wn.count == 1);
-        CHECK(strstr(wn.items[0].msg, "hodling") != NULL);
+        CHECK(d.nerrors == 0);
+        CHECK(d.count == 1);
+        CHECK(d.items[0].sev == STORY_WARNING);
+        CHECK(strstr(d.items[0].msg, "hodling") != NULL);
         world_free(wl);
         intern_free(sy);
     }
     /* a head concluded later in the file must not be reported as an orphan */
     {
         intern *sy = intern_new();
-        char err[256] = "";
-        story_warning wi[8];
-        story_warnings wn = { wi, 8, 0 };
+        story_diag di[8];
+        story_diags d = { di, 8, 0, 0 };
         world *wl = story_compile(
-            "state y\nrule a: derived => x\nrule b: y => derived",
-            sy, err, sizeof err, &wn);
+            "state y\nrule a: derived => x\nrule b: y => derived", sy, &d);
         CHECK(wl != NULL);
-        if (wn.count) fprintf(stderr, "unexpected warning: %s\n", wn.items[0].msg);
-        CHECK(wn.count == 0);
+        if (d.count) fprintf(stderr, "unexpected diagnostic: %s\n", d.items[0].msg);
+        CHECK(d.count == 0);
         world_free(wl);
         intern_free(sy);
     }
+    return 0;
+}
+
+/* Panic-mode recovery (§10): independent errors in separate declarations are
+ * all reported — one bad declaration does not mask the rest of the file — and
+ * valid declarations between them still compile. */
+static int test_recovery(void)
+{
+    const char *src =
+        "rule bad1: a =>\n"              /* err: missing head           */
+        "rule ok:   strong => weak\n"    /* valid — must not be skipped */
+        "action bad2: causes\n"          /* err: missing effect         */
+        "state ( strong )\n";            /* valid                       */
+
+    intern *sy = intern_new();
+    story_diag di[8];
+    story_diags d = { di, 8, 0, 0 };
+    world *w = story_compile(src, sy, &d);
+
+    CHECK(w == NULL);                    /* errors present -> no world  */
+    CHECK(d.nerrors == 2);               /* both, not just the first    */
+    CHECK(d.items[0].sev == STORY_ERROR);
+    CHECK(d.items[1].sev == STORY_ERROR);
+    CHECK(d.items[0].line < d.items[1].line);   /* recovery moved forward */
+
+    intern_free(sy);
     return 0;
 }
 
@@ -191,6 +219,7 @@ int main(void)
     if (test_cellar_from_story()) return 1;
     if (test_errors())            return 1;
     if (test_orphan())            return 1;
+    if (test_recovery())          return 1;
     printf("test_parse: all passed\n");
     return 0;
 }

@@ -14,13 +14,13 @@
 #define MAX_ATOMS     1024
 
 typedef struct {
-    lexer    lx;
-    token    cur;
-    intern  *syms;
-    world   *w;
-    char    *err;
-    size_t   errsz;
-    bool     failed;
+    lexer        lx;
+    token        cur;
+    intern      *syms;
+    world       *w;
+    story_diags *diags;
+    int          nerrors;    /* total errors, tracked even without a sink */
+    bool         err_flag;   /* an error hit in the current declaration */
 
     uint32_t fluents[MAX_FLUENTS];
     int      nfluents;
@@ -42,17 +42,42 @@ typedef struct {
 
 /* ---- diagnostics ---------------------------------------------------- */
 
+static void add_diag(parser *p, story_severity sev, int line, int col,
+                     const char *fmt, va_list ap)
+{
+    if (sev == STORY_ERROR) p->nerrors++;
+    story_diags *d = p->diags;
+    if (!d) return;
+    int idx = d->count++;
+    if (sev == STORY_ERROR) d->nerrors++;
+    if (d->items && idx < d->cap) {
+        story_diag *dg = &d->items[idx];
+        dg->sev = sev;
+        dg->line = line;
+        dg->col = col;
+        vsnprintf(dg->msg, sizeof dg->msg, fmt, ap);
+    }
+}
+
+/* Report one error and enter recovery for the current declaration. At most
+ * one error is recorded per declaration (err_flag); the top-level loop
+ * synchronises to the next declaration boundary and clears it. */
 static void fail(parser *p, int line, int col, const char *fmt, ...)
 {
-    if (p->failed) return;                 /* keep the first error */
-    p->failed = true;
-    char msg[256];
+    if (p->err_flag) return;
+    p->err_flag = true;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(msg, sizeof msg, fmt, ap);
+    add_diag(p, STORY_ERROR, line, col, fmt, ap);
     va_end(ap);
-    if (p->err && p->errsz)
-        snprintf(p->err, p->errsz, "%d:%d: %s", line, col, msg);
+}
+
+static void warn(parser *p, int line, int col, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    add_diag(p, STORY_WARNING, line, col, fmt, ap);
+    va_end(ap);
 }
 
 /* Human-readable spelling of an actual token: show the text for names and
@@ -136,33 +161,18 @@ static void note_ref(parser *p, uint32_t atom, int line, int col)
     }
 }
 
-static void emit_warning(story_warnings *w, int line, int col,
-                         const char *fmt, ...)
-{
-    int idx = w->count++;
-    if (w->items && idx < w->cap) {
-        story_warning *d = &w->items[idx];
-        d->line = line;
-        d->col = col;
-        va_list ap;
-        va_start(ap, fmt);
-        vsnprintf(d->msg, sizeof d->msg, fmt, ap);
-        va_end(ap);
-    }
-}
-
 /* Any atom used in a condition that is neither a declared fluent nor concluded
  * by some rule can never be true — flag it as a probable typo or a missing
  * declaration. */
-static void check_orphans(parser *p, story_warnings *warn)
+static void check_orphans(parser *p)
 {
     for (int i = 0; i < p->nrefs; i++) {
         uint32_t a = p->refs[i].atom;
         if (is_declared_fluent(p, a) || is_head(p, a)) continue;
-        emit_warning(warn, p->refs[i].line, p->refs[i].col,
-                     "'%s' is used as a condition but is never a declared "
-                     "fluent or concluded by any rule — typo, or a missing "
-                     "declaration?", intern_name(p->syms, a));
+        warn(p, p->refs[i].line, p->refs[i].col,
+             "'%s' is used as a condition but is never a declared fluent or "
+             "concluded by any rule — typo, or a missing declaration?",
+             intern_name(p->syms, a));
     }
 }
 
@@ -285,7 +295,7 @@ static void parse_fluent_list(parser *p, bool set_init)
             world_set(p->w, atom, true);
         } else {
             declare_fluent(p, atom, id.line, id.col);
-            if (p->failed) return;
+            if (p->err_flag) return;
         }
     } while (grouped && p->cur.kind == TK_IDENT);
 
@@ -425,20 +435,41 @@ static void parse_sup(parser *p)
 
 /* ---- entry ---------------------------------------------------------- */
 
-world *story_compile(const char *src, intern *syms, char *err, size_t errsz,
-                     story_warnings *warnings)
+/* Panic-mode recovery (§10): after an error, skip to the next declaration
+ * boundary so a single bad declaration does not cascade. Only the structural
+ * keywords are treated as boundaries — a bare identifier is ambiguous with
+ * mid-declaration garbage, so we do not resynchronise on it (a superiority
+ * statement stranded after a broken rule is skipped to the next keyword).
+ * Every declaration parser consumes at least its leading token before it can
+ * fail, so progress is guaranteed even when this returns immediately. */
+static void synchronize(parser *p)
+{
+    while (p->cur.kind != TK_EOF) {
+        switch (p->cur.kind) {
+        case TK_STATE:
+        case TK_INIT:
+        case TK_RULE:
+        case TK_ACTION:
+            return;
+        default:
+            advance(p);
+        }
+    }
+}
+
+world *story_compile(const char *src, intern *syms, story_diags *diags)
 {
     parser p;
     memset(&p, 0, sizeof p);
     lexer_init(&p.lx, src);
     p.syms = syms;
     p.w = world_new(syms);
-    p.err = err;
-    p.errsz = errsz;
-    if (err && errsz) err[0] = '\0';
+    p.diags = diags;
+    if (diags) { diags->count = 0; diags->nerrors = 0; }
 
     advance(&p);                                   /* prime lookahead */
-    while (p.cur.kind != TK_EOF && !p.failed) {
+    while (p.cur.kind != TK_EOF) {
+        p.err_flag = false;                        /* one error per decl */
         switch (p.cur.kind) {
         case TK_STATE:  parse_fluent_list(&p, false); break;
         case TK_INIT:   parse_fluent_list(&p, true);  break;
@@ -454,14 +485,15 @@ world *story_compile(const char *src, intern *syms, char *err, size_t errsz,
             break;
         }
         }
+        if (p.err_flag) synchronize(&p);
     }
 
-    if (p.failed) {
+    if (p.nerrors > 0) {
         world_free(p.w);
         return NULL;
     }
 
     /* Non-fatal analysis runs only on a well-formed parse. */
-    if (warnings) check_orphans(&p, warnings);
+    check_orphans(&p);
     return p.w;
 }

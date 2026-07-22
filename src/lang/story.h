@@ -27,26 +27,35 @@
  *   lit     := [ '~' ] IDENT
  *
  * Atoms are interned into `syms`; conclusions (rule heads) need no declaration.
- * Returns a freshly built world on success, or NULL with a `line:col: message`
- * written into `err` (fail-fast; panic-mode recovery is a follow-up). The
- * returned world borrows `syms`, which must outlive it. */
+ * The returned world borrows `syms`, which must outlive it.
+ *
+ * Diagnostics (errors and warnings) collect into a caller-supplied sink; the
+ * parser recovers at declaration boundaries (panic mode, §10) so one bad
+ * declaration does not mask the rest of the file. Returns the compiled world
+ * when no error-severity diagnostic was produced, or NULL if any error was —
+ * warnings (e.g. orphan/typo detection, §6.1) never fail the compile.
+ *
+ * `items`/`cap` are caller-owned; `count` is the total number of diagnostics
+ * produced (may exceed `cap`, in which case only the first `cap` are stored)
+ * and `nerrors` how many of them were errors. Pass NULL for `diags` to
+ * compile without collecting messages (the return value still reflects
+ * success). Any prior `count`/`nerrors` are reset on entry. */
 
-/* Non-fatal diagnostics (DESIGN.md §6.1 Tier-1: orphan/typo detection).
- * Caller supplies `items`/`cap`; `count` reports how many warnings were
- * produced and may exceed `cap`, in which case only the first `cap` are
- * stored. Pass NULL to `warnings` to skip the analysis entirely. */
+typedef enum { STORY_ERROR, STORY_WARNING } story_severity;
+
 typedef struct {
-    int  line, col;
-    char msg[192];
-} story_warning;
+    story_severity sev;
+    int            line, col;
+    char           msg[192];
+} story_diag;
 
 typedef struct {
-    story_warning *items;
-    int            cap;
-    int            count;
-} story_warnings;
+    story_diag *items;
+    int         cap;
+    int         count;
+    int         nerrors;
+} story_diags;
 
-world *story_compile(const char *src, intern *syms, char *err, size_t errsz,
-                     story_warnings *warnings);
+world *story_compile(const char *src, intern *syms, story_diags *diags);
 
 #endif
