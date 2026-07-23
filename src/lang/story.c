@@ -1854,19 +1854,25 @@ static void synchronize(parser *p)
     }
 }
 
-/* ---- lane grounding (the DoD thesis, increment 2a) ----
+/* ---- lane grounding (the DoD thesis, increments 2a + partial coverage) ----
  *
- * If the whole judgment program is homogeneous over ONE sort S — every rule
- * single-variable over S, every atom a unary predicate over S (arg = the
- * quantified variable) or an arity-0 global — emit it as ONE N-lane dl_col
- * family: entities become bit-parallel lanes (64 per word), the rule schema is
- * shared, and NOT grounded per entity. Conservative first cut: bail (leaving
- * only the N=1 grounding) on anything mixed — guards, MV, numeric, 2+ vars,
- * cross-sort, constant-entity args, or any step rules. The lane family is
- * validated against the N=1 path (world_lanes_check), not yet queried through
- * (the dl_col-prototyped-before-adopted playbook). Per-sort axis, forced: a
- * single variable has exactly one lane axis, so there is nothing to plan and no
- * cost model — the plan is a pure local function of each rule's text. */
+ * Emit the lane-eligible slice of the judgment program as per-sort N-lane dl_col
+ * families: a predicate over sort S becomes a column over S's entities, a
+ * single-variable rule over S becomes ONE schema rule run bit-parallel across 64
+ * lanes per word — not grounded per entity. The rest of the program (numeric,
+ * MV, multi-var, guarded, cross-sort) stays on the N=1 judgment family; a query
+ * routes to whichever holds its atom. Lane families are validated against the
+ * N=1 path (world_lanes_check) — the same differential discipline test_col
+ * applies to dl vs dl_col.
+ *
+ * A predicate may lane only if it is *dependency-closed*: every rule concluding
+ * it — and, since attackers must resolve together, its complement — is
+ * lane-eligible, and every predicate they read is itself lane-clean. Anything
+ * that fails taints the predicate, and taint propagates to its dependents and
+ * across superiority edges that would otherwise split a conflict across the
+ * lane/N=1 boundary. What survives is a closed subset that derives identically
+ * either way. Per-sort axis, forced (one variable = one axis): no plan, no cost
+ * model — the plan is a pure local function of each rule's text. */
 
 static bool lane_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var,
                          bool is_head)
@@ -1883,6 +1889,28 @@ static bool lane_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var,
     return a->nargs == 1 && a->args[0].name == var; /* arg is the quantified var */
 }
 
+/* A rule can lane iff it is single-variable and every atom is unary over that
+ * one sort (arg = the variable) or an arity-0 global body input. */
+static bool rule_eligible(parser *p, ast_rule *r)
+{
+    if (r->nvars != 1 || r->has_guard)
+        return false;
+    int S = r->vars[0].sort;
+    uint32_t var = r->vars[0].name;
+    if (!lane_atom_ok(p, &r->head, S, var, true))
+        return false;
+    for (int b = 0; b < r->nbody; b++)
+        if (!lane_atom_ok(p, &r->body[b], S, var, false))
+            return false;
+    return true;
+}
+
+static int pred_idx(parser *p, uint32_t pred)
+{
+    pred_info *pi = find_pred(p, pred);
+    return pi ? (int)(pi - p->preds) : -1;
+}
+
 static int rule_index(parser *p, const char *label)
 {
     for (int i = 0; i < p->nrules; i++)
@@ -1890,36 +1918,65 @@ static int rule_index(parser *p, const char *label)
     return -1;
 }
 
-static void build_lane_families(parser *p)
+/* The taint fixpoint: taint[pi] true iff predicate pi cannot lane. Polarity is
+ * merged (a head `~P` shares P's registry entry), so P and its attackers taint
+ * together. */
+static void compute_taint(parser *p, bool *taint)
 {
-    if (p->nrules == 0 || p->nactions > 0)         /* judgment-only for 2a */
-        return;
-    if (p->rules[0].nvars != 1)
-        return;
-    int S = p->rules[0].vars[0].sort;
-
-    for (int i = 0; i < p->nrules; i++) {
-        ast_rule *r = &p->rules[i];
-        if (r->nvars != 1 || r->vars[0].sort != S || r->has_guard)
-            return;
-        uint32_t var = r->vars[0].name;
-        if (!lane_atom_ok(p, &r->head, S, var, true))
-            return;
-        for (int b = 0; b < r->nbody; b++)
-            if (!lane_atom_ok(p, &r->body[b], S, var, false))
-                return;
+    for (int i = 0; i < p->npreds; i++) taint[i] = false;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int i = 0; i < p->nrules; i++) {
+            ast_rule *r = &p->rules[i];
+            int hp = pred_idx(p, r->head.pred);
+            if (hp < 0 || taint[hp]) continue;
+            bool bad = !rule_eligible(p, r);
+            for (int b = 0; b < r->nbody && !bad; b++) {
+                int bp = pred_idx(p, r->body[b].pred);
+                if (bp >= 0 && p->preds[bp].is_head && taint[bp])
+                    bad = true;                    /* reads a tainted conclusion */
+            }
+            if (bad) { taint[hp] = true; changed = true; }
+        }
+        /* a superiority edge must not split a conflict across the boundary */
+        for (int s = 0; s < p->nsups; s++) {
+            int ri = rule_index(p, p->sups[s].a), rj = rule_index(p, p->sups[s].b);
+            if (ri < 0 || rj < 0) continue;
+            int pi = pred_idx(p, p->rules[ri].head.pred);
+            int pj = pred_idx(p, p->rules[rj].head.pred);
+            if (pi < 0 || pj < 0 || taint[pi] == taint[pj]) continue;
+            taint[pi] = taint[pj] = true;
+            changed = true;
+        }
     }
+}
 
+/* Emit one N-lane family for the untainted rules over sort S (if any). */
+static void emit_sort_lanes(parser *p, int S, const bool *taint)
+{
     int nent = domain_size(p, S);
     if (nent == 0)
         return;
 
-    /* collect the distinct predicates (head + bodies) as family-local atoms */
+    /* the laned rules: untainted, single-variable, head over S */
+    int laned[MAX_RULES], nlaned = 0;
+    for (int i = 0; i < p->nrules; i++) {
+        ast_rule *r = &p->rules[i];
+        int hp = pred_idx(p, r->head.pred);
+        if (hp < 0 || taint[hp] || r->nvars != 1 || r->vars[0].sort != S)
+            continue;
+        laned[nlaned++] = i;
+    }
+    if (nlaned == 0)
+        return;
+
+    /* distinct predicates (head + bodies) as family-local atoms */
     uint32_t preds[MAX_PREDS];
     bool pf[MAX_PREDS];
     int npred = 0;
-    for (int i = 0; i < p->nrules; i++) {
-        ast_rule *r = &p->rules[i];
+    for (int li = 0; li < nlaned; li++) {
+        ast_rule *r = &p->rules[laned[li]];
         const ast_atom *atoms[1 + MAX_BODY];
         int na = 0;
         atoms[na++] = &r->head;
@@ -1941,9 +1998,10 @@ static void build_lane_families(parser *p)
     for (int a = 0; a < npred; a++)
         dlcol_set_atom_name(f, (uint32_t)a, intern_name(p->syms, preds[a]));
 
-    int schema_id[MAX_RULES];
-    for (int i = 0; i < p->nrules; i++) {
-        ast_rule *r = &p->rules[i];
+    int schema_id[MAX_RULES];                      /* rule index -> schema id */
+    for (int i = 0; i < p->nrules; i++) schema_id[i] = -1;
+    for (int li = 0; li < nlaned; li++) {
+        ast_rule *r = &p->rules[laned[li]];
         int hl = -1;
         for (int j = 0; j < npred; j++) if (preds[j] == r->head.pred) { hl = j; break; }
         dl_lit head = { (uint32_t)hl, r->head.neg };
@@ -1957,16 +2015,16 @@ static void build_lane_families(parser *p)
         int h = dlcol_add_rule(f, r->label, r->kind, head, body, r->nbody);
         char pbuf[MAX_NAME + 24];
         dlcol_set_prov(f, h, prov_str(p, r->line, pbuf, sizeof pbuf));
-        schema_id[i] = h;
+        schema_id[laned[li]] = h;
     }
     for (int s = 0; s < p->nsups; s++) {
         int wi = rule_index(p, p->sups[s].a), li = rule_index(p, p->sups[s].b);
-        if (wi >= 0 && li >= 0)
+        if (wi >= 0 && li >= 0 && schema_id[wi] >= 0 && schema_id[li] >= 0)
             dlcol_add_sup(f, schema_id[wi], schema_id[li]);
     }
 
-    /* the (predicate-local, lane) -> named ground atom map, for facts + the
-     * differential check against the N=1 path */
+    /* (predicate-local, lane) -> named ground atom, for facts + the differential
+     * check; a global (arity 0) broadcasts the same atom to every lane */
     uint32_t *ground = malloc((size_t)npred * (size_t)nent * sizeof *ground);
     for (int a = 0; a < npred; a++) {
         pred_info *pi = find_pred(p, preds[a]);
@@ -1978,6 +2036,16 @@ static void build_lane_families(parser *p)
     }
     world_add_lane_family(p->w, f, npred, nent, ground, pf);
     free(ground);
+}
+
+static void build_lane_families(parser *p)
+{
+    if (p->nrules == 0 || p->nactions > 0)         /* judgment-only for now */
+        return;
+    bool taint[MAX_PREDS];
+    compute_taint(p, taint);
+    for (int S = 0; S < p->nsorts; S++)
+        emit_sort_lanes(p, S, taint);
 }
 
 world *story_compile(const char *src, const char *srcname, intern *syms,

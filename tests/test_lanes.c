@@ -34,6 +34,7 @@ static const char *HOMO =
     "rule weakens(X: actor):  poisoned(X)          => weak(X)\n"
     "rule holds_up(X: actor): blessed(X)           => ~weak(X)\n"
     "holds_up > weakens\n"
+    "rule staggers(X: actor): weak(X)              => slow(X)\n"  /* reads a lane conclusion */
     "rule engages(X: actor):  alert(X) & danger    => acts(X)\n"
     "init (poisoned(guard) poisoned(thug) blessed(thug) blessed(priest)"
     "      alert(mage) alert(guard) danger)\n";
@@ -67,6 +68,10 @@ static int test_homogeneous_agrees(void)
     CHECK(world_query(w, dl_pos(intern_id(sy, "weak(guard)"))) == DL_PROVED);
     CHECK(world_query(w, dl_pos(intern_id(sy, "acts(mage)")))  == DL_PROVED);
     CHECK(world_query(w, dl_pos(intern_id(sy, "acts(guard)"))) == DL_PROVED);
+    /* a two-level chain within the family: slow derives from weak (itself a lane
+     * conclusion), so guard (weak) is slow but thug (~weak wins) is not */
+    CHECK(world_query(w, dl_pos(intern_id(sy, "slow(guard)"))) == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "slow(thug)")))  != DL_PROVED);
 
     /* a state edit must invalidate the lane solve-cache: un-poison guard, and
      * weak(guard) — routed through the lane family — must stop being proved,
@@ -83,8 +88,10 @@ static int test_homogeneous_agrees(void)
     return 0;
 }
 
-/* A numeric guard makes the program non-homogeneous, so no lane family forms —
- * the N=1 path still handles it. (Same for MV, 2+ vars, step rules.) */
+/* Partial coverage: a mixed program lanes the clean part and leaves the rest on
+ * the N=1 path. `weak` is lane-clean (a plain defeasible rule over a base
+ * fluent); `dead` depends on a numeric guard, so it taints and stays on jfam.
+ * The lane family forms for `weak`, and both answers stay correct. */
 static const char *MIXED =
     "sort actor\n"
     "entity guard : actor\n"
@@ -93,14 +100,23 @@ static const char *MIXED =
     "rule dying(X: actor):   hp(X) <= 0  -> dead(X)\n"
     "init poisoned(guard)\n";
 
-static int test_mixed_bails(void)
+static int test_mixed_partial(void)
 {
     intern *sy = intern_new();
     world *w = story_compile(MIXED, "mixed.story", sy, NULL);
     CHECK(w != NULL);
-    CHECK(world_lane_family_count(w) == 0);        /* conservative bail */
-    /* the N=1 path still works */
+
+    /* the clean slice lanes; the numeric slice does not — a family still forms */
+    CHECK(world_lane_family_count(w) == 1);
+    bool ok = false;
+    CHECK(world_lanes_check(w, &ok) > 0);
+    CHECK(ok);
+
+    /* weak routes through the lane family; dead (numeric-guarded) through jfam.
+     * hp defaults to 0, so hp <= 0 holds and dead(guard) is proved. */
     CHECK(world_query(w, dl_pos(intern_id(sy, "weak(guard)"))) == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "dead(guard)"))) == DL_PROVED);
+
     world_free(w);
     intern_free(sy);
     return 0;
@@ -109,7 +125,7 @@ static int test_mixed_bails(void)
 int main(void)
 {
     if (test_homogeneous_agrees()) return 1;
-    if (test_mixed_bails()) return 1;
+    if (test_mixed_partial()) return 1;
     printf("test_lanes: all passed\n");
     return 0;
 }
