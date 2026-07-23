@@ -1237,12 +1237,16 @@ int world_step(world *w, const uint32_t *actions, int nactions,
                (size_t)(w->nnum - w->caprcpt) * sizeof *w->rcpt);
         w->caprcpt = w->nnum;
     }
-    for (int i = 0; rc == 0 && i < w->nnum; i++) {
-        num_receipt *rcp = &w->rcpt[i];
-        rcp->n = 0;
-        bool have_assign = false, assign_conflict = false;
-        long assign_val = 0, delta = 0;
-        const char *assign_rule = NULL;
+    /* One pass over the step rules — NOT nnum × nsr (that double scan, matching
+     * every fluent against every rule's effects, was the O(N²) crowd wall). Each
+     * fired numeric effect routes to its fluent's accumulator via the O(1) num
+     * index; a second pass over the fluents runs the pipeline (base + Σ deltas,
+     * clamp) and finishes the receipts. Total is O(nsr + effects + nnum). */
+    if (rc == 0 && w->nnum > 0) {
+        struct nacc { long delta, assign_val; const char *rule;
+                      bool have, conflict; } *acc =
+            calloc((size_t)w->nnum, sizeof *acc);
+        for (int i = 0; i < w->nnum; i++) w->rcpt[i].n = 0;
 
         for (int s = 0; s < w->nsr; s++) {
             const srule *r = &w->srules[s];
@@ -1250,49 +1254,54 @@ int world_step(world *w, const uint32_t *actions, int nactions,
                 continue;
             for (int e = 0; e < r->nneff; e++) {
                 const num_effect *ef = &r->neffs[e];
-                if (ef->num_atom != w->nums[i].atom)
-                    continue;
+                int i = num_index(w, ef->num_atom);
+                if (i < 0) continue;
                 long v = eval_expr(w, ef->code, ef->ncode);
                 if (ef->op == WORLD_OP_ASSIGN) {
-                    if (have_assign) {
-                        if (v != assign_val) assign_conflict = true;
+                    if (acc[i].have) {
+                        if (v != acc[i].assign_val) acc[i].conflict = true;
                     } else {
-                        have_assign = true;
-                        assign_val = v;
-                        assign_rule = r->name;
+                        acc[i].have = true;
+                        acc[i].assign_val = v;
+                        acc[i].rule = r->name;
                     }
                 } else {
                     long d = (ef->op == WORLD_OP_ADD) ? v : -v;
-                    delta += d;
-                    rcpt_push(rcp, r->name, ef->op, d);
+                    acc[i].delta += d;
+                    rcpt_push(&w->rcpt[i], r->name, ef->op, d);
                 }
             }
         }
-        if (assign_conflict) {
-            if (err)
-                snprintf(err, errsz,
-                         "conflicting `:=` effects on numeric fluent '%s'",
-                         intern_name(w->syms, w->nums[i].atom));
-            rc = -1;
-            break;
+
+        for (int i = 0; rc == 0 && i < w->nnum; i++) {
+            num_receipt *rcp = &w->rcpt[i];
+            if (acc[i].conflict) {
+                if (err)
+                    snprintf(err, errsz,
+                             "conflicting `:=` effects on numeric fluent '%s'",
+                             intern_name(w->syms, w->nums[i].atom));
+                rc = -1;
+                break;
+            }
+            /* receipt order: winning assign first, then the deltas in scan order */
+            if (acc[i].have) {
+                rcpt_push(rcp, NULL, WORLD_OP_ASSIGN, 0);   /* grow, then shift */
+                memmove(&rcp->items[1], &rcp->items[0],
+                        (size_t)(rcp->n - 1) * sizeof *rcp->items);
+                rcp->items[0].rule = acc[i].rule;
+                rcp->items[0].op = WORLD_OP_ASSIGN;
+                rcp->items[0].amount = acc[i].assign_val;
+            }
+            long base = acc[i].have ? acc[i].assign_val : w->nums[i].value;
+            rcp->base = base;
+            long val = base + acc[i].delta;
+            if (w->nums[i].has_range) {
+                if (val < w->nums[i].min) val = w->nums[i].min;
+                if (val > w->nums[i].max) val = w->nums[i].max;
+            }
+            nextnum[i] = val;
         }
-        /* receipt order: winning assign first, then the deltas in scan order */
-        if (have_assign) {
-            rcpt_push(rcp, NULL, WORLD_OP_ASSIGN, 0);   /* grow, then shift */
-            memmove(&rcp->items[1], &rcp->items[0],
-                    (size_t)(rcp->n - 1) * sizeof *rcp->items);
-            rcp->items[0].rule = assign_rule;
-            rcp->items[0].op = WORLD_OP_ASSIGN;
-            rcp->items[0].amount = assign_val;
-        }
-        long base = have_assign ? assign_val : w->nums[i].value;
-        rcp->base = base;
-        long val = base + delta;
-        if (w->nums[i].has_range) {
-            if (val < w->nums[i].min) val = w->nums[i].min;
-            if (val > w->nums[i].max) val = w->nums[i].max;
-        }
-        nextnum[i] = val;
+        free(acc);
     }
 
     if (rc == 0) {
