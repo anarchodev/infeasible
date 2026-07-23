@@ -2067,22 +2067,27 @@ static void emit_sort_lanes(parser *p, int S, const bool *taint)
     free(ground);
 }
 
-/* ---- the join matcher: two-variable rules (M3) ----
+/* ---- the join matcher: multi-variable rules (M3) ----
  *
- * A rule over two variables has no single forced lane axis, so the compiler
- * chooses one — structurally, never from cardinality (the never-cost-based rule
- * we settled on): the FIRST variable is the lane axis, the second is iterated.
- * The binary predicates slice per iterated entity; each slice is a single-var
- * lane family solved bit-parallel over the lane axis (lane one, loop the other).
- * First cut: exactly two variables, and every body/guard predicate a BASE fluent
- * (derived-body joins and N>2 variables are later widenings). Each such rule
- * gets its own island family — validated against N=1, not yet routed. */
+ * A rule over more than one variable has no single forced lane axis, so the
+ * compiler chooses one — structurally, never from cardinality (the
+ * never-cost-based rule we settled on): the FIRST variable is the lane axis, the
+ * rest are iterated. The predicates slice per iterated assignment; each slice is
+ * a single-var lane family solved bit-parallel over the lane axis (lane one,
+ * loop the others). For two variables that loop is one sort; for K variables it
+ * is the cartesian product of the K-1 non-lane sorts, flattened into the
+ * family's `niter` index — so this reuses the same family API, and world_query's
+ * per-iteration routing, unchanged. Constraint: every body/guard predicate a
+ * BASE fluent (derived-body joins are a later widening). Each such rule gets its
+ * own island family — validated against N=1 (world_lanes_check), and routed for
+ * the atoms that name a full assignment (the relational head + full-arity bodies). */
 
-/* An atom in a two-var rule reduces, per fixed iteration, to a lane column: its
- * args must be drawn from {lane var, iter var} (any arity/order) or none
- * (global). `roles` receives 0 for a lane-var arg, 1 for an iter-var arg. */
-static bool join_atom_ok(parser *p, const ast_atom *a, uint32_t lane, uint32_t iter,
-                         bool is_head, int *roles)
+/* An atom in a multi-var rule reduces, per fixed iteration, to a lane column: its
+ * args must each be one of the rule's variables (any arity/order) or none
+ * (global). `roles[k]` receives the variable index the k-th arg binds — 0 for
+ * the lane var, 1..nvars-1 for an iterated var. */
+static bool join_atom_ok(parser *p, const ast_atom *a, const var_bind *vars,
+                         int nvars, bool is_head, int *roles)
 {
     if (a->value != INTERN_NONE || a->is_guard || a->is_num_effect)
         return false;
@@ -2092,36 +2097,49 @@ static bool join_atom_ok(parser *p, const ast_atom *a, uint32_t lane, uint32_t i
     if (!is_head && pi->is_head)
         return false;                              /* body/guard must be base */
     for (int k = 0; k < a->nargs; k++) {
-        if (a->args[k].name == lane)      roles[k] = 0;
-        else if (a->args[k].name == iter) roles[k] = 1;
-        else return false;                         /* constant / other variable */
+        int rho = -1;
+        for (int v = 0; v < nvars; v++)
+            if (a->args[k].name == vars[v].name) { rho = v; break; }
+        if (rho < 0) return false;                 /* constant / other variable */
+        roles[k] = rho;
     }
     return true;
 }
 
 static void emit_join_family(parser *p, ast_rule *r)
 {
-    uint32_t lane = r->vars[0].name, iter = r->vars[1].name;
-    int Sl = r->vars[0].sort, Si = r->vars[1].sort;
-    int nent = domain_size(p, Sl), niter = domain_size(p, Si);
-    if (nent == 0 || niter == 0)
+    int Sl = r->vars[0].sort;
+    int nent = domain_size(p, Sl);
+    if (nent == 0)
         return;
+
+    /* the iterated axes: vars 1..nvars-1, their cartesian product flattened into
+     * `niter`. vsize[v] is var v's domain size (least-significant last in the
+     * mixed-radix decode below); vsize[0] is unused (the lane axis is nent). */
+    int vsize[MAX_ARGS];
+    long niter = 1;
+    for (int v = 1; v < r->nvars; v++) {
+        vsize[v] = domain_size(p, r->vars[v].sort);
+        if (vsize[v] == 0)
+            return;
+        niter *= vsize[v];
+    }
 
     /* every atom (body, head, guard) must reduce to a lane column */
     const ast_atom *ats[1 + 2 * MAX_BODY];
     int roleslot[1 + 2 * MAX_BODY][MAX_ARGS];
     int nat = 0;
     ats[nat] = &r->head;
-    if (!join_atom_ok(p, &r->head, lane, iter, true, roleslot[nat])) return;
+    if (!join_atom_ok(p, &r->head, r->vars, r->nvars, true, roleslot[nat])) return;
     nat++;
     for (int b = 0; b < r->nbody; b++) {
         ats[nat] = &r->body[b];
-        if (!join_atom_ok(p, &r->body[b], lane, iter, false, roleslot[nat])) return;
+        if (!join_atom_ok(p, &r->body[b], r->vars, r->nvars, false, roleslot[nat])) return;
         nat++;
     }
     for (int g = 0; g < r->nguard; g++) {
         ats[nat] = &r->guard[g];
-        if (!join_atom_ok(p, &r->guard[g], lane, iter, false, roleslot[nat])) return;
+        if (!join_atom_ok(p, &r->guard[g], r->vars, r->nvars, false, roleslot[nat])) return;
         nat++;
     }
 
@@ -2172,19 +2190,30 @@ static void emit_join_family(parser *p, ast_rule *r)
     }
 
     /* ground[(local*niter + it)*nent + e]: substitute the lane entity for role-0
-     * args and the iteration entity for role-1 args */
-    uint32_t *ground = malloc((size_t)npred * niter * nent * sizeof *ground);
+     * args, and for each iterated role v the entity picked out of var v's domain
+     * by the iteration `it` (decoded mixed-radix over the non-lane sorts). */
+    uint32_t *ground = malloc((size_t)npred * (size_t)niter * nent * sizeof *ground);
     for (int a = 0; a < npred; a++)
-        for (int it = 0; it < niter; it++)
+        for (long it = 0; it < niter; it++) {
+            /* decode `it` into a per-iterated-var entity index */
+            int vidx[MAX_ARGS];
+            long rem = it;
+            for (int v = r->nvars - 1; v >= 1; v--) {
+                vidx[v] = (int)(rem % vsize[v]);
+                rem /= vsize[v];
+            }
             for (int e = 0; e < nent; e++) {
                 uint32_t args[MAX_ARGS];
-                for (int m = 0; m < pnarg[a]; m++)
-                    args[m] = prole[a][m] == 0 ? domain_at(p, Sl, e)
-                                               : domain_at(p, Si, it);
+                for (int m = 0; m < pnarg[a]; m++) {
+                    int rho = prole[a][m];
+                    args[m] = rho == 0 ? domain_at(p, Sl, e)
+                                       : domain_at(p, r->vars[rho].sort, vidx[rho]);
+                }
                 ground[((size_t)a * niter + it) * nent + e] =
                     ground_pred(p, preds[a], args, pnarg[a]);
             }
-    world_add_lane_family(p->w, f, npred, nent, niter, ground, pf);
+        }
+    world_add_lane_family(p->w, f, npred, nent, (int)niter, ground, pf);
     free(ground);
 }
 
@@ -2197,7 +2226,7 @@ static void build_lane_families(parser *p)
     for (int S = 0; S < p->nsorts; S++)
         emit_sort_lanes(p, S, taint);
     for (int i = 0; i < p->nrules; i++)
-        if (p->rules[i].nvars == 2)                /* the join matcher */
+        if (p->rules[i].nvars >= 2)                /* the join matcher (2+ vars) */
             emit_join_family(p, &p->rules[i]);
 }
 

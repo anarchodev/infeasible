@@ -220,12 +220,68 @@ static int test_join_matcher(void)
     return 0;
 }
 
+/* The join matcher generalized to THREE variables: actor x item x place. Lane
+ * over the first variable (actor), iterate the other two as one flattened
+ * cartesian product (item x place) — the family's niter. The relational head
+ * drops(X,T,L) names all three variables, so each ground atom is one
+ * (lane, iteration) cell and routes; the binary bodies each drop a variable, so
+ * they repeat across cells and stay on the N=1 path. */
+static const char *JOIN3 =
+    "sort actor, item, place\n"
+    "entity (guard, thug : actor)\n"
+    "entity (torch, vase : item)\n"
+    "entity (hall, cellar : place)\n"
+    "state (holding(actor, item) at(actor, place) dark(place))\n"
+    "rule fumbles(X: actor, T: item, L: place):"
+    "     holding(X, T) & at(X, L) & dark(L) => drops(X, T, L)\n"
+    "init (holding(guard, torch) at(guard, cellar) dark(cellar))\n";
+
+static int test_join3_matcher(void)
+{
+    intern *sy = intern_new();
+    story_diag di[16];
+    story_diags d = { di, 16, 0, 0 };
+    world *w = story_compile(JOIN3, "join3.story", sy, &d);
+    if (!w) {
+        fprintf(stderr, "FAIL compile: %s\n", d.count ? d.items[0].msg : "?");
+        intern_free(sy);
+        return 1;
+    }
+    CHECK(d.nerrors == 0);
+
+    /* one join family (lane=actor, iterate item x place = 4 slices) */
+    CHECK(world_lane_family_count(w) == 1);
+    bool ok = false;
+    CHECK(world_lanes_check(w, &ok) > 0);
+    CHECK(ok);
+
+    /* routed through the lane family across the flattened iteration: guard holds
+     * the torch, is at the cellar, and the cellar is dark -> drops it there;
+     * every other actor/item/place assignment fails one conjunct */
+    CHECK(world_query(w, dl_pos(intern_id(sy, "drops(guard,torch,cellar)"))) == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "drops(guard,torch,hall)")))   != DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "drops(guard,vase,cellar)")))  != DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "drops(thug,torch,cellar)")))  != DL_PROVED);
+
+    /* a fact edit invalidates the cached slice: light the cellar, guard keeps it */
+    world_set(w, intern_id(sy, "dark(cellar)"), false);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "drops(guard,torch,cellar)"))) != DL_PROVED);
+    bool ok2 = false;
+    CHECK(world_lanes_check(w, &ok2) > 0);
+    CHECK(ok2);
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
 int main(void)
 {
     if (test_homogeneous_agrees()) return 1;
     if (test_mixed_partial()) return 1;
     if (test_unless_lanes()) return 1;
     if (test_join_matcher()) return 1;
+    if (test_join3_matcher()) return 1;
     printf("test_lanes: all passed\n");
     return 0;
 }
