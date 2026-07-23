@@ -53,6 +53,9 @@ typedef struct {
     bool        is_num_effect; /* numeric write `f := / += / -= expr` (§5.8) */
     world_numop numop;
     int         expr_root;     /* index into parser.exprs, when is_num_effect */
+    bool        is_expr_guard; /* `expr <cmp> expr` guard (roll-/int-/paren-led) — a
+                                * body-only computed atom, e.g. roll(20)+atk >= ac */
+    int         lhs_root, rhs_root;   /* the two expr trees, when is_expr_guard */
     int       line, col;
 } ast_atom;
 
@@ -576,6 +579,35 @@ static bool parse_atom(parser *p, ast_atom *out)
 {
     memset(out, 0, sizeof *out);
     if (p->cur.kind == TK_TILDE) { out->neg = true; advance(p); }
+    /* An expression guard `expr <cmp> expr` (§5.8/§5.10) — recognised when the
+     * conjunct starts with something a boolean atom can't: a `roll`/`min`/`max`
+     * function call, an int, `(`, or `-`. Covers the d20:
+     * `roll(20) + atk(A) >= ac(T)` and `max(roll(20,1), roll(20,2)) + atk >= ac`. */
+    if (ident_is(p->cur, "roll") || ident_is(p->cur, "min") || ident_is(p->cur, "max") ||
+        p->cur.kind == TK_INT || p->cur.kind == TK_LPAREN || p->cur.kind == TK_MINUS) {
+        token lead = p->cur;
+        int lhs = parse_expr(p);
+        if (lhs < 0) return false;
+        world_cmp op; bool have = true;
+        switch (p->cur.kind) {
+        case TK_LE: op = WORLD_CMP_LE; break; case TK_LT: op = WORLD_CMP_LT; break;
+        case TK_GE: op = WORLD_CMP_GE; break; case TK_GT: op = WORLD_CMP_GT; break;
+        case TK_EQ: op = WORLD_CMP_EQ; break; default: have = false; break;
+        }
+        if (!have) {
+            char d[64]; tok_desc(p->cur, d, sizeof d);
+            fail(p, p->cur.line, p->cur.col,
+                 "expected a comparison (<=, <, >=, >, =) in a roll/expression guard, found %s", d);
+            return false;
+        }
+        advance(p);
+        int rhs = parse_expr(p);
+        if (rhs < 0) return false;
+        out->is_expr_guard = true;
+        out->lhs_root = lhs; out->rhs_root = rhs; out->cmp = op;
+        out->line = lead.line; out->col = lead.col;
+        return true;
+    }
     if (p->cur.kind != TK_IDENT) {
         char d[64]; tok_desc(p->cur, d, sizeof d);
         fail(p, p->cur.line, p->cur.col, "expected an atom name, found %s", d);
@@ -1526,6 +1558,16 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
 static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
                        bool note, bool in_effect, bool allow_prime, const char *ctx)
 {
+    if (at->is_expr_guard) {                        /* `expr <op> expr` guard */
+        if (in_effect) {
+            serr(p, at->line, at->col,
+                 "a comparison guard can't appear in a `causes` clause");
+            return;
+        }
+        check_expr(p, at->lhs_root, vars, nvars);
+        check_expr(p, at->rhs_root, vars, nvars);
+        return;
+    }
     if (note) note_ref(p, at->pred, at->line, at->col);
     if (at->primed) {
         if (!allow_prime) {
@@ -1633,6 +1675,21 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
     check_pred_args(p, at->pred, pi, at->args, at->nargs, vars, nvars, ctx);
 }
 
+/* Does expression tree e read variable `name` (in an EX_LOAD fluent read)? */
+static bool expr_uses_var(parser *p, int e, uint32_t name)
+{
+    if (e < 0) return false;
+    ex_node *n = &p->exprs[e];
+    switch (n->kind) {
+    case EX_CONST: case EX_ROLL: return false;
+    case EX_LOAD:
+        for (int k = 0; k < n->nargs; k++) if (n->args[k].name == name) return true;
+        return false;
+    case EX_NEG: return expr_uses_var(p, n->lhs, name);
+    default:     return expr_uses_var(p, n->lhs, name) || expr_uses_var(p, n->rhs, name);
+    }
+}
+
 /* Every rule variable must occur in the body — the safety / range-restriction
  * discipline (§5.2 item 1). Typed vars bound the domain (item 2), so an unused
  * var is a probable authoring slip, not an unsafe grounding: warn, don't fail. */
@@ -1640,9 +1697,15 @@ static void check_safety(parser *p, ast_rule *r)
 {
     for (int i = 0; i < r->nvars; i++) {
         bool used = false;
-        for (int b = 0; b < r->nbody && !used; b++)
+        for (int b = 0; b < r->nbody && !used; b++) {
+            if (r->body[b].is_expr_guard) {          /* variables live in the exprs */
+                if (expr_uses_var(p, r->body[b].lhs_root, r->vars[i].name) ||
+                    expr_uses_var(p, r->body[b].rhs_root, r->vars[i].name)) used = true;
+                continue;
+            }
             for (int k = 0; k < r->body[b].nargs; k++)
                 if (r->body[b].args[k].name == r->vars[i].name) { used = true; break; }
+        }
         if (!used)
             warn(p, r->vars[i].line, r->vars[i].col,
                  "variable '%s' of rule '%s' does not occur in the body — "
@@ -1898,9 +1961,24 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
     if (*pos < MAX_CODE) { code[*pos].op = op; code[(*pos)++].arg = 0; }
 }
 
+static void inst_name(parser *p, char *buf, size_t n, const char *label,
+                      var_bind *vars, int nvars, const uint32_t *binding);
+
 static dl_lit ground_lit(parser *p, ast_atom *at, var_bind *vars, int nvars,
                          const uint32_t *binding)
 {
+    if (at->is_expr_guard) {                       /* `expr <op> expr` — e.g. the d20 */
+        expr_ins lcode[MAX_CODE], rcode[MAX_CODE];
+        int nl = 0, nr = 0;
+        emit_expr(p, at->lhs_root, vars, nvars, binding, lcode, &nl);
+        emit_expr(p, at->rhs_root, vars, nvars, binding, rcode, &nr);
+        char label[24], nm[MAX_GROUND];
+        snprintf(label, sizeof label, "eg%d", at->lhs_root);   /* per guard occurrence */
+        inst_name(p, nm, sizeof nm, label, vars, nvars, binding);
+        uint32_t g = intern_id(p->syms, nm);
+        world_add_expr_guard(p->w, g, lcode, nl, rcode, nr, at->cmp);
+        return at->neg ? dl_neg(g) : dl_pos(g);
+    }
     uint32_t args[MAX_ARGS];
     for (int k = 0; k < at->nargs; k++)
         args[k] = resolve_arg(vars, nvars, binding, at->args[k]);
@@ -2308,7 +2386,9 @@ static void check_orphans(parser *p)
 {
     for (int i = 0; i < p->nrefs; i++) {
         uint32_t a = p->refs[i].pred;
-        if (is_fluent_pred(p, a) || is_head_pred(p, a)) continue;
+        pred_info *pi = find_pred(p, a);
+        if (is_fluent_pred(p, a) || is_head_pred(p, a) || (pi && pi->is_provider))
+            continue;
         warn(p, p->refs[i].line, p->refs[i].col,
              "'%s' is used as a condition but is never a declared fluent or "
              "concluded by any rule — typo, or a missing declaration?",
@@ -2355,11 +2435,11 @@ static void synchronize(parser *p)
 static bool lane_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var,
                          bool is_head)
 {
-    if (a->value != INTERN_NONE || a->is_guard || a->is_num_effect)
-        return false;                              /* MV / numeric: out */
+    if (a->value != INTERN_NONE || a->is_guard || a->is_num_effect || a->is_expr_guard)
+        return false;                              /* MV / numeric / expr guard: out */
     pred_info *pi = find_pred(p, a->pred);
-    if (!pi || pi->is_mv || pi->is_num)
-        return false;
+    if (!pi || pi->is_mv || pi->is_num || pi->is_provider)
+        return false;                              /* providers are host-answered, not laned */
     if (pi->arity == 0)
         return !is_head;                           /* globals: broadcast body only */
     if (pi->arity != 1 || pi->argsort[0] != S)
@@ -2567,11 +2647,11 @@ static void emit_sort_lanes(parser *p, int S, const bool *taint)
 static bool join_atom_ok(parser *p, const ast_atom *a, const var_bind *vars,
                          int nvars, bool is_head, int *roles)
 {
-    if (a->value != INTERN_NONE || a->is_guard || a->is_num_effect)
+    if (a->value != INTERN_NONE || a->is_guard || a->is_num_effect || a->is_expr_guard)
         return false;
     pred_info *pi = find_pred(p, a->pred);
-    if (!pi || pi->is_mv || pi->is_num || pi->arity != a->nargs)
-        return false;
+    if (!pi || pi->is_mv || pi->is_num || pi->is_provider || pi->arity != a->nargs)
+        return false;                              /* providers are host-answered, not laned */
     (void)is_head;   /* a derived body/guard pred is allowed: it imports (§5.5) */
     for (int k = 0; k < a->nargs; k++) {
         int rho = -1;

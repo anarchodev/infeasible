@@ -190,12 +190,79 @@ static int test_example(void)
     return 0;
 }
 
+/* adjacency: any two distinct actors (melee brawl) */
+static bool adj_any(void *ctx, uint32_t pred, const uint32_t *a, int n)
+{ (void)ctx; (void)pred; return n == 2 && a[0] != a[1]; }
+
+/* --- roll inside a guard: the d20. Varies across ticks; replays exactly. --- */
+static int test_roll_guard(void)
+{
+    static const char *src =
+        "sort actor\nentity ( a, b : actor )\n"
+        "state ( dummy(actor)  atk(actor):int  ac(actor):int )\n"
+        "init ( atk(a)=5 ac(b)=15 )\n"
+        "rule hit(A: actor, T: actor): roll(20) + atk(A) >= ac(T) -> hit(A, T)\n"
+        "action nop(A: actor): causes dummy(A)\n";
+    /* two worlds, same seed: the roll-guard sequence must vary AND be identical */
+    int seq[2][40];
+    for (int run = 0; run < 2; run++) {
+        intern *sy = intern_new(); world *w = compile(src, sy); CHECK(w);
+        world_set_seed(w, 0xD20D20);
+        uint32_t nop = intern_id(sy, "nop(a)"); char err[128];
+        for (int i = 0; i < 40; i++) {
+            seq[run][i] = world_query(w, dl_pos(intern_id(sy, "hit(a,b)"))) == DL_PROVED;
+            CHECK(world_step(w, &nop, 1, err, sizeof err) == 0);
+        }
+        world_free(w); intern_free(sy);
+    }
+    int hits = 0;
+    for (int i = 0; i < 40; i++) {
+        CHECK(seq[0][i] == seq[1][i]);              /* I4: same seed replays exactly */
+        hits += seq[0][i];
+    }
+    CHECK(hits > 5 && hits < 35);                   /* neither stuck-miss nor stuck-hit (~55%) */
+    return 0;
+}
+
+/* --- the shipped combat example: engine-side rolls + provider, replay-exact --- */
+static int test_combat_replay(void)
+{
+    char *src = slurp(STORY_DIR "/combat_srd.story");
+    CHECK(src != NULL);
+    const char *script[] = { "shove(aria,grunk)", "strike(snik,aria)",
+                             "strike(aria,grunk)", "strike(aria,snik)",
+                             "strike(snik,aria)", "strike(aria,snik)" };
+    long fin[2][3];
+    for (int run = 0; run < 2; run++) {
+        intern *sy = intern_new(); world *w = compile(src, sy); CHECK(w);
+        world_set_provider_fn(w, adj_any, NULL);
+        world_set_seed(w, 0x5E5A11);
+        char err[128];
+        for (size_t i = 0; i < sizeof script / sizeof script[0]; i++) {
+            uint32_t a = intern_id(sy, script[i]);
+            CHECK(world_step(w, &a, 1, err, sizeof err) == 0);
+        }
+        fin[run][0] = world_get_num(w, intern_id(sy, "hp(aria)"));
+        fin[run][1] = world_get_num(w, intern_id(sy, "hp(grunk)"));
+        fin[run][2] = world_get_num(w, intern_id(sy, "hp(snik)"));
+        world_free(w); intern_free(sy);
+    }
+    /* same seed + same action log => identical final state (I4 replay) */
+    for (int k = 0; k < 3; k++) CHECK(fin[0][k] == fin[1][k]);
+    /* and the fight actually happened (engine-side rolls landed some blows) */
+    CHECK(fin[0][0] < 24 || fin[0][1] < 7 || fin[0][2] < 7);
+    free(src);
+    return 0;
+}
+
 int main(void)
 {
-    if (test_provider()) return 1;
-    if (test_roll())     return 1;
-    if (test_faithful()) return 1;
-    if (test_example())  return 1;
+    if (test_provider())      return 1;
+    if (test_roll())          return 1;
+    if (test_faithful())      return 1;
+    if (test_example())       return 1;
+    if (test_roll_guard())    return 1;
+    if (test_combat_replay()) return 1;
     printf("test_provider: all passed\n");
     return 0;
 }

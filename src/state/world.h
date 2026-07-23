@@ -95,6 +95,13 @@ typedef enum {
 } expr_op;
 typedef struct { expr_op op; long arg; } expr_ins;
 
+/* Register an expression guard: `guard` is proved when `lhs <op> rhs` holds, where
+ * both sides are effect-expression bytecode (roll/fluent reads/const). Bytecode is
+ * copied. Consulted at solve time (§5.8/§5.10) — e.g. the d20 `roll(20)+atk >= ac`. */
+void world_add_expr_guard(world *w, uint32_t guard,
+                          const expr_ins *lhs, int nlhs,
+                          const expr_ins *rhs, int nrhs, world_cmp op);
+
 /* Judgment rules (query layer). Returns rule handle for world_add_sup. */
 int  world_add_rule(world *w, const char *name, dl_rule_kind kind,
                     dl_lit head, const dl_lit *body, int nbody);

@@ -130,6 +130,12 @@ struct world {
     int nnum, capnum;
     struct { uint32_t guard, num; world_cmp op; long threshold; } *guards;
     int ng, capg;
+    /* Expression guards (§5.8/§5.10): `expr <op> expr` — e.g. roll(20)+atk >= ac.
+     * Two RHS-bytecode programs compared at solve time; loads as a fact like a
+     * numeric guard. Bytecode is arena-copied. */
+    struct { uint32_t guard; const expr_ins *lhs; int nlhs;
+             const expr_ins *rhs; int nrhs; world_cmp op; } *eguards;
+    int neguard, capeguard;
 
     /* Providers (§5.2/§5.6/§5.10): computed relations answered host-side, never
      * stored. Each ground provider atom records its predicate + entity args; at
@@ -252,6 +258,7 @@ void world_free(world *w)
     free(w->srules);
     free(w->nums);
     free(w->guards);
+    free(w->eguards);
     free(w->provs);
     free(w->rollsites);
     if (w->rcpt) {
@@ -444,11 +451,9 @@ static long roll_value(const world *w, int idx)
     return (long)(x % (uint64_t)sides) + 1;
 }
 
-/* Does guard g hold for the current value of its numeric fluent? */
-static bool guard_holds(const world *w, int g)
+static bool cmp_ok(long v, long t, world_cmp op)
 {
-    long v = world_get_num(w, w->guards[g].num), t = w->guards[g].threshold;
-    switch (w->guards[g].op) {
+    switch (op) {
     case WORLD_CMP_LE: return v <= t;
     case WORLD_CMP_LT: return v <  t;
     case WORLD_CMP_GE: return v >= t;
@@ -456,6 +461,52 @@ static bool guard_holds(const world *w, int g)
     case WORLD_CMP_EQ: return v == t;
     }
     return false;
+}
+
+/* Does guard g hold for the current value of its numeric fluent? */
+static bool guard_holds(const world *w, int g)
+{
+    return cmp_ok(world_get_num(w, w->guards[g].num), w->guards[g].threshold,
+                  w->guards[g].op);
+}
+
+static long eval_expr(const world *w, const expr_ins *code, int n);
+
+void world_add_expr_guard(world *w, uint32_t guard,
+                          const expr_ins *lhs, int nlhs,
+                          const expr_ins *rhs, int nrhs, world_cmp op)
+{
+    for (int i = 0; i < w->neguard; i++)     /* dedup: one entry per ground atom */
+        if (w->eguards[i].guard == guard) return;
+    GROW(w->eguards, w->neguard, w->capeguard);
+    expr_ins *l = arena_alloc(&w->a, (size_t)(nlhs ? nlhs : 1) * sizeof *l);
+    expr_ins *r = arena_alloc(&w->a, (size_t)(nrhs ? nrhs : 1) * sizeof *r);
+    if (nlhs) memcpy(l, lhs, (size_t)nlhs * sizeof *l);
+    if (nrhs) memcpy(r, rhs, (size_t)nrhs * sizeof *r);
+    w->eguards[w->neguard].guard = guard;
+    w->eguards[w->neguard].lhs = l; w->eguards[w->neguard].nlhs = nlhs;
+    w->eguards[w->neguard].rhs = r; w->eguards[w->neguard].nrhs = nrhs;
+    w->eguards[w->neguard].op = op;
+    w->neguard++;
+}
+
+/* Does expression guard i hold? Evaluates both bytecode sides (roll/fluent/const)
+ * and compares. Rolls read the current tick — idempotent within a solve. */
+static bool guard_holds_expr(const world *w, int i)
+{
+    return cmp_ok(eval_expr(w, w->eguards[i].lhs, w->eguards[i].nlhs),
+                  eval_expr(w, w->eguards[i].rhs, w->eguards[i].nrhs),
+                  w->eguards[i].op);
+}
+
+/* Load every ground expression guard as a closed-world fact (like numeric guards). */
+static void load_eguards(world *w, dlcol *f)
+{
+    for (int i = 0; i < w->neguard; i++) {
+        uint32_t ga = w->eguards[i].guard;
+        if (ga < w->loc_cap && w->loc_of[ga] != LOC_NONE)
+            dlcol_add_fact(f, (dl_lit){ w->loc_of[ga], !guard_holds_expr(w, i) }, 0);
+    }
 }
 
 int world_add_rule(world *w, const char *name, dl_rule_kind kind,
@@ -1199,6 +1250,7 @@ static void solve_judgment_family(world *w)
         }
     }
     load_providers(w, f);
+    load_eguards(w, f);
     dlcol_solve(f);
     w->jfam_solved = true;
 }
@@ -1297,6 +1349,7 @@ static void solve_step_family_vals(world *w, const bool *vals,
         }
     }
     load_providers(w, f);
+    load_eguards(w, f);
     dlcol_solve(f);
 }
 
