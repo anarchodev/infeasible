@@ -4,7 +4,7 @@
  * bench_col times the dl_col solver directly, this times the whole step:
  * closed-world fact load, the fixpoint, contested check, and commit.
  *
- *   ./bench_step [nents]      default sweep: 1000 10000
+ *   ./bench_step [nents]      default sweep: 1000 10000 100000
  *
  * A homogeneous per-unit transition (3 boolean fluents over one sort, 3 actions,
  * one primed-body ramification):
@@ -16,10 +16,10 @@
  * step lane family) and the C API (grounded per entity -> the N=1 step family).
  * Results are verified identical before timing.
  *
- * Note: construction is O(n^2) today — world_declare_fluent / fluent_index scan
- * linearly — so this reports build time separately and the sweep stops at 10000.
- * The PER-TICK solve, not construction, is the RTS number; bench_col shows the
- * underlying columnar solve scales to 100000. */
+ * Build time is reported separately from the per-tick solve (the RTS number).
+ * Both the world's atom->index maps and the grounder's entity lookups are hashed
+ * (direct-indexed on the dense interns), so construction is ~linear and 100000
+ * entities build in well under a second. */
 
 #include "lang/story.h"
 #include "state/world.h"
@@ -161,7 +161,7 @@ static int bench_one(int n)
     if (bad) { fprintf(stderr, "bench_step: verification FAILED at N=%d\n", n); return 1; }
 
     /* ---- time both per-tick paths ---- */
-    int n1_iters = n <= 1000 ? 50 : 15, lane_iters = 200;
+    int n1_iters = n <= 1000 ? 50 : n <= 10000 ? 15 : 5, lane_iters = 200;
     double lane_med = median_step(wl, acts, nacts, lane_iters);
     double n1_med   = median_step(wn, acts, nacts, n1_iters);
 
@@ -186,7 +186,7 @@ int main(int argc, char **argv)
            "generated inertia; world_step lanes vs N=1\n");
     if (argc > 1)
         return bench_one(atoi(argv[1]));
-    static const int sweep[] = { 1000, 10000 };
+    static const int sweep[] = { 1000, 10000, 100000 };
     for (size_t i = 0; i < sizeof sweep / sizeof sweep[0]; i++)
         if (bench_one(sweep[i]))
             return 1;

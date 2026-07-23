@@ -145,6 +145,13 @@ typedef struct {
     int nsorts;
     struct ent_rec { uint32_t atom; int sort; int line, col; } *ents;  /* heap, grown */
     int nents, capents;
+    /* O(1) entity lookups (built in resolve_entities), so grounding is not O(n^2):
+     * ent_of maps an entity atom -> its p->ents index (interns are dense, so the
+     * direct-indexed array is a perfect hash); ent_pos is that entity's position
+     * within its own sort; domain_ents[s]/domain_n[s] is sort s's entity list. */
+    int *ent_of; uint32_t ent_of_cap;
+    int *ent_pos;
+    uint32_t *domain_ents[MAX_SORTS]; int domain_n[MAX_SORTS];
     ast_fluent  fluents[MAX_FLUENTS];
     int nfluents;
     ast_rule   *rules;            /* heap; MAX_RULES */
@@ -934,36 +941,28 @@ static int find_sort(parser *p, uint32_t name_atom)
     return -1;
 }
 
+/* All O(1) via the maps built in resolve_entities (was linear — the source of
+ * the O(n^2) grounding wall, since decode_binding hits these per instance). */
 static int find_entity(parser *p, uint32_t atom)
 {
-    for (int i = 0; i < p->nents; i++)
-        if (p->ents[i].atom == atom) return i;
-    return -1;
+    return atom < p->ent_of_cap ? p->ent_of[atom] : -1;
 }
 
 /* domain of a sort: entities declared for it, in declaration order */
 static int domain_size(parser *p, int sort)
 {
-    int n = 0;
-    for (int i = 0; i < p->nents; i++)
-        if (p->ents[i].sort == sort) n++;
-    return n;
+    return (sort >= 0 && sort < p->nsorts) ? p->domain_n[sort] : 0;
 }
 static uint32_t domain_at(parser *p, int sort, int k)
 {
-    for (int i = 0; i < p->nents; i++)
-        if (p->ents[i].sort == sort && k-- == 0) return p->ents[i].atom;
-    return INTERN_NONE;
+    if (sort < 0 || sort >= p->nsorts || k < 0 || k >= p->domain_n[sort])
+        return INTERN_NONE;
+    return p->domain_ents[sort][k];
 }
 static int entity_pos(parser *p, int sort, uint32_t atom)
 {
-    int pos = 0;
-    for (int i = 0; i < p->nents; i++) {
-        if (p->ents[i].sort != sort) continue;
-        if (p->ents[i].atom == atom) return pos;
-        pos++;
-    }
-    return -1;
+    int i = find_entity(p, atom);
+    return (i >= 0 && p->ents[i].sort == sort) ? p->ent_pos[i] : -1;
 }
 
 static pred_info *find_pred(parser *p, uint32_t pred)
@@ -1021,6 +1020,20 @@ static int decode_sort(parser *p, int encoded, int line, int col, const char *wh
 }
 
 /* Resolve entity sort assignments, then validate uniqueness. */
+/* atom -> int map with geometric growth (amortized O(1); a grow-to-key+1 per
+ * call would reintroduce O(n^2)). New slots init to -1. */
+static void atom_map_set(int **map, uint32_t *cap, uint32_t key, int val)
+{
+    if (key >= *cap) {
+        uint32_t nc = *cap ? *cap : 16;
+        while (nc <= key) nc *= 2;
+        *map = realloc(*map, (size_t)nc * sizeof **map);
+        for (uint32_t k = *cap; k < nc; k++) (*map)[k] = -1;
+        *cap = nc;
+    }
+    (*map)[key] = val;
+}
+
 static void resolve_entities(parser *p)
 {
     for (int i = 0; i < p->nents; i++) {
@@ -1028,11 +1041,34 @@ static void resolve_entities(parser *p)
                             "an entity declaration");
         p->ents[i].sort = s;                       /* may be -1 on error */
     }
+
+    /* atom -> first-occurrence index (also an O(n) duplicate check) */
+    for (int i = 0; i < p->nents; i++) {
+        uint32_t at = p->ents[i].atom;
+        int prev = at < p->ent_of_cap ? p->ent_of[at] : -1;
+        if (prev >= 0)
+            serr(p, p->ents[i].line, p->ents[i].col,
+                 "duplicate entity '%s'", intern_name(p->syms, at));
+        else
+            atom_map_set(&p->ent_of, &p->ent_of_cap, at, i);
+    }
+
+    /* per-sort entity lists + each entity's position within its sort */
+    for (int s = 0; s < p->nsorts; s++) p->domain_n[s] = 0;
     for (int i = 0; i < p->nents; i++)
-        for (int j = i + 1; j < p->nents; j++)
-            if (p->ents[i].atom == p->ents[j].atom)
-                serr(p, p->ents[j].line, p->ents[j].col,
-                     "duplicate entity '%s'", intern_name(p->syms, p->ents[i].atom));
+        if (p->ents[i].sort >= 0) p->domain_n[p->ents[i].sort]++;
+    for (int s = 0; s < p->nsorts; s++)
+        p->domain_ents[s] = malloc((size_t)(p->domain_n[s] ? p->domain_n[s] : 1)
+                                   * sizeof *p->domain_ents[s]);
+    p->ent_pos = malloc((size_t)(p->nents ? p->nents : 1) * sizeof *p->ent_pos);
+    int fill[MAX_SORTS];
+    for (int s = 0; s < p->nsorts; s++) fill[s] = 0;
+    for (int i = 0; i < p->nents; i++) {
+        int s = p->ents[i].sort;
+        if (s < 0) { p->ent_pos[i] = -1; continue; }
+        p->ent_pos[i] = fill[s];
+        p->domain_ents[s][fill[s]++] = p->ents[i].atom;
+    }
 }
 
 /* Build the predicate registry: fluents (with arg sorts) plus rule heads. */
@@ -2487,6 +2523,9 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
     free(p->actions);
     free(p->exprs);
     free(p->ents);
+    free(p->ent_of);
+    free(p->ent_pos);
+    for (int s = 0; s < p->nsorts; s++) free(p->domain_ents[s]);
     free(p);
     return result;
 }

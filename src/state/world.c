@@ -95,6 +95,11 @@ struct world {
     uint32_t *fluents; bool *vals; uint32_t *primed;
     const char **fl_prov;         /* decl span per fluent (§6.3), or NULL */
     int nfl, capfl;
+    /* atom -> index maps, so declare/lookup is O(1) not a linear scan (interns
+     * are dense uint32, so a direct-indexed array is the natural perfect hash).
+     * Grown geometrically; slot value -1 = absent. Fluents/nums are append-only. */
+    int *fluent_of; uint32_t fluent_of_cap;
+    int *num_of;    uint32_t num_of_cap;
     jrule *jrules; int njr, capjr;
     jsup *jsups; int njs, capjs;
     srule *srules; int nsr, capsr;
@@ -200,6 +205,8 @@ void world_free(world *w)
     free(w->vals);
     free(w->primed);
     free(w->fl_prov);
+    free(w->fluent_of);
+    free(w->num_of);
     free(w->jrules);
     free(w->jsups);
     free(w->srules);
@@ -213,12 +220,24 @@ void world_free(world *w)
     free(w);
 }
 
+/* atom -> index map: geometric growth keeps declare amortized O(1) even when
+ * atoms arrive in increasing id order (a per-call grow-to-atom+1 would be O(n^2)
+ * of reallocs — the very trap this replaces). New slots init to -1. */
+static void atom_map_set(int **map, uint32_t *cap, uint32_t key, int val)
+{
+    if (key >= *cap) {
+        uint32_t nc = *cap ? *cap : 16;
+        while (nc <= key) nc *= 2;
+        *map = realloc(*map, (size_t)nc * sizeof **map);
+        for (uint32_t k = *cap; k < nc; k++) (*map)[k] = -1;
+        *cap = nc;
+    }
+    (*map)[key] = val;
+}
+
 static int fluent_index(const world *w, uint32_t atom)
 {
-    for (int i = 0; i < w->nfl; i++)
-        if (w->fluents[i] == atom)
-            return i;
-    return -1;
+    return atom < w->fluent_of_cap ? w->fluent_of[atom] : -1;
 }
 
 void world_declare_fluent(world *w, uint32_t atom)
@@ -239,6 +258,7 @@ void world_declare_fluent(world *w, uint32_t atom)
     w->vals[w->nfl] = false;
     w->primed[w->nfl] = intern_id(w->syms, buf);
     w->fl_prov[w->nfl] = NULL;
+    atom_map_set(&w->fluent_of, &w->fluent_of_cap, atom, w->nfl);
     w->nfl++;
     w->fam_dirty = true;
     w->lanes_ok = false;          /* a structural edit stales the lane families */
@@ -272,9 +292,7 @@ bool world_get(const world *w, uint32_t atom)
 
 static int num_index(const world *w, uint32_t atom)
 {
-    for (int i = 0; i < w->nnum; i++)
-        if (w->nums[i].atom == atom) return i;
-    return -1;
+    return atom < w->num_of_cap ? w->num_of[atom] : -1;
 }
 
 void world_declare_num(world *w, uint32_t atom, long min, long max, bool has_range)
@@ -286,6 +304,7 @@ void world_declare_num(world *w, uint32_t atom, long min, long max, bool has_ran
     w->nums[w->nnum].min = min;
     w->nums[w->nnum].max = max;
     w->nums[w->nnum].has_range = has_range;
+    atom_map_set(&w->num_of, &w->num_of_cap, atom, w->nnum);
     w->nnum++;
 }
 
