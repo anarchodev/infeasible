@@ -102,6 +102,12 @@ typedef struct {
         uint32_t   marker;        /* family-local: the fired marker (readout) */
     } *numeff;
     bool     covers_numeric;      /* numeric commit is fully laned -> routable */
+
+    /* broadcast cast triggers (`for each` binders): a ground cast atom maps to the
+     * WORLD_STEP_BCAST local it drives; when it occurs, every lane of that local
+     * is set (the cast fans out over the target lanes). -1 = not a cast atom. */
+    int     *bcast_of;
+    uint32_t bcast_of_cap;
 } step_lane_family;
 
 struct world {
@@ -209,6 +215,7 @@ void world_free(world *w)
         free(w->steplanes[i].act_of);
         free(w->steplanes[i].num_cell);
         free(w->steplanes[i].numeff);
+        free(w->steplanes[i].bcast_of);
     }
     free(w->steplanes);
     free(w->step_snap);
@@ -664,6 +671,7 @@ void world_add_step_lane_family(world *w, dlcol *fam, int nloc, int nent,
     sf->numsc = 0; sf->num_cell = NULL;           /* numeric extension: off unless */
     sf->nnumeff = 0; sf->numeff = NULL;            /* world_step_lane_set_numeric */
     sf->covers_numeric = false;
+    sf->bcast_of = NULL; sf->bcast_of_cap = 0;     /* broadcast triggers: off unless set */
     size_t g = (size_t)nloc * (size_t)nent;
     sf->ground = malloc((g ? g : 1) * sizeof *sf->ground);
     memcpy(sf->ground, ground, (g ? g : 1) * sizeof *sf->ground);
@@ -742,6 +750,22 @@ void world_step_lane_set_numeric(world *w, int numsc, const uint32_t *num_atom_c
     sf->covers_numeric = true;
 }
 
+/* Register broadcast cast triggers on the last-added step lane family: each of the
+ * `ncast` ground cast atoms drives the WORLD_STEP_BCAST local `cast_local[i]` — a
+ * `for each` binder's cast fans out over every target lane of that local. */
+void world_step_lane_set_bcast(world *w, int ncast, const uint32_t *cast_atom,
+                               const int *cast_local)
+{
+    if (w->nsteplanes == 0 || ncast == 0) return;
+    step_lane_family *sf = &w->steplanes[w->nsteplanes - 1];
+    uint32_t maxa = 0;
+    for (int i = 0; i < ncast; i++) if (cast_atom[i] > maxa) maxa = cast_atom[i];
+    sf->bcast_of_cap = maxa + 1;
+    sf->bcast_of = malloc((size_t)sf->bcast_of_cap * sizeof *sf->bcast_of);
+    for (uint32_t k = 0; k < sf->bcast_of_cap; k++) sf->bcast_of[k] = -1;
+    for (int i = 0; i < ncast; i++) sf->bcast_of[cast_atom[i]] = cast_local[i];
+}
+
 int world_step_lane_family_count(const world *w) { return w->nsteplanes; }
 
 /* True iff world_step will route the numeric transition through the lane family
@@ -768,8 +792,8 @@ static void solve_step_lane_family(world *w, step_lane_family *sf,
                 dl_lit l = { (uint32_t)a, !(i >= 0 && w->vals[i]) };
                 dlcol_add_fact(sf->fam, l, e);
             }
-        } else if (sf->kind[a] == WORLD_STEP_ACTION) {
-            /* default every lane to "action did not occur" (~action); the
+        } else if (sf->kind[a] == WORLD_STEP_ACTION || sf->kind[a] == WORLD_STEP_BCAST) {
+            /* default every lane to "did not occur" (~action / ~cast); the
              * occurring ones are flipped below in O(#actions), not O(lanes) */
             uint64_t *pos = dlcol_fact_row(sf->fam, (dl_lit){ (uint32_t)a, false });
             uint64_t *neg = dlcol_fact_row(sf->fam, (dl_lit){ (uint32_t)a, true });
@@ -788,6 +812,18 @@ static void solve_step_lane_family(world *w, step_lane_family *sf,
         uint64_t *neg = dlcol_fact_row(sf->fam, (dl_lit){ (uint32_t)a, true });
         pos[e / 64] |=  (1ull << (e % 64));
         neg[e / 64] &= ~(1ull << (e % 64));
+    }
+    /* a broadcast cast (a `for each` binder) sets its whole column — the discrete
+     * cast fans out over every target lane; per-lane `where`/`when` guards then
+     * decide which lanes actually take the effect in the solve. */
+    for (int i = 0; i < nactions; i++) {
+        uint32_t at = actions[i];
+        if (at >= sf->bcast_of_cap || sf->bcast_of[at] < 0) continue;
+        int a = sf->bcast_of[at];
+        uint64_t *pos = dlcol_fact_row(sf->fam, (dl_lit){ (uint32_t)a, false });
+        uint64_t *neg = dlcol_fact_row(sf->fam, (dl_lit){ (uint32_t)a, true });
+        memset(pos, 0xFF, (size_t)W * sizeof *pos);
+        memset(neg, 0x00, (size_t)W * sizeof *neg);
     }
     dlcol_solve(sf->fam);
 }

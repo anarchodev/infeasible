@@ -2717,15 +2717,52 @@ static void emit_step_lanes(parser *p)
     int na = 0;
     uint32_t glob[MAX_PREDS];
     int ng = 0;
-    bool act_has_num[MAX_ACTIONS];
-    for (int i = 0; i < p->nactions; i++) act_has_num[i] = false;
+    bool act_has_num[MAX_ACTIONS], act_is_binder[MAX_ACTIONS];
+    for (int i = 0; i < p->nactions; i++) { act_has_num[i] = false; act_is_binder[i] = false; }
     int neff_act[MAX_LANE_NUMEFF], neff_schema[MAX_LANE_NUMEFF], neff_op[MAX_LANE_NUMEFF];
     long neff_konst[MAX_LANE_NUMEFF];
     int nne = 0;
+    /* binder items to lane (one numeric const effect per item): its action, item
+     * index, target-numeric schema, op, constant. */
+    int bitem_act[MAX_LANE_NUMEFF], bitem_it[MAX_LANE_NUMEFF];
+    int bitem_schema[MAX_LANE_NUMEFF], bitem_op[MAX_LANE_NUMEFF];
+    long bitem_konst[MAX_LANE_NUMEFF];
+    int nbitem = 0;
     for (int i = 0; i < p->nactions; i++) {
         ast_action *a = &p->actions[i];
-        if (a->nbind > 0)          /* binder effects live outside a->effects: N=1 */
-            return;
+        if (a->nbind > 0) {
+            /* a `for each` binder cast (e.g. Fireball): the binder's target var is
+             * the lane axis and the cast is a broadcast trigger. First cut: one
+             * caster var, one binder over S, no caster-side requires/effects,
+             * boolean where/when guards over the target (arity-1 over S), and
+             * constant-RHS numeric effects on the target. */
+            if (a->neff != 0 || a->nreq != 0 || a->nvars != 1 || a->nbind != 1)
+                return;
+            ast_binder *bnd = &p->binders[a->bind_ix[0]];
+            if (bnd->nvars != 1 || bnd->vars[0].sort != S) return;
+            uint32_t tv = bnd->vars[0].name;             /* the target (lane) var */
+            for (int b = 0; b < bnd->nwhere; b++)
+                if (!step_atom_ok(p, &bnd->where[b], S, tv, false) ||
+                    find_pred(p, bnd->where[b].pred)->arity != 1) return;
+            for (int it = 0; it < bnd->nitems; it++) {
+                binder_item *item = &bnd->items[it];
+                long k;
+                if (!item->eff.is_num_effect || !num_eff_ok(p, &item->eff, S, tv, &k)) return;
+                int sc = -1;
+                for (int j = 0; j < nnp; j++)
+                    if (p->preds[numpred[j]].pred == item->eff.pred) { sc = j; break; }
+                if (sc < 0) return;
+                for (int b = 0; b < item->nwhen; b++)
+                    if (!step_atom_ok(p, &item->when[b], S, tv, false) ||
+                        find_pred(p, item->when[b].pred)->arity != 1) return;
+                if (nbitem >= MAX_LANE_NUMEFF) return;
+                bitem_act[nbitem] = i; bitem_it[nbitem] = it; bitem_schema[nbitem] = sc;
+                bitem_op[nbitem] = (int)item->eff.numop; bitem_konst[nbitem] = k;
+                nbitem++;
+            }
+            act_is_binder[i] = true;
+            continue;                                    /* not a per-lane action */
+        }
         if (a->nvars != 1 || a->vars[0].sort != S)
             return;
         uint32_t var = a->vars[0].name;
@@ -2769,14 +2806,17 @@ static void emit_step_lanes(parser *p)
      * trigger one action local; per action with numeric effects one fired-marker
      * readout (a synthetic head `body -> marker`, read by the numeric commit).
      * cur/pri interleaved so index math stays local. */
-    int nmark = 0;
-    for (int i = 0; i < p->nactions; i++) if (act_has_num[i]) nmark++;
-    int nloc = 2 * nf + ng + na + nmark;
+    int nmark = 0, nbcast = 0;
+    for (int i = 0; i < p->nactions; i++) {
+        if (act_has_num[i]) nmark++;
+        if (act_is_binder[i]) nbcast++;
+    }
+    int nloc = 2 * nf + ng + na + nmark + nbcast + nbitem;
     dlcol *f = dlcol_new(nloc, nent);
     int cur_local[MAX_PREDS], pri_local[MAX_PREDS], glob_local[MAX_PREDS];
     int inertia_pos[MAX_PREDS], inertia_neg[MAX_PREDS], act_local[MAX_ACTIONS];
-    int marker_local[MAX_ACTIONS];
-    for (int i = 0; i < p->nactions; i++) marker_local[i] = -1;
+    int marker_local[MAX_ACTIONS], bcast_local[MAX_ACTIONS], bmarker[MAX_LANE_NUMEFF];
+    for (int i = 0; i < p->nactions; i++) { marker_local[i] = -1; bcast_local[i] = -1; }
     uint8_t *kind = malloc((size_t)nloc * sizeof *kind);
     int n = 0;
     char nbuf[MAX_GROUND + 2];
@@ -2809,6 +2849,21 @@ static void emit_step_lanes(parser *p)
         dlcol_set_atom_name(f, (uint32_t)n, mname);
         n++;
     }
+    /* one broadcast-cast local per binder action, then one fired marker per item */
+    for (int i = 0; i < p->nactions; i++) if (act_is_binder[i]) {
+        bcast_local[i] = n; kind[n] = WORLD_STEP_BCAST;
+        char cn[MAX_NAME + 8];
+        snprintf(cn, sizeof cn, "cast:%s", p->actions[i].name);
+        dlcol_set_atom_name(f, (uint32_t)n, cn);
+        n++;
+    }
+    for (int k = 0; k < nbitem; k++) {
+        bmarker[k] = n; kind[n] = WORLD_STEP_PRIMED;
+        char mn[MAX_NAME + 16];
+        snprintf(mn, sizeof mn, "fired:%s#%d", p->actions[bitem_act[k]].name, bitem_it[k]);
+        dlcol_set_atom_name(f, (uint32_t)n, mn);
+        n++;
+    }
 
     /* generated inertia, one pair per fluent (ids kept for causal superiority) */
     char rbuf[MAX_NAME + 16];
@@ -2825,6 +2880,7 @@ static void emit_step_lanes(parser *p)
      * inertia rule it conflicts with (matches world.c emit_step_family) */
     for (int i = 0; i < p->nactions; i++) {
         ast_action *a = &p->actions[i];
+        if (act_is_binder[i]) continue;            /* binder marker rules built below */
         int nbody = a->nreq + (a->is_ramif ? 0 : 1);
         dl_lit body[MAX_BODY + 1];
         int bi = 0;
@@ -2873,6 +2929,36 @@ static void emit_step_lanes(parser *p)
         }
     }
 
+    /* binder fired markers: `cast & where(T) & when(T) => marker` — the broadcast
+     * cast, ANDed with the per-lane boolean guards, decides which target lanes take
+     * the effect. Numeric effects don't defeat, so a defeasible head suffices. */
+    for (int k = 0; k < nbitem; k++) {
+        int i = bitem_act[k], it = bitem_it[k];
+        ast_action *a = &p->actions[i];
+        ast_binder *bnd = &p->binders[a->bind_ix[0]];
+        binder_item *item = &bnd->items[it];
+        dl_lit body[MAX_BODY + 1];
+        int bi = 0;
+        body[bi++] = (dl_lit){ (uint32_t)bcast_local[i], false };
+        for (int b = 0; b < bnd->nwhere && bi < MAX_BODY; b++) {
+            int fi = step_fidx(p, fpred, nf, bnd->where[b].pred);
+            int loc = bnd->where[b].primed ? pri_local[fi] : cur_local[fi];
+            body[bi++] = (dl_lit){ (uint32_t)loc, bnd->where[b].neg };
+        }
+        for (int b = 0; b < item->nwhen && bi < MAX_BODY; b++) {
+            int fi = step_fidx(p, fpred, nf, item->when[b].pred);
+            int loc = item->when[b].primed ? pri_local[fi] : cur_local[fi];
+            body[bi++] = (dl_lit){ (uint32_t)loc, item->when[b].neg };
+        }
+        char mn[MAX_NAME + 16];
+        snprintf(mn, sizeof mn, "fired:%s#%d", a->name, it);
+        char pbuf[MAX_NAME + 24];
+        prov_str(p, bnd->line, pbuf, sizeof pbuf);
+        int mid = dlcol_add_rule(f, mn, DL_DEFEASIBLE,
+                                 (dl_lit){ (uint32_t)bmarker[k], false }, body, bi);
+        dlcol_set_prov(f, mid, pbuf);
+    }
+
     /* ground map: cur(P)@e -> P(e), pri(P)@e -> P(e)', action(A)@e -> A(e) */
     uint32_t *ground = malloc((size_t)nloc * nent * sizeof *ground);
     for (int i = 0; i < nf; i++) {
@@ -2899,11 +2985,23 @@ static void emit_step_lanes(parser *p)
         uint32_t ma = intern_id(p->syms, mname);
         for (int e = 0; e < nent; e++) ground[(size_t)marker_local[i] * nent + e] = ma;
     }
+    for (int i = 0; i < p->nactions; i++) if (act_is_binder[i]) {   /* bcast local: non-fluent */
+        char cn[MAX_NAME + 16];
+        snprintf(cn, sizeof cn, "cast:%s#", p->actions[i].name);
+        uint32_t ca = intern_id(p->syms, cn);
+        for (int e = 0; e < nent; e++) ground[(size_t)bcast_local[i] * nent + e] = ca;
+    }
+    for (int k = 0; k < nbitem; k++) {                             /* binder marker: non-fluent */
+        char mn[MAX_NAME + 24];
+        snprintf(mn, sizeof mn, "fired:%s#%d#", p->actions[bitem_act[k]].name, bitem_it[k]);
+        uint32_t ma = intern_id(p->syms, mn);
+        for (int e = 0; e < nent; e++) ground[(size_t)bmarker[k] * nent + e] = ma;
+    }
 
     world_add_step_lane_family(p->w, f, nloc, nent, ground, kind);
 
-    /* numeric lane extension: per-schema ground columns + the effect specs, each
-     * pointing at its action's fired-marker local (read per lane at commit). */
+    /* numeric lane extension: per-schema ground columns + all effect specs (slice-1
+     * per-lane effects and binder items), each pointing at its fired-marker local. */
     if (nnp > 0) {
         uint32_t *numcell = malloc((size_t)nnp * nent * sizeof *numcell);
         for (int s = 0; s < nnp; s++) {
@@ -2913,11 +3011,45 @@ static void emit_step_lanes(parser *p)
                 numcell[(size_t)s * nent + e] = ground_pred(p, P, &ent, 1);
             }
         }
-        uint32_t effmark[MAX_LANE_NUMEFF];
-        for (int k = 0; k < nne; k++) effmark[k] = (uint32_t)marker_local[neff_act[k]];
-        world_step_lane_set_numeric(p->w, nnp, numcell, nne,
-                                    neff_schema, neff_op, neff_konst, effmark);
+        int sc_schema[2 * MAX_LANE_NUMEFF], sc_op[2 * MAX_LANE_NUMEFF], nspec = 0;
+        long sc_konst[2 * MAX_LANE_NUMEFF];
+        uint32_t effmark[2 * MAX_LANE_NUMEFF];
+        for (int k = 0; k < nne; k++) {
+            sc_schema[nspec] = neff_schema[k]; sc_op[nspec] = neff_op[k];
+            sc_konst[nspec] = neff_konst[k];
+            effmark[nspec] = (uint32_t)marker_local[neff_act[k]]; nspec++;
+        }
+        for (int k = 0; k < nbitem; k++) {
+            sc_schema[nspec] = bitem_schema[k]; sc_op[nspec] = bitem_op[k];
+            sc_konst[nspec] = bitem_konst[k];
+            effmark[nspec] = (uint32_t)bmarker[k]; nspec++;
+        }
+        world_step_lane_set_numeric(p->w, nnp, numcell, nspec,
+                                    sc_schema, sc_op, sc_konst, effmark);
         free(numcell);
+    }
+
+    /* register broadcast cast atoms: every ground `action(caster)` -> its BCAST
+     * local, so the discrete cast fans out over the target lanes. */
+    if (nbcast > 0) {
+        int total = 0;
+        for (int i = 0; i < p->nactions; i++)
+            if (act_is_binder[i]) total += domain_size(p, p->actions[i].vars[0].sort);
+        uint32_t *catom = malloc((size_t)(total ? total : 1) * sizeof *catom);
+        int *clocal = malloc((size_t)(total ? total : 1) * sizeof *clocal);
+        int ncast = 0;
+        for (int i = 0; i < p->nactions; i++) if (act_is_binder[i]) {
+            int Sc = p->actions[i].vars[0].sort, kc = domain_size(p, Sc);
+            uint32_t nameatom = intern_id(p->syms, p->actions[i].name);
+            for (int c = 0; c < kc; c++) {
+                uint32_t ent = domain_at(p, Sc, c);
+                catom[ncast] = ground_pred(p, nameatom, &ent, 1);
+                clocal[ncast] = bcast_local[i];
+                ncast++;
+            }
+        }
+        world_step_lane_set_bcast(p->w, ncast, catom, clocal);
+        free(catom); free(clocal);
     }
     free(ground);
     free(kind);
