@@ -79,8 +79,14 @@ typedef struct {
     int      nloc, nent;
     uint32_t *ground;             /* [nloc*nent] */
     uint8_t *kind;                /* [nloc]: WORLD_STEP_{CUR,PRIMED,ACTION} */
-    int     *commit_fl;           /* [nloc*nent]: world fluent index a PRIMED cell
-                                   * commits to, -1 otherwise (built by the world) */
+    int     *fl_of;               /* [nloc*nent]: world fluent index for a CUR cell
+                                   * (fact source) or PRIMED cell (commit target),
+                                   * -1 otherwise — so the solve reads w->vals and
+                                   * the commit writes it directly, no linear scan */
+    int     *act_of;              /* [act_of_cap]: ground action atom -> flat cell
+                                   * (local*nent + lane), -1 if not an action cell —
+                                   * so a step's action list maps to lanes in O(k) */
+    uint32_t act_of_cap;
 } step_lane_family;
 
 struct world {
@@ -179,7 +185,8 @@ void world_free(world *w)
         dlcol_free(w->steplanes[i].fam);
         free(w->steplanes[i].ground);
         free(w->steplanes[i].kind);
-        free(w->steplanes[i].commit_fl);
+        free(w->steplanes[i].fl_of);
+        free(w->steplanes[i].act_of);
     }
     free(w->steplanes);
     free(w->step_snap);
@@ -624,23 +631,47 @@ void world_add_step_lane_family(world *w, dlcol *fam, int nloc, int nent,
     sf->kind = malloc((size_t)(nloc ? nloc : 1) * sizeof *sf->kind);
     memcpy(sf->kind, kind, (size_t)(nloc ? nloc : 1) * sizeof *sf->kind);
 
-    /* map each PRIMED cell to the world fluent index it commits to, so world_step
-     * can read the next state per lane. A reverse index (primed atom -> fluent)
-     * keeps this O(cells) rather than a scan per cell. */
-    sf->commit_fl = malloc((g ? g : 1) * sizeof *sf->commit_fl);
-    for (size_t k = 0; k < g; k++) sf->commit_fl[k] = -1;
-    uint32_t maxp = 0;
-    for (int i = 0; i < w->nfl; i++) if (w->primed[i] > maxp) maxp = w->primed[i];
-    int *rev = malloc(((size_t)maxp + 1) * sizeof *rev);
-    for (uint32_t k = 0; k <= maxp; k++) rev[k] = -1;
-    for (int i = 0; i < w->nfl; i++) rev[w->primed[i]] = i;
+    /* Map each cell to a world fluent index (CUR = fact source, PRIMED = commit
+     * target) and each ground action atom to its cell, so a step reads w->vals
+     * and its action list in O(cells)/O(k) — never the linear fluent_index scan.
+     * A reverse index over the fluent + primed atoms makes the build O(cells)
+     * too (a scan per cell would be O(nfl^2)). */
+    sf->fl_of = malloc((g ? g : 1) * sizeof *sf->fl_of);
+    for (size_t k = 0; k < g; k++) sf->fl_of[k] = -1;
+
+    uint32_t maxf = 0;
+    for (int i = 0; i < w->nfl; i++) {
+        if (w->fluents[i] > maxf) maxf = w->fluents[i];
+        if (w->primed[i]  > maxf) maxf = w->primed[i];
+    }
+    int *revf = malloc(((size_t)maxf + 1) * sizeof *revf);
+    for (uint32_t k = 0; k <= maxf; k++) revf[k] = -1;
+    for (int i = 0; i < w->nfl; i++) {
+        revf[w->fluents[i]] = i;      /* the CUR ground atom is the fluent itself */
+        revf[w->primed[i]]  = i;      /* the PRIMED ground atom is its f' twin    */
+    }
+
+    uint32_t maxa = 0;
     for (int a = 0; a < nloc; a++)
-        if (kind[a] == WORLD_STEP_PRIMED)
+        if (kind[a] == WORLD_STEP_ACTION)
             for (int e = 0; e < nent; e++) {
-                uint32_t pa = ground[(size_t)a * nent + e];
-                sf->commit_fl[(size_t)a * nent + e] = pa <= maxp ? rev[pa] : -1;
+                uint32_t ga = ground[(size_t)a * nent + e];
+                if (ga > maxa) maxa = ga;
             }
-    free(rev);
+    sf->act_of_cap = maxa + 1;
+    sf->act_of = malloc((size_t)sf->act_of_cap * sizeof *sf->act_of);
+    for (uint32_t k = 0; k < sf->act_of_cap; k++) sf->act_of[k] = -1;
+
+    for (int a = 0; a < nloc; a++)
+        for (int e = 0; e < nent; e++) {
+            uint32_t ga = ground[(size_t)a * nent + e];
+            size_t cell = (size_t)a * nent + e;
+            if (kind[a] == WORLD_STEP_ACTION)
+                sf->act_of[ga] = (int)cell;
+            else
+                sf->fl_of[cell] = ga <= maxf ? revf[ga] : -1;
+        }
+    free(revf);
     w->lanes_ok = true;           /* step lanes now reflect the current structure */
 }
 
@@ -653,24 +684,36 @@ int world_step_lane_family_count(const world *w) { return w->nsteplanes; }
 static void solve_step_lane_family(world *w, step_lane_family *sf,
                                    const uint32_t *actions, int nactions)
 {
+    int W = (sf->nent + 63) / 64;
     dlcol_clear_facts(sf->fam);
     for (int a = 0; a < sf->nloc; a++) {
         if (sf->kind[a] == WORLD_STEP_CUR) {
+            /* closed-world current state, read straight from w->vals via fl_of */
             for (int e = 0; e < sf->nent; e++) {
-                uint32_t g = sf->ground[(size_t)a * sf->nent + e];
-                dl_lit l = { (uint32_t)a, !world_get(w, g) };
+                int i = sf->fl_of[(size_t)a * sf->nent + e];
+                dl_lit l = { (uint32_t)a, !(i >= 0 && w->vals[i]) };
                 dlcol_add_fact(sf->fam, l, e);
             }
         } else if (sf->kind[a] == WORLD_STEP_ACTION) {
-            for (int e = 0; e < sf->nent; e++) {
-                uint32_t g = sf->ground[(size_t)a * sf->nent + e];
-                bool occurred = false;
-                for (int i = 0; i < nactions; i++)
-                    if (actions[i] == g) { occurred = true; break; }
-                dl_lit l = { (uint32_t)a, !occurred };   /* closed-world actions */
-                dlcol_add_fact(sf->fam, l, e);
-            }
+            /* default every lane to "action did not occur" (~action); the
+             * occurring ones are flipped below in O(#actions), not O(lanes) */
+            uint64_t *pos = dlcol_fact_row(sf->fam, (dl_lit){ (uint32_t)a, false });
+            uint64_t *neg = dlcol_fact_row(sf->fam, (dl_lit){ (uint32_t)a, true });
+            memset(pos, 0x00, (size_t)W * sizeof *pos);
+            memset(neg, 0xFF, (size_t)W * sizeof *neg);
         }
+    }
+    /* flip the occurring actions to true at their lanes (reverse map, O(k)) */
+    for (int i = 0; i < nactions; i++) {
+        uint32_t at = actions[i];
+        if (at >= sf->act_of_cap) continue;
+        int cell = sf->act_of[at];
+        if (cell < 0) continue;
+        int a = cell / sf->nent, e = cell % sf->nent;
+        uint64_t *pos = dlcol_fact_row(sf->fam, (dl_lit){ (uint32_t)a, false });
+        uint64_t *neg = dlcol_fact_row(sf->fam, (dl_lit){ (uint32_t)a, true });
+        pos[e / 64] |=  (1ull << (e % 64));
+        neg[e / 64] &= ~(1ull << (e % 64));
     }
     dlcol_solve(sf->fam);
 }
@@ -1103,7 +1146,7 @@ static int world_step_lanes(world *w, const uint32_t *actions, int nactions,
     for (int a = 0; a < sf->nloc && rc == 0; a++) {
         if (sf->kind[a] != WORLD_STEP_PRIMED) continue;
         for (int e = 0; e < sf->nent; e++) {
-            int i = sf->commit_fl[(size_t)a * sf->nent + e];
+            int i = sf->fl_of[(size_t)a * sf->nent + e];
             if (i < 0) continue;
             dl_lit p = { (uint32_t)a, false };
             if (dlcol_defeasible(sf->fam, p, e) == DL_PROVED) {

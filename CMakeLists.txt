@@ -58,3 +58,8 @@ target_compile_options(bench_col PRIVATE -O2)
 add_executable(bench_slice tests/bench_slice.c)
 target_link_libraries(bench_slice PRIVATE infeasible_core)
 target_compile_options(bench_slice PRIVATE -O2)
+
+# Transition-layer benchmark: world_step routed on lanes vs the N=1 path.
+add_executable(bench_step tests/bench_step.c)
+target_link_libraries(bench_step PRIVATE infeasible_core)
+target_compile_options(bench_step PRIVATE -O2)
