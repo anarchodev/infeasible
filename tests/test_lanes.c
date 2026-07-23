@@ -331,6 +331,73 @@ static int test_derived_body_join(void)
     return 0;
 }
 
+/* The transition layer on lanes: a homogeneous single-sort boolean step world.
+ * `arm` is an action (causal, beats inertia on the acted lane only); `wary` is a
+ * ramification reading the NEXT state (`armed(X)'`) — inertia, causal, and a
+ * primed-body ramification, all solved bit-parallel across actors. Validated
+ * against the N=1 step family by world_step_lanes_check (not yet routed). */
+static const char *STEP =
+    "sort actor\n"
+    "entity (guard, thug, mage : actor)\n"
+    "state (armed(actor) alert(actor))\n"
+    "action arm(X: actor): causes armed(X)\n"
+    "rule wary(X: actor): armed(X)' causes alert(X)\n"
+    "init (armed(thug))\n";
+
+static int test_step_lanes(void)
+{
+    intern *sy = intern_new();
+    story_diag di[16];
+    story_diags d = { di, 16, 0, 0 };
+    world *w = story_compile(STEP, "step.story", sy, &d);
+    if (!w) {
+        fprintf(stderr, "FAIL compile: %s\n", d.count ? d.items[0].msg : "?");
+        intern_free(sy);
+        return 1;
+    }
+    CHECK(d.nerrors == 0);
+
+    /* the step theory lanes into one step family */
+    CHECK(world_step_lane_family_count(w) == 1);
+
+    /* the bit-parallel transition must agree with the N=1 step family for every
+     * fluent's next-state verdict, across a range of action sets */
+    uint32_t arm_guard = intern_id(sy, "arm(guard)");
+    uint32_t arm_mage  = intern_id(sy, "arm(mage)");
+    uint32_t both[2] = { arm_guard, arm_mage };
+
+    bool ok = false;
+    CHECK(world_step_lanes_check(w, NULL, 0, &ok) > 0);   /* pure inertia (no-op) */
+    CHECK(ok);
+    ok = false;
+    CHECK(world_step_lanes_check(w, &arm_guard, 1, &ok) > 0); /* causal on one lane */
+    CHECK(ok);
+    ok = false;
+    CHECK(world_step_lanes_check(w, both, 2, &ok) > 0);   /* causal on two lanes */
+    CHECK(ok);
+
+    /* vary the current state (the check commits nothing) and re-validate: the
+     * lane transition must still track N=1 at the new state */
+    world_set(w, intern_id(sy, "armed(mage)"), true);
+    ok = false;
+    CHECK(world_step_lanes_check(w, &arm_guard, 1, &ok) > 0);
+    CHECK(ok);
+
+    /* the transition itself is unchanged — world_step still runs the N=1 path,
+     * so a real step commits the expected next state (arm(guard): guard armed
+     * and, via the ramification, alert; mage stays armed from the edit above) */
+    char err[128];
+    CHECK(world_step(w, &arm_guard, 1, err, sizeof err) == 0);
+    CHECK(world_get(w, intern_id(sy, "armed(guard)")));
+    CHECK(world_get(w, intern_id(sy, "alert(guard)")));
+    CHECK(world_get(w, intern_id(sy, "armed(mage)")));
+    CHECK(world_get(w, intern_id(sy, "armed(thug)")));           /* inertia held it */
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
 int main(void)
 {
     if (test_homogeneous_agrees()) return 1;
@@ -339,6 +406,7 @@ int main(void)
     if (test_join_matcher()) return 1;
     if (test_join3_matcher()) return 1;
     if (test_derived_body_join()) return 1;
+    if (test_step_lanes()) return 1;
     printf("test_lanes: all passed\n");
     return 0;
 }

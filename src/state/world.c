@@ -67,6 +67,20 @@ typedef struct {
  * routable lane atom (unmentioned, or ambiguous within a join family). */
 typedef struct { int fam, a, e, it; } lane_ref;
 
+/* A step lane family: the transition theory (generated inertia + causal rules)
+ * over one lane sort, bit-parallel across `nent` entities. Each local is a
+ * current fluent (loaded closed-world from the fact store), a primed fluent (the
+ * next-state readout), or an action (loaded from the step's action list).
+ * `ground[a*nent + e]` names the equivalent scalar atom for local `a`, lane `e` —
+ * the primed local's is the fluent's `f'` twin, so the differential can look up
+ * the N=1 verdict. Prototype-before-adopt: validated, not yet driving world_step. */
+typedef struct {
+    dlcol   *fam;
+    int      nloc, nent;
+    uint32_t *ground;             /* [nloc*nent] */
+    uint8_t *kind;                /* [nloc]: WORLD_STEP_{CUR,PRIMED,ACTION} */
+} step_lane_family;
+
 struct world {
     arena a;
     intern *syms;
@@ -110,6 +124,9 @@ struct world {
     lane_ref *lane_map;           /* ground atom -> (family, local, lane)        */
     uint32_t lane_map_cap;
     bool lanes_ok;                /* lane families reflect the current structure */
+
+    step_lane_family *steplanes;  /* transition layer, bit-parallel (DoD thesis) */
+    int nsteplanes, capsteplanes;
 };
 
 #define GROW(arr, n, cap) \
@@ -149,6 +166,12 @@ void world_free(world *w)
         free(w->lanes[i].is_import);
     }
     free(w->lanes);
+    for (int i = 0; i < w->nsteplanes; i++) {
+        dlcol_free(w->steplanes[i].fam);
+        free(w->steplanes[i].ground);
+        free(w->steplanes[i].kind);
+    }
+    free(w->steplanes);
     free(w->lane_map);
     free(w->loc_of);
     free(w->fl_loc);
@@ -389,6 +412,7 @@ void world_add_num_effect(world *w, int rule, uint32_t num_atom,
 static void ensure_families(world *w);
 static void solve_judgment_family(world *w);
 static void solve_lane_iter(world *w, lane_family *lf, int it);
+static void solve_step_family(world *w, const uint32_t *actions, int nactions);
 
 /* The N=1 judgment path: the proven route, and the oracle world_lanes_check
  * measures the lane families against. */
@@ -566,6 +590,89 @@ int world_lanes_check(world *w, bool *ok)
                 }
         }
         lf->solved = false;   /* left dirty for the router (it re-solves iter 0) */
+    }
+    return checks;
+}
+
+/* ---- step lane families (DoD thesis: the transition layer, bit-parallel) ---- */
+
+void world_add_step_lane_family(world *w, dlcol *fam, int nloc, int nent,
+                                const uint32_t *ground, const uint8_t *kind)
+{
+    GROW(w->steplanes, w->nsteplanes, w->capsteplanes);
+    step_lane_family *sf = &w->steplanes[w->nsteplanes++];
+    sf->fam = fam;
+    sf->nloc = nloc;
+    sf->nent = nent;
+    size_t g = (size_t)nloc * (size_t)nent;
+    sf->ground = malloc((g ? g : 1) * sizeof *sf->ground);
+    memcpy(sf->ground, ground, (g ? g : 1) * sizeof *sf->ground);
+    sf->kind = malloc((size_t)(nloc ? nloc : 1) * sizeof *sf->kind);
+    memcpy(sf->kind, kind, (size_t)(nloc ? nloc : 1) * sizeof *sf->kind);
+}
+
+int world_step_lane_family_count(const world *w) { return w->nsteplanes; }
+
+/* Load a step lane family's fact columns from the current state and the given
+ * action list, and solve it bit-parallel across lanes. Current fluents are
+ * closed-world; an action local's lane bit is set iff its ground action atom is
+ * in `actions`; primed locals carry no facts (they are the readout). */
+static void solve_step_lane_family(world *w, step_lane_family *sf,
+                                   const uint32_t *actions, int nactions)
+{
+    dlcol_clear_facts(sf->fam);
+    for (int a = 0; a < sf->nloc; a++) {
+        if (sf->kind[a] == WORLD_STEP_CUR) {
+            for (int e = 0; e < sf->nent; e++) {
+                uint32_t g = sf->ground[(size_t)a * sf->nent + e];
+                dl_lit l = { (uint32_t)a, !world_get(w, g) };
+                dlcol_add_fact(sf->fam, l, e);
+            }
+        } else if (sf->kind[a] == WORLD_STEP_ACTION) {
+            for (int e = 0; e < sf->nent; e++) {
+                uint32_t g = sf->ground[(size_t)a * sf->nent + e];
+                bool occurred = false;
+                for (int i = 0; i < nactions; i++)
+                    if (actions[i] == g) { occurred = true; break; }
+                dl_lit l = { (uint32_t)a, !occurred };   /* closed-world actions */
+                dlcol_add_fact(sf->fam, l, e);
+            }
+        }
+    }
+    dlcol_solve(sf->fam);
+}
+
+int world_step_lanes_check(world *w, const uint32_t *actions, int nactions,
+                           bool *ok)
+{
+    int checks = 0;
+    if (ok) *ok = true;
+    ensure_families(w);
+    solve_step_family(w, actions, nactions);       /* the N=1 oracle */
+
+    for (int i = 0; i < w->nsteplanes; i++) {
+        step_lane_family *sf = &w->steplanes[i];
+        solve_step_lane_family(w, sf, actions, nactions);
+        /* every fluent's next-state verdict per lane must match the N=1 step
+         * family on that fluent's primed twin */
+        for (int a = 0; a < sf->nloc; a++) {
+            if (sf->kind[a] != WORLD_STEP_PRIMED)
+                continue;
+            for (int e = 0; e < sf->nent; e++) {
+                uint32_t pa = sf->ground[(size_t)a * sf->nent + e];   /* the f' atom */
+                for (int neg = 0; neg < 2; neg++) {
+                    dl_lit la = { (uint32_t)a, neg != 0 };
+                    dl_verdict n1 = DL_UNDECIDED;
+                    if (pa < w->loc_cap && w->loc_of[pa] != LOC_NONE) {
+                        dl_lit gq = { w->loc_of[pa], neg != 0 };
+                        n1 = dlcol_defeasible(w->fam, gq, 0);
+                    }
+                    if (dlcol_defeasible(sf->fam, la, e) != n1)
+                        if (ok) *ok = false;
+                    checks++;
+                }
+            }
+        }
     }
     return checks;
 }
@@ -886,14 +993,13 @@ static void rcpt_push(num_receipt *rc, const char *rule, world_numop op, long am
     rc->n++;
 }
 
-int world_step(world *w, const uint32_t *actions, int nactions,
-               char *err, size_t errsz)
+/* Load the current state (closed-world fluents + numeric guard atoms) and the
+ * occurring actions into the N=1 step family, and solve it. Shared by world_step
+ * and world_step_lanes_check (the latter reads the primed columns without
+ * committing). An action atom no rule mentions is semantically inert; skip it. */
+static void solve_step_family(world *w, const uint32_t *actions, int nactions)
 {
-    ensure_families(w);
     dlcol *f = w->fam;
-
-    /* fact columns: current state closed-world, plus occurring actions.
-     * An action atom no rule mentions is semantically inert; skip it. */
     dlcol_clear_facts(f);
     for (int i = 0; i < w->nfl; i++) {
         dl_lit l = { w->fl_loc[i], !w->vals[i] };
@@ -914,8 +1020,16 @@ int world_step(world *w, const uint32_t *actions, int nactions,
             dlcol_add_fact(f, l, 0);
         }
     }
-
     dlcol_solve(f);
+}
+
+int world_step(world *w, const uint32_t *actions, int nactions,
+               char *err, size_t errsz)
+{
+    ensure_families(w);
+    dlcol *f = w->fam;
+
+    solve_step_family(w, actions, nactions);
 
     int rc = 0;
     bool *next = malloc((size_t)(w->nfl ? w->nfl : 1) * sizeof *next);

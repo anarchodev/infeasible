@@ -2223,9 +2223,188 @@ static void emit_join_family(parser *p, ast_rule *r)
     free(ground);
 }
 
+/* ---- step lanes: the transition layer, bit-parallel (M3, thesis) ----
+ *
+ * The judgment half of the engine lanes "what's true"; this lanes "what happens
+ * next". The step theory — generated inertia (f => f', ~f => ~f') plus causal
+ * rules and ramifications, causal superior to inertia — becomes ONE dl_col over
+ * a single lane sort, so a transition is solved once across all entities instead
+ * of grounded per entity into distinct atoms. This is the biggest thesis payoff:
+ * in an RTS the per-tick transition runs for everyone, every tick.
+ *
+ * First cut, conservative bail (mirrors emit_join_family): a homogeneous
+ * single-sort boolean step world — every fluent boolean/arity-1 over one sort S,
+ * no judgment rules, every action/ramification single-var over S with boolean
+ * requires/effects (no numeric, MV, globals, or `unless`). Built and validated
+ * against the N=1 step family (world_step_lanes_check) but not yet routed through
+ * world_step, the same prototype-before-adopt path the judgment lanes took. */
+
+/* Index of a fluent pred atom in the family's fluent list (all validated to be
+ * present before this is called). */
+static int step_fidx(parser *p, const int *fpred, int nf, uint32_t pred)
+{
+    for (int i = 0; i < nf; i++)
+        if (p->preds[fpred[i]].pred == pred) return i;
+    return -1;
+}
+
+/* A boolean fluent read/write of the action's own variable over sort S. */
+static bool step_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var)
+{
+    if (a->is_guard || a->is_num_effect || a->value != INTERN_NONE)
+        return false;                              /* numeric guard / MV: out */
+    pred_info *pi = find_pred(p, a->pred);
+    if (!pi || !pi->is_fluent || pi->is_mv || pi->is_num || pi->arity != 1)
+        return false;
+    if (pi->argsort[0] != S)
+        return false;
+    return a->nargs == 1 && a->args[0].name == var;
+}
+
+static void emit_step_lanes(parser *p)
+{
+    if (p->nrules != 0)                             /* pure inertia+causal for now */
+        return;
+
+    /* the lane sort S: every boolean fluent must be arity-1 over one shared sort;
+     * a numeric/MV/global/multi-sort fluent bails the whole family. */
+    int S = -1, fpred[MAX_PREDS], nf = 0;
+    for (int i = 0; i < p->npreds; i++) {
+        pred_info *pi = &p->preds[i];
+        if (!pi->is_fluent)
+            continue;
+        if (pi->is_num || pi->is_mv || pi->arity != 1)
+            return;
+        if (S < 0) S = pi->argsort[0];
+        else if (pi->argsort[0] != S) return;      /* multi-sort: bail */
+        fpred[nf++] = i;                            /* index into p->preds */
+    }
+    if (nf == 0 || S < 0)
+        return;
+    int nent = domain_size(p, S);
+    if (nent == 0)
+        return;
+
+    /* validate every action/ramification, and collect the distinct trigger
+     * predicates of the (non-ramification) actions */
+    uint32_t apred[MAX_ACTIONS];
+    int na = 0;
+    for (int i = 0; i < p->nactions; i++) {
+        ast_action *a = &p->actions[i];
+        if (a->nvars != 1 || a->vars[0].sort != S)
+            return;
+        uint32_t var = a->vars[0].name;
+        for (int b = 0; b < a->nreq; b++)
+            if (!step_atom_ok(p, &a->requires[b], S, var)) return;
+        for (int b = 0; b < a->neff; b++)
+            if (!step_atom_ok(p, &a->effects[b], S, var)) return;
+        if (!a->is_ramif) {
+            uint32_t tr = intern_id(p->syms, a->name);
+            int found = -1;
+            for (int j = 0; j < na; j++) if (apred[j] == tr) { found = j; break; }
+            if (found < 0) { if (na >= MAX_ACTIONS) return; apred[na++] = tr; }
+        }
+    }
+
+    /* family locals: per fluent a current + a primed local, per action trigger
+     * one action local. cur/pri interleaved so index math stays local. */
+    int nloc = 2 * nf + na;
+    dlcol *f = dlcol_new(nloc, nent);
+    int cur_local[MAX_PREDS], pri_local[MAX_PREDS];
+    int inertia_pos[MAX_PREDS], inertia_neg[MAX_PREDS], act_local[MAX_ACTIONS];
+    uint8_t *kind = malloc((size_t)nloc * sizeof *kind);
+    int n = 0;
+    char nbuf[MAX_GROUND + 2];
+    for (int i = 0; i < nf; i++) {
+        uint32_t P = p->preds[fpred[i]].pred;
+        cur_local[i] = n; kind[n] = WORLD_STEP_CUR;
+        dlcol_set_atom_name(f, (uint32_t)n, intern_name(p->syms, P));
+        n++;
+        pri_local[i] = n; kind[n] = WORLD_STEP_PRIMED;
+        snprintf(nbuf, sizeof nbuf, "%s'", intern_name(p->syms, P));
+        dlcol_set_atom_name(f, (uint32_t)n, nbuf);
+        n++;
+    }
+    for (int j = 0; j < na; j++) {
+        act_local[j] = n; kind[n] = WORLD_STEP_ACTION;
+        dlcol_set_atom_name(f, (uint32_t)n, intern_name(p->syms, apred[j]));
+        n++;
+    }
+
+    /* generated inertia, one pair per fluent (ids kept for causal superiority) */
+    char rbuf[MAX_NAME + 16];
+    for (int i = 0; i < nf; i++) {
+        const char *fname = intern_name(p->syms, p->preds[fpred[i]].pred);
+        snprintf(rbuf, sizeof rbuf, "inertia on %s", fname);
+        dl_lit cur = { (uint32_t)cur_local[i], false }, pri = { (uint32_t)pri_local[i], false };
+        inertia_pos[i] = dlcol_add_rule(f, rbuf, DL_DEFEASIBLE, pri, &cur, 1);
+        dl_lit ncur = dl_complement(cur), npri = dl_complement(pri);
+        inertia_neg[i] = dlcol_add_rule(f, rbuf, DL_DEFEASIBLE, npri, &ncur, 1);
+    }
+
+    /* causal rules and ramifications, one per effect, each superior to the
+     * inertia rule it conflicts with (matches world.c emit_step_family) */
+    for (int i = 0; i < p->nactions; i++) {
+        ast_action *a = &p->actions[i];
+        int nbody = a->nreq + (a->is_ramif ? 0 : 1);
+        dl_lit body[MAX_BODY + 1];
+        int bi = 0;
+        for (int b = 0; b < a->nreq; b++) {
+            int fi = step_fidx(p, fpred, nf, a->requires[b].pred);
+            int loc = a->requires[b].primed ? pri_local[fi] : cur_local[fi];
+            body[bi++] = (dl_lit){ (uint32_t)loc, a->requires[b].neg };
+        }
+        if (!a->is_ramif) {
+            uint32_t tr = intern_id(p->syms, a->name);
+            int aj = -1;
+            for (int j = 0; j < na; j++) if (apred[j] == tr) { aj = j; break; }
+            body[bi++] = (dl_lit){ (uint32_t)act_local[aj], false };
+        }
+        char pbuf[MAX_NAME + 24];
+        prov_str(p, a->line, pbuf, sizeof pbuf);
+        for (int b = 0; b < a->neff; b++) {
+            int fi = step_fidx(p, fpred, nf, a->effects[b].pred);
+            dl_lit head = { (uint32_t)pri_local[fi], a->effects[b].neg };
+            char cname[MAX_NAME + 8];
+            snprintf(cname, sizeof cname, "%s/%s%s", a->name,
+                     a->effects[b].neg ? "~" : "",
+                     intern_name(p->syms, a->effects[b].pred));
+            int rid = dlcol_add_rule(f, cname, DL_DEFEASIBLE, head, body, nbody);
+            dlcol_set_prov(f, rid, pbuf);
+            dlcol_add_sup(f, rid, a->effects[b].neg ? inertia_pos[fi] : inertia_neg[fi]);
+        }
+    }
+
+    /* ground map: cur(P)@e -> P(e), pri(P)@e -> P(e)', action(A)@e -> A(e) */
+    uint32_t *ground = malloc((size_t)nloc * nent * sizeof *ground);
+    for (int i = 0; i < nf; i++) {
+        uint32_t P = p->preds[fpred[i]].pred;
+        for (int e = 0; e < nent; e++) {
+            uint32_t ent = domain_at(p, S, e);
+            uint32_t base = ground_pred(p, P, &ent, 1);
+            ground[(size_t)cur_local[i] * nent + e] = base;
+            snprintf(nbuf, sizeof nbuf, "%s'", intern_name(p->syms, base));
+            ground[(size_t)pri_local[i] * nent + e] = intern_id(p->syms, nbuf);
+        }
+    }
+    for (int j = 0; j < na; j++)
+        for (int e = 0; e < nent; e++) {
+            uint32_t ent = domain_at(p, S, e);
+            ground[(size_t)act_local[j] * nent + e] = ground_pred(p, apred[j], &ent, 1);
+        }
+
+    world_add_step_lane_family(p->w, f, nloc, nent, ground, kind);
+    free(ground);
+    free(kind);
+}
+
 static void build_lane_families(parser *p)
 {
-    if (p->nrules == 0 || p->nactions > 0)         /* judgment-only for now */
+    if (p->nactions > 0) {         /* a step world: lane the transition (first cut) */
+        emit_step_lanes(p);        /* bails unless nrules==0 + homogeneous over S */
+        return;
+    }
+    if (p->nrules == 0)            /* nothing to lane */
         return;
     bool taint[MAX_PREDS];
     compute_taint(p, taint);

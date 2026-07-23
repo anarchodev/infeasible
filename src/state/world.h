@@ -129,6 +129,26 @@ int  world_lane_family_count(const world *w);
  * sets *ok false on any mismatch (both polarities checked). */
 int  world_lanes_check(world *w, bool *ok);
 
+/* Step lane family (the DoD thesis for the *transition* layer). One dl_col over
+ * one lane sort holding the whole step theory bit-parallel: per fluent a current
+ * and a primed local, per action an action local, plus generated inertia and
+ * causal/ramification rules. `kind[loc]` classifies each local; `ground[loc*nent
+ * + e]` is the named ground atom for that (local, lane) — the primed local's
+ * ground atom is the fluent's `f'` twin. The world copies both and owns `fam`.
+ * Prototype-before-adopt: built and validated (world_step_lanes_check) but not
+ * yet routed through world_step, mirroring how the judgment lanes landed. */
+enum { WORLD_STEP_CUR, WORLD_STEP_PRIMED, WORLD_STEP_ACTION };
+void world_add_step_lane_family(world *w, dlcol *fam, int nloc, int nent,
+                                const uint32_t *ground, const uint8_t *kind);
+int  world_step_lane_family_count(const world *w);
+
+/* Differential pin for the transition layer: solve both the N=1 step family and
+ * the step lane family from the current state + the given actions, and compare
+ * each fluent's next-state (primed) verdict per lane. Commits nothing. Returns
+ * the number of comparisons; sets *ok false on any mismatch (both polarities). */
+int  world_step_lanes_check(world *w, const uint32_t *actions, int nactions,
+                            bool *ok);
+
 /* Trace how a fluent reached its value in the *last* step (causal rules,
  * ramifications, generated inertia). `next` true reads q's atom in the next
  * state (its primed form — the usual "why did it end up this way?"), false the
