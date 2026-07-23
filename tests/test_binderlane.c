@@ -33,7 +33,7 @@
 
 static const char *SRC_L = "sort actor\n" BODY;
 static const char *SRC_N = "sort actor\n" BODY
-    "rule j(X: actor): saved(X) => marked(X)\n";   /* judgment -> N=1 */
+    "action pin(A: actor, B: actor): causes clustered(A)\n";  /* 2-var -> N=1 (never cast) */
 
 static world *compile(const char *src, intern *sy)
 {

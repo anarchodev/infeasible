@@ -32,7 +32,8 @@ static const char *SRC_L =
     "action douse(X: unit):  causes ~on_fire(X)\n"
     "rule burn(X: unit): on_fire(X) causes hp(X) -= 5\n";
 
-/* identical numerics, plus one judgment rule -> nrules>0 -> step lanes bail -> N=1 */
+/* identical numerics, plus a 2-var action -> emit_step_lanes bails -> N=1 oracle.
+ * (A judgment rule no longer forces N=1: read-side judgments now lane.) */
 static const char *SRC_N =
     "sort unit\n"
     "entity ( u0, u1, u2, u3 : unit )\n"
@@ -44,7 +45,7 @@ static const char *SRC_N =
     "action ignite(X: unit): causes on_fire(X)\n"
     "action douse(X: unit):  causes ~on_fire(X)\n"
     "rule burn(X: unit): on_fire(X) causes hp(X) -= 5\n"
-    "rule guard(X: unit): shielded(X) => guarded(X)\n";
+    "action pin(A: unit, B: unit): causes shielded(A)\n";   /* 2-var -> N=1 (never cast) */
 
 static world *compile(const char *src, intern *sy)
 {

@@ -2680,8 +2680,13 @@ static bool num_eff_ok(parser *p, const ast_atom *e, int S, uint32_t var, long *
 
 static void emit_step_lanes(parser *p)
 {
-    if (p->nrules != 0)                             /* pure inertia+causal for now */
-        return;
+    /* Judgment rules do not block the transition: a judgment never changes a
+     * fluent (I1), so the next-state fluents are judgment-independent, and a step
+     * rule that *reads* a judgment head is rejected by step_atom_ok below (not a
+     * fluent) — bailing to N=1. So read-side judgments (queried by the host, not
+     * gating any transition) can coexist with a laned step; they stay on jfam for
+     * world_query. Incorporating judgment-gated step rules as derived lane locals
+     * is the next widening. */
 
     /* the lane sort S: every per-entity fluent must be arity-1 over one shared
      * sort. Boolean fluents lane directly; numeric fluents (§5.8) become columns
