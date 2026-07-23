@@ -195,12 +195,25 @@ static int test_join_matcher(void)
     CHECK(world_lanes_check(w, &ok) > 0);
     CHECK(ok);
 
-    /* the join semantics, checked through the N=1 path (join not yet routed):
-     * guard holds the fragile vase and is careless -> broken; thug holds a torch
-     * that is not fragile -> not; guard+torch never held -> not */
+    /* the join semantics, now ROUTED through the lane family: the relational
+     * head broken(X,T) mentions both variables, so each ground atom names one
+     * (lane, iteration) cell — world_query answers from the bit-parallel slice,
+     * re-solving per iteration on demand. guard holds the fragile vase and is
+     * careless -> broken; thug holds a torch that is not fragile -> not; the
+     * guard+torch pair was never held -> not. The three queries hit two distinct
+     * item slices (vase, torch), exercising the per-iteration solve cache. */
     CHECK(world_query(w, dl_pos(intern_id(sy, "broken(guard,vase)")))  == DL_PROVED);
     CHECK(world_query(w, dl_pos(intern_id(sy, "broken(thug,torch)")))  != DL_PROVED);
     CHECK(world_query(w, dl_pos(intern_id(sy, "broken(guard,torch)"))) != DL_PROVED);
+
+    /* a base-fact edit must invalidate the cached iteration solve: drop the
+     * vase's fragility and guard no longer breaks it, while the differential
+     * against the N=1 path still holds at the new state */
+    world_set(w, intern_id(sy, "fragile(vase)"), false);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "broken(guard,vase)"))) != DL_PROVED);
+    bool ok2 = false;
+    CHECK(world_lanes_check(w, &ok2) > 0);
+    CHECK(ok2);
 
     world_free(w);
     intern_free(sy);

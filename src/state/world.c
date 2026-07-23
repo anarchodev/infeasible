@@ -54,12 +54,16 @@ typedef struct {
     int      natoms, nent, niter;
     uint32_t *ground;             /* [natoms*niter*nent] */
     bool    *is_fluent;           /* [natoms] */
-    bool     solved;              /* niter==1: holds the current state (routed) */
+    bool     solved;              /* fam currently holds iteration cur_it, and
+                                   * that solve reflects the live base facts */
+    int      cur_it;              /* which iteration is loaded/solved in fam
+                                   * (always 0 when niter==1) */
 } lane_family;
 
-/* reverse map: a named ground atom -> its (family, predicate-local, lane), so
- * world_query can route to the lane family. fam < 0 = not a lane atom. */
-typedef struct { int fam, a, e; } lane_ref;
+/* reverse map: a named ground atom -> its (family, predicate-local, lane,
+ * iteration), so world_query can route to the lane family. fam < 0 = not a
+ * routable lane atom (unmentioned, or ambiguous within a join family). */
+typedef struct { int fam, a, e, it; } lane_ref;
 
 struct world {
     arena a;
@@ -400,12 +404,16 @@ dl_verdict world_query(world *w, dl_lit q)
 {
     ensure_families(w);
     /* the hot path: if this atom is a lane cell, answer from the bit-parallel
-     * family (all entities solved at once) instead of the N=1 judgment family */
+     * family (all lanes solved at once) instead of the N=1 judgment family. For
+     * a join family the cell names an iteration too; solve that iteration's fact
+     * slice on demand and cache it (cur_it), so a run of queries into the same
+     * slice pays one solve — the per-iteration adopt of the join matcher. */
     if (w->lanes_ok && q.atom < w->lane_map_cap && w->lane_map[q.atom].fam >= 0) {
         lane_ref r = w->lane_map[q.atom];
         lane_family *lf = &w->lanes[r.fam];
-        if (!lf->solved) {
-            solve_lane_iter(w, lf, 0);             /* single-iteration (niter==1) */
+        if (!lf->solved || lf->cur_it != r.it) {
+            solve_lane_iter(w, lf, r.it);
+            lf->cur_it = r.it;
             lf->solved = true;
         }
         dl_lit la = { (uint32_t)r.a, q.neg };
@@ -441,27 +449,46 @@ void world_add_lane_family(world *w, dlcol *fam, int natoms, int nent, int niter
     lf->nent = nent;
     lf->niter = niter;
     lf->solved = false;
+    lf->cur_it = 0;
     size_t g = (size_t)natoms * (size_t)niter * (size_t)nent;
     lf->ground = malloc((g ? g : 1) * sizeof *lf->ground);
     memcpy(lf->ground, ground, (g ? g : 1) * sizeof *lf->ground);
     lf->is_fluent = malloc((size_t)(natoms ? natoms : 1) * sizeof *lf->is_fluent);
     memcpy(lf->is_fluent, is_fluent, (size_t)(natoms ? natoms : 1) * sizeof *lf->is_fluent);
 
-    /* index each ground atom back to its lane cell so world_query can route —
-     * single-iteration families only; a join family (niter>1) is validated but
-     * not yet routed (the prototype-before-adopt discipline). */
-    if (niter == 1)
-        for (int a = 0; a < natoms; a++)
+    /* Index each ground atom back to its lane cell so world_query can route —
+     * for join families (niter>1) as well as single-variable ones. A join
+     * family repeats role-0-only atoms across iterations and role-1-only atoms
+     * across lanes, so a ground atom can name more than one cell; such an atom
+     * has no single verdict to route to and stays on the N=1 path. Only atoms
+     * UNIQUE within the family are routable — which, for a join, are exactly the
+     * ones mentioning both variables (the relational head and binary bodies).
+     * Single-variable families (niter==1) are unique by construction. First
+     * family to claim an atom keeps it; a later family's cell for the same atom
+     * is redundant (both validated against the same N=1 verdict). */
+    size_t ncells = (size_t)natoms * (size_t)niter * (size_t)nent;
+    uint32_t maxat = 0;
+    for (size_t k = 0; k < ncells; k++)
+        if (ground[k] > maxat) maxat = ground[k];
+    uint8_t *mult = calloc((size_t)maxat + 1, 1);   /* 0 unseen, 1 once, 2 = dup */
+    for (size_t k = 0; k < ncells; k++)
+        if (mult[ground[k]] < 2) mult[ground[k]]++;
+
+    for (int a = 0; a < natoms; a++)
+        for (int it = 0; it < niter; it++)
             for (int e = 0; e < nent; e++) {
-                uint32_t at = ground[(size_t)a * nent + e];
+                uint32_t at = ground[((size_t)a * niter + it) * nent + e];
+                if (mult[at] != 1) continue;   /* ambiguous within family -> jfam */
                 if (at >= w->lane_map_cap) {
                     uint32_t nc = at + 1;
                     w->lane_map = realloc(w->lane_map, (size_t)nc * sizeof *w->lane_map);
                     for (uint32_t k = w->lane_map_cap; k < nc; k++) w->lane_map[k].fam = -1;
                     w->lane_map_cap = nc;
                 }
-                w->lane_map[at] = (lane_ref){ fi, a, e };
+                if (w->lane_map[at].fam < 0)         /* unclaimed: first wins */
+                    w->lane_map[at] = (lane_ref){ fi, a, e, it };
             }
+    free(mult);
     w->lanes_ok = true;
 }
 
