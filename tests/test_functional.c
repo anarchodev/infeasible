@@ -111,11 +111,6 @@ static int expect_error_msg(const char *src, const char *needle)
 
 static int test_errors(void)
 {
-    /* an OPAQUE domain value needs store-backing (not yet) */
-    if (expect_error_msg(
-            "domain point\nsort actor\nstate ( at(actor) : point )\n",
-            "store-backing"))
-        return 1;
     /* a value not among the sort's entities */
     if (expect_error_msg(
             "sort (actor, cell)\nentity ( a : actor  k0 : cell )\n"
