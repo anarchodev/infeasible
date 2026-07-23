@@ -54,6 +54,11 @@ int       dlcol_row_words(const dlcol *f);
  * statuses first — the branchless sweep is the point; see 5.8). */
 void dlcol_solve(dlcol *f);
 
+/* Heap bytes of the solve engine (columnar arrays dominate; excludes cold
+ * why-only name strings). Call after dlcol_solve. */
+#include <stddef.h>
+size_t dlcol_footprint(const dlcol *f);
+
 dl_verdict dlcol_definite(const dlcol *f, dl_lit q, int entity);   /* +/-Delta */
 dl_verdict dlcol_defeasible(const dlcol *f, dl_lit q, int entity); /* +/-d    */
 

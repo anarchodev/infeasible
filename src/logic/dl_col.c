@@ -113,6 +113,28 @@ void dlcol_free(dlcol *f)
     free(f);
 }
 
+/* Heap bytes of the solve engine (the DoD-relevant footprint): the columnar
+ * fact/status arrays (nlits*W each) dominate, plus rules/bodies and the
+ * per-sweep applicability rows. Excludes cold why-only name strings. Call after
+ * dlcol_solve so the compiled indices and app rows are counted. */
+size_t dlcol_footprint(const dlcol *f)
+{
+    size_t nm = (size_t)f->nlits * f->W;
+    size_t b = sizeof *f;
+    b += 5 * nm * sizeof(uint64_t);                       /* fact, delta_t/f, part_t/f */
+    b += (size_t)8 * f->W * sizeof(uint64_t);             /* scratch */
+    if (f->app_t) b += 2 * (size_t)f->nrules * f->W * sizeof(uint64_t);
+    b += (size_t)f->caprules * sizeof *f->rules;
+    b += (size_t)f->capbody * sizeof *f->body;
+    b += (size_t)f->capsups * sizeof *f->sups;
+    b += (size_t)f->natoms * sizeof *f->aname;            /* pointer array, not strings */
+    if (f->head_off)  b += (size_t)(f->nlits + 1) * sizeof(int32_t);
+    if (f->head_rule) b += (size_t)f->nrules * sizeof(int32_t);
+    if (f->beat_off)  b += (size_t)(f->nlits + 1) * sizeof(int32_t);
+    if (f->beat_by)   b += (size_t)f->nsups * sizeof(int32_t);
+    return b;
+}
+
 int dlcol_add_rule(dlcol *f, const char *name, dl_rule_kind kind,
                    dl_lit head, const dl_lit *body, int nbody)
 {
