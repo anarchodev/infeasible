@@ -122,10 +122,51 @@ static int test_mixed_partial(void)
     return 0;
 }
 
+/* An `unless` guard — the engine's exception mechanism — lowered into lanes as a
+ * defeater `immune ~> ~weak`, run bit-parallel. poisoned actors weaken unless
+ * immune; the defeater must block per lane, not globally. */
+static const char *UNLESS =
+    "sort actor\n"
+    "entity (guard, thug, mage : actor)\n"
+    "state (poisoned(actor) immune(actor))\n"
+    "rule weakens(X: actor): poisoned(X) => weak(X) unless immune(X)\n"
+    "init (poisoned(guard) poisoned(thug) immune(thug))\n";
+
+static int test_unless_lanes(void)
+{
+    intern *sy = intern_new();
+    story_diag di[16];
+    story_diags d = { di, 16, 0, 0 };
+    world *w = story_compile(UNLESS, "unless.story", sy, &d);
+    if (!w) {
+        fprintf(stderr, "FAIL compile: %s\n", d.count ? d.items[0].msg : "?");
+        intern_free(sy);
+        return 1;
+    }
+    CHECK(d.nerrors == 0);
+
+    /* the guarded rule lanes (unary guard) — one family, agreeing with jfam */
+    CHECK(world_lane_family_count(w) == 1);
+    bool ok = false;
+    CHECK(world_lanes_check(w, &ok) > 0);
+    CHECK(ok);
+
+    /* guard: poisoned, not immune -> weak; thug: poisoned but immune, the
+     * defeater blocks weak (undecided), so not proved; mage: not poisoned */
+    CHECK(world_query(w, dl_pos(intern_id(sy, "weak(guard)"))) == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "weak(thug)")))  != DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "weak(mage)")))  != DL_PROVED);
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
 int main(void)
 {
     if (test_homogeneous_agrees()) return 1;
     if (test_mixed_partial()) return 1;
+    if (test_unless_lanes()) return 1;
     printf("test_lanes: all passed\n");
     return 0;
 }

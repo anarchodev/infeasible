@@ -1889,11 +1889,13 @@ static bool lane_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var,
     return a->nargs == 1 && a->args[0].name == var; /* arg is the quantified var */
 }
 
-/* A rule can lane iff it is single-variable and every atom is unary over that
- * one sort (arg = the variable) or an arity-0 global body input. */
+/* A rule can lane iff it is single-variable and every atom — body, head, and any
+ * `unless` guard — is unary over that one sort (arg = the variable) or an
+ * arity-0 global input. An `unless` guard lowers to a defeater `guard ~> ~head`
+ * (§6), emitted as its own schema rule, so its atoms must lane too. */
 static bool rule_eligible(parser *p, ast_rule *r)
 {
-    if (r->nvars != 1 || r->has_guard)
+    if (r->nvars != 1)
         return false;
     int S = r->vars[0].sort;
     uint32_t var = r->vars[0].name;
@@ -1901,6 +1903,9 @@ static bool rule_eligible(parser *p, ast_rule *r)
         return false;
     for (int b = 0; b < r->nbody; b++)
         if (!lane_atom_ok(p, &r->body[b], S, var, false))
+            return false;
+    for (int g = 0; g < r->nguard; g++)
+        if (!lane_atom_ok(p, &r->guard[g], S, var, false))
             return false;
     return true;
 }
@@ -1936,6 +1941,11 @@ static void compute_taint(parser *p, bool *taint)
                 int bp = pred_idx(p, r->body[b].pred);
                 if (bp >= 0 && p->preds[bp].is_head && taint[bp])
                     bad = true;                    /* reads a tainted conclusion */
+            }
+            for (int g = 0; g < r->nguard && !bad; g++) {
+                int gp = pred_idx(p, r->guard[g].pred);
+                if (gp >= 0 && p->preds[gp].is_head && taint[gp])
+                    bad = true;                    /* the defeater reads a tainted pred */
             }
             if (bad) { taint[hp] = true; changed = true; }
         }
@@ -1977,10 +1987,11 @@ static void emit_sort_lanes(parser *p, int S, const bool *taint)
     int npred = 0;
     for (int li = 0; li < nlaned; li++) {
         ast_rule *r = &p->rules[laned[li]];
-        const ast_atom *atoms[1 + MAX_BODY];
+        const ast_atom *atoms[1 + 2 * MAX_BODY];
         int na = 0;
         atoms[na++] = &r->head;
-        for (int b = 0; b < r->nbody; b++) atoms[na++] = &r->body[b];
+        for (int b = 0; b < r->nbody; b++)  atoms[na++] = &r->body[b];
+        for (int g = 0; g < r->nguard; g++) atoms[na++] = &r->guard[g];
         for (int k = 0; k < na; k++) {
             uint32_t pr = atoms[k]->pred;
             int found = -1;
@@ -2012,10 +2023,28 @@ static void emit_sort_lanes(parser *p, int S, const bool *taint)
                 if (preds[j] == r->body[b].pred) { bl = j; break; }
             body[b] = (dl_lit){ (uint32_t)bl, r->body[b].neg };
         }
-        int h = dlcol_add_rule(f, r->label, r->kind, head, body, r->nbody);
         char pbuf[MAX_NAME + 24];
-        dlcol_set_prov(f, h, prov_str(p, r->line, pbuf, sizeof pbuf));
+        prov_str(p, r->line, pbuf, sizeof pbuf);
+        int h = dlcol_add_rule(f, r->label, r->kind, head, body, r->nbody);
+        dlcol_set_prov(f, h, pbuf);
         schema_id[laned[li]] = h;
+
+        /* `unless G` lowers to a defeater `G ~> ~head` (§6), one schema rule run
+         * across all lanes — the engine's exception mechanism, bit-parallel. */
+        if (r->has_guard) {
+            dl_lit dhead = { (uint32_t)hl, !r->head.neg };
+            dl_lit guard[MAX_BODY];
+            for (int g = 0; g < r->nguard; g++) {
+                int gl = -1;
+                for (int j = 0; j < npred; j++)
+                    if (preds[j] == r->guard[g].pred) { gl = j; break; }
+                guard[g] = (dl_lit){ (uint32_t)gl, r->guard[g].neg };
+            }
+            char gname[MAX_NAME + 8];
+            snprintf(gname, sizeof gname, "%s.unless", r->label);
+            int gh = dlcol_add_rule(f, gname, DL_DEFEATER, dhead, guard, r->nguard);
+            dlcol_set_prov(f, gh, pbuf);
+        }
     }
     for (int s = 0; s < p->nsups; s++) {
         int wi = rule_index(p, p->sups[s].a), li = rule_index(p, p->sups[s].b);
