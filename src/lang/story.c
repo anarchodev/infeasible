@@ -2063,7 +2063,128 @@ static void emit_sort_lanes(parser *p, int S, const bool *taint)
                 pi->arity == 0 ? preds[a] : ground_pred(p, preds[a], &ent, 1);
         }
     }
-    world_add_lane_family(p->w, f, npred, nent, ground, pf);
+    world_add_lane_family(p->w, f, npred, nent, 1, ground, pf);
+    free(ground);
+}
+
+/* ---- the join matcher: two-variable rules (M3) ----
+ *
+ * A rule over two variables has no single forced lane axis, so the compiler
+ * chooses one — structurally, never from cardinality (the never-cost-based rule
+ * we settled on): the FIRST variable is the lane axis, the second is iterated.
+ * The binary predicates slice per iterated entity; each slice is a single-var
+ * lane family solved bit-parallel over the lane axis (lane one, loop the other).
+ * First cut: exactly two variables, and every body/guard predicate a BASE fluent
+ * (derived-body joins and N>2 variables are later widenings). Each such rule
+ * gets its own island family — validated against N=1, not yet routed. */
+
+/* An atom in a two-var rule reduces, per fixed iteration, to a lane column: its
+ * args must be drawn from {lane var, iter var} (any arity/order) or none
+ * (global). `roles` receives 0 for a lane-var arg, 1 for an iter-var arg. */
+static bool join_atom_ok(parser *p, const ast_atom *a, uint32_t lane, uint32_t iter,
+                         bool is_head, int *roles)
+{
+    if (a->value != INTERN_NONE || a->is_guard || a->is_num_effect)
+        return false;
+    pred_info *pi = find_pred(p, a->pred);
+    if (!pi || pi->is_mv || pi->is_num || pi->arity != a->nargs)
+        return false;
+    if (!is_head && pi->is_head)
+        return false;                              /* body/guard must be base */
+    for (int k = 0; k < a->nargs; k++) {
+        if (a->args[k].name == lane)      roles[k] = 0;
+        else if (a->args[k].name == iter) roles[k] = 1;
+        else return false;                         /* constant / other variable */
+    }
+    return true;
+}
+
+static void emit_join_family(parser *p, ast_rule *r)
+{
+    uint32_t lane = r->vars[0].name, iter = r->vars[1].name;
+    int Sl = r->vars[0].sort, Si = r->vars[1].sort;
+    int nent = domain_size(p, Sl), niter = domain_size(p, Si);
+    if (nent == 0 || niter == 0)
+        return;
+
+    /* every atom (body, head, guard) must reduce to a lane column */
+    const ast_atom *ats[1 + 2 * MAX_BODY];
+    int roleslot[1 + 2 * MAX_BODY][MAX_ARGS];
+    int nat = 0;
+    ats[nat] = &r->head;
+    if (!join_atom_ok(p, &r->head, lane, iter, true, roleslot[nat])) return;
+    nat++;
+    for (int b = 0; b < r->nbody; b++) {
+        ats[nat] = &r->body[b];
+        if (!join_atom_ok(p, &r->body[b], lane, iter, false, roleslot[nat])) return;
+        nat++;
+    }
+    for (int g = 0; g < r->nguard; g++) {
+        ats[nat] = &r->guard[g];
+        if (!join_atom_ok(p, &r->guard[g], lane, iter, false, roleslot[nat])) return;
+        nat++;
+    }
+
+    /* distinct predicates -> family-local atoms (arg pattern from first use) */
+    uint32_t preds[MAX_PREDS];
+    bool pf[MAX_PREDS];
+    int prole[MAX_PREDS][MAX_ARGS], pnarg[MAX_PREDS], npred = 0;
+    for (int k = 0; k < nat; k++) {
+        uint32_t pr = ats[k]->pred;
+        int found = -1;
+        for (int j = 0; j < npred; j++) if (preds[j] == pr) { found = j; break; }
+        if (found < 0) {
+            if (npred >= MAX_PREDS) return;
+            preds[npred] = pr;
+            pf[npred] = find_pred(p, pr)->is_fluent;
+            pnarg[npred] = ats[k]->nargs;
+            for (int m = 0; m < ats[k]->nargs; m++) prole[npred][m] = roleslot[k][m];
+            npred++;
+        }
+    }
+
+    int local_of[1 + 2 * MAX_BODY];
+    for (int k = 0; k < nat; k++)
+        for (int j = 0; j < npred; j++)
+            if (preds[j] == ats[k]->pred) { local_of[k] = j; break; }
+
+    dlcol *f = dlcol_new(npred, nent);
+    for (int a = 0; a < npred; a++)
+        dlcol_set_atom_name(f, (uint32_t)a, intern_name(p->syms, preds[a]));
+
+    dl_lit head = { (uint32_t)local_of[0], r->head.neg };
+    dl_lit body[MAX_BODY];
+    for (int b = 0; b < r->nbody; b++)
+        body[b] = (dl_lit){ (uint32_t)local_of[1 + b], r->body[b].neg };
+    char pbuf[MAX_NAME + 24];
+    prov_str(p, r->line, pbuf, sizeof pbuf);
+    int h = dlcol_add_rule(f, r->label, r->kind, head, body, r->nbody);
+    dlcol_set_prov(f, h, pbuf);
+    if (r->has_guard) {
+        dl_lit dhead = { (uint32_t)local_of[0], !r->head.neg };
+        dl_lit guard[MAX_BODY];
+        for (int g = 0; g < r->nguard; g++)
+            guard[g] = (dl_lit){ (uint32_t)local_of[1 + r->nbody + g], r->guard[g].neg };
+        char gname[MAX_NAME + 8];
+        snprintf(gname, sizeof gname, "%s.unless", r->label);
+        int gh = dlcol_add_rule(f, gname, DL_DEFEATER, dhead, guard, r->nguard);
+        dlcol_set_prov(f, gh, pbuf);
+    }
+
+    /* ground[(local*niter + it)*nent + e]: substitute the lane entity for role-0
+     * args and the iteration entity for role-1 args */
+    uint32_t *ground = malloc((size_t)npred * niter * nent * sizeof *ground);
+    for (int a = 0; a < npred; a++)
+        for (int it = 0; it < niter; it++)
+            for (int e = 0; e < nent; e++) {
+                uint32_t args[MAX_ARGS];
+                for (int m = 0; m < pnarg[a]; m++)
+                    args[m] = prole[a][m] == 0 ? domain_at(p, Sl, e)
+                                               : domain_at(p, Si, it);
+                ground[((size_t)a * niter + it) * nent + e] =
+                    ground_pred(p, preds[a], args, pnarg[a]);
+            }
+    world_add_lane_family(p->w, f, npred, nent, niter, ground, pf);
     free(ground);
 }
 
@@ -2075,6 +2196,9 @@ static void build_lane_families(parser *p)
     compute_taint(p, taint);
     for (int S = 0; S < p->nsorts; S++)
         emit_sort_lanes(p, S, taint);
+    for (int i = 0; i < p->nrules; i++)
+        if (p->rules[i].nvars == 2)                /* the join matcher */
+            emit_join_family(p, &p->rules[i]);
 }
 
 world *story_compile(const char *src, const char *srcname, intern *syms,

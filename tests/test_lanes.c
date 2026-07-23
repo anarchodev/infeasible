@@ -162,11 +162,57 @@ static int test_unless_lanes(void)
     return 0;
 }
 
+/* The join matcher: a two-variable rule over actor x item. Lane over the first
+ * variable (actor), iterate the second (item); the binary `holding` slices per
+ * item. Each item-slice is solved bit-parallel over actors. */
+static const char *JOIN =
+    "sort actor, item\n"
+    "entity (guard, thug : actor)\n"
+    "entity (torch, vase : item)\n"
+    "state (holding(actor, item) fragile(item) careless(actor))\n"
+    "rule breaks(X: actor, T: item):"
+    "     holding(X, T) & fragile(T) & careless(X) => broken(X, T)\n"
+    "init (holding(guard, vase) holding(thug, torch)"
+    "      fragile(vase) careless(guard) careless(thug))\n";
+
+static int test_join_matcher(void)
+{
+    intern *sy = intern_new();
+    story_diag di[16];
+    story_diags d = { di, 16, 0, 0 };
+    world *w = story_compile(JOIN, "join.story", sy, &d);
+    if (!w) {
+        fprintf(stderr, "FAIL compile: %s\n", d.count ? d.items[0].msg : "?");
+        intern_free(sy);
+        return 1;
+    }
+    CHECK(d.nerrors == 0);
+
+    /* the two-variable rule forms a join family (lane=actor, iterate item) */
+    CHECK(world_lane_family_count(w) == 1);
+    /* every (predicate, actor) verdict, at every item slice, matches N=1 */
+    bool ok = false;
+    CHECK(world_lanes_check(w, &ok) > 0);
+    CHECK(ok);
+
+    /* the join semantics, checked through the N=1 path (join not yet routed):
+     * guard holds the fragile vase and is careless -> broken; thug holds a torch
+     * that is not fragile -> not; guard+torch never held -> not */
+    CHECK(world_query(w, dl_pos(intern_id(sy, "broken(guard,vase)")))  == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "broken(thug,torch)")))  != DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "broken(guard,torch)"))) != DL_PROVED);
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
 int main(void)
 {
     if (test_homogeneous_agrees()) return 1;
     if (test_mixed_partial()) return 1;
     if (test_unless_lanes()) return 1;
+    if (test_join_matcher()) return 1;
     printf("test_lanes: all passed\n");
     return 0;
 }

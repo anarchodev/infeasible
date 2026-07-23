@@ -115,7 +115,7 @@ void       world_why(world *w, dl_lit q, FILE *out);
  * natoms*nent array of the equivalent named ground atom for each
  * (predicate-local-id, lane); `is_fluent` flags which locals take base facts.
  * The world copies both and takes ownership of `fam`. */
-void world_add_lane_family(world *w, dlcol *fam, int natoms, int nent,
+void world_add_lane_family(world *w, dlcol *fam, int natoms, int nent, int niter,
                            const uint32_t *ground, const bool *is_fluent);
 int  world_lane_family_count(const world *w);
 
