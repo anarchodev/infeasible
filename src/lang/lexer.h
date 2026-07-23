@@ -19,6 +19,7 @@ typedef enum {
     TK_RULE, TK_ACTION, TK_REQUIRES, TK_CAUSES, TK_UNLESS,
     TK_MODULE, TK_EXTEND, TK_SCENE, TK_IN,
     TK_BANDS,      /* priority-ladder declaration (§6.2) */
+    TK_DOMAIN,     /* opaque value-domain declaration (§5.6/§13) */
     /* set-quantified effect binder (§13): `for each T where G: E when C` */
     TK_FOR, TK_EACH, TK_WHERE, TK_WHEN, TK_LIMIT,
     /* first-class value domains (§13): `enum school { … }`, `set of actor` */

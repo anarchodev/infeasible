@@ -55,7 +55,7 @@ static const struct { const char *word; tok_kind kind; } keywords[] = {
     { "rule", TK_RULE },       { "action", TK_ACTION }, { "requires", TK_REQUIRES },
     { "causes", TK_CAUSES },   { "unless", TK_UNLESS }, { "module", TK_MODULE },
     { "extend", TK_EXTEND },   { "scene", TK_SCENE },   { "in", TK_IN },
-    { "bands", TK_BANDS },
+    { "bands", TK_BANDS },     { "domain", TK_DOMAIN },
     { "for", TK_FOR },         { "each", TK_EACH },     { "where", TK_WHERE },
     { "when", TK_WHEN },       { "limit", TK_LIMIT },   { "enum", TK_ENUM },
     { "set", TK_SET },         { "of", TK_OF },
@@ -165,6 +165,7 @@ const char *tok_kind_name(tok_kind k)
     case TK_SCENE:    return "'scene'";
     case TK_IN:       return "'in'";
     case TK_BANDS:    return "'bands'";
+    case TK_DOMAIN:   return "'domain'";
     case TK_FOR:      return "'for'";
     case TK_EACH:     return "'each'";
     case TK_WHERE:    return "'where'";
