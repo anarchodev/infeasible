@@ -32,10 +32,14 @@
 #define CARD_WARN      100000      /* cross-product cardinality warning (§5.2) */
 #define MAX_LADDERS    16          /* priority ladders (`bands …`, §6.2) */
 #define MAX_BANDS      16          /* bands per ladder */
+#define INT_SORT       (-3)        /* provider-arg sort sentinel for `int` (§5.6) */
 
 /* ---- AST ------------------------------------------------------------ */
 
-typedef struct { uint32_t name; int line, col; } ast_arg;
+/* `is_int`: a numeric literal argument (`near(X, Y, 2)`, §5.6). `name` is the
+ * interned decimal string ("2"), so grounding and the ground-term rendering are
+ * unchanged; `ival` is the value. Legal only in an `int` provider-arg position. */
+typedef struct { uint32_t name; int line, col; bool is_int; long ival; } ast_arg;
 
 /* An atom is either boolean (`p`, `p(a)`) or a multi-valued reference/assignment
  * (`f = v`, `f(a) = v`): `value` is 0 for boolean, else the interned value
@@ -363,6 +367,12 @@ static bool ident_is(token t, const char *word)
 {
     return t.kind == TK_IDENT && (int)strlen(word) == t.len &&
            memcmp(t.start, word, (size_t)t.len) == 0;
+}
+
+/* Does interned atom `a` spell `word`? (parser has p->syms.) */
+static bool ident_atom_is(parser *p, uint32_t a, const char *word)
+{
+    return strcmp(intern_name(p->syms, a), word) == 0;
 }
 
 /* Parse an integer literal with an optional leading minus. */
@@ -781,10 +791,10 @@ static bool parse_atom(parser *p, ast_atom *out)
     if (p->cur.kind == TK_LPAREN) {
         advance(p);
         for (;;) {
-            if (p->cur.kind != TK_IDENT) {
+            if (p->cur.kind != TK_IDENT && p->cur.kind != TK_INT) {
                 char d[64]; tok_desc(p->cur, d, sizeof d);
                 fail(p, p->cur.line, p->cur.col,
-                     "expected an argument name, found %s", d);
+                     "expected an argument name or integer, found %s", d);
                 return false;
             }
             if (out->nargs >= MAX_ARGS) {
@@ -792,9 +802,12 @@ static bool parse_atom(parser *p, ast_atom *out)
                      "too many arguments (max %d)", MAX_ARGS);
                 return false;
             }
-            out->args[out->nargs].name = intern_tok(p, p->cur);
-            out->args[out->nargs].line = p->cur.line;
-            out->args[out->nargs].col = p->cur.col;
+            ast_arg *ag = &out->args[out->nargs];
+            ag->name = intern_tok(p, p->cur);      /* IDENT name or the digit string */
+            ag->line = p->cur.line;
+            ag->col = p->cur.col;
+            ag->is_int = (p->cur.kind == TK_INT);  /* a numeric literal arg (§5.6) */
+            ag->ival = ag->is_int ? p->cur.ival : 0;
             out->nargs++;
             advance(p);
             if (p->cur.kind == TK_COMMA) { advance(p); continue; }
@@ -1743,9 +1756,13 @@ static void build_pred_registry(parser *p)
         if (!pi) { serr(p, pr->line, pr->col, "too many predicates"); return; }
         pi->is_provider = true;
         pi->arity = pr->nargs;
-        for (int k = 0; k < pr->nargs; k++)
-            pi->argsort[k] = decode_sort(p, -(int)pr->argsort[k] - 2,
-                                         pr->line, pr->col, "a provider declaration");
+        for (int k = 0; k < pr->nargs; k++) {
+            if (ident_atom_is(p, pr->argsort[k], "int"))   /* a numeric arg (§5.6) */
+                pi->argsort[k] = INT_SORT;
+            else
+                pi->argsort[k] = decode_sort(p, -(int)pr->argsort[k] - 2,
+                                             pr->line, pr->col, "a provider declaration");
+        }
     }
 
     /* rule heads register the conclusion predicates (arity from the head). */
@@ -1793,8 +1810,17 @@ static void check_pred_args(parser *p, uint32_t pred, pred_info *pi,
                             const ast_arg *args, int nargs,
                             var_bind *vars, int nvars, const char *ctx)
 {
+    bool schema = pi && (pi->is_fluent || pi->is_provider);
     for (int k = 0; k < nargs; k++) {
         const ast_arg *arg = &args[k];
+        int want = schema ? pi->argsort[k] : -1;
+        if (arg->is_int) {                      /* a numeric literal — int slots only */
+            if (schema && want != INT_SORT)
+                serr(p, arg->line, arg->col,
+                     "argument %d of '%s' is the integer %ld, but that position is "
+                     "not declared `int`", k + 1, intern_name(p->syms, pred), arg->ival);
+            continue;
+        }
         int vi = var_index(vars, nvars, arg->name);
         int ei = find_entity(p, arg->name);
         if (vi < 0 && ei < 0) {
@@ -1803,10 +1829,13 @@ static void check_pred_args(parser *p, uint32_t pred, pred_info *pi,
                  intern_name(p->syms, arg->name), ctx);
             continue;
         }
-        if (pi && pi->is_fluent) {              /* sort-check against schema */
-            int want = pi->argsort[k];
+        if (schema) {                           /* sort-check against schema */
             int got = vi >= 0 ? vars[vi].sort : p->ents[ei].sort;
-            if (want >= 0 && got >= 0 && want != got)
+            if (want == INT_SORT)
+                serr(p, arg->line, arg->col,
+                     "argument %d of '%s' expects an integer but got '%s'",
+                     k + 1, intern_name(p->syms, pred), intern_name(p->syms, arg->name));
+            else if (want >= 0 && got >= 0 && want != got)
                 serr(p, arg->line, arg->col,
                      "argument %d of '%s' expects sort '%s' but got '%s'",
                      k + 1, intern_name(p->syms, pred),
