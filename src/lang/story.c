@@ -164,6 +164,9 @@ typedef struct {
     bool     is_mv;               /* declared with a `: { … }` value domain */
     uint32_t values[MAX_DOMAIN];  /* the domain's value symbols, in order */
     int      nvalues;
+    uint32_t val_sort;            /* `: cell` — valued in an entity sort's entities
+                                   * (§5.6 functional fluent); 0 if not. Values are
+                                   * populated from the sort after resolve_entities. */
     bool     is_num;              /* declared `: int` (§5.8) */
     bool     has_range;           /* declared `in lo..hi` — the clamp range */
     long     rmin, rmax;          /* constant bounds (when each side folds) */
@@ -205,6 +208,8 @@ typedef struct {
     bool     is_mv;               /* a multi-valued fluent */
     uint32_t values[MAX_DOMAIN];  /* its domain, for value-in-domain checks */
     int      nvalues;
+    int      val_sort;            /* value sort index for `: cell` fluents, else -1;
+                                   * lets `at(X) = c` bind `c` as a join variable */
     bool     is_num;              /* a numeric fluent (§5.8) */
     bool     is_provider;         /* a computed relation, host-answered (§5.6) */
 } pred_info;
@@ -940,6 +945,8 @@ static void parse_enum(parser *p)
 
 /* fdecl := IDENT [ '(' IDENT (',' IDENT)* ')' ]; a ':' after it is a typed or
  * multi-valued fluent, out of this slice. */
+static int find_sort(parser *p, uint32_t name_atom);   /* defined below */
+
 static bool parse_fdecl(parser *p, ast_fluent *f)
 {
     memset(f, 0, sizeof *f);
@@ -1007,20 +1014,32 @@ static bool parse_fdecl(parser *p, ast_fluent *f)
             f->is_num = true;
             return true;
         }
-        if (p->cur.kind == TK_IDENT) {             /* `: enumname` — a named domain */
+        if (p->cur.kind == TK_IDENT) {             /* `: enumname` or `: sortname` */
             int ei = find_enum(p, p->cur);
-            if (ei < 0) {
-                fail(p, p->cur.line, p->cur.col,
-                     "'%.*s' is not a declared enum; only `: int`, `: { … }`, "
-                     "or a declared `enum` domain are supported (entity-domain "
-                     "fluents land later)", p->cur.len, p->cur.start);
-                return false;
+            if (ei >= 0) {                          /* a named enum value domain */
+                f->is_mv = true;
+                f->nvalues = p->enums[ei].nvalues;
+                for (int v = 0; v < f->nvalues; v++) f->values[v] = p->enums[ei].values[v];
+                advance(p);
+                return true;
             }
-            f->is_mv = true;
-            f->nvalues = p->enums[ei].nvalues;
-            for (int v = 0; v < f->nvalues; v++) f->values[v] = p->enums[ei].values[v];
-            advance(p);
-            return true;
+            int si = find_sort(p, intern_tok(p, p->cur));
+            if (si >= 0 && !p->sorts[si].is_domain) {
+                /* `: cell` — a functional fluent valued in an entity sort (§5.6):
+                 * exactly one entity per tick, logic-backed over §5.7 (values =
+                 * the sort's entities, filled after resolve_entities). The
+                 * store-backed representation for large domains is a follow-up. */
+                f->is_mv = true;
+                f->val_sort = intern_tok(p, p->cur);
+                advance(p);
+                return true;
+            }
+            fail(p, p->cur.line, p->cur.col,
+                 "'%.*s' is not a declared enum or sort; a fluent value type is "
+                 "`: int`, `: { … }`, an `enum`, or a `sort` (an opaque `domain` "
+                 "value needs store-backing, not yet — #19)",
+                 p->cur.len, p->cur.start);
+            return false;
         }
         if (p->cur.kind != TK_LBRACE) {
             /* `: cell`, `: tile default …` — entity-domain/functional, later */
@@ -1603,6 +1622,7 @@ static pred_info *intern_pred(parser *p, uint32_t pred, int arity)
     memset(pi, 0, sizeof *pi);
     pi->pred = pred;
     pi->arity = arity;
+    pi->val_sort = -1;
     return pi;
 }
 
@@ -1731,6 +1751,7 @@ static void build_pred_registry(parser *p)
         }
         pi->is_num = f->is_num;
         pi->is_mv = f->is_mv;
+        pi->val_sort = f->val_sort ? find_sort(p, f->val_sort) : -1;
         pi->nvalues = f->nvalues;
         for (int k = 0; k < f->nvalues; k++) {
             pi->values[k] = f->values[k];
@@ -2032,6 +2053,14 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
         bool in_domain = false;
         for (int i = 0; i < pi->nvalues; i++)
             if (pi->values[i] == at->value) { in_domain = true; break; }
+        if (!in_domain) {
+            /* a `: cell` functional fluent admits a JOIN: `at(X) = c` where `c`
+             * is a bound variable over the value sort (§5.6) — grounds to the
+             * actor's cell per instance. */
+            int vi = var_index(vars, nvars, at->value);
+            if (pi->val_sort >= 0 && vi >= 0 && vars[vi].sort == pi->val_sort)
+                in_domain = true;
+        }
         if (!in_domain)
             serr(p, at->line, at->col,
                  "'%s' is not a value of '%s'",
@@ -2171,9 +2200,42 @@ static void register_set_providers(parser *p)
     }
 }
 
+/* A functional fluent `at(X) : cell` (§5.6) is valued in a sort's entities. The
+ * entities are known only after resolve_entities, so fill the fluent's MV value
+ * domain from them here. Logic-backed over §5.7 (one value-atom per cell); a
+ * large domain exceeds MAX_DOMAIN and needs the store-backed representation
+ * (not yet, #19) — a located error, never a silent overflow. */
+static void populate_sort_valued_fluents(parser *p)
+{
+    for (int i = 0; i < p->nfluents; i++) {
+        ast_fluent *f = &p->fluents[i];
+        if (!f->val_sort) continue;
+        int si = find_sort(p, f->val_sort);
+        if (si < 0) continue;                      /* checked at parse */
+        int n = p->domain_n[si];
+        if (n == 0) {
+            serr(p, f->line, f->col,
+                 "functional fluent '%s' is valued in sort '%s', which has no "
+                 "entities", intern_name(p->syms, f->pred), p->sorts[si].name);
+            continue;
+        }
+        if (n > MAX_DOMAIN) {
+            serr(p, f->line, f->col,
+                 "functional fluent '%s' ranges over %d entities of sort '%s' "
+                 "(max %d, logic-backed); the store-backed representation for "
+                 "large cell domains is not implemented yet (#19)",
+                 intern_name(p->syms, f->pred), n, p->sorts[si].name, MAX_DOMAIN);
+            continue;
+        }
+        f->nvalues = n;
+        for (int v = 0; v < n; v++) f->values[v] = p->domain_ents[si][v];
+    }
+}
+
 static void semantic_pass(parser *p)
 {
     resolve_entities(p);
+    populate_sort_valued_fluents(p);
     register_set_providers(p);
     build_pred_registry(p);
     check_fluent_bounds(p);
@@ -2464,7 +2526,12 @@ static dl_lit ground_lit(parser *p, ast_atom *at, var_bind *vars, int nvars,
         g = ground_guard_atom(p, at->pred, args, at->nargs, at->cmp, at->threshold);
         world_add_guard(p->w, g, term, at->cmp, at->threshold);
     } else if (at->value != INTERN_NONE) {
-        g = ground_mv_atom(p, at->pred, args, at->nargs, at->value);
+        /* a join value (`at(X) = c`) resolves through the binding; a literal
+         * value (`at(X) = k1`) is not a variable and passes through unchanged. */
+        uint32_t val = at->value;
+        int vvi = var_index(vars, nvars, val);
+        if (vvi >= 0) val = binding[vvi];
+        g = ground_mv_atom(p, at->pred, args, at->nargs, val);
     } else {
         g = ground_pred(p, at->pred, args, at->nargs);
         pred_info *pi = find_pred(p, at->pred);
@@ -2693,9 +2760,13 @@ static void ground_action(parser *p, ast_action *a)
             for (int k = 0; k < e->nargs; k++)
                 args[k] = resolve_arg(a->vars, a->nvars, binding, e->args[k]);
             pred_info *pi = find_pred(p, e->pred);
-            eff[ne++] = dl_pos(ground_mv_atom(p, e->pred, args, e->nargs, e->value));
+            /* a join effect value (`at(X) = to`) resolves through the binding */
+            uint32_t ev = e->value;
+            int evi = var_index(a->vars, a->nvars, ev);
+            if (evi >= 0) ev = binding[evi];
+            eff[ne++] = dl_pos(ground_mv_atom(p, e->pred, args, e->nargs, ev));
             for (int v = 0; v < pi->nvalues && ne < MAX_BODY; v++)
-                if (pi->values[v] != e->value)
+                if (pi->values[v] != ev)
                     eff[ne++] = dl_neg(ground_mv_atom(p, e->pred, args, e->nargs,
                                                       pi->values[v]));
         }
@@ -2773,10 +2844,13 @@ static void ground_action(parser *p, ast_action *a)
                             for (int k = 0; k < e->nargs; k++)
                                 mvarg[k] = resolve_arg(cv, ncv, cb, e->args[k]);
                             pred_info *pi = find_pred(p, e->pred);
+                            uint32_t ev = e->value;      /* join value → binding */
+                            int evi = var_index(cv, ncv, ev);
+                            if (evi >= 0) ev = cb[evi];
                             eff2[ne2++] = dl_pos(ground_mv_atom(p, e->pred, mvarg,
-                                                                e->nargs, e->value));
+                                                                e->nargs, ev));
                             for (int v = 0; v < pi->nvalues && ne2 < MAX_BODY; v++)
-                                if (pi->values[v] != e->value)
+                                if (pi->values[v] != ev)
                                     eff2[ne2++] = dl_neg(ground_mv_atom(p, e->pred, mvarg,
                                                                         e->nargs, pi->values[v]));
                         }
