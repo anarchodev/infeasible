@@ -13,7 +13,7 @@
 #define MAX_BODY       32      /* atoms per conjunction (post-family expansion) */
 #define MAX_DOMAIN     32      /* values in a multi-valued fluent domain */
 #define MAX_SORTS      32
-#define MAX_ENTS       512
+#define MAX_ENTS       (1 << 20)   /* sanity ceiling; entities grow on the heap */
 #define MAX_FLUENTS    256     /* fluent *predicate* schemas */
 #define MAX_PREDS      512     /* predicate registry (fluents + heads) */
 #define MAX_RULES      256
@@ -143,8 +143,8 @@ typedef struct {
 
     struct { char name[MAX_NAME]; int line, col; } sorts[MAX_SORTS];
     int nsorts;
-    struct { uint32_t atom; int sort; int line, col; } ents[MAX_ENTS];
-    int nents;
+    struct ent_rec { uint32_t atom; int sort; int line, col; } *ents;  /* heap, grown */
+    int nents, capents;
     ast_fluent  fluents[MAX_FLUENTS];
     int nfluents;
     ast_rule   *rules;            /* heap; MAX_RULES */
@@ -312,33 +312,44 @@ static void parse_entity(parser *p)
     bool grouped = false;
     if (p->cur.kind == TK_LPAREN) { grouped = true; advance(p); }
     do {
-        token names[MAX_ENTS];                     /* names sharing one sort */
-        int nn = 0;
+        token *names = NULL;                        /* names sharing one sort (heap) */
+        int nn = 0, ncap = 0;
         for (;;) {
             if (p->cur.kind != TK_IDENT) {
                 char d[64]; tok_desc(p->cur, d, sizeof d);
                 fail(p, p->cur.line, p->cur.col,
                      "expected an entity name, found %s", d);
+                free(names);
                 return;
             }
-            if (nn < MAX_ENTS) names[nn++] = p->cur;
+            if (nn == ncap) {
+                ncap = ncap ? ncap * 2 : 16;
+                names = realloc(names, (size_t)ncap * sizeof *names);
+            }
+            names[nn++] = p->cur;
             advance(p);
             if (p->cur.kind == TK_COMMA) { advance(p); continue; }
             break;
         }
-        if (!expect(p, TK_COLON)) return;
+        if (!expect(p, TK_COLON)) { free(names); return; }
         if (p->cur.kind != TK_IDENT) {
             char d[64]; tok_desc(p->cur, d, sizeof d);
             fail(p, p->cur.line, p->cur.col, "expected a sort name, found %s", d);
+            free(names);
             return;
         }
         uint32_t sort_atom = intern_tok(p, p->cur);
         int sortline = p->cur.line, sortcol = p->cur.col;
         advance(p);
         for (int i = 0; i < nn; i++) {
-            if (p->nents >= MAX_ENTS) {
+            if (p->nents >= MAX_ENTS) {             /* runaway guard — scream, don't drop */
                 fail(p, sortline, sortcol, "too many entities (max %d)", MAX_ENTS);
+                free(names);
                 return;
+            }
+            if (p->nents == p->capents) {
+                p->capents = p->capents ? p->capents * 2 : 64;
+                p->ents = realloc(p->ents, (size_t)p->capents * sizeof *p->ents);
             }
             /* sort resolves in the semantic pass; store the sort name atom in
              * a temporary sort slot of -1 tagged via argsort trick — instead
@@ -351,6 +362,7 @@ static void parse_entity(parser *p)
             /* (resolved in resolve_entities using ents_sortname[]) */
             p->nents++;
         }
+        free(names);
         /* record the sort name for these entities */
         for (int i = p->nents - nn; i < p->nents; i++)
             p->ents[i].sort = -(int)sort_atom - 2;  /* encode name atom, decode later */
@@ -2474,6 +2486,7 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
     free(p->rules);
     free(p->actions);
     free(p->exprs);
+    free(p->ents);
     free(p);
     return result;
 }
