@@ -29,14 +29,14 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 enable_testing()
-foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse test_ground test_mv test_numeric test_numpipe test_numeff test_ramif test_prov test_lanes)
+foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse test_ground test_mv test_numeric test_numpipe test_numeff test_ramif test_prov test_lanes test_binder)
   add_executable(${t} tests/${t}.c)
   target_link_libraries(${t} PRIVATE infeasible_core)
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
 
 # These compile real .story files from the source tree; hand them the path.
-foreach(t IN ITEMS test_parse test_ground test_mv test_numeric test_numeff test_ramif)
+foreach(t IN ITEMS test_parse test_ground test_mv test_numeric test_numeff test_ramif test_binder)
   target_compile_definitions(${t} PRIVATE
     STORY_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples")
 endforeach()

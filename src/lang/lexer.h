@@ -18,6 +18,10 @@ typedef enum {
     TK_SORT, TK_ENTITY, TK_STATE, TK_INIT, TK_PROVIDER,
     TK_RULE, TK_ACTION, TK_REQUIRES, TK_CAUSES, TK_UNLESS,
     TK_MODULE, TK_EXTEND, TK_SCENE, TK_IN,
+    /* set-quantified effect binder (§13): `for each T where G: E when C` */
+    TK_FOR, TK_EACH, TK_WHERE, TK_WHEN, TK_LIMIT,
+    /* first-class value domains (§13): `enum school { … }`, `set of actor` */
+    TK_ENUM, TK_SET, TK_OF,
 
     TK_LPAREN, TK_RPAREN, TK_LBRACE, TK_RBRACE,
     TK_COLON, TK_COMMA, TK_AMP, TK_TILDE,

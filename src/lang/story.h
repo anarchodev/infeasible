@@ -23,6 +23,17 @@
  * legal only in a ramification body and only on a boolean or multi-valued
  * fluent read — a primed numeric guard or judgment (`hp' <= 0`, `dead'`) is the
  * §5.8 stratification case, rejected with a located error.
+ * Set-quantified effect binders (§13): a `causes` body may contain, alongside
+ * plain effects, `for each T: sort [where <guard>]: <effect> [when <cond>]` (a
+ * single effect, or a `{ … }` block of comma-separated `effect when <cond>`
+ * items). The bound var(s) extend the enclosing action's binding at ground
+ * time, so one guarded step-rule is emitted per (cast × target × item), sharing
+ * the action's trigger; the `where`/`when` conjuncts lower to step conditions,
+ * resolving the affected set at tick time — an AoE/multi-target effect over a
+ * host-marked or state-guarded set (Fireball, Faerie Fire). `limit` (bounded
+ * quantification) and provider-answered guards are a later slice. `enum` names
+ * a value domain reusable as a fluent type (`f(a) : school`), erasing to the
+ * same multi-valued machinery as an inline `: { … }`.
  * Still out: MV judgment-rule heads / negative MV effects (they need the §5.7
  * family reification), each rejected with a located error.
  * The variable-free fragment is the degenerate arity-0 case: cellar_prop.story
@@ -31,20 +42,27 @@
  * Grammar handled by this slice:
  *
  *   file    := decl*
- *   decl    := sort | entity | state | init | rule | action | sup
+ *   decl    := sort | enum | entity | state | init | rule | action | sup
  *   sort    := 'sort'   ( IDENT | '(' IDENT (','? IDENT)* ')' )
+ *   enum    := 'enum' IDENT '{' IDENT (',' IDENT)* '}'  -- named value domain (§13)
  *   entity  := 'entity' ( ebind | '(' ebind* ')' )
  *   ebind   := IDENT (',' IDENT)* ':' IDENT            -- names : sort
  *   state   := 'state'  ( fdecl | '(' fdecl* ')' )
  *   fdecl   := IDENT [ '(' IDENT (',' IDENT)* ')' ] [ ftype ]
  *   ftype   := ':' 'int' [ 'in' INT '..' INT ]         -- numeric + clamp range
- *            | ':' '{' IDENT (',' IDENT)* '}'           -- multi-valued domain
+ *            | ':' '{' IDENT (',' IDENT)* '}'           -- inline multi-valued domain
+ *            | ':' IDENT                                -- a declared `enum` domain
  *   init    := 'init'   ( iatom | '(' iatom* ')' )      -- ground
  *   iatom   := atom | IDENT '=' (IDENT | INT)           -- MV / numeric init
  *   rule    := 'rule' IDENT [ params ] ':' conj                 -- judgment
  *                ( OP atom [ 'unless' conj ]
- *                | 'causes' conj )                              -- ramification
- *   action  := 'action' IDENT [ params ] ':' [ 'requires' conj ] 'causes' conj
+ *                | 'causes' effects )                           -- ramification
+ *   action  := 'action' IDENT [ params ] ':' [ 'requires' conj ] 'causes' effects
+ *   effects := effitem ( '&' effitem )*                         -- effect body
+ *   effitem := eatom | binder                                   -- plain or set-quantified
+ *   binder  := 'for' 'each' vbind (',' vbind)* [ 'where' conj ] ':'  -- §13
+ *                ( bindeff | '{' bindeff (',' bindeff)* '}' )
+ *   bindeff := eatom [ 'when' conj ]                            -- `when` in blocks only
  *   params  := '(' vbind (',' vbind)* ')'
  *   vbind   := IDENT ':' IDENT                          -- var : sort
  *   OP      := '->' | '=>' | '~>'

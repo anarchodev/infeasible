@@ -23,6 +23,11 @@
 #define MAX_GROUND     256     /* ground atom name buffer */
 #define MAX_EXPRS      4096    /* effect-expression AST node pool */
 #define MAX_CODE       64      /* VM bytecode per ground effect */
+#define MAX_ENUMS      16      /* named value domains (`enum school { … }`, §13) */
+#define MAX_WHEN       8       /* conjuncts in a binder `where` / item `when` */
+#define MAX_ITEMS      8       /* effect items in one `for each` block */
+#define MAX_ACT_BINDERS 4      /* `for each` binders per action */
+#define MAX_BINDERS    64      /* binder pool across the whole file */
 #define MAX_INSTANCES  (1 << 20)   /* per-rule grounding blow-up guard */
 #define CARD_WARN      100000      /* cross-product cardinality warning (§5.2) */
 
@@ -100,7 +105,31 @@ typedef struct {
     int       nreq;
     ast_atom  effects[MAX_BODY];
     int       neff;
+    int       bind_ix[MAX_ACT_BINDERS];   /* indices into parser.binders (§13) */
+    int       nbind;
 } ast_action;
+
+/* A `for each T [, U] where <guard> [limit n]: { <eff> [when <cond>] , … }`
+ * set-quantified effect binder (DESIGN.md §13). Bound vars extend the enclosing
+ * action's var list at ground time, so one guarded step-rule is emitted per
+ * (cast × inner binding × item) — the where/when conjuncts lower to step
+ * conditions, exactly like a `requires`. `limit` is reserved for a later slice. */
+typedef struct {
+    ast_atom eff;
+    ast_atom when[MAX_WHEN];
+    int      nwhen;
+} binder_item;
+
+typedef struct {
+    var_bind    vars[MAX_ARGS];
+    int         nvars;
+    ast_atom    where[MAX_WHEN];
+    int         nwhere;
+    int         limit;                    /* -1 = unbounded (reserved) */
+    binder_item items[MAX_ITEMS];
+    int         nitems;
+    int         line, col;
+} ast_binder;
 
 typedef struct {
     uint32_t pred;
@@ -116,6 +145,15 @@ typedef struct {
 } ast_fluent;
 
 typedef struct { char a[MAX_NAME], b[MAX_NAME]; int aline, acol, bline, bcol; } ast_sup;
+
+/* A named value domain (`enum school { … }`, §13) — distinct from a `sort`
+ * (entities); usable as a fluent type, erasing to the multi-valued machinery. */
+typedef struct {
+    char     name[MAX_NAME];
+    uint32_t values[MAX_DOMAIN];
+    int      nvalues;
+    int      line, col;
+} enum_dom;
 
 /* predicate registry entry: a name is a fluent (with arg sorts) and/or a
  * conclusion head. Arity must be consistent across all its uses. */
@@ -158,6 +196,10 @@ typedef struct {
     int nrules;
     ast_action *actions;          /* heap; MAX_ACTIONS */
     int nactions;
+    ast_binder *binders;          /* heap; MAX_BINDERS — the `for each` pool */
+    int nbinders;
+    enum_dom enums[MAX_ENUMS];    /* named value domains (§13) */
+    int nenums;
     ast_sup     sups[MAX_SUPS];
     int nsups;
     ast_atom    inits[MAX_INITS];
@@ -615,6 +657,64 @@ static int parse_conj(parser *p, ast_atom *out, int cap)
     return n;
 }
 
+/* A declared `enum` value domain (§13), matched by name; -1 if none. */
+static int find_enum(parser *p, token t)
+{
+    for (int i = 0; i < p->nenums; i++)
+        if ((int)strlen(p->enums[i].name) == t.len &&
+            memcmp(p->enums[i].name, t.start, (size_t)t.len) == 0)
+            return i;
+    return -1;
+}
+
+/* enum := 'enum' IDENT '{' IDENT (',' IDENT)* '}' — a named value domain,
+ * usable as a fluent type (`conc_spell(actor) : spell`). Distinct from `sort`,
+ * which is for entities (§13). */
+static void parse_enum(parser *p)
+{
+    advance(p);                                    /* 'enum' */
+    if (p->cur.kind != TK_IDENT) {
+        char d[64]; tok_desc(p->cur, d, sizeof d);
+        fail(p, p->cur.line, p->cur.col, "expected an enum name, found %s", d);
+        return;
+    }
+    if (p->nenums >= MAX_ENUMS) {
+        fail(p, p->cur.line, p->cur.col, "too many enums (max %d)", MAX_ENUMS);
+        return;
+    }
+    if (find_enum(p, p->cur) >= 0) {
+        fail(p, p->cur.line, p->cur.col, "enum '%.*s' is already declared",
+             p->cur.len, p->cur.start);
+        return;
+    }
+    enum_dom *e = &p->enums[p->nenums];
+    copy_ident(e->name, MAX_NAME, p->cur);
+    e->line = p->cur.line; e->col = p->cur.col; e->nvalues = 0;
+    advance(p);
+    if (!expect(p, TK_LBRACE)) return;
+    for (;;) {
+        if (p->cur.kind != TK_IDENT) {
+            char d[64]; tok_desc(p->cur, d, sizeof d);
+            fail(p, p->cur.line, p->cur.col, "expected a value name, found %s", d);
+            return;
+        }
+        if (e->nvalues >= MAX_DOMAIN) {
+            fail(p, p->cur.line, p->cur.col, "too many enum values (max %d)", MAX_DOMAIN);
+            return;
+        }
+        e->values[e->nvalues++] = intern_tok(p, p->cur);
+        advance(p);
+        if (p->cur.kind == TK_COMMA) { advance(p); continue; }
+        break;
+    }
+    if (!expect(p, TK_RBRACE)) return;
+    if (e->nvalues < 2) {
+        fail(p, e->line, e->col, "a value domain needs at least two values");
+        return;
+    }
+    p->nenums++;
+}
+
 /* fdecl := IDENT [ '(' IDENT (',' IDENT)* ')' ]; a ':' after it is a typed or
  * multi-valued fluent, out of this slice. */
 static bool parse_fdecl(parser *p, ast_fluent *f)
@@ -664,6 +764,21 @@ static bool parse_fdecl(parser *p, ast_fluent *f)
                 f->has_range = true;
             }
             f->is_num = true;
+            return true;
+        }
+        if (p->cur.kind == TK_IDENT) {             /* `: enumname` — a named domain */
+            int ei = find_enum(p, p->cur);
+            if (ei < 0) {
+                fail(p, p->cur.line, p->cur.col,
+                     "'%.*s' is not a declared enum; only `: int`, `: { … }`, "
+                     "or a declared `enum` domain are supported (entity-domain "
+                     "fluents land later)", p->cur.len, p->cur.start);
+                return false;
+            }
+            f->is_mv = true;
+            f->nvalues = p->enums[ei].nvalues;
+            for (int v = 0; v < f->nvalues; v++) f->values[v] = p->enums[ei].values[v];
+            advance(p);
             return true;
         }
         if (p->cur.kind != TK_LBRACE) {
@@ -790,6 +905,131 @@ static bool parse_params(parser *p, var_bind *vars, int *nvars)
     return expect(p, TK_RPAREN);
 }
 
+/* Bound vars of a `for each`: `T : sort (',' U : sort)*` — like parse_params
+ * but unparenthesized (we are already past `each`). */
+static bool parse_binder_vars(parser *p, ast_binder *bnd)
+{
+    for (;;) {
+        if (p->cur.kind != TK_IDENT) {
+            char d[64]; tok_desc(p->cur, d, sizeof d);
+            fail(p, p->cur.line, p->cur.col, "expected a bound variable, found %s", d);
+            return false;
+        }
+        if (bnd->nvars >= MAX_ARGS) {
+            fail(p, p->cur.line, p->cur.col, "too many bound variables (max %d)", MAX_ARGS);
+            return false;
+        }
+        var_bind *v = &bnd->vars[bnd->nvars];
+        v->name = intern_tok(p, p->cur);
+        v->line = p->cur.line; v->col = p->cur.col; v->sort = -1;
+        advance(p);
+        if (!expect(p, TK_COLON)) return false;
+        if (p->cur.kind != TK_IDENT) {
+            char d[64]; tok_desc(p->cur, d, sizeof d);
+            fail(p, p->cur.line, p->cur.col, "expected a sort name, found %s", d);
+            return false;
+        }
+        v->sort = -(int)intern_tok(p, p->cur) - 2;   /* encoded for the semantic pass */
+        bnd->nvars++;
+        advance(p);
+        if (p->cur.kind == TK_COMMA) { advance(p); continue; }
+        break;
+    }
+    return true;
+}
+
+/* binder := 'for' 'each' bvars [ 'where' conj ] [ 'limit' INT ] ':'
+ *            ( bind_eff | '{' bind_eff (',' bind_eff)* '}' )
+ * bind_eff := atom [ 'when' conj ]      -- `when` only inside a `{ … }` block
+ * The parsed binder is stashed in the file-wide pool; the enclosing action
+ * records its index. */
+static bool parse_binder(parser *p, ast_action *a)
+{
+    token ft = p->cur;
+    advance(p);                                    /* 'for' */
+    if (!expect(p, TK_EACH)) return false;
+    if (p->nbinders >= MAX_BINDERS) {
+        fail(p, ft.line, ft.col, "too many `for each` binders (max %d)", MAX_BINDERS);
+        return false;
+    }
+    if (a->nbind >= MAX_ACT_BINDERS) {
+        fail(p, ft.line, ft.col, "too many binders in one action (max %d)", MAX_ACT_BINDERS);
+        return false;
+    }
+    int slot = p->nbinders;
+    ast_binder *bnd = &p->binders[slot];
+    memset(bnd, 0, sizeof *bnd);
+    bnd->line = ft.line; bnd->col = ft.col; bnd->limit = -1;
+
+    if (!parse_binder_vars(p, bnd)) return false;
+    if (p->cur.kind == TK_WHERE) {
+        advance(p);
+        int nw = parse_conj(p, bnd->where, MAX_WHEN);
+        if (nw < 0) return false;
+        bnd->nwhere = nw;
+    }
+    if (p->cur.kind == TK_LIMIT) {                  /* reserved for a later slice */
+        fail(p, p->cur.line, p->cur.col,
+             "`limit` is not supported yet (bounded quantification is a later "
+             "slice); drop it or split the effect");
+        return false;
+    }
+    if (!expect(p, TK_COLON)) return false;
+
+    if (p->cur.kind == TK_LBRACE) {                 /* block: many items, per-item `when` */
+        advance(p);
+        for (;;) {
+            if (bnd->nitems >= MAX_ITEMS) {
+                fail(p, p->cur.line, p->cur.col, "too many effect items (max %d)", MAX_ITEMS);
+                return false;
+            }
+            binder_item *it = &bnd->items[bnd->nitems];
+            memset(it, 0, sizeof *it);
+            if (!parse_atom(p, &it->eff)) return false;
+            if (p->cur.kind == TK_WHEN) {
+                advance(p);
+                int nw = parse_conj(p, it->when, MAX_WHEN);
+                if (nw < 0) return false;
+                it->nwhen = nw;
+            }
+            bnd->nitems++;
+            if (p->cur.kind == TK_COMMA) { advance(p); continue; }
+            break;
+        }
+        if (!expect(p, TK_RBRACE)) return false;
+    } else {                                        /* single form: one effect, no `when` */
+        binder_item *it = &bnd->items[0];
+        memset(it, 0, sizeof *it);
+        if (!parse_atom(p, &it->eff)) return false;
+        bnd->nitems = 1;
+    }
+    p->nbinders++;
+    a->bind_ix[a->nbind++] = slot;
+    return true;
+}
+
+/* A `causes` effect body: `&`-separated items, each a plain effect atom or a
+ * `for each` binder. Shared by actions and `rule … causes` ramifications. */
+static bool parse_effects(parser *p, ast_action *a)
+{
+    for (;;) {
+        if (p->cur.kind == TK_FOR) {
+            if (!parse_binder(p, a)) return false;
+        } else {
+            if (a->neff >= MAX_BODY) {
+                fail(p, p->cur.line, p->cur.col,
+                     "too many effects (max %d atoms)", MAX_BODY);
+                return false;
+            }
+            if (!parse_atom(p, &a->effects[a->neff])) return false;
+            a->neff++;
+        }
+        if (p->cur.kind == TK_AMP) { advance(p); continue; }
+        break;
+    }
+    return true;
+}
+
 /* rule := 'rule' IDENT [ params ] ':' conj ( OP atom [ 'unless' conj ]
  *                                          | 'causes' conj )
  * A `causes` clause (in place of a rule arrow) makes it a ramification: a step
@@ -839,9 +1079,7 @@ static void parse_rule(parser *p)
         a->nreq = r->nbody;
         for (int b = 0; b < r->nbody; b++) a->requires[b] = r->body[b];
         advance(p);                                /* 'causes' */
-        int ne = parse_conj(p, a->effects, MAX_BODY);
-        if (ne < 0) return;
-        a->neff = ne;
+        if (!parse_effects(p, a)) return;
         p->nactions++;
         return;
     }
@@ -902,9 +1140,7 @@ static void parse_action(parser *p)
         a->nreq = nr;
     }
     if (!expect(p, TK_CAUSES)) return;
-    int ne = parse_conj(p, a->effects, MAX_BODY);
-    if (ne < 0) return;
-    a->neff = ne;
+    if (!parse_effects(p, a)) return;
     p->nactions++;
 }
 
@@ -1060,7 +1296,7 @@ static void resolve_entities(parser *p)
     for (int s = 0; s < p->nsorts; s++)
         p->domain_ents[s] = malloc((size_t)(p->domain_n[s] ? p->domain_n[s] : 1)
                                    * sizeof *p->domain_ents[s]);
-    p->ent_pos = malloc((size_t)(p->nents ? p->nents : 1) * sizeof *p->ent_pos);
+    p->ent_pos = malloc((size_t)(p->nents > 0 ? p->nents : 1) * sizeof *p->ent_pos);
     int fill[MAX_SORTS];
     for (int s = 0; s < p->nsorts; s++) fill[s] = 0;
     for (int i = 0; i < p->nents; i++) {
@@ -1395,6 +1631,36 @@ static void semantic_pass(parser *p)
                      "assign the intended value instead",
                      intern_name(p->syms, a->effects[b].pred),
                      intern_name(p->syms, a->effects[b].value));
+        }
+        /* `for each` binders: resolve bound vars, then check the where/when
+         * guards and effects against the combined (action ++ binder) scope. */
+        for (int bi = 0; bi < a->nbind; bi++) {
+            ast_binder *bnd = &p->binders[a->bind_ix[bi]];
+            resolve_vars(p, bnd->vars, bnd->nvars, "a `for each` binder");
+            for (int k = 0; k < bnd->nvars; k++)
+                if (var_index(a->vars, a->nvars, bnd->vars[k].name) >= 0)
+                    serr(p, bnd->vars[k].line, bnd->vars[k].col,
+                         "bound variable '%s' shadows an action parameter",
+                         intern_name(p->syms, bnd->vars[k].name));
+            var_bind cv[2 * MAX_ARGS];
+            int nc = a->nvars;
+            for (int k = 0; k < a->nvars; k++)  cv[k] = a->vars[k];
+            for (int k = 0; k < bnd->nvars; k++) cv[nc + k] = bnd->vars[k];
+            nc += bnd->nvars;
+            for (int b = 0; b < bnd->nwhere; b++)
+                check_atom(p, &bnd->where[b], cv, nc, true, false, false, "a `where` guard");
+            for (int it = 0; it < bnd->nitems; it++) {
+                binder_item *item = &bnd->items[it];
+                check_atom(p, &item->eff, cv, nc, false, true, false, "a `for each` effect");
+                if (item->eff.value != INTERN_NONE && item->eff.neg)
+                    serr(p, item->eff.line, item->eff.col,
+                         "a negative multi-valued effect ('~(%s = %s)') is not "
+                         "supported yet — assign the intended value instead",
+                         intern_name(p->syms, item->eff.pred),
+                         intern_name(p->syms, item->eff.value));
+                for (int b = 0; b < item->nwhen; b++)
+                    check_atom(p, &item->when[b], cv, nc, true, false, false, "a `when` guard");
+            }
         }
     }
 
@@ -1795,6 +2061,88 @@ static void ground_action(parser *p, ast_action *a)
             int nc = 0;
             emit_expr(p, e->expr_root, a->vars, a->nvars, binding, code, &nc);
             world_add_num_effect(p->w, h, num, e->numop, code, nc);
+        }
+
+        /* set-quantified effect binders (§13). The bound var(s) extend this
+         * instance's binding; one step rule is emitted per (inner binding ×
+         * item), all sharing this action's trigger `act`. The `where` guard and
+         * an item's `when` guard lower to step conditions (like a `requires`),
+         * so the per-target subset is resolved at tick time. */
+        for (int bi = 0; bi < a->nbind; bi++) {
+            ast_binder *bnd = &p->binders[a->bind_ix[bi]];
+            var_bind cv[2 * MAX_ARGS];
+            uint32_t  cb[2 * MAX_ARGS];
+            for (int k = 0; k < a->nvars; k++) { cv[k] = a->vars[k]; cb[k] = binding[k]; }
+            for (int k = 0; k < bnd->nvars; k++) cv[a->nvars + k] = bnd->vars[k];
+            int ncv = a->nvars + bnd->nvars;
+
+            bool bof = false;
+            long inner = instance_count(p, bnd->vars, bnd->nvars, &bof);
+            if (bof) {
+                warn(p, bnd->line, bnd->col,
+                     "a `for each` in '%s' grounds to more than %d instances",
+                     a->name, MAX_INSTANCES);
+                continue;
+            }
+            for (long j = 0; j < inner; j++) {
+                uint32_t ib[MAX_ARGS];
+                decode_binding(p, bnd->vars, bnd->nvars, j, ib);
+                for (int k = 0; k < bnd->nvars; k++) cb[a->nvars + k] = ib[k];
+
+                for (int it = 0; it < bnd->nitems; it++) {
+                    binder_item *item = &bnd->items[it];
+                    /* conds = action requires + binder where + item when */
+                    step_cond bc[MAX_BODY];
+                    int nbc = 0;
+                    for (int b = 0; b < a->nreq && nbc < MAX_BODY; b++) {
+                        bc[nbc].lit = ground_lit(p, &a->requires[b], cv, ncv, cb);
+                        bc[nbc++].primed = a->requires[b].primed;
+                    }
+                    for (int b = 0; b < bnd->nwhere && nbc < MAX_BODY; b++) {
+                        bc[nbc].lit = ground_lit(p, &bnd->where[b], cv, ncv, cb);
+                        bc[nbc++].primed = false;
+                    }
+                    for (int b = 0; b < item->nwhen && nbc < MAX_BODY; b++) {
+                        bc[nbc].lit = ground_lit(p, &item->when[b], cv, ncv, cb);
+                        bc[nbc++].primed = false;
+                    }
+
+                    ast_atom *e = &item->eff;
+                    dl_lit eff2[MAX_BODY];
+                    int ne2 = 0;
+                    if (!e->is_num_effect) {
+                        if (e->value == INTERN_NONE) {
+                            eff2[ne2++] = ground_lit(p, e, cv, ncv, cb);
+                        } else {                       /* MV: chosen value + sibling negations */
+                            uint32_t mvarg[MAX_ARGS];
+                            for (int k = 0; k < e->nargs; k++)
+                                mvarg[k] = resolve_arg(cv, ncv, cb, e->args[k]);
+                            pred_info *pi = find_pred(p, e->pred);
+                            eff2[ne2++] = dl_pos(ground_mv_atom(p, e->pred, mvarg,
+                                                                e->nargs, e->value));
+                            for (int v = 0; v < pi->nvalues && ne2 < MAX_BODY; v++)
+                                if (pi->values[v] != e->value)
+                                    eff2[ne2++] = dl_neg(ground_mv_atom(p, e->pred, mvarg,
+                                                                        e->nargs, pi->values[v]));
+                        }
+                    }
+                    char bname[MAX_GROUND];
+                    inst_name(p, bname, sizeof bname, a->name, cv, ncv, cb);
+                    int h2 = world_add_step_rule(p->w, bname, act, bc, nbc, eff2, ne2);
+                    char pbuf[MAX_NAME + 24];
+                    world_set_step_prov(p->w, h2, prov_str(p, bnd->line, pbuf, sizeof pbuf));
+                    if (e->is_num_effect) {
+                        uint32_t narg[MAX_ARGS];
+                        for (int k = 0; k < e->nargs; k++)
+                            narg[k] = resolve_arg(cv, ncv, cb, e->args[k]);
+                        uint32_t num = ground_pred(p, e->pred, narg, e->nargs);
+                        expr_ins code[MAX_CODE];
+                        int nc = 0;
+                        emit_expr(p, e->expr_root, cv, ncv, cb, code, &nc);
+                        world_add_num_effect(p->w, h2, num, e->numop, code, nc);
+                    }
+                }
+            }
         }
     }
 }
@@ -2354,6 +2702,8 @@ static void emit_step_lanes(parser *p)
     int ng = 0;
     for (int i = 0; i < p->nactions; i++) {
         ast_action *a = &p->actions[i];
+        if (a->nbind > 0)          /* binder effects live outside a->effects: N=1 */
+            return;
         if (a->nvars != 1 || a->vars[0].sort != S)
             return;
         uint32_t var = a->vars[0].name;
@@ -2508,6 +2858,7 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
     parser *p = calloc(1, sizeof *p);
     p->rules = calloc(MAX_RULES, sizeof *p->rules);
     p->actions = calloc(MAX_ACTIONS, sizeof *p->actions);
+    p->binders = calloc(MAX_BINDERS, sizeof *p->binders);
     p->exprs = calloc(MAX_EXPRS, sizeof *p->exprs);
     lexer_init(&p->lx, src);
     p->syms = syms;
@@ -2522,6 +2873,7 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
         p->err_flag = false;
         switch (p->cur.kind) {
         case TK_SORT:   parse_sort(p);   break;
+        case TK_ENUM:   parse_enum(p);   break;
         case TK_ENTITY: parse_entity(p); break;
         case TK_STATE:  parse_state(p);  break;
         case TK_INIT:   parse_init(p);   break;
@@ -2531,7 +2883,7 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
         default: {
             char d[64]; tok_desc(p->cur, d, sizeof d);
             fail(p, p->cur.line, p->cur.col,
-                 "expected a declaration (sort/entity/state/init/rule/action) "
+                 "expected a declaration (sort/enum/entity/state/init/rule/action) "
                  "or a superiority statement, found %s", d);
             break;
         }
@@ -2560,6 +2912,7 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
     for (int i = 0; i < p->nrules; i++) free(p->rules[i].insts);
     free(p->rules);
     free(p->actions);
+    free(p->binders);
     free(p->exprs);
     free(p->ents);
     free(p->ent_of);
