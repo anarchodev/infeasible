@@ -114,9 +114,13 @@ void       world_why(world *w, dl_lit q, FILE *out);
  * dl_col-was-prototyped-before-adopted playbook). `ground` is a flat
  * natoms*nent array of the equivalent named ground atom for each
  * (predicate-local-id, lane); `is_fluent` flags which locals take base facts.
- * The world copies both and takes ownership of `fam`. */
+ * `is_import` (may be NULL = none) flags locals that are DERIVED elsewhere and
+ * imported: their per-cell verdict is queried and injected each solve, rather
+ * than concluded here — the join matcher's derived-body case (§5.5 import).
+ * The world copies all and takes ownership of `fam`. */
 void world_add_lane_family(world *w, dlcol *fam, int natoms, int nent, int niter,
-                           const uint32_t *ground, const bool *is_fluent);
+                           const uint32_t *ground, const bool *is_fluent,
+                           const bool *is_import);
 int  world_lane_family_count(const world *w);
 
 /* Differential pin (mirrors test_col's dl-vs-dl_col): load current state into

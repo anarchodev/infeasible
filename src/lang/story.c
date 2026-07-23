@@ -2063,7 +2063,7 @@ static void emit_sort_lanes(parser *p, int S, const bool *taint)
                 pi->arity == 0 ? preds[a] : ground_pred(p, preds[a], &ent, 1);
         }
     }
-    world_add_lane_family(p->w, f, npred, nent, 1, ground, pf);
+    world_add_lane_family(p->w, f, npred, nent, 1, ground, pf, NULL);
     free(ground);
 }
 
@@ -2094,8 +2094,7 @@ static bool join_atom_ok(parser *p, const ast_atom *a, const var_bind *vars,
     pred_info *pi = find_pred(p, a->pred);
     if (!pi || pi->is_mv || pi->is_num || pi->arity != a->nargs)
         return false;
-    if (!is_head && pi->is_head)
-        return false;                              /* body/guard must be base */
+    (void)is_head;   /* a derived body/guard pred is allowed: it imports (§5.5) */
     for (int k = 0; k < a->nargs; k++) {
         int rho = -1;
         for (int v = 0; v < nvars; v++)
@@ -2166,6 +2165,13 @@ static void emit_join_family(parser *p, ast_rule *r)
         for (int j = 0; j < npred; j++)
             if (preds[j] == ats[k]->pred) { local_of[k] = j; break; }
 
+    /* classify locals: the head (local_of[0]) is concluded here; a non-fluent
+     * body/guard pred is DERIVED elsewhere and imported (its verdict injected
+     * per cell at solve time); everything else is a base fluent. */
+    bool pimport[MAX_PREDS];
+    for (int j = 0; j < npred; j++)
+        pimport[j] = !pf[j] && j != local_of[0];
+
     dlcol *f = dlcol_new(npred, nent);
     for (int a = 0; a < npred; a++)
         dlcol_set_atom_name(f, (uint32_t)a, intern_name(p->syms, preds[a]));
@@ -2213,7 +2219,7 @@ static void emit_join_family(parser *p, ast_rule *r)
                     ground_pred(p, preds[a], args, pnarg[a]);
             }
         }
-    world_add_lane_family(p->w, f, npred, nent, (int)niter, ground, pf);
+    world_add_lane_family(p->w, f, npred, nent, (int)niter, ground, pf, pimport);
     free(ground);
 }
 

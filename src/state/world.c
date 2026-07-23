@@ -53,7 +53,9 @@ typedef struct {
     dlcol   *fam;
     int      natoms, nent, niter;
     uint32_t *ground;             /* [natoms*niter*nent] */
-    bool    *is_fluent;           /* [natoms] */
+    bool    *is_fluent;           /* [natoms]: local takes closed-world base facts */
+    bool    *is_import;           /* [natoms]: local is derived elsewhere, its
+                                   * per-cell verdict queried and injected (§5.5) */
     bool     solved;              /* fam currently holds iteration cur_it, and
                                    * that solve reflects the live base facts */
     int      cur_it;              /* which iteration is loaded/solved in fam
@@ -144,6 +146,7 @@ void world_free(world *w)
         dlcol_free(w->lanes[i].fam);
         free(w->lanes[i].ground);
         free(w->lanes[i].is_fluent);
+        free(w->lanes[i].is_import);
     }
     free(w->lanes);
     free(w->lane_map);
@@ -439,7 +442,8 @@ void world_why(world *w, dl_lit q, FILE *out)
 /* ---- lane families (DoD thesis) ---- */
 
 void world_add_lane_family(world *w, dlcol *fam, int natoms, int nent, int niter,
-                           const uint32_t *ground, const bool *is_fluent)
+                           const uint32_t *ground, const bool *is_fluent,
+                           const bool *is_import)
 {
     GROW(w->lanes, w->nlanes, w->caplanes);
     int fi = w->nlanes;
@@ -455,6 +459,9 @@ void world_add_lane_family(world *w, dlcol *fam, int natoms, int nent, int niter
     memcpy(lf->ground, ground, (g ? g : 1) * sizeof *lf->ground);
     lf->is_fluent = malloc((size_t)(natoms ? natoms : 1) * sizeof *lf->is_fluent);
     memcpy(lf->is_fluent, is_fluent, (size_t)(natoms ? natoms : 1) * sizeof *lf->is_fluent);
+    lf->is_import = calloc((size_t)(natoms ? natoms : 1), sizeof *lf->is_import);
+    if (is_import)
+        memcpy(lf->is_import, is_import, (size_t)(natoms ? natoms : 1) * sizeof *lf->is_import);
 
     /* Index each ground atom back to its lane cell so world_query can route —
      * for join families (niter>1) as well as single-variable ones. A join
@@ -474,7 +481,9 @@ void world_add_lane_family(world *w, dlcol *fam, int natoms, int nent, int niter
     for (size_t k = 0; k < ncells; k++)
         if (mult[ground[k]] < 2) mult[ground[k]]++;
 
-    for (int a = 0; a < natoms; a++)
+    for (int a = 0; a < natoms; a++) {
+        if (is_import && is_import[a])
+            continue;                          /* not concluded here: never route */
         for (int it = 0; it < niter; it++)
             for (int e = 0; e < nent; e++) {
                 uint32_t at = ground[((size_t)a * niter + it) * nent + e];
@@ -488,6 +497,7 @@ void world_add_lane_family(world *w, dlcol *fam, int natoms, int nent, int niter
                 if (w->lane_map[at].fam < 0)         /* unclaimed: first wins */
                     w->lane_map[at] = (lane_ref){ fi, a, e, it };
             }
+    }
     free(mult);
     w->lanes_ok = true;
 }
@@ -501,11 +511,31 @@ static void solve_lane_iter(world *w, lane_family *lf, int it)
 {
     dlcol_clear_facts(lf->fam);
     for (int a = 0; a < lf->natoms; a++) {
-        if (!lf->is_fluent[a]) continue;
-        for (int e = 0; e < lf->nent; e++) {
-            uint32_t g = lf->ground[((size_t)a * lf->niter + it) * lf->nent + e];
-            dl_lit l = { (uint32_t)a, !world_get(w, g) };   /* a if true, ~a else */
-            dlcol_add_fact(lf->fam, l, e);
+        if (lf->is_fluent[a]) {
+            for (int e = 0; e < lf->nent; e++) {
+                uint32_t g = lf->ground[((size_t)a * lf->niter + it) * lf->nent + e];
+                dl_lit l = { (uint32_t)a, !world_get(w, g) };  /* a if true, ~a else */
+                dlcol_add_fact(lf->fam, l, e);
+            }
+        } else if (lf->is_import[a]) {
+            /* a derived body atom, concluded elsewhere: query it and inject the
+             * conclusion for each cell. Inject a literal ONLY when it is genuinely
+             * proved (+∂): +a if a is PROVED, ~a if the complement is PROVED. Do
+             * NOT map REFUTED to a ~a fact — REFUTED means -∂a (a finitely failed),
+             * which does not make ~a provable; injecting it would force the wrong
+             * verdict on the complement. With nothing injected the atom finitely
+             * fails here too (no local rule concludes it), matching the N=1 path.
+             * Equivalent to a defeasible import (§5.5), since nothing local
+             * concludes `a`. (A cyclic UNDECIDED import can't be reproduced this
+             * way — the differential oracle would flag it; the compiler rejects
+             * cycles.) */
+            for (int e = 0; e < lf->nent; e++) {
+                uint32_t g = lf->ground[((size_t)a * lf->niter + it) * lf->nent + e];
+                if (world_query(w, (dl_lit){ g, false }) == DL_PROVED)
+                    dlcol_add_fact(lf->fam, (dl_lit){ (uint32_t)a, false }, e);
+                else if (world_query(w, (dl_lit){ g, true }) == DL_PROVED)
+                    dlcol_add_fact(lf->fam, (dl_lit){ (uint32_t)a, true }, e);
+            }
         }
     }
     dlcol_solve(lf->fam);

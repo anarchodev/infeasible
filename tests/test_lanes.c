@@ -275,6 +275,62 @@ static int test_join3_matcher(void)
     return 0;
 }
 
+/* A derived-body join: the two-variable rule reads `weak(X)`, which is itself a
+ * conclusion of a single-variable rule — not a base fluent. `weak` lanes as its
+ * own single-var family; the join family imports its per-cell verdict (§5.5)
+ * rather than concluding it, querying it at solve time. Two families form. */
+static const char *DERIVED_JOIN =
+    "sort actor, item\n"
+    "entity (guard, thug : actor)\n"
+    "entity (torch, vase : item)\n"
+    "state (poisoned(actor) holding(actor, item) fragile(item))\n"
+    "rule weakens(X: actor): poisoned(X) => weak(X)\n"
+    "rule fumbles(X: actor, T: item):"
+    "     weak(X) & holding(X, T) & fragile(T) => drops(X, T)\n"
+    "init (poisoned(guard) holding(guard, vase) holding(thug, torch)"
+    "      fragile(vase) fragile(torch))\n";
+
+static int test_derived_body_join(void)
+{
+    intern *sy = intern_new();
+    story_diag di[16];
+    story_diags d = { di, 16, 0, 0 };
+    world *w = story_compile(DERIVED_JOIN, "derived.story", sy, &d);
+    if (!w) {
+        fprintf(stderr, "FAIL compile: %s\n", d.count ? d.items[0].msg : "?");
+        intern_free(sy);
+        return 1;
+    }
+    CHECK(d.nerrors == 0);
+
+    /* two families: the single-var `weak` lane, and the join importing it */
+    CHECK(world_lane_family_count(w) == 2);
+    bool ok = false;
+    CHECK(world_lanes_check(w, &ok) > 0);
+    CHECK(ok);
+
+    /* guard is poisoned -> weak, holds the fragile vase -> drops it (the join
+     * read `weak(guard)` by importing the single-var family's verdict); thug is
+     * not poisoned so never weak -> never drops; guard never held the torch */
+    CHECK(world_query(w, dl_pos(intern_id(sy, "weak(guard)")))        == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "drops(guard,vase)")))  == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "drops(thug,torch)")))  != DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "drops(guard,torch)"))) != DL_PROVED);
+
+    /* editing the base fact that feeds the IMPORTED conclusion must ripple: cure
+     * the poison, weak(guard) collapses, and the join answer follows it */
+    world_set(w, intern_id(sy, "poisoned(guard)"), false);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "weak(guard)")))       != DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "drops(guard,vase)"))) != DL_PROVED);
+    bool ok2 = false;
+    CHECK(world_lanes_check(w, &ok2) > 0);
+    CHECK(ok2);
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
 int main(void)
 {
     if (test_homogeneous_agrees()) return 1;
@@ -282,6 +338,7 @@ int main(void)
     if (test_unless_lanes()) return 1;
     if (test_join_matcher()) return 1;
     if (test_join3_matcher()) return 1;
+    if (test_derived_body_join()) return 1;
     printf("test_lanes: all passed\n");
     return 0;
 }
