@@ -2280,15 +2280,18 @@ static void emit_join_family(parser *p, ast_rule *r)
  * of grounded per entity into distinct atoms. This is the biggest thesis payoff:
  * in an RTS the per-tick transition runs for everyone, every tick.
  *
- * First cut, conservative bail (mirrors emit_join_family): a homogeneous
- * single-sort boolean step world — every fluent boolean/arity-1 over one sort S,
- * no judgment rules, every action/ramification single-var over S with boolean
- * requires/effects (no numeric, MV, globals, or `unless`). Built and validated
- * against the N=1 step family (world_step_lanes_check) but not yet routed through
- * world_step, the same prototype-before-adopt path the judgment lanes took. */
+ * The step world is a homogeneous single-sort boolean one: per-entity fluents
+ * are arity-1 over one sort S, actions/ramifications single-var over S. Globals
+ * (arity-0 fluents) are allowed as broadcast READS in requires — a per-unit rule
+ * gated by a shared flag — represented as a CUR local whose fact is the same in
+ * every lane; being read-only here they need no primed/inertia (a global's next
+ * value is its current one). Still bails to N=1 on: judgment rules, numeric/MV,
+ * a global as an EFFECT (existential/aggregation — per-lane verdicts would
+ * diverge from one global value), `unless`, or multi-sort. Built and validated
+ * against the N=1 step family (world_step_lanes_check), the prototype-before-
+ * adopt path the judgment lanes took (and now routed — see world_step). */
 
-/* Index of a fluent pred atom in the family's fluent list (all validated to be
- * present before this is called). */
+/* Index of a per-entity fluent pred in fpred[] (validated present when called). */
 static int step_fidx(parser *p, const int *fpred, int nf, uint32_t pred)
 {
     for (int i = 0; i < nf; i++)
@@ -2296,15 +2299,20 @@ static int step_fidx(parser *p, const int *fpred, int nf, uint32_t pred)
     return -1;
 }
 
-/* A boolean fluent read/write of the action's own variable over sort S. */
-static bool step_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var)
+/* A boolean fluent read/write for a step rule: the action's own variable over S
+ * (any polarity), or — for a READ (is_effect=false) — an arity-0 global, which
+ * broadcasts to every lane. Globals as effects are deferred (return false). */
+static bool step_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var,
+                         bool is_effect)
 {
     if (a->is_guard || a->is_num_effect || a->value != INTERN_NONE)
         return false;                              /* numeric guard / MV: out */
     pred_info *pi = find_pred(p, a->pred);
-    if (!pi || !pi->is_fluent || pi->is_mv || pi->is_num || pi->arity != 1)
+    if (!pi || !pi->is_fluent || pi->is_mv || pi->is_num)
         return false;
-    if (pi->argsort[0] != S)
+    if (pi->arity == 0)
+        return !is_effect;                         /* global: read-only broadcast */
+    if (pi->arity != 1 || pi->argsort[0] != S)
         return false;
     return a->nargs == 1 && a->args[0].name == var;
 }
@@ -2314,14 +2322,19 @@ static void emit_step_lanes(parser *p)
     if (p->nrules != 0)                             /* pure inertia+causal for now */
         return;
 
-    /* the lane sort S: every boolean fluent must be arity-1 over one shared sort;
-     * a numeric/MV/global/multi-sort fluent bails the whole family. */
+    /* the lane sort S: every per-entity fluent must be arity-1 over one shared
+     * sort. Arity-0 globals are set aside (added as read locals on demand);
+     * numeric/MV/multi-sort bails the whole family. */
     int S = -1, fpred[MAX_PREDS], nf = 0;
     for (int i = 0; i < p->npreds; i++) {
         pred_info *pi = &p->preds[i];
         if (!pi->is_fluent)
             continue;
-        if (pi->is_num || pi->is_mv || pi->arity != 1)
+        if (pi->is_num || pi->is_mv)
+            return;
+        if (pi->arity == 0)
+            continue;                               /* a global: handled on demand */
+        if (pi->arity != 1)
             return;
         if (S < 0) S = pi->argsort[0];
         else if (pi->argsort[0] != S) return;      /* multi-sort: bail */
@@ -2333,19 +2346,28 @@ static void emit_step_lanes(parser *p)
     if (nent == 0)
         return;
 
-    /* validate every action/ramification, and collect the distinct trigger
-     * predicates of the (non-ramification) actions */
+    /* validate every action/ramification; collect the distinct action triggers
+     * and the distinct global fluents read anywhere (broadcast read locals). */
     uint32_t apred[MAX_ACTIONS];
     int na = 0;
+    uint32_t glob[MAX_PREDS];
+    int ng = 0;
     for (int i = 0; i < p->nactions; i++) {
         ast_action *a = &p->actions[i];
         if (a->nvars != 1 || a->vars[0].sort != S)
             return;
         uint32_t var = a->vars[0].name;
-        for (int b = 0; b < a->nreq; b++)
-            if (!step_atom_ok(p, &a->requires[b], S, var)) return;
+        for (int b = 0; b < a->nreq; b++) {
+            if (!step_atom_ok(p, &a->requires[b], S, var, false)) return;
+            if (find_pred(p, a->requires[b].pred)->arity == 0) {   /* a global read */
+                uint32_t g = a->requires[b].pred;
+                int found = -1;
+                for (int j = 0; j < ng; j++) if (glob[j] == g) { found = j; break; }
+                if (found < 0) { if (ng >= MAX_PREDS) return; glob[ng++] = g; }
+            }
+        }
         for (int b = 0; b < a->neff; b++)
-            if (!step_atom_ok(p, &a->effects[b], S, var)) return;
+            if (!step_atom_ok(p, &a->effects[b], S, var, true)) return;
         if (!a->is_ramif) {
             uint32_t tr = intern_id(p->syms, a->name);
             int found = -1;
@@ -2354,11 +2376,12 @@ static void emit_step_lanes(parser *p)
         }
     }
 
-    /* family locals: per fluent a current + a primed local, per action trigger
-     * one action local. cur/pri interleaved so index math stays local. */
-    int nloc = 2 * nf + na;
+    /* family locals: per per-entity fluent a current + a primed local; per read
+     * global one CUR local (broadcast, read-only — no primed/inertia); per action
+     * trigger one action local. cur/pri interleaved so index math stays local. */
+    int nloc = 2 * nf + ng + na;
     dlcol *f = dlcol_new(nloc, nent);
-    int cur_local[MAX_PREDS], pri_local[MAX_PREDS];
+    int cur_local[MAX_PREDS], pri_local[MAX_PREDS], glob_local[MAX_PREDS];
     int inertia_pos[MAX_PREDS], inertia_neg[MAX_PREDS], act_local[MAX_ACTIONS];
     uint8_t *kind = malloc((size_t)nloc * sizeof *kind);
     int n = 0;
@@ -2371,6 +2394,11 @@ static void emit_step_lanes(parser *p)
         pri_local[i] = n; kind[n] = WORLD_STEP_PRIMED;
         snprintf(nbuf, sizeof nbuf, "%s'", intern_name(p->syms, P));
         dlcol_set_atom_name(f, (uint32_t)n, nbuf);
+        n++;
+    }
+    for (int j = 0; j < ng; j++) {
+        glob_local[j] = n; kind[n] = WORLD_STEP_CUR;   /* broadcast read-only input */
+        dlcol_set_atom_name(f, (uint32_t)n, intern_name(p->syms, glob[j]));
         n++;
     }
     for (int j = 0; j < na; j++) {
@@ -2398,8 +2426,16 @@ static void emit_step_lanes(parser *p)
         dl_lit body[MAX_BODY + 1];
         int bi = 0;
         for (int b = 0; b < a->nreq; b++) {
-            int fi = step_fidx(p, fpred, nf, a->requires[b].pred);
-            int loc = a->requires[b].primed ? pri_local[fi] : cur_local[fi];
+            uint32_t rp = a->requires[b].pred;
+            int loc;
+            if (find_pred(p, rp)->arity == 0) {        /* a global: broadcast read */
+                int gj = -1;
+                for (int j = 0; j < ng; j++) if (glob[j] == rp) { gj = j; break; }
+                loc = glob_local[gj];                  /* read-only: global' == global */
+            } else {
+                int fi = step_fidx(p, fpred, nf, rp);
+                loc = a->requires[b].primed ? pri_local[fi] : cur_local[fi];
+            }
             body[bi++] = (dl_lit){ (uint32_t)loc, a->requires[b].neg };
         }
         if (!a->is_ramif) {
@@ -2435,6 +2471,9 @@ static void emit_step_lanes(parser *p)
             ground[(size_t)pri_local[i] * nent + e] = intern_id(p->syms, nbuf);
         }
     }
+    for (int j = 0; j < ng; j++)
+        for (int e = 0; e < nent; e++)
+            ground[(size_t)glob_local[j] * nent + e] = glob[j];  /* broadcast (arity 0) */
     for (int j = 0; j < na; j++)
         for (int e = 0; e < nent; e++) {
             uint32_t ent = domain_at(p, S, e);

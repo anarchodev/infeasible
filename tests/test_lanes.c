@@ -423,6 +423,65 @@ static int test_step_lanes(void)
     return 0;
 }
 
+/* Step lanes with a GLOBAL fluent read in a requires: `alarm` is arity-0, so it
+ * broadcasts to every actor lane — a per-unit action gated by a shared flag. The
+ * global is a read-only broadcast input (no primed/inertia); the transition must
+ * still match N=1 at both flag states, and world_step must gate correctly. */
+static const char *STEP_GLOBAL =
+    "sort actor\n"
+    "entity (guard, thug, mage : actor)\n"
+    "state (armed(actor) alert(actor) alarm)\n"
+    "action arm(X: actor): requires alarm causes armed(X)\n"
+    "rule wary(X: actor): armed(X)' causes alert(X)\n"
+    "init (alarm)\n";
+
+static int test_step_lanes_global(void)
+{
+    intern *sy = intern_new();
+    story_diag di[16];
+    story_diags d = { di, 16, 0, 0 };
+    world *w = story_compile(STEP_GLOBAL, "stepg.story", sy, &d);
+    if (!w) {
+        fprintf(stderr, "FAIL compile: %s\n", d.count ? d.items[0].msg : "?");
+        intern_free(sy);
+        return 1;
+    }
+    CHECK(d.nerrors == 0);
+    CHECK(world_step_lane_family_count(w) == 1);   /* globals didn't force a bail */
+
+    uint32_t arm_guard = intern_id(sy, "arm(guard)");
+    uint32_t armed_guard = intern_id(sy, "armed(guard)");
+    uint32_t alarm = intern_id(sy, "alarm");
+
+    /* the broadcast global read must be loaded right at BOTH flag states — the
+     * differential compares every lane's next-state verdict to N=1 */
+    bool ok = false;
+    CHECK(world_step_lanes_check(w, &arm_guard, 1, &ok) > 0);   /* alarm = true */
+    CHECK(ok);
+    world_set(w, alarm, false);
+    ok = false;
+    CHECK(world_step_lanes_check(w, &arm_guard, 1, &ok) > 0);   /* alarm = false */
+    CHECK(ok);
+
+    /* gate on: alarm true -> arm(guard) fires */
+    world_set(w, alarm, true);
+    world_set(w, armed_guard, false);
+    char err[128];
+    CHECK(world_step(w, &arm_guard, 1, err, sizeof err) == 0);
+    CHECK(world_get(w, armed_guard));
+    CHECK(world_get(w, intern_id(sy, "alert(guard)")));        /* ramification too */
+
+    /* gate off: alarm false -> arm(guard) blocked, inertia keeps armed false */
+    world_set(w, alarm, false);
+    world_set(w, armed_guard, false);
+    CHECK(world_step(w, &arm_guard, 1, err, sizeof err) == 0);
+    CHECK(!world_get(w, armed_guard));
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
 int main(void)
 {
     if (test_homogeneous_agrees()) return 1;
@@ -432,6 +491,7 @@ int main(void)
     if (test_join3_matcher()) return 1;
     if (test_derived_body_join()) return 1;
     if (test_step_lanes()) return 1;
+    if (test_step_lanes_global()) return 1;
     printf("test_lanes: all passed\n");
     return 0;
 }
