@@ -2665,30 +2665,47 @@ static bool step_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var,
     return a->nargs == 1 && a->args[0].name == var;
 }
 
+/* S1: a numeric effect laneable iff it writes a numeric fluent arity-1 over S on
+ * the action's own var with a constant-folding RHS (*konst gets the value). */
+static bool num_eff_ok(parser *p, const ast_atom *e, int S, uint32_t var, long *konst)
+{
+    pred_info *pi = find_pred(p, e->pred);
+    if (!pi || !pi->is_fluent || !pi->is_num) return false;
+    if (pi->arity != 1 || pi->argsort[0] != S) return false;
+    if (e->nargs != 1 || e->args[0].name != var) return false;
+    return expr_fold(p, e->expr_root, konst);
+}
+
+#define MAX_LANE_NUMEFF 512
+
 static void emit_step_lanes(parser *p)
 {
     if (p->nrules != 0)                             /* pure inertia+causal for now */
         return;
 
     /* the lane sort S: every per-entity fluent must be arity-1 over one shared
-     * sort. Arity-0 globals are set aside (added as read locals on demand);
-     * numeric/MV/multi-sort bails the whole family. */
-    int S = -1, fpred[MAX_PREDS], nf = 0;
+     * sort. Boolean fluents lane directly; numeric fluents (§5.8) become columns
+     * committed column-parallel. Arity-0 booleans are read-only globals; a numeric
+     * global, MV, or multi-sort bails the whole family. */
+    int S = -1, fpred[MAX_PREDS], nf = 0, numpred[MAX_PREDS], nnp = 0;
     for (int i = 0; i < p->npreds; i++) {
         pred_info *pi = &p->preds[i];
         if (!pi->is_fluent)
             continue;
-        if (pi->is_num || pi->is_mv)
+        if (pi->is_mv)
             return;
-        if (pi->arity == 0)
-            continue;                               /* a global: handled on demand */
+        if (pi->arity == 0) {
+            if (pi->is_num) return;                 /* numeric global: not laned yet */
+            continue;                               /* boolean global: on demand */
+        }
         if (pi->arity != 1)
             return;
         if (S < 0) S = pi->argsort[0];
         else if (pi->argsort[0] != S) return;      /* multi-sort: bail */
-        fpred[nf++] = i;                            /* index into p->preds */
+        if (pi->is_num) numpred[nnp++] = i;
+        else fpred[nf++] = i;
     }
-    if (nf == 0 || S < 0)
+    if ((nf == 0 && nnp == 0) || S < 0)
         return;
     int nent = domain_size(p, S);
     if (nent == 0)
@@ -2700,6 +2717,11 @@ static void emit_step_lanes(parser *p)
     int na = 0;
     uint32_t glob[MAX_PREDS];
     int ng = 0;
+    bool act_has_num[MAX_ACTIONS];
+    for (int i = 0; i < p->nactions; i++) act_has_num[i] = false;
+    int neff_act[MAX_LANE_NUMEFF], neff_schema[MAX_LANE_NUMEFF], neff_op[MAX_LANE_NUMEFF];
+    long neff_konst[MAX_LANE_NUMEFF];
+    int nne = 0;
     for (int i = 0; i < p->nactions; i++) {
         ast_action *a = &p->actions[i];
         if (a->nbind > 0)          /* binder effects live outside a->effects: N=1 */
@@ -2716,8 +2738,24 @@ static void emit_step_lanes(parser *p)
                 if (found < 0) { if (ng >= MAX_PREDS) return; glob[ng++] = g; }
             }
         }
-        for (int b = 0; b < a->neff; b++)
-            if (!step_atom_ok(p, &a->effects[b], S, var, true)) return;
+        for (int b = 0; b < a->neff; b++) {
+            ast_atom *e = &a->effects[b];
+            if (e->is_num_effect) {                /* a numeric effect: lane it (S1) */
+                long k;
+                if (!num_eff_ok(p, e, S, var, &k)) return;   /* not laneable -> N=1 */
+                if (nne >= MAX_LANE_NUMEFF) return;
+                int sc = -1;
+                for (int j = 0; j < nnp; j++)
+                    if (p->preds[numpred[j]].pred == e->pred) { sc = j; break; }
+                if (sc < 0) return;
+                neff_act[nne] = i; neff_schema[nne] = sc;
+                neff_op[nne] = (int)e->numop; neff_konst[nne] = k;
+                nne++;
+                act_has_num[i] = true;
+            } else if (!step_atom_ok(p, e, S, var, true)) {
+                return;
+            }
+        }
         if (!a->is_ramif) {
             uint32_t tr = intern_id(p->syms, a->name);
             int found = -1;
@@ -2728,11 +2766,17 @@ static void emit_step_lanes(parser *p)
 
     /* family locals: per per-entity fluent a current + a primed local; per read
      * global one CUR local (broadcast, read-only — no primed/inertia); per action
-     * trigger one action local. cur/pri interleaved so index math stays local. */
-    int nloc = 2 * nf + ng + na;
+     * trigger one action local; per action with numeric effects one fired-marker
+     * readout (a synthetic head `body -> marker`, read by the numeric commit).
+     * cur/pri interleaved so index math stays local. */
+    int nmark = 0;
+    for (int i = 0; i < p->nactions; i++) if (act_has_num[i]) nmark++;
+    int nloc = 2 * nf + ng + na + nmark;
     dlcol *f = dlcol_new(nloc, nent);
     int cur_local[MAX_PREDS], pri_local[MAX_PREDS], glob_local[MAX_PREDS];
     int inertia_pos[MAX_PREDS], inertia_neg[MAX_PREDS], act_local[MAX_ACTIONS];
+    int marker_local[MAX_ACTIONS];
+    for (int i = 0; i < p->nactions; i++) marker_local[i] = -1;
     uint8_t *kind = malloc((size_t)nloc * sizeof *kind);
     int n = 0;
     char nbuf[MAX_GROUND + 2];
@@ -2754,6 +2798,15 @@ static void emit_step_lanes(parser *p)
     for (int j = 0; j < na; j++) {
         act_local[j] = n; kind[n] = WORLD_STEP_ACTION;
         dlcol_set_atom_name(f, (uint32_t)n, intern_name(p->syms, apred[j]));
+        n++;
+    }
+    /* fired markers — PRIMED-kind readouts with no fluent backing (fl_of -> -1),
+     * so the boolean commit skips them; the numeric commit reads them per lane. */
+    for (int i = 0; i < p->nactions; i++) if (act_has_num[i]) {
+        marker_local[i] = n; kind[n] = WORLD_STEP_PRIMED;
+        char mname[MAX_NAME + 8];
+        snprintf(mname, sizeof mname, "fired:%s", p->actions[i].name);
+        dlcol_set_atom_name(f, (uint32_t)n, mname);
         n++;
     }
 
@@ -2797,6 +2850,7 @@ static void emit_step_lanes(parser *p)
         char pbuf[MAX_NAME + 24];
         prov_str(p, a->line, pbuf, sizeof pbuf);
         for (int b = 0; b < a->neff; b++) {
+            if (a->effects[b].is_num_effect) continue;   /* numeric: the marker below */
             int fi = step_fidx(p, fpred, nf, a->effects[b].pred);
             dl_lit head = { (uint32_t)pri_local[fi], a->effects[b].neg };
             char cname[MAX_NAME + 8];
@@ -2806,6 +2860,16 @@ static void emit_step_lanes(parser *p)
             int rid = dlcol_add_rule(f, cname, DL_DEFEASIBLE, head, body, nbody);
             dlcol_set_prov(f, rid, pbuf);
             dlcol_add_sup(f, rid, a->effects[b].neg ? inertia_pos[fi] : inertia_neg[fi]);
+        }
+        /* one fired marker per action with numeric effects: `body -> marker`.
+         * Numeric effects don't defeat, so this defeasible head is +∂ exactly when
+         * the body holds — matching the N=1 srule_fired test, per lane. */
+        if (act_has_num[i]) {
+            dl_lit mh = { (uint32_t)marker_local[i], false };
+            char mname[MAX_NAME + 8];
+            snprintf(mname, sizeof mname, "fired:%s", a->name);
+            int mid = dlcol_add_rule(f, mname, DL_DEFEASIBLE, mh, body, nbody);
+            dlcol_set_prov(f, mid, pbuf);
         }
     }
 
@@ -2829,8 +2893,32 @@ static void emit_step_lanes(parser *p)
             uint32_t ent = domain_at(p, S, e);
             ground[(size_t)act_local[j] * nent + e] = ground_pred(p, apred[j], &ent, 1);
         }
+    for (int i = 0; i < p->nactions; i++) if (act_has_num[i]) {   /* marker: a non-fluent atom */
+        char mname[MAX_NAME + 16];
+        snprintf(mname, sizeof mname, "fired:%s#", p->actions[i].name);
+        uint32_t ma = intern_id(p->syms, mname);
+        for (int e = 0; e < nent; e++) ground[(size_t)marker_local[i] * nent + e] = ma;
+    }
 
     world_add_step_lane_family(p->w, f, nloc, nent, ground, kind);
+
+    /* numeric lane extension: per-schema ground columns + the effect specs, each
+     * pointing at its action's fired-marker local (read per lane at commit). */
+    if (nnp > 0) {
+        uint32_t *numcell = malloc((size_t)nnp * nent * sizeof *numcell);
+        for (int s = 0; s < nnp; s++) {
+            uint32_t P = p->preds[numpred[s]].pred;
+            for (int e = 0; e < nent; e++) {
+                uint32_t ent = domain_at(p, S, e);
+                numcell[(size_t)s * nent + e] = ground_pred(p, P, &ent, 1);
+            }
+        }
+        uint32_t effmark[MAX_LANE_NUMEFF];
+        for (int k = 0; k < nne; k++) effmark[k] = (uint32_t)marker_local[neff_act[k]];
+        world_step_lane_set_numeric(p->w, nnp, numcell, nne,
+                                    neff_schema, neff_op, neff_konst, effmark);
+        free(numcell);
+    }
     free(ground);
     free(kind);
 }

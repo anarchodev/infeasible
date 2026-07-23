@@ -87,6 +87,21 @@ typedef struct {
                                    * (local*nent + lane), -1 if not an action cell —
                                    * so a step's action list maps to lanes in O(k) */
     uint32_t act_of_cap;
+
+    /* Numeric lane extension (§5.8 write side, bit-parallel). A numeric effect
+     * does not defeat (every fired one contributes), so its firing is a synthetic
+     * STRICT rule `body -> marker` solved with the boolean transition; the commit
+     * then reads each marker column and sums deltas into the numeric column. */
+    int      numsc;               /* # numeric fluent schemas over the lane sort */
+    int     *num_cell;            /* [numsc*nent]: schema s, lane e -> w->nums index */
+    int      nnumeff;             /* # numeric effect specs */
+    struct num_lane_eff {
+        int        schema;        /* into num_cell rows */
+        world_numop op;
+        long       konst;         /* S1: constant RHS (RHS constant-folds) */
+        uint32_t   marker;        /* family-local: the fired marker (readout) */
+    } *numeff;
+    bool     covers_numeric;      /* numeric commit is fully laned -> routable */
 } step_lane_family;
 
 struct world {
@@ -192,6 +207,8 @@ void world_free(world *w)
         free(w->steplanes[i].kind);
         free(w->steplanes[i].fl_of);
         free(w->steplanes[i].act_of);
+        free(w->steplanes[i].num_cell);
+        free(w->steplanes[i].numeff);
     }
     free(w->steplanes);
     free(w->step_snap);
@@ -644,6 +661,9 @@ void world_add_step_lane_family(world *w, dlcol *fam, int nloc, int nent,
     sf->fam = fam;
     sf->nloc = nloc;
     sf->nent = nent;
+    sf->numsc = 0; sf->num_cell = NULL;           /* numeric extension: off unless */
+    sf->nnumeff = 0; sf->numeff = NULL;            /* world_step_lane_set_numeric */
+    sf->covers_numeric = false;
     size_t g = (size_t)nloc * (size_t)nent;
     sf->ground = malloc((g ? g : 1) * sizeof *sf->ground);
     memcpy(sf->ground, ground, (g ? g : 1) * sizeof *sf->ground);
@@ -694,7 +714,42 @@ void world_add_step_lane_family(world *w, dlcol *fam, int nloc, int nent,
     w->lanes_ok = true;           /* step lanes now reflect the current structure */
 }
 
+/* Attach the numeric lane extension to the last-added step lane family: `num_cell`
+ * [numsc*nent] maps each (schema, lane) to a w->nums index; the effect arrays give
+ * each fired numeric effect its schema, op, constant RHS, and marker local. Called
+ * by emit_step_lanes after world_add_step_lane_family, only for the fully-covered
+ * numeric case (covers_numeric = true → world_step may route here). */
+void world_step_lane_set_numeric(world *w, int numsc, const uint32_t *num_atom_cell,
+                                 int nnumeff, const int *eff_schema,
+                                 const int *eff_op, const long *eff_konst,
+                                 const uint32_t *eff_marker)
+{
+    if (w->nsteplanes == 0) return;
+    step_lane_family *sf = &w->steplanes[w->nsteplanes - 1];
+    sf->numsc = numsc;
+    size_t nc = (size_t)numsc * (size_t)sf->nent;
+    sf->num_cell = malloc((nc ? nc : 1) * sizeof *sf->num_cell);
+    for (size_t i = 0; i < nc; i++)              /* ground atom -> w->nums index */
+        sf->num_cell[i] = num_index(w, num_atom_cell[i]);
+    sf->nnumeff = nnumeff;
+    sf->numeff = malloc((size_t)(nnumeff ? nnumeff : 1) * sizeof *sf->numeff);
+    for (int i = 0; i < nnumeff; i++) {
+        sf->numeff[i].schema = eff_schema[i];
+        sf->numeff[i].op     = (world_numop)eff_op[i];
+        sf->numeff[i].konst  = eff_konst[i];
+        sf->numeff[i].marker = eff_marker[i];
+    }
+    sf->covers_numeric = true;
+}
+
 int world_step_lane_family_count(const world *w) { return w->nsteplanes; }
+
+/* True iff world_step will route the numeric transition through the lane family
+ * (a single family that covers the numerics bit-parallel) — for tests/telemetry. */
+bool world_routes_numeric(const world *w)
+{
+    return w->lanes_ok && w->nsteplanes == 1 && w->steplanes[0].covers_numeric;
+}
 
 /* Load a step lane family's fact columns from the current state and the given
  * action list, and solve it bit-parallel across lanes. Current fluents are
@@ -1149,10 +1204,73 @@ static void save_step_snapshot(world *w, const uint32_t *actions, int nactions)
     w->last_nactions = nactions;
 }
 
+/* Column-parallel numeric commit for a routed step (§5.8, bit-parallel firing).
+ * Each numeric effect's `marker` was solved bit-parallel across lanes; read it per
+ * lane and sum deltas / take the winning assign into the numeric column. Fills a
+ * freshly-allocated `*out` [numsc*nent] with the next values (reads pre-step
+ * values, writes nothing — the caller commits only if the whole step is clean).
+ * Returns -1 on a contested `:=` without mutating. */
+static int compute_step_lane_numerics(world *w, step_lane_family *sf,
+                                      long **out, char *err, size_t errsz)
+{
+    int nent = sf->nent, numsc = sf->numsc;
+    size_t cells = (size_t)numsc * (size_t)nent;
+    long *delta = calloc(cells ? cells : 1, sizeof *delta);
+    long *aval  = calloc(cells ? cells : 1, sizeof *aval);
+    bool *have  = calloc(cells ? cells : 1, sizeof *have);
+    bool *confl = calloc(cells ? cells : 1, sizeof *confl);
+
+    for (int k = 0; k < sf->nnumeff; k++) {
+        struct num_lane_eff *ef = &sf->numeff[k];
+        dl_lit m = { ef->marker, false };
+        for (int e = 0; e < nent; e++) {
+            if (dlcol_defeasible(sf->fam, m, e) != DL_PROVED) continue;   /* did not fire */
+            size_t c = (size_t)ef->schema * nent + e;
+            if (ef->op == WORLD_OP_ASSIGN) {
+                if (have[c]) { if (ef->konst != aval[c]) confl[c] = true; }
+                else { have[c] = true; aval[c] = ef->konst; }
+            } else {
+                delta[c] += (ef->op == WORLD_OP_ADD) ? ef->konst : -ef->konst;
+            }
+        }
+    }
+
+    int rc = 0;
+    long *nextcol = malloc((cells ? cells : 1) * sizeof *nextcol);
+    for (int s = 0; s < numsc && rc == 0; s++)
+        for (int e = 0; e < nent; e++) {
+            size_t c = (size_t)s * nent + e;
+            int idx = sf->num_cell[c];
+            if (confl[c]) {
+                if (err)
+                    snprintf(err, errsz, "conflicting `:=` effects on numeric fluent '%s'",
+                             intern_name(w->syms, w->nums[idx].atom));
+                rc = -1;
+                break;
+            }
+            long base = have[c] ? aval[c] : w->nums[idx].value;
+            long val = base + delta[c];
+            if (w->nums[idx].has_range) {
+                if (val < w->nums[idx].min) val = w->nums[idx].min;
+                if (val > w->nums[idx].max) val = w->nums[idx].max;
+            }
+            nextcol[c] = val;
+        }
+
+    free(delta); free(aval); free(have); free(confl);
+    if (rc != 0) { free(nextcol); *out = NULL; return rc; }
+    *out = nextcol;
+    return 0;
+}
+
 /* The routed transition: solve the step lane family bit-parallel and commit the
  * next state per lane, instead of the N=1 per-named-atom path. Contested/undecided
  * next values are an authoring error — return -1 without mutating (as N=1 does).
- * Precondition: exactly one step lane family covering every fluent, no numerics. */
+ * Booleans commit via the primed readout; when the family covers numerics, the
+ * numeric columns commit in the same atomic step. Precondition: exactly one step
+ * lane family covering every boolean fluent (and every numeric, if covers_numeric).
+ * NOTE: a routed numeric step does not build per-fluent receipts (world_num_receipt
+ * reflects the last N=1 step) — receipts on the fast path are a follow-up. */
 static int world_step_lanes(world *w, const uint32_t *actions, int nactions,
                             char *err, size_t errsz)
 {
@@ -1166,7 +1284,7 @@ static int world_step_lanes(world *w, const uint32_t *actions, int nactions,
         if (sf->kind[a] != WORLD_STEP_PRIMED) continue;
         for (int e = 0; e < sf->nent; e++) {
             int i = sf->fl_of[(size_t)a * sf->nent + e];
-            if (i < 0) continue;
+            if (i < 0) continue;                        /* a marker / non-fluent readout */
             dl_lit p = { (uint32_t)a, false };
             if (dlcol_defeasible(sf->fam, p, e) == DL_PROVED) {
                 next[i] = true;
@@ -1183,14 +1301,23 @@ static int world_step_lanes(world *w, const uint32_t *actions, int nactions,
         }
     }
 
+    long *nextcol = NULL;
+    if (rc == 0 && sf->covers_numeric && sf->numsc > 0)
+        rc = compute_step_lane_numerics(w, sf, &nextcol, err, errsz);
+
     if (rc == 0) {
         save_step_snapshot(w, actions, nactions);   /* before overwriting vals */
         if (w->nfl)
             memcpy(w->vals, next, (size_t)w->nfl * sizeof *next);
+        for (int s = 0; s < sf->numsc; s++)          /* commit numeric columns */
+            for (int e = 0; e < sf->nent; e++)
+                w->nums[sf->num_cell[(size_t)s * sf->nent + e]].value =
+                    nextcol[(size_t)s * sf->nent + e];
         invalidate_state_solved(w);
         w->last_routed = true;
     }
     free(next);
+    free(nextcol);
     return rc;
 }
 
@@ -1199,10 +1326,12 @@ int world_step(world *w, const uint32_t *actions, int nactions,
 {
     ensure_families(w);
 
-    /* the hot path: a homogeneous boolean step world lanes its whole transition,
-     * so solve it bit-parallel across entities. (w->lanes_ok guards post-compile
-     * structural edits; the step lanes only ever form when nnum==0.) */
-    if (w->lanes_ok && w->nsteplanes == 1 && w->nnum == 0)
+    /* the hot path: a homogeneous step world lanes its whole transition, so solve
+     * it bit-parallel across entities. Numerics ride when the family covers them
+     * (covers_numeric): the boolean firing solves bit-parallel and the numeric
+     * columns commit column-parallel. (w->lanes_ok guards post-compile edits.) */
+    if (w->lanes_ok && w->nsteplanes == 1 &&
+        (w->nnum == 0 || w->steplanes[0].covers_numeric))
         return world_step_lanes(w, actions, nactions, err, errsz);
 
     dlcol *f = w->fam;

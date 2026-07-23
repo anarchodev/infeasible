@@ -140,7 +140,18 @@ int  world_lanes_check(world *w, bool *ok);
 enum { WORLD_STEP_CUR, WORLD_STEP_PRIMED, WORLD_STEP_ACTION };
 void world_add_step_lane_family(world *w, dlcol *fam, int nloc, int nent,
                                 const uint32_t *ground, const uint8_t *kind);
+/* Attach the numeric lane extension (§5.8) to the last-added step lane family:
+ * `num_atom_cell` [numsc*nent] gives each (schema, lane)'s ground numeric atom
+ * (resolved to a w->nums index internally); the effect arrays give each fired
+ * numeric effect its schema, op, constant RHS, and the family-local id of its
+ * fired marker. Marks the family covers_numeric (routable). */
+void world_step_lane_set_numeric(world *w, int numsc, const uint32_t *num_atom_cell,
+                                 int nnumeff, const int *eff_schema,
+                                 const int *eff_op, const long *eff_konst,
+                                 const uint32_t *eff_marker);
 int  world_step_lane_family_count(const world *w);
+/* True iff world_step routes the numeric transition through the lane family. */
+bool world_routes_numeric(const world *w);
 
 /* Differential pin for the transition layer: solve both the N=1 step family and
  * the step lane family from the current state + the given actions, and compare
