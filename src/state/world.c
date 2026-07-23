@@ -79,6 +79,8 @@ typedef struct {
     int      nloc, nent;
     uint32_t *ground;             /* [nloc*nent] */
     uint8_t *kind;                /* [nloc]: WORLD_STEP_{CUR,PRIMED,ACTION} */
+    int     *commit_fl;           /* [nloc*nent]: world fluent index a PRIMED cell
+                                   * commits to, -1 otherwise (built by the world) */
 } step_lane_family;
 
 struct world {
@@ -127,6 +129,13 @@ struct world {
 
     step_lane_family *steplanes;  /* transition layer, bit-parallel (DoD thesis) */
     int nsteplanes, capsteplanes;
+
+    /* When world_step is answered on the step lanes, w->fam does NOT hold the
+     * transition — so world_step_why lazily re-solves it from this snapshot of
+     * the pre-step state + actions (the analog of world_why staying on jfam). */
+    bool last_routed;
+    bool *step_snap; int step_snap_cap;
+    uint32_t *last_actions; int last_nactions, last_actions_cap;
 };
 
 #define GROW(arr, n, cap) \
@@ -170,8 +179,11 @@ void world_free(world *w)
         dlcol_free(w->steplanes[i].fam);
         free(w->steplanes[i].ground);
         free(w->steplanes[i].kind);
+        free(w->steplanes[i].commit_fl);
     }
     free(w->steplanes);
+    free(w->step_snap);
+    free(w->last_actions);
     free(w->lane_map);
     free(w->loc_of);
     free(w->fl_loc);
@@ -413,6 +425,8 @@ static void ensure_families(world *w);
 static void solve_judgment_family(world *w);
 static void solve_lane_iter(world *w, lane_family *lf, int it);
 static void solve_step_family(world *w, const uint32_t *actions, int nactions);
+static void solve_step_family_vals(world *w, const bool *vals,
+                                   const uint32_t *actions, int nactions);
 
 /* The N=1 judgment path: the proven route, and the oracle world_lanes_check
  * measures the lane families against. */
@@ -609,6 +623,25 @@ void world_add_step_lane_family(world *w, dlcol *fam, int nloc, int nent,
     memcpy(sf->ground, ground, (g ? g : 1) * sizeof *sf->ground);
     sf->kind = malloc((size_t)(nloc ? nloc : 1) * sizeof *sf->kind);
     memcpy(sf->kind, kind, (size_t)(nloc ? nloc : 1) * sizeof *sf->kind);
+
+    /* map each PRIMED cell to the world fluent index it commits to, so world_step
+     * can read the next state per lane. A reverse index (primed atom -> fluent)
+     * keeps this O(cells) rather than a scan per cell. */
+    sf->commit_fl = malloc((g ? g : 1) * sizeof *sf->commit_fl);
+    for (size_t k = 0; k < g; k++) sf->commit_fl[k] = -1;
+    uint32_t maxp = 0;
+    for (int i = 0; i < w->nfl; i++) if (w->primed[i] > maxp) maxp = w->primed[i];
+    int *rev = malloc(((size_t)maxp + 1) * sizeof *rev);
+    for (uint32_t k = 0; k <= maxp; k++) rev[k] = -1;
+    for (int i = 0; i < w->nfl; i++) rev[w->primed[i]] = i;
+    for (int a = 0; a < nloc; a++)
+        if (kind[a] == WORLD_STEP_PRIMED)
+            for (int e = 0; e < nent; e++) {
+                uint32_t pa = ground[(size_t)a * nent + e];
+                sf->commit_fl[(size_t)a * nent + e] = pa <= maxp ? rev[pa] : -1;
+            }
+    free(rev);
+    w->lanes_ok = true;           /* step lanes now reflect the current structure */
 }
 
 int world_step_lane_family_count(const world *w) { return w->nsteplanes; }
@@ -698,6 +731,10 @@ void world_step_why(world *w, dl_lit q, bool next, FILE *out)
                 w->fam_dirty ? " (no step taken since the last edit)" : "");
         return;
     }
+    /* if the last step was answered on the lanes, w->fam does not hold that
+     * transition — replay it from the snapshot so the trace is the real one. */
+    if (w->last_routed)
+        solve_step_family_vals(w, w->step_snap, w->last_actions, w->last_nactions);
     dl_lit loc = { w->loc_of[atom], q.neg };
     dlcol_why(w->fam, loc, 0, out);
 }
@@ -993,16 +1030,18 @@ static void rcpt_push(num_receipt *rc, const char *rule, world_numop op, long am
     rc->n++;
 }
 
-/* Load the current state (closed-world fluents + numeric guard atoms) and the
+/* Load a state (closed-world fluents from `vals` + numeric guard atoms) and the
  * occurring actions into the N=1 step family, and solve it. Shared by world_step
  * and world_step_lanes_check (the latter reads the primed columns without
- * committing). An action atom no rule mentions is semantically inert; skip it. */
-static void solve_step_family(world *w, const uint32_t *actions, int nactions)
+ * committing), and by world_step_why replaying a routed step's snapshot. An
+ * action atom no rule mentions is semantically inert; skip it. */
+static void solve_step_family_vals(world *w, const bool *vals,
+                                   const uint32_t *actions, int nactions)
 {
     dlcol *f = w->fam;
     dlcol_clear_facts(f);
     for (int i = 0; i < w->nfl; i++) {
-        dl_lit l = { w->fl_loc[i], !w->vals[i] };
+        dl_lit l = { w->fl_loc[i], !vals[i] };
         dlcol_add_fact(f, l, 0);
     }
     for (int i = 0; i < nactions; i++) {
@@ -1023,10 +1062,87 @@ static void solve_step_family(world *w, const uint32_t *actions, int nactions)
     dlcol_solve(f);
 }
 
+static void solve_step_family(world *w, const uint32_t *actions, int nactions)
+{
+    solve_step_family_vals(w, w->vals, actions, nactions);
+}
+
+/* Snapshot the pre-step state + actions so a subsequent world_step_why can
+ * replay a routed transition on the N=1 family (which the fast path skips). */
+static void save_step_snapshot(world *w, const uint32_t *actions, int nactions)
+{
+    if (w->step_snap_cap < w->nfl) {
+        w->step_snap = realloc(w->step_snap, (size_t)w->nfl * sizeof *w->step_snap);
+        w->step_snap_cap = w->nfl;
+    }
+    if (w->nfl)
+        memcpy(w->step_snap, w->vals, (size_t)w->nfl * sizeof *w->vals);
+    if (w->last_actions_cap < nactions) {
+        w->last_actions = realloc(w->last_actions,
+                                  (size_t)nactions * sizeof *w->last_actions);
+        w->last_actions_cap = nactions;
+    }
+    if (nactions)
+        memcpy(w->last_actions, actions, (size_t)nactions * sizeof *actions);
+    w->last_nactions = nactions;
+}
+
+/* The routed transition: solve the step lane family bit-parallel and commit the
+ * next state per lane, instead of the N=1 per-named-atom path. Contested/undecided
+ * next values are an authoring error — return -1 without mutating (as N=1 does).
+ * Precondition: exactly one step lane family covering every fluent, no numerics. */
+static int world_step_lanes(world *w, const uint32_t *actions, int nactions,
+                            char *err, size_t errsz)
+{
+    step_lane_family *sf = &w->steplanes[0];
+    solve_step_lane_family(w, sf, actions, nactions);
+
+    int rc = 0;
+    bool *next = malloc((size_t)(w->nfl ? w->nfl : 1) * sizeof *next);
+    for (int i = 0; i < w->nfl; i++) next[i] = w->vals[i];   /* full coverage anyway */
+    for (int a = 0; a < sf->nloc && rc == 0; a++) {
+        if (sf->kind[a] != WORLD_STEP_PRIMED) continue;
+        for (int e = 0; e < sf->nent; e++) {
+            int i = sf->commit_fl[(size_t)a * sf->nent + e];
+            if (i < 0) continue;
+            dl_lit p = { (uint32_t)a, false };
+            if (dlcol_defeasible(sf->fam, p, e) == DL_PROVED) {
+                next[i] = true;
+            } else if (dlcol_defeasible(sf->fam, dl_complement(p), e) == DL_PROVED) {
+                next[i] = false;
+            } else {
+                if (err)
+                    snprintf(err, errsz,
+                             "conflicting or undecided effects on fluent '%s'",
+                             intern_name(w->syms, w->fluents[i]));
+                rc = -1;
+                break;
+            }
+        }
+    }
+
+    if (rc == 0) {
+        save_step_snapshot(w, actions, nactions);   /* before overwriting vals */
+        if (w->nfl)
+            memcpy(w->vals, next, (size_t)w->nfl * sizeof *next);
+        invalidate_state_solved(w);
+        w->last_routed = true;
+    }
+    free(next);
+    return rc;
+}
+
 int world_step(world *w, const uint32_t *actions, int nactions,
                char *err, size_t errsz)
 {
     ensure_families(w);
+
+    /* the hot path: a homogeneous boolean step world lanes its whole transition,
+     * so solve it bit-parallel across entities. (w->lanes_ok guards post-compile
+     * structural edits; the step lanes only ever form when nnum==0.) */
+    if (w->lanes_ok && w->nsteplanes == 1 && w->nnum == 0)
+        return world_step_lanes(w, actions, nactions, err, errsz);
+
     dlcol *f = w->fam;
 
     solve_step_family(w, actions, nactions);
@@ -1123,6 +1239,7 @@ int world_step(world *w, const uint32_t *actions, int nactions,
         for (int i = 0; i < w->nnum; i++)
             w->nums[i].value = nextnum[i];
         invalidate_state_solved(w);                /* new state: judgments stale */
+        w->last_routed = false;                    /* w->fam holds this transition */
     }
 
     free(next);

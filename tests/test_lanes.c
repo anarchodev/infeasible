@@ -341,6 +341,7 @@ static const char *STEP =
     "entity (guard, thug, mage : actor)\n"
     "state (armed(actor) alert(actor))\n"
     "action arm(X: actor): causes armed(X)\n"
+    "action disarm(X: actor): causes ~armed(X)\n"
     "rule wary(X: actor): armed(X)' causes alert(X)\n"
     "init (armed(thug))\n";
 
@@ -383,15 +384,39 @@ static int test_step_lanes(void)
     CHECK(world_step_lanes_check(w, &arm_guard, 1, &ok) > 0);
     CHECK(ok);
 
-    /* the transition itself is unchanged — world_step still runs the N=1 path,
-     * so a real step commits the expected next state (arm(guard): guard armed
-     * and, via the ramification, alert; mage stays armed from the edit above) */
+    /* world_step is now ROUTED through the step lanes: a real step commits the
+     * expected next state (arm(guard): guard armed and, via the ramification,
+     * alert; mage stays armed from the edit above; thug held by inertia) */
     char err[128];
     CHECK(world_step(w, &arm_guard, 1, err, sizeof err) == 0);
     CHECK(world_get(w, intern_id(sy, "armed(guard)")));
     CHECK(world_get(w, intern_id(sy, "alert(guard)")));
     CHECK(world_get(w, intern_id(sy, "armed(mage)")));
     CHECK(world_get(w, intern_id(sy, "armed(thug)")));           /* inertia held it */
+
+    /* world_step_why must still work after a routed step: w->fam did not hold the
+     * transition, so the trace is replayed from the snapshot. Ask why guard ends
+     * up armed next — the trace should name the causal rule that fired. */
+    {
+        char *buf = NULL; size_t n = 0;
+        FILE *m = open_memstream(&buf, &n);
+        world_step_why(w, dl_pos(intern_id(sy, "armed(guard)")), true, m);
+        fclose(m);
+        CHECK(buf && strstr(buf, "arm") != NULL);
+        free(buf);
+    }
+
+    /* contested transition on the routed path: arm and disarm the same entity in
+     * one step — two causal rules concluding armed(guard)' and ~armed(guard)',
+     * neither superior, so the fluent is undecided. world_step must reject it
+     * (-1) without mutating, naming the offending fluent, exactly as N=1 does. */
+    bool was_armed = world_get(w, intern_id(sy, "armed(guard)"));
+    uint32_t disarm_guard = intern_id(sy, "disarm(guard)");
+    uint32_t clash[2] = { arm_guard, disarm_guard };
+    err[0] = '\0';
+    CHECK(world_step(w, clash, 2, err, sizeof err) == -1);
+    CHECK(strstr(err, "armed(guard)") != NULL);
+    CHECK(world_get(w, intern_id(sy, "armed(guard)")) == was_armed);  /* unmutated */
 
     world_free(w);
     intern_free(sy);
