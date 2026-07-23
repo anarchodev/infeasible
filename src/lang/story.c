@@ -184,6 +184,15 @@ typedef struct {
     story_diags *diags;
     int          nerrors;
     bool         err_flag;        /* an error hit in the current declaration */
+    int          ndecls;          /* declarations parsed so far (header must be first) */
+
+    /* Flat top-level `scene NAME` header (§4.1/§6.4). A single scene is one
+     * partition — semantically invisible (no atom is qualified), because there
+     * is no second scope to import from yet; the name is recorded for future
+     * provenance/imports (§5.5, M4). */
+    char         scene_name[MAX_NAME];
+    int          scene_line, scene_col;
+    bool         has_scene;
 
     struct { char name[MAX_NAME]; int line, col; } sorts[MAX_SORTS];
     int nsorts;
@@ -335,6 +344,59 @@ static bool parse_int(parser *p, long *out)
 }
 
 /* ---- declaration parsing -------------------------------------------- */
+
+/* Module/scene header (§6.4). Only the flat top-level `scene NAME` form is
+ * implemented in this slice:
+ *
+ *   scene NAME               -- accepted: names the world's single scope (§4.1)
+ *   scene NAME in MODULE     -- rejected: nested scopes are M4 (§5.5)
+ *   module NAME / extend M   -- rejected: module extension is M4 (§6.4)
+ *
+ * A flat scene is a single partition and therefore semantically invisible —
+ * it changes no atom's vocabulary. The nested/extension forms need
+ * scope-tagged atoms and generated imports, so they fail loudly with a located
+ * "not yet" rather than being silently swallowed. The header, if present, must
+ * be the first declaration and may appear at most once. */
+static void parse_module_header(parser *p)
+{
+    token kw = p->cur;
+    advance(p);                                    /* 'scene' | 'module' | 'extend' */
+
+    if (kw.kind != TK_SCENE) {
+        fail(p, kw.line, kw.col,
+             "module extension (`%s …`) is not implemented yet (M4, §6.4); "
+             "only a flat top-level `scene NAME` header is supported",
+             kw.kind == TK_MODULE ? "module" : "extend");
+        return;
+    }
+    if (p->has_scene) {
+        fail(p, kw.line, kw.col, "duplicate `scene` header");
+        return;
+    }
+    if (p->ndecls != 0) {
+        fail(p, kw.line, kw.col,
+             "a `scene` header must be the first declaration in the file");
+        return;
+    }
+    if (p->cur.kind != TK_IDENT) {
+        char d[64]; tok_desc(p->cur, d, sizeof d);
+        fail(p, p->cur.line, p->cur.col, "expected a scene name, found %s", d);
+        return;
+    }
+    copy_ident(p->scene_name, MAX_NAME, p->cur);
+    p->scene_line = p->cur.line;
+    p->scene_col  = p->cur.col;
+    p->has_scene  = true;
+    advance(p);
+
+    if (p->cur.kind == TK_IN) {
+        fail(p, p->cur.line, p->cur.col,
+             "nested scopes (`scene %s in M`) are not implemented yet "
+             "(M4, §5.5); a flat top-level `scene %s` is accepted",
+             p->scene_name, p->scene_name);
+        return;
+    }
+}
 
 /* sort := 'sort' ( IDENT | '(' (','? IDENT)* ')' ) */
 static void parse_sort(parser *p)
@@ -3259,6 +3321,9 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
     while (p->cur.kind != TK_EOF) {
         p->err_flag = false;
         switch (p->cur.kind) {
+        case TK_SCENE:
+        case TK_MODULE:
+        case TK_EXTEND: parse_module_header(p); break;
         case TK_SORT:   parse_sort(p);   break;
         case TK_ENUM:   parse_enum(p);   break;
         case TK_ENTITY: parse_entity(p); break;
@@ -3271,12 +3336,14 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
         default: {
             char d[64]; tok_desc(p->cur, d, sizeof d);
             fail(p, p->cur.line, p->cur.col,
-                 "expected a declaration (sort/enum/entity/state/init/rule/action) "
+                 "expected a declaration "
+                 "(scene/sort/enum/entity/state/init/rule/action) "
                  "or a superiority statement, found %s", d);
             break;
         }
         }
         if (p->err_flag) synchronize(p);
+        p->ndecls++;
     }
 
     world *result = NULL;
