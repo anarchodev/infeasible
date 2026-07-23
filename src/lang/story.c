@@ -116,6 +116,13 @@ typedef struct {
      * `T in name` / `T not in name` in a guard reads it. */
     struct { uint32_t name, sortname; int line, col; } sets[MAX_ARGS];
     int       nsets;
+    /* `name : DOMAIN` params (§5.6/§13): a single opaque host value, likewise
+     * kept out of the entity var list. In a provider read the param resolves to
+     * a stable placeholder atom (its name) that the host maps to the value from
+     * its provider context — the engine never sees the value. Held as var_binds
+     * (with the domain sort) so they extend the guard-checking scope. */
+    var_bind  dparams[MAX_ARGS];
+    int       ndparams;
     ast_atom  requires[MAX_BODY];
     int       nreq;
     ast_atom  effects[MAX_BODY];
@@ -217,7 +224,12 @@ typedef struct {
     int          scene_line, scene_col;
     bool         has_scene;
 
-    struct { char name[MAX_NAME]; int line, col; } sorts[MAX_SORTS];
+    /* `is_domain`: an opaque value domain (§5.6/§13), declared with `domain`.
+     * A domain is a sort the engine never enumerates — it has no entities and
+     * cannot be grounded over; its values are host-minted handles that appear
+     * only as provider/action-param arg types. Sharing the sort table lets the
+     * arity/sort checks treat a domain arg like any other. */
+    struct { char name[MAX_NAME]; int line, col; bool is_domain; } sorts[MAX_SORTS];
     int nsorts;
     struct ent_rec { uint32_t atom; int sort; int line, col; } *ents;  /* heap, grown */
     int nents, capents;
@@ -442,6 +454,36 @@ static void parse_sort(parser *p)
         copy_ident(p->sorts[p->nsorts].name, MAX_NAME, p->cur);
         p->sorts[p->nsorts].line = p->cur.line;
         p->sorts[p->nsorts].col = p->cur.col;
+        p->nsorts++;
+        advance(p);
+        if (p->cur.kind == TK_COMMA) advance(p);    /* optional separator */
+    } while (p->cur.kind == TK_IDENT);
+    if (grouped && !expect(p, TK_RPAREN)) return;
+}
+
+/* domain := 'domain' ( IDENT | '(' (','? IDENT)* ')' )  -- opaque value domain
+ * (§5.6/§13). Same shape as `sort`, but flags the entry so the engine never
+ * enumerates it: its values are host-minted handles that appear only as
+ * provider/action-param arg types. */
+static void parse_domain(parser *p)
+{
+    advance(p);                                    /* 'domain' */
+    bool grouped = false;
+    if (p->cur.kind == TK_LPAREN) { grouped = true; advance(p); }
+    do {
+        if (p->cur.kind != TK_IDENT) {
+            char d[64]; tok_desc(p->cur, d, sizeof d);
+            fail(p, p->cur.line, p->cur.col, "expected a domain name, found %s", d);
+            return;
+        }
+        if (p->nsorts >= MAX_SORTS) {
+            fail(p, p->cur.line, p->cur.col, "too many sorts/domains (max %d)", MAX_SORTS);
+            return;
+        }
+        copy_ident(p->sorts[p->nsorts].name, MAX_NAME, p->cur);
+        p->sorts[p->nsorts].line = p->cur.line;
+        p->sorts[p->nsorts].col = p->cur.col;
+        p->sorts[p->nsorts].is_domain = true;
         p->nsorts++;
         advance(p);
         if (p->cur.kind == TK_COMMA) advance(p);    /* optional separator */
@@ -1084,8 +1126,16 @@ static void parse_init(parser *p)
 }
 
 /* params := '(' vbind (',' vbind)* ')'; vbind := IDENT ':' IDENT */
-/* `act` (nullable) receives `set of SORT` params — actions only; rules pass
- * NULL, so a `set of` there is a located error. */
+static bool is_declared_domain_tok(parser *p, token t)
+{
+    for (int i = 0; i < p->nsorts; i++)
+        if (p->sorts[i].is_domain && ident_is(t, p->sorts[i].name)) return true;
+    return false;
+}
+
+/* `act` (nullable) receives `set of SORT` and `: DOMAIN` params — actions only;
+ * rules pass NULL, so either there is a located error. A domain must be declared
+ * before the action that uses it (so the type is classifiable at parse time). */
 static bool parse_params(parser *p, var_bind *vars, int *nvars, ast_action *act)
 {
     *nvars = 0;
@@ -1124,6 +1174,25 @@ static bool parse_params(parser *p, var_bind *vars, int *nvars, ast_action *act)
             act->sets[act->nsets].col = nm.col;
             act->nsets++;
             advance(p);                            /* the element sort */
+            if (p->cur.kind == TK_COMMA) { advance(p); continue; }
+            break;
+        }
+        if (p->cur.kind == TK_IDENT && is_declared_domain_tok(p, p->cur)) {
+            if (!act) {
+                fail(p, nm.line, nm.col,
+                     "domain parameters are only allowed on actions");
+                return false;
+            }
+            if (act->ndparams >= MAX_ARGS) {
+                fail(p, nm.line, nm.col, "too many domain parameters (max %d)", MAX_ARGS);
+                return false;
+            }
+            var_bind *dv = &act->dparams[act->ndparams++];
+            dv->name = intern_tok(p, nm);
+            dv->line = nm.line;
+            dv->col = nm.col;
+            dv->sort = -(int)intern_tok(p, p->cur) - 2;   /* encoded, resolved in semantic */
+            advance(p);                            /* the domain type */
             if (p->cur.kind == TK_COMMA) { advance(p); continue; }
             break;
         }
@@ -1637,9 +1706,16 @@ static void build_pred_registry(parser *p)
                  intern_name(p->syms, f->pred), pi->arity, f->nargs);
         pi->is_fluent = true;
         pi->arity = f->nargs;
-        for (int k = 0; k < f->nargs; k++)
+        for (int k = 0; k < f->nargs; k++) {
             pi->argsort[k] = decode_sort(p, -(int)f->argsort[k] - 2,
                                          f->line, f->col, "a fluent declaration");
+            if (pi->argsort[k] >= 0 && p->sorts[pi->argsort[k]].is_domain)
+                serr(p, f->line, f->col,
+                     "fluent '%s' is keyed by the domain '%s'; domain-keyed "
+                     "fluents (functional fluents / terrain over cells) are not "
+                     "supported yet (#19). A domain is a provider/param arg type "
+                     "only", intern_name(p->syms, f->pred), p->sorts[pi->argsort[k]].name);
+        }
         pi->is_num = f->is_num;
         pi->is_mv = f->is_mv;
         pi->nvalues = f->nvalues;
@@ -1687,8 +1763,14 @@ static void build_pred_registry(parser *p)
 /* Resolve a rule/action's variable sorts and check for duplicate names. */
 static void resolve_vars(parser *p, var_bind *vars, int nvars, const char *what)
 {
-    for (int i = 0; i < nvars; i++)
+    for (int i = 0; i < nvars; i++) {
         vars[i].sort = decode_sort(p, vars[i].sort, vars[i].line, vars[i].col, what);
+        if (vars[i].sort >= 0 && p->sorts[vars[i].sort].is_domain)
+            serr(p, vars[i].line, vars[i].col,
+                 "cannot range a variable over the opaque domain '%s' (%s) — a "
+                 "domain is never enumerated; use it only as a provider/param "
+                 "argument type", p->sorts[vars[i].sort].name, what);
+    }
     for (int i = 0; i < nvars; i++)
         for (int j = i + 1; j < nvars; j++)
             if (vars[i].name == vars[j].name)
@@ -2096,9 +2178,26 @@ static void semantic_pass(parser *p)
     for (int i = 0; i < p->nactions; i++) {
         ast_action *a = &p->actions[i];
         resolve_vars(p, a->vars, a->nvars, a->is_ramif ? "a ramification" : "an action");
+        /* Domain params (§5.6/§13) extend the guard-checking scope: `at` is a
+         * known name of its domain sort, so `in_radius(T, at)` type-checks. They
+         * are NOT in a->vars, so grounding leaves them as placeholder atoms. */
+        var_bind ascope[2 * MAX_ARGS];
+        int nas = a->nvars;
+        for (int k = 0; k < a->nvars; k++) ascope[k] = a->vars[k];
+        for (int k = 0; k < a->ndparams; k++) {
+            a->dparams[k].sort = decode_sort(p, a->dparams[k].sort,
+                                             a->dparams[k].line, a->dparams[k].col,
+                                             "a domain parameter");
+            if (a->dparams[k].sort >= 0 && !p->sorts[a->dparams[k].sort].is_domain)
+                serr(p, a->dparams[k].line, a->dparams[k].col,
+                     "parameter '%s' has sort '%s', which is not a `domain`",
+                     intern_name(p->syms, a->dparams[k].name),
+                     p->sorts[a->dparams[k].sort].name);
+            if (nas < 2 * MAX_ARGS) ascope[nas++] = a->dparams[k];
+        }
         const char *bctx = a->is_ramif ? "a ramification body" : "a `requires` clause";
         for (int b = 0; b < a->nreq; b++)
-            check_atom(p, &a->requires[b], a->vars, a->nvars, true, false, a->is_ramif, bctx);
+            check_atom(p, &a->requires[b], ascope, nas, true, false, a->is_ramif, bctx);
         for (int b = 0; b < a->neff; b++) {
             check_atom(p, &a->effects[b], a->vars, a->nvars, false, true, false, "a `causes` clause");
             if (a->effects[b].value != INTERN_NONE && a->effects[b].neg)
@@ -2119,11 +2218,10 @@ static void semantic_pass(parser *p)
                     serr(p, bnd->vars[k].line, bnd->vars[k].col,
                          "bound variable '%s' shadows an action parameter",
                          intern_name(p->syms, bnd->vars[k].name));
-            var_bind cv[2 * MAX_ARGS];
-            int nc = a->nvars;
-            for (int k = 0; k < a->nvars; k++)  cv[k] = a->vars[k];
-            for (int k = 0; k < bnd->nvars; k++) cv[nc + k] = bnd->vars[k];
-            nc += bnd->nvars;
+            var_bind cv[3 * MAX_ARGS];
+            int nc = 0;
+            for (int k = 0; k < nas; k++)        cv[nc++] = ascope[k];   /* action vars + domain params */
+            for (int k = 0; k < bnd->nvars && nc < 3 * MAX_ARGS; k++) cv[nc++] = bnd->vars[k];
             for (int b = 0; b < bnd->nwhere; b++)
                 check_atom(p, &bnd->where[b], cv, nc, true, false, false, "a `where` guard");
             for (int it = 0; it < bnd->nitems; it++) {
@@ -2846,7 +2944,7 @@ static void synchronize(parser *p)
 {
     while (p->cur.kind != TK_EOF) {
         switch (p->cur.kind) {
-        case TK_SORT: case TK_ENTITY: case TK_STATE:
+        case TK_SORT: case TK_DOMAIN: case TK_ENTITY: case TK_STATE:
         case TK_INIT: case TK_RULE:   case TK_ACTION:
         case TK_BANDS:
             return;
@@ -3707,6 +3805,7 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
         case TK_MODULE:
         case TK_EXTEND: parse_module_header(p); break;
         case TK_SORT:   parse_sort(p);   break;
+        case TK_DOMAIN: parse_domain(p); break;
         case TK_ENUM:   parse_enum(p);   break;
         case TK_ENTITY: parse_entity(p); break;
         case TK_STATE:  parse_state(p);  break;
@@ -3720,7 +3819,7 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
             char d[64]; tok_desc(p->cur, d, sizeof d);
             fail(p, p->cur.line, p->cur.col,
                  "expected a declaration "
-                 "(scene/sort/enum/entity/state/init/rule/action/bands) "
+                 "(scene/sort/domain/enum/entity/state/init/rule/action/bands) "
                  "or a superiority statement, found %s", d);
             break;
         }
