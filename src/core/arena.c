@@ -10,8 +10,12 @@ struct arena_block {
     /* data follows */
 };
 
-#define BLOCK_DATA(b) ((unsigned char *)(b) + sizeof(arena_block))
 #define DEFAULT_BLOCK (64 * 1024)
+
+static inline unsigned char *block_data(arena_block *b)
+{
+    return (unsigned char *)b + sizeof(arena_block);
+}
 
 void arena_init(arena *a)
 {
@@ -40,7 +44,7 @@ void *arena_alloc(arena *a, size_t n)
         a->head = nb;
         b = nb;
     }
-    void *p = BLOCK_DATA(b) + b->used;
+    void *p = block_data(b) + b->used;
     b->used += n;
     memset(p, 0, n);
     return p;

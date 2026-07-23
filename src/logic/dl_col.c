@@ -1,5 +1,6 @@
 #include "logic/dl_col.h"
 #include "logic/dl_trace.h"
+#include "core/grow.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -47,14 +48,6 @@ struct dlcol {
     uint64_t *app_t, *app_f;                   /* [nrules][W] */
     uint64_t *scratch;                         /* 8 rows */
 };
-
-#define GROW(arr, n, cap) \
-    do { \
-        if ((n) == (cap)) { \
-            (cap) = (cap) ? (cap) * 2 : 16; \
-            (arr) = realloc((arr), (size_t)(cap) * sizeof *(arr)); \
-        } \
-    } while (0)
 
 static int lit_idx(dl_lit l) { return (int)l.atom * 2 + (l.neg ? 1 : 0); }
 static dl_lit lit_from_idx(int i) { dl_lit l = { (uint32_t)(i >> 1), (i & 1) != 0 }; return l; }

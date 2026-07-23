@@ -1,5 +1,6 @@
 #include "state/world.h"
 #include "core/arena.h"
+#include "core/grow.h"
 #include "logic/dl_col.h"
 
 #include <stdlib.h>
@@ -191,14 +192,6 @@ struct world {
     bool *step_snap; int step_snap_cap;
     uint32_t *last_actions; int last_nactions, last_actions_cap;
 };
-
-#define GROW(arr, n, cap) \
-    do { \
-        if ((n) == (cap)) { \
-            (cap) = (cap) ? (cap) * 2 : 16; \
-            (arr) = realloc((arr), (size_t)(cap) * sizeof *(arr)); \
-        } \
-    } while (0)
 
 world *world_new(intern *syms)
 {
