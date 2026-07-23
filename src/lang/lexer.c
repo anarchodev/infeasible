@@ -55,6 +55,7 @@ static const struct { const char *word; tok_kind kind; } keywords[] = {
     { "rule", TK_RULE },       { "action", TK_ACTION }, { "requires", TK_REQUIRES },
     { "causes", TK_CAUSES },   { "unless", TK_UNLESS }, { "module", TK_MODULE },
     { "extend", TK_EXTEND },   { "scene", TK_SCENE },   { "in", TK_IN },
+    { "bands", TK_BANDS },
     { "for", TK_FOR },         { "each", TK_EACH },     { "where", TK_WHERE },
     { "when", TK_WHEN },       { "limit", TK_LIMIT },   { "enum", TK_ENUM },
     { "set", TK_SET },         { "of", TK_OF },
@@ -110,6 +111,7 @@ token lexer_next(lexer *lx)
               else                 t.kind = TK_COLON;
               break;
     case ',':  t.kind = TK_COMMA; break;
+    case '@':  t.kind = TK_AT;    break;   /* band annotation (§6.2) */
     case '&':  t.kind = TK_AMP;   break;
     case '*':  t.kind = TK_STAR;  break;
     case '\'': t.kind = TK_PRIME; break;   /* postfix next-state mark (§5.4) */
@@ -162,6 +164,7 @@ const char *tok_kind_name(tok_kind k)
     case TK_EXTEND:   return "'extend'";
     case TK_SCENE:    return "'scene'";
     case TK_IN:       return "'in'";
+    case TK_BANDS:    return "'bands'";
     case TK_FOR:      return "'for'";
     case TK_EACH:     return "'each'";
     case TK_WHERE:    return "'where'";
@@ -176,6 +179,7 @@ const char *tok_kind_name(tok_kind k)
     case TK_RBRACE:   return "'}'";
     case TK_COLON:    return "':'";
     case TK_COMMA:    return "','";
+    case TK_AT:       return "'@'";
     case TK_AMP:      return "'&'";
     case TK_TILDE:    return "'~'";
     case TK_ARROW:    return "'->'";

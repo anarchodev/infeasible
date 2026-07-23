@@ -30,6 +30,8 @@
 #define MAX_BINDERS    64      /* binder pool across the whole file */
 #define MAX_INSTANCES  (1 << 20)   /* per-rule grounding blow-up guard */
 #define CARD_WARN      100000      /* cross-product cardinality warning (§5.2) */
+#define MAX_LADDERS    16          /* priority ladders (`bands …`, §6.2) */
+#define MAX_BANDS      16          /* bands per ladder */
 
 /* ---- AST ------------------------------------------------------------ */
 
@@ -85,6 +87,8 @@ typedef struct {
     char         label[MAX_NAME];
     int          line, col;
     dl_rule_kind kind;
+    char         band[MAX_NAME];  /* `@band` annotation (§6.2), "" if none */
+    int          band_line, band_col;
     var_bind     vars[MAX_ARGS];
     int          nvars;
     ast_atom     body[MAX_BODY];
@@ -150,6 +154,18 @@ typedef struct {
 } ast_fluent;
 
 typedef struct { char a[MAX_NAME], b[MAX_NAME]; int aline, acol, bline, bcol; } ast_sup;
+
+/* A named priority ladder (`bands stat_stack: base < condition < feat`, §6.2):
+ * a totally-ordered list of band names, low to high. Bands are pure sugar over
+ * pairwise `>` — at ground time a higher-band rule is made superior to a
+ * lower-band rule wherever the two conflict (their heads oppose). The engine,
+ * dl_why, and the M3 pipeline never learn bands exist. */
+typedef struct {
+    char name[MAX_NAME];
+    char band[MAX_BANDS][MAX_NAME];   /* index = rank, ascending */
+    int  nbands;
+    int  line, col;
+} ast_ladder;
 
 /* A named value domain (`enum school { … }`, §13) — distinct from a `sort`
  * (entities); usable as a fluent type, erasing to the multi-valued machinery. */
@@ -219,6 +235,8 @@ typedef struct {
     int nenums;
     ast_sup     sups[MAX_SUPS];
     int nsups;
+    ast_ladder  ladders[MAX_LADDERS];   /* priority ladders (`bands …`, §6.2) */
+    int nladders;
     ast_atom    inits[MAX_INITS];
     int ninits;
 
@@ -1249,6 +1267,20 @@ static void parse_rule(parser *p)
         r->nguard = ng;
         r->has_guard = true;
     }
+
+    /* optional `@band` annotation (§6.2): assigns this rule to a priority band */
+    if (p->cur.kind == TK_AT) {
+        advance(p);                                /* '@' */
+        if (p->cur.kind != TK_IDENT) {
+            char d[64]; tok_desc(p->cur, d, sizeof d);
+            fail(p, p->cur.line, p->cur.col, "expected a band name after '@', found %s", d);
+            return;
+        }
+        copy_ident(r->band, MAX_NAME, p->cur);
+        r->band_line = p->cur.line;
+        r->band_col = p->cur.col;
+        advance(p);
+    }
     p->nrules++;
 }
 
@@ -1287,6 +1319,52 @@ static void parse_action(parser *p)
 }
 
 /* sup := IDENT '>' IDENT (label > label) */
+/* bands := 'bands' IDENT ':' IDENT ('<' IDENT)*    -- a priority ladder (§6.2).
+ * Names a totally-ordered list of band names, low to high. Semantic validation
+ * (unique names, no band shared across ladders) happens in the semantic pass. */
+static void parse_bands(parser *p)
+{
+    advance(p);                                    /* 'bands' */
+    if (p->nladders >= MAX_LADDERS) {
+        fail(p, p->cur.line, p->cur.col, "too many priority ladders (max %d)", MAX_LADDERS);
+        return;
+    }
+    if (p->cur.kind != TK_IDENT) {
+        char d[64]; tok_desc(p->cur, d, sizeof d);
+        fail(p, p->cur.line, p->cur.col, "expected a ladder name, found %s", d);
+        return;
+    }
+    ast_ladder *l = &p->ladders[p->nladders];
+    l->nbands = 0;
+    copy_ident(l->name, MAX_NAME, p->cur);
+    l->line = p->cur.line;
+    l->col = p->cur.col;
+    advance(p);
+    if (!expect(p, TK_COLON)) return;
+
+    for (;;) {
+        if (p->cur.kind != TK_IDENT) {
+            char d[64]; tok_desc(p->cur, d, sizeof d);
+            fail(p, p->cur.line, p->cur.col, "expected a band name, found %s", d);
+            return;
+        }
+        if (l->nbands >= MAX_BANDS) {
+            fail(p, p->cur.line, p->cur.col,
+                 "too many bands in ladder '%s' (max %d)", l->name, MAX_BANDS);
+            return;
+        }
+        copy_ident(l->band[l->nbands++], MAX_NAME, p->cur);
+        advance(p);
+        if (p->cur.kind != TK_LT) break;
+        advance(p);                                /* '<' */
+    }
+    if (l->nbands < 2)
+        warn(p, l->line, l->col,
+             "ladder '%s' has %d band(s); a ladder with fewer than two bands "
+             "orders nothing", l->name, l->nbands);
+    p->nladders++;
+}
+
 static void parse_sup(parser *p)
 {
     if (p->nsups >= MAX_SUPS) {
@@ -1777,6 +1855,46 @@ static void check_safety(parser *p, ast_rule *r)
     }
 }
 
+/* Priority-ladder well-formedness (§6.2): ladder names unique, band names
+ * unique within a ladder, and no band shared across ladders (comparability
+ * must be unambiguous). Every `@band` annotation must name a declared band —
+ * an unbanded default would let a rule's defeat behaviour change because a
+ * ladder was declared elsewhere (the non-local surprise §6.1 forbids). */
+static void check_bands(parser *p)
+{
+    for (int i = 0; i < p->nladders; i++) {
+        ast_ladder *li = &p->ladders[i];
+        for (int j = i + 1; j < p->nladders; j++)
+            if (strcmp(li->name, p->ladders[j].name) == 0)
+                serr(p, p->ladders[j].line, p->ladders[j].col,
+                     "duplicate priority ladder '%s'", li->name);
+        for (int a = 0; a < li->nbands; a++) {
+            for (int b = a + 1; b < li->nbands; b++)
+                if (strcmp(li->band[a], li->band[b]) == 0)
+                    serr(p, li->line, li->col,
+                         "band '%s' listed twice in ladder '%s'", li->band[a], li->name);
+            for (int j = i + 1; j < p->nladders; j++)
+                for (int b = 0; b < p->ladders[j].nbands; b++)
+                    if (strcmp(li->band[a], p->ladders[j].band[b]) == 0)
+                        serr(p, p->ladders[j].line, p->ladders[j].col,
+                             "band '%s' appears in both ladders '%s' and '%s'; "
+                             "a band belongs to exactly one ladder",
+                             li->band[a], li->name, p->ladders[j].name);
+        }
+    }
+    for (int i = 0; i < p->nrules; i++) {
+        ast_rule *r = &p->rules[i];
+        if (r->band[0] == '\0') continue;
+        bool found = false;
+        for (int li = 0; li < p->nladders && !found; li++)
+            for (int b = 0; b < p->ladders[li].nbands; b++)
+                if (strcmp(p->ladders[li].band[b], r->band) == 0) { found = true; break; }
+        if (!found)
+            serr(p, r->band_line, r->band_col,
+                 "unknown band '%s' — no `bands` ladder declares it", r->band);
+    }
+}
+
 static void semantic_pass(parser *p)
 {
     resolve_entities(p);
@@ -1876,6 +1994,8 @@ static void semantic_pass(parser *p)
                      "init argument '%s' must be a declared entity",
                      intern_name(p->syms, a->args[k].name));
     }
+
+    check_bands(p);
 }
 
 /* ---- grounding: emit ground rules into world_* ---------------------- */
@@ -2393,18 +2513,13 @@ static long encode_rule_index(parser *p, ast_rule *r, const uint32_t *ent_for_va
 /* Ground `A > B` over the union of both rules' variables, matching shared
  * names. `too_weak(X) > can_force(X)` becomes one edge per actor, not the
  * cross product; unshared vars range independently. */
-static void ground_sup(parser *p, ast_sup *s)
+/* Make every ground instance of `ra` superior to the aligned instance of `rb`
+ * (`ra > rb`). Instances are aligned over the union of the two rules' variables
+ * shared by name; a variable appearing in both must agree on sort. Shared by the
+ * explicit `>` (ground_sup) and by band-generated edges (ground_bands). `line`/
+ * `col` locate the shared-sort error at the edge's declaration site. */
+static void emit_sup_edges(parser *p, ast_rule *ra, ast_rule *rb, int line, int col)
 {
-    ast_rule *ra = find_rule(p, s->a);
-    ast_rule *rb = find_rule(p, s->b);
-    if (!ra) {
-        serr(p, s->aline, s->acol, "unknown rule label '%s' in superiority", s->a);
-        return;
-    }
-    if (!rb) {
-        serr(p, s->bline, s->bcol, "unknown rule label '%s' in superiority", s->b);
-        return;
-    }
     if (!ra->insts || !rb->insts) return;          /* a rule failed to ground */
 
     /* union variable list, shared by name (sorts must agree) */
@@ -2415,9 +2530,9 @@ static void ground_sup(parser *p, ast_sup *s)
         int j = var_index(uni, nuni, rb->vars[i].name);
         if (j < 0) uni[nuni++] = rb->vars[i];
         else if (uni[j].sort != rb->vars[i].sort) {
-            serr(p, s->bline, s->bcol,
-                 "superiority '%s > %s' shares variable '%s' at different sorts",
-                 s->a, s->b, intern_name(p->syms, rb->vars[i].name));
+            serr(p, line, col,
+                 "'%s > %s' shares variable '%s' at different sorts",
+                 ra->label, rb->label, intern_name(p->syms, rb->vars[i].name));
             return;
         }
     }
@@ -2439,6 +2554,86 @@ static void ground_sup(parser *p, ast_sup *s)
         long bi = encode_rule_index(p, rb, bbind);
         if (ai < 0 || bi < 0 || ai >= ra->ninst || bi >= rb->ninst) continue;
         world_add_sup(p->w, ra->insts[ai].handle, rb->insts[bi].handle);
+    }
+}
+
+static void ground_sup(parser *p, ast_sup *s)
+{
+    ast_rule *ra = find_rule(p, s->a);
+    ast_rule *rb = find_rule(p, s->b);
+    if (!ra) {
+        serr(p, s->aline, s->acol, "unknown rule label '%s' in superiority", s->a);
+        return;
+    }
+    if (!rb) {
+        serr(p, s->bline, s->bcol, "unknown rule label '%s' in superiority", s->b);
+        return;
+    }
+    emit_sup_edges(p, ra, rb, s->bline, s->bcol);
+}
+
+/* Resolve a band name to its ladder and rank (0 = lowest). Returns false if no
+ * declared ladder contains it. */
+static bool find_band(parser *p, const char *name, int *ladder, int *rank)
+{
+    for (int li = 0; li < p->nladders; li++)
+        for (int b = 0; b < p->ladders[li].nbands; b++)
+            if (strcmp(p->ladders[li].band[b], name) == 0) {
+                if (ladder) *ladder = li;
+                if (rank) *rank = b;
+                return true;
+            }
+    return false;
+}
+
+/* Two boolean judgment-rule heads conflict iff they assert complementary
+ * literals of the same predicate (`p` vs `~p`). MV heads are already rejected
+ * upstream (§5.7), and numeric-effect bands are out of scope (§5.8), so bands
+ * apply to the boolean read-side only. */
+static bool heads_conflict(const ast_rule *a, const ast_rule *b)
+{
+    if (a->head.pred != b->head.pred) return false;
+    if (a->head.value != INTERN_NONE || b->head.value != INTERN_NONE) return false;
+    if (a->head.is_guard || b->head.is_guard) return false;
+    return a->head.neg != b->head.neg;
+}
+
+/* Desugar bands into pairwise `>` (§6.2): for each pair of banded judgment
+ * rules on the SAME ladder whose heads conflict, append a synthetic superiority
+ * edge (higher band > lower). Emitting into p->sups — rather than adding world
+ * edges directly — is what makes bands *pure sugar*: grounding, the lane-family
+ * taint analysis (which reads p->sups), and why-traces then treat a band edge
+ * exactly like a hand-written `>`, and the engine never learns bands exist.
+ * Same band = incomparable (no edge); different ladders or banded-vs-unbanded =
+ * incomparable (as before bands existed). Runs before grounding. */
+static void desugar_bands(parser *p)
+{
+    for (int i = 0; i < p->nrules; i++) {
+        ast_rule *ri = &p->rules[i];
+        if (ri->band[0] == '\0') continue;
+        int li, ranki;
+        if (!find_band(p, ri->band, &li, &ranki)) continue;   /* errored in check_bands */
+        for (int j = i + 1; j < p->nrules; j++) {
+            ast_rule *rj = &p->rules[j];
+            if (rj->band[0] == '\0') continue;
+            int lj, rankj;
+            if (!find_band(p, rj->band, &lj, &rankj)) continue;
+            if (li != lj || ranki == rankj) continue;          /* incomparable */
+            if (!heads_conflict(ri, rj)) continue;
+            ast_rule *hi = ranki > rankj ? ri : rj;
+            ast_rule *lo = ranki > rankj ? rj : ri;
+            if (p->nsups >= MAX_SUPS) {
+                serr(p, hi->band_line, hi->band_col,
+                     "priority bands generated more than %d superiority edges — "
+                     "raise MAX_SUPS or split the ladder", MAX_SUPS);
+                return;
+            }
+            ast_sup *s = &p->sups[p->nsups++];
+            snprintf(s->a, MAX_NAME, "%s", hi->label);
+            snprintf(s->b, MAX_NAME, "%s", lo->label);
+            s->aline = s->bline = hi->band_line;
+            s->acol  = s->bcol  = hi->band_col;
+        }
     }
 }
 
@@ -2467,6 +2662,7 @@ static void synchronize(parser *p)
         switch (p->cur.kind) {
         case TK_SORT: case TK_ENTITY: case TK_STATE:
         case TK_INIT: case TK_RULE:   case TK_ACTION:
+        case TK_BANDS:
             return;
         default:
             advance(p);
@@ -3332,12 +3528,13 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
         case TK_INIT:   parse_init(p);   break;
         case TK_RULE:   parse_rule(p);   break;
         case TK_ACTION: parse_action(p); break;
+        case TK_BANDS:  parse_bands(p);  break;
         case TK_IDENT:  parse_sup(p);    break;
         default: {
             char d[64]; tok_desc(p->cur, d, sizeof d);
             fail(p, p->cur.line, p->cur.col,
                  "expected a declaration "
-                 "(scene/sort/enum/entity/state/init/rule/action) "
+                 "(scene/sort/enum/entity/state/init/rule/action/bands) "
                  "or a superiority statement, found %s", d);
             break;
         }
@@ -3351,6 +3548,7 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
         /* pass 2: semantic analysis, then build-time grounding */
         semantic_pass(p);
         if (p->nerrors == 0) {
+            desugar_bands(p);                     /* band ladders → pairwise `>` (§6.2) */
             declare_ground_fluents(p);
             ground_inits(p);
             for (int i = 0; i < p->nrules; i++)   ground_rule(p, &p->rules[i]);
