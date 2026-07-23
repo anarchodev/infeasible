@@ -1,6 +1,7 @@
 #include "logic/dl.h"
 #include "logic/dl_trace.h"
 #include "core/arena.h"
+#include "core/grow.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -67,14 +68,6 @@ struct dl_result {
     int32_t *dep_off;        /* [nlits+1]      */
     int32_t *dep_to;         /* [2*total_body] */
 };
-
-#define GROW(arr, n, cap) \
-    do { \
-        if ((n) == (cap)) { \
-            (cap) = (cap) ? (cap) * 2 : 16; \
-            (arr) = realloc((arr), (size_t)(cap) * sizeof *(arr)); \
-        } \
-    } while (0)
 
 dl_theory *dl_theory_new(intern *syms)
 {
