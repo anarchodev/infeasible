@@ -51,6 +51,27 @@ long world_get_num(const world *w, uint32_t atom);
 void world_add_guard(world *w, uint32_t guard, uint32_t num,
                      world_cmp op, long threshold);
 
+/* Providers (§5.2/§5.6): a computed relation answered host-side (adjacency,
+ * range, line-of-sight), consulted at solve time and never stored. The callback
+ * answers whether ground `pred(args)` holds; args are entity atoms. Set once by
+ * the host; the grounder registers each ground provider atom it emits. A provider
+ * atom with no callback set reads false (closed-world). */
+typedef bool (*world_provider_fn)(void *ctx, uint32_t pred,
+                                  const uint32_t *args, int nargs);
+void world_set_provider_fn(world *w, world_provider_fn fn, void *ctx);
+void world_declare_provider_atom(world *w, uint32_t atom, uint32_t pred,
+                                 const uint32_t *args, int nargs);
+
+/* Seeded randomness (§5.10): a roll is a keyed lookup, not a stream. `seed` is
+ * save state; `tick` is a monotone step counter the engine bumps each successful
+ * world_step. A roll site (die `sides`, a precomputed `site` key folding the
+ * calling rule-instance + an author tag) reads 1..sides from hash(seed, tick,
+ * site) — idempotent within a tick, fresh the next. Returns the site's index for
+ * the effect/guard bytecode (EXPR_ROLL). */
+void world_set_seed(world *w, uint64_t seed);
+uint64_t world_tick(const world *w);
+int  world_add_roll_site(world *w, int sides, uint64_t site);
+
 /* Numeric effects — the write side (§5.8). Attached to a step rule (below);
  * they fire when that rule fires and run in the *commit* phase, after the
  * boolean fixpoint has settled. Effects are a closed operator set:
@@ -69,6 +90,7 @@ typedef enum { WORLD_OP_ASSIGN, WORLD_OP_ADD, WORLD_OP_SUB } world_numop;
 typedef enum {
     EXPR_CONST,   /* push arg */
     EXPR_LOAD,    /* push current value of the numeric fluent whose atom = arg */
+    EXPR_ROLL,    /* push a seeded die face 1..sides for roll-site index = arg (§5.10) */
     EXPR_ADD, EXPR_SUB, EXPR_MUL, EXPR_NEG, EXPR_MIN, EXPR_MAX
 } expr_op;
 typedef struct { expr_op op; long arg; } expr_ins;

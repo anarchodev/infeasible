@@ -61,8 +61,10 @@ typedef struct {
  * nodes are the closed arithmetic set. Grounding walks the tree per instance,
  * folding constant subtrees and emitting VM bytecode for the rest. */
 typedef enum {
-    EX_CONST, EX_LOAD, EX_ADD, EX_SUB, EX_MUL, EX_NEG, EX_MIN, EX_MAX
+    EX_CONST, EX_LOAD, EX_ROLL, EX_ADD, EX_SUB, EX_MUL, EX_NEG, EX_MIN, EX_MAX
 } ex_kind;
+/* EX_ROLL (§5.10): a seeded die. `konst` = sides, `lhs` = an author disambiguator
+ * tag (0 default). The roll site is keyed by (this node, the binding, tag). */
 
 typedef struct {
     ex_kind  kind;
@@ -167,6 +169,7 @@ typedef struct {
     uint32_t values[MAX_DOMAIN];  /* its domain, for value-in-domain checks */
     int      nvalues;
     bool     is_num;              /* a numeric fluent (§5.8) */
+    bool     is_provider;         /* a computed relation, host-answered (§5.6) */
 } pred_info;
 
 typedef struct {
@@ -192,6 +195,8 @@ typedef struct {
     uint32_t *domain_ents[MAX_SORTS]; int domain_n[MAX_SORTS];
     ast_fluent  fluents[MAX_FLUENTS];
     int nfluents;
+    ast_fluent  providers[MAX_FLUENTS];   /* computed relations (§5.6), host-answered */
+    int nproviders;
     ast_rule   *rules;            /* heap; MAX_RULES */
     int nrules;
     ast_action *actions;          /* heap; MAX_ACTIONS */
@@ -474,6 +479,19 @@ static int parse_factor(parser *p)
         token id = p->cur;
         bool ismin = ident_is(id, "min"), ismax = ident_is(id, "max");
         advance(p);
+        if (ident_is(id, "roll") && p->cur.kind == TK_LPAREN) {   /* roll(sides[, tag]) */
+            advance(p);
+            long sides, tag = 0;
+            if (!parse_int(p, &sides)) return -1;
+            if (sides < 1) { fail(p, id.line, id.col, "roll(N): N must be >= 1"); return -1; }
+            if (p->cur.kind == TK_COMMA) { advance(p); if (!parse_int(p, &tag)) return -1; }
+            if (!expect(p, TK_RPAREN)) return -1;
+            int n = alloc_expr(p, EX_ROLL, id.line, id.col);
+            if (n < 0) return -1;
+            p->exprs[n].konst = sides;
+            p->exprs[n].lhs = (int)tag;
+            return n;
+        }
         if ((ismin || ismax) && p->cur.kind == TK_LPAREN) {   /* min/max(a, b) */
             advance(p);
             int a = parse_expr(p);
@@ -834,6 +852,36 @@ static void parse_state(parser *p)
         }
         if (!parse_fdecl(p, &p->fluents[p->nfluents])) return;
         p->nfluents++;
+    } while (grouped && p->cur.kind == TK_IDENT);
+    if (grouped && !expect(p, TK_RPAREN)) return;
+}
+
+/* provider := 'provider' ( pdecl | '(' pdecl* ')' ); pdecl := IDENT '(' sort,… ')'
+ * A computed relation (§5.6), host-answered — like a boolean fluent decl but with
+ * no value type. */
+static void parse_provider(parser *p)
+{
+    advance(p);                                    /* 'provider' */
+    bool grouped = false;
+    if (p->cur.kind == TK_LPAREN) { grouped = true; advance(p); }
+    do {
+        if (p->cur.kind != TK_IDENT) {
+            char d[64]; tok_desc(p->cur, d, sizeof d);
+            fail(p, p->cur.line, p->cur.col, "expected a provider name, found %s", d);
+            return;
+        }
+        if (p->nproviders >= MAX_FLUENTS) {
+            fail(p, p->cur.line, p->cur.col, "too many providers (max %d)", MAX_FLUENTS);
+            return;
+        }
+        ast_fluent *pr = &p->providers[p->nproviders];
+        if (!parse_fdecl(p, pr)) return;
+        if (pr->is_num || pr->is_mv) {
+            fail(p, pr->line, pr->col,
+                 "a provider is a relation, not a typed fluent — drop the `: …`");
+            return;
+        }
+        p->nproviders++;
     } while (grouped && p->cur.kind == TK_IDENT);
     if (grouped && !expect(p, TK_RPAREN)) return;
 }
@@ -1349,6 +1397,24 @@ static void build_pred_registry(parser *p)
         }
     }
 
+    /* providers register a relation predicate with its arg sorts (no value). */
+    for (int i = 0; i < p->nproviders; i++) {
+        ast_fluent *pr = &p->providers[i];
+        pred_info *pi = find_pred(p, pr->pred);
+        if (pi && (pi->is_fluent || pi->is_provider)) {
+            serr(p, pr->line, pr->col, "'%s' is already declared",
+                 intern_name(p->syms, pr->pred));
+            continue;
+        }
+        pi = intern_pred(p, pr->pred, pr->nargs);
+        if (!pi) { serr(p, pr->line, pr->col, "too many predicates"); return; }
+        pi->is_provider = true;
+        pi->arity = pr->nargs;
+        for (int k = 0; k < pr->nargs; k++)
+            pi->argsort[k] = decode_sort(p, -(int)pr->argsort[k] - 2,
+                                         pr->line, pr->col, "a provider declaration");
+    }
+
     /* rule heads register the conclusion predicates (arity from the head). */
     for (int i = 0; i < p->nrules; i++) {
         ast_atom *h = &p->rules[i].head;
@@ -1418,6 +1484,7 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
     ex_node *n = &p->exprs[e];
     switch (n->kind) {
     case EX_CONST:
+    case EX_ROLL:                    /* a seeded draw — nothing to resolve */
         return;
     case EX_LOAD: {
         note_ref(p, n->pred, n->line, n->col);
@@ -1770,6 +1837,7 @@ static bool expr_fold(parser *p, int e, long *out)
     switch (n->kind) {
     case EX_CONST: *out = n->konst; return true;
     case EX_LOAD:  return false;
+    case EX_ROLL:  return false;              /* a fresh draw — never a constant */
     case EX_NEG:
         if (!expr_fold(p, n->lhs, &a)) return false;
         *out = -a; return true;
@@ -1806,6 +1874,17 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
         if (*pos < MAX_CODE) { code[*pos].op = EXPR_LOAD; code[(*pos)++].arg = (long)g; }
         return;
     }
+    if (n->kind == EX_ROLL) {
+        /* site keyed by (this node, the ground binding, tag) — the node is the
+         * rule namespace (§5.10), the binding gives each instance its own draw. */
+        uint64_t site = 0x9E3779B97F4A7C15ull ^ ((uint64_t)e * 0x100000001B3ull)
+                        ^ ((uint64_t)(uint32_t)n->lhs + 1);
+        for (int k = 0; k < nvars; k++)
+            site = site * 0x100000001B3ull ^ binding[k];
+        int idx = world_add_roll_site(p->w, (int)n->konst, site);
+        if (*pos < MAX_CODE) { code[*pos].op = EXPR_ROLL; code[(*pos)++].arg = (long)idx; }
+        return;
+    }
     if (n->kind == EX_NEG) {
         emit_expr(p, n->lhs, vars, nvars, binding, code, pos);
         if (*pos < MAX_CODE) { code[*pos].op = EXPR_NEG; code[(*pos)++].arg = 0; }
@@ -1834,6 +1913,9 @@ static dl_lit ground_lit(parser *p, ast_atom *at, var_bind *vars, int nvars,
         g = ground_mv_atom(p, at->pred, args, at->nargs, at->value);
     } else {
         g = ground_pred(p, at->pred, args, at->nargs);
+        pred_info *pi = find_pred(p, at->pred);
+        if (pi && pi->is_provider)                 /* a computed relation (§5.6) */
+            world_declare_provider_atom(p->w, g, at->pred, args, at->nargs);
     }
     return at->neg ? dl_neg(g) : dl_pos(g);
 }
@@ -3101,6 +3183,7 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
         case TK_ENUM:   parse_enum(p);   break;
         case TK_ENTITY: parse_entity(p); break;
         case TK_STATE:  parse_state(p);  break;
+        case TK_PROVIDER: parse_provider(p); break;
         case TK_INIT:   parse_init(p);   break;
         case TK_RULE:   parse_rule(p);   break;
         case TK_ACTION: parse_action(p); break;

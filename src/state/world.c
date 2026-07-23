@@ -131,6 +131,22 @@ struct world {
     struct { uint32_t guard, num; world_cmp op; long threshold; } *guards;
     int ng, capg;
 
+    /* Providers (§5.2/§5.6/§5.10): computed relations answered host-side, never
+     * stored. Each ground provider atom records its predicate + entity args; at
+     * solve time it loads as a fact from the registered callback (closed-world),
+     * exactly like a numeric guard. Read-only: providers never appear as heads. */
+    struct { uint32_t atom, pred; int nargs; uint32_t args[4]; } *provs;
+    int nprov, capprov;
+    world_provider_fn provider_fn; void *provider_ctx;
+
+    /* Seeded randomness (§5.10): a roll is a keyed lookup hash(seed, tick, site),
+     * idempotent under re-read and independent across sites — so it can sit inside
+     * the fixpoint. `tick` is a monotone step counter (deterministic, not
+     * wall-clock). Each roll site records its die size + precomputed site key. */
+    uint64_t seed, tick;
+    struct { int sides; uint64_t site; } *rollsites;
+    int nrollsite, caprollsite;
+
     /* commit receipts, one per numeric fluent (parallel to nums), valid only
      * immediately after a successful world_step (§5.8 write side). Sized lazily
      * and grown when new numeric fluents are declared after a step. */
@@ -236,6 +252,8 @@ void world_free(world *w)
     free(w->srules);
     free(w->nums);
     free(w->guards);
+    free(w->provs);
+    free(w->rollsites);
     if (w->rcpt) {
         for (int i = 0; i < w->caprcpt; i++)
             free(w->rcpt[i].items);
@@ -360,6 +378,72 @@ void world_add_guard(world *w, uint32_t guard, uint32_t num,
     w->ng++;
 }
 
+#define LOC_NONE (~0u)   /* schema location for an atom absent from the family */
+
+void world_set_provider_fn(world *w, world_provider_fn fn, void *ctx)
+{
+    w->provider_fn = fn;
+    w->provider_ctx = ctx;
+}
+
+void world_declare_provider_atom(world *w, uint32_t atom, uint32_t pred,
+                                 const uint32_t *args, int nargs)
+{
+    if (nargs > 4) nargs = 4;
+    for (int i = 0; i < w->nprov; i++)       /* dedup: one entry per ground atom */
+        if (w->provs[i].atom == atom) return;
+    GROW(w->provs, w->nprov, w->capprov);
+    w->provs[w->nprov].atom = atom;
+    w->provs[w->nprov].pred = pred;
+    w->provs[w->nprov].nargs = nargs;
+    for (int k = 0; k < nargs; k++) w->provs[w->nprov].args[k] = args[k];
+    w->nprov++;
+}
+
+/* Does provider atom i hold now? No callback -> closed-world false. */
+static bool provider_holds(const world *w, int i)
+{
+    if (!w->provider_fn) return false;
+    return w->provider_fn(w->provider_ctx, w->provs[i].pred,
+                          w->provs[i].args, w->provs[i].nargs);
+}
+
+/* Load every ground provider atom as a closed-world fact from the callback —
+ * mirrors the numeric-guard load; consulted fresh each solve (positions/state may
+ * have changed), constant within the solve so the fixpoint's re-reads agree. */
+static void load_providers(world *w, dlcol *f)
+{
+    for (int i = 0; i < w->nprov; i++) {
+        uint32_t pa = w->provs[i].atom;
+        if (pa < w->loc_cap && w->loc_of[pa] != LOC_NONE)
+            dlcol_add_fact(f, (dl_lit){ w->loc_of[pa], !provider_holds(w, i) }, 0);
+    }
+}
+
+void world_set_seed(world *w, uint64_t seed) { w->seed = seed; }
+uint64_t world_tick(const world *w) { return w->tick; }
+
+int world_add_roll_site(world *w, int sides, uint64_t site)
+{
+    GROW(w->rollsites, w->nrollsite, w->caprollsite);
+    w->rollsites[w->nrollsite].sides = sides < 1 ? 1 : sides;
+    w->rollsites[w->nrollsite].site = site;
+    return w->nrollsite++;
+}
+
+/* splitmix64-style mix of (seed, tick, site) -> a die face 1..sides. Pure: the
+ * same (seed, tick, site) always yields the same face (idempotent re-read). */
+static long roll_value(const world *w, int idx)
+{
+    uint64_t x = w->seed ^ (w->rollsites[idx].site * 0x9E3779B97F4A7C15ull)
+                         ^ (w->tick + 0x2545F4914F6CDD1Dull);
+    x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ull;
+    x ^= x >> 27; x *= 0x94D049BB133111EBull;
+    x ^= x >> 31;
+    int sides = w->rollsites[idx].sides;
+    return (long)(x % (uint64_t)sides) + 1;
+}
+
 /* Does guard g hold for the current value of its numeric fluent? */
 static bool guard_holds(const world *w, int g)
 {
@@ -465,8 +549,6 @@ void world_add_num_effect(world *w, int rule, uint32_t num_atom,
     /* numeric effects run in the commit phase, not the fixpoint — the cached
      * boolean family is unaffected, so no fam_dirty here. */
 }
-
-#define LOC_NONE (~0u)   /* schema location for an atom absent from the family */
 
 /* Both families (step + judgment) are built from one location map; the query
  * layer runs on the columnar engine too (DESIGN.md §6.3 — one production
@@ -1116,6 +1198,7 @@ static void solve_judgment_family(world *w)
             dlcol_add_fact(f, l, 0);
         }
     }
+    load_providers(w, f);
     dlcol_solve(f);
     w->jfam_solved = true;
 }
@@ -1134,6 +1217,7 @@ static long eval_expr(const world *w, const expr_ins *code, int n)
         switch (code[i].op) {
         case EXPR_CONST: st[sp++] = code[i].arg; break;
         case EXPR_LOAD:  st[sp++] = world_get_num(w, (uint32_t)code[i].arg); break;
+        case EXPR_ROLL:  st[sp++] = roll_value(w, (int)code[i].arg); break;
         case EXPR_NEG:   st[sp-1] = -st[sp-1]; break;
         case EXPR_ADD:   sp--; st[sp-1] += st[sp]; break;
         case EXPR_SUB:   sp--; st[sp-1] -= st[sp]; break;
@@ -1212,6 +1296,7 @@ static void solve_step_family_vals(world *w, const bool *vals,
             dlcol_add_fact(f, l, 0);
         }
     }
+    load_providers(w, f);
     dlcol_solve(f);
 }
 
@@ -1367,8 +1452,11 @@ int world_step(world *w, const uint32_t *actions, int nactions,
      * (covers_numeric): the boolean firing solves bit-parallel and the numeric
      * columns commit column-parallel. (w->lanes_ok guards post-compile edits.) */
     if (w->lanes_ok && w->nsteplanes == 1 &&
-        (w->nnum == 0 || w->steplanes[0].covers_numeric))
-        return world_step_lanes(w, actions, nactions, err, errsz);
+        (w->nnum == 0 || w->steplanes[0].covers_numeric)) {
+        int rc = world_step_lanes(w, actions, nactions, err, errsz);
+        if (rc == 0) w->tick++;                    /* monotone step counter (§5.10) */
+        return rc;
+    }
 
     dlcol *f = w->fam;
 
@@ -1478,6 +1566,7 @@ int world_step(world *w, const uint32_t *actions, int nactions,
         w->last_routed = false;                    /* w->fam holds this transition */
     }
 
+    if (rc == 0) w->tick++;                        /* monotone step counter (§5.10) */
     free(next);
     free(nextnum);
     return rc;
