@@ -110,6 +110,12 @@ typedef struct {
                                    * holds the match condition (§5.4, §11 M1) */
     var_bind  vars[MAX_ARGS];
     int       nvars;
+    /* `set of SORT` params (§13): transient, host-answered membership relations,
+     * kept out of the entity var list (they are not part of the ground action
+     * atom or its cross-product). Each registers a provider relation `name(SORT)`;
+     * `T in name` / `T not in name` in a guard reads it. */
+    struct { uint32_t name, sortname; int line, col; } sets[MAX_ARGS];
+    int       nsets;
     ast_atom  requires[MAX_BODY];
     int       nreq;
     ast_atom  effects[MAX_BODY];
@@ -701,6 +707,35 @@ static bool parse_atom(parser *p, ast_atom *out)
     out->line = id.line;
     out->col = id.col;
     advance(p);
+    /* set membership: `T in P` / `T not in P` over a `set of` param — the
+     * leading id is the element var, P the set (a host-answered provider
+     * relation, §5.6/§13). Lowers to a read of P(T): `not in` negates it. */
+    if (p->cur.kind == TK_IN || ident_is(p->cur, "not")) {
+        bool notin = false;
+        if (ident_is(p->cur, "not")) {
+            token nt = p->cur; advance(p);
+            if (p->cur.kind != TK_IN) {
+                fail(p, nt.line, nt.col, "expected `in` after `not` in a set membership test");
+                return false;
+            }
+            notin = true;
+        }
+        advance(p);                                /* 'in' */
+        if (p->cur.kind != TK_IDENT) {
+            char d[64]; tok_desc(p->cur, d, sizeof d);
+            fail(p, p->cur.line, p->cur.col,
+                 "expected a `set of` parameter name after `in`, found %s", d);
+            return false;
+        }
+        out->args[0].name = out->pred;             /* the element var T */
+        out->args[0].line = id.line;
+        out->args[0].col = id.col;
+        out->nargs = 1;
+        out->pred = intern_tok(p, p->cur);         /* the set/provider name P */
+        out->neg ^= notin;
+        advance(p);                                /* past P */
+        return true;
+    }
     if (p->cur.kind == TK_LPAREN) {
         advance(p);
         for (;;) {
@@ -1049,7 +1084,9 @@ static void parse_init(parser *p)
 }
 
 /* params := '(' vbind (',' vbind)* ')'; vbind := IDENT ':' IDENT */
-static bool parse_params(parser *p, var_bind *vars, int *nvars)
+/* `act` (nullable) receives `set of SORT` params — actions only; rules pass
+ * NULL, so a `set of` there is a located error. */
+static bool parse_params(parser *p, var_bind *vars, int *nvars, ast_action *act)
 {
     *nvars = 0;
     if (p->cur.kind != TK_LPAREN) return true;     /* no params */
@@ -1060,22 +1097,49 @@ static bool parse_params(parser *p, var_bind *vars, int *nvars)
             fail(p, p->cur.line, p->cur.col, "expected a variable name, found %s", d);
             return false;
         }
-        if (*nvars >= MAX_ARGS) {
-            fail(p, p->cur.line, p->cur.col, "too many variables (max %d)", MAX_ARGS);
-            return false;
-        }
-        var_bind *v = &vars[*nvars];
-        v->name = intern_tok(p, p->cur);
-        v->line = p->cur.line;
-        v->col = p->cur.col;
-        v->sort = -1;
+        token nm = p->cur;
         advance(p);
         if (!expect(p, TK_COLON)) return false;
+        if (p->cur.kind == TK_SET) {               /* `set of SORT` — a set param */
+            if (!act) {
+                fail(p, nm.line, nm.col,
+                     "`set of` parameters are only allowed on actions");
+                return false;
+            }
+            advance(p);                            /* 'set' */
+            if (!expect(p, TK_OF)) return false;
+            if (p->cur.kind != TK_IDENT) {
+                char d[64]; tok_desc(p->cur, d, sizeof d);
+                fail(p, p->cur.line, p->cur.col,
+                     "expected an element sort after `set of`, found %s", d);
+                return false;
+            }
+            if (act->nsets >= MAX_ARGS) {
+                fail(p, nm.line, nm.col, "too many set parameters (max %d)", MAX_ARGS);
+                return false;
+            }
+            act->sets[act->nsets].name = intern_tok(p, nm);
+            act->sets[act->nsets].sortname = intern_tok(p, p->cur);
+            act->sets[act->nsets].line = nm.line;
+            act->sets[act->nsets].col = nm.col;
+            act->nsets++;
+            advance(p);                            /* the element sort */
+            if (p->cur.kind == TK_COMMA) { advance(p); continue; }
+            break;
+        }
+        if (*nvars >= MAX_ARGS) {
+            fail(p, nm.line, nm.col, "too many variables (max %d)", MAX_ARGS);
+            return false;
+        }
         if (p->cur.kind != TK_IDENT) {
             char d[64]; tok_desc(p->cur, d, sizeof d);
             fail(p, p->cur.line, p->cur.col, "expected a sort name, found %s", d);
             return false;
         }
+        var_bind *v = &vars[*nvars];
+        v->name = intern_tok(p, nm);
+        v->line = nm.line;
+        v->col = nm.col;
         /* encode the sort name atom for resolution in the semantic pass */
         v->sort = -(int)intern_tok(p, p->cur) - 2;
         (*nvars)++;
@@ -1234,7 +1298,7 @@ static void parse_rule(parser *p)
     r->col = p->cur.col;
     advance(p);
 
-    if (!parse_params(p, r->vars, &r->nvars)) return;
+    if (!parse_params(p, r->vars, &r->nvars, NULL)) return;   /* rules: no set params */
     if (!expect(p, TK_COLON)) return;
 
     int nb = parse_conj(p, r->body, MAX_BODY);
@@ -1325,7 +1389,7 @@ static void parse_action(parser *p)
     a->col = p->cur.col;
     advance(p);
 
-    if (!parse_params(p, a->vars, &a->nvars)) return;
+    if (!parse_params(p, a->vars, &a->nvars, a)) return;
     if (!expect(p, TK_COLON)) return;
 
     if (p->cur.kind == TK_REQUIRES) {
@@ -1958,9 +2022,48 @@ static void check_bands(parser *p)
     }
 }
 
+/* A `set of SORT` action param (§13) is a transient, host-answered membership
+ * relation: register it as a provider `name(SORT)` so `T in name` reads it
+ * through the ordinary provider path (§5.6). Deduped by name across actions;
+ * a same-name clash at a different arity/sort is an error. Runs before the
+ * predicate registry so the relation is marked provider-answered. */
+static void register_set_providers(parser *p)
+{
+    for (int i = 0; i < p->nactions; i++) {
+        ast_action *a = &p->actions[i];
+        for (int s = 0; s < a->nsets; s++) {
+            uint32_t name = a->sets[s].name, esort = a->sets[s].sortname;
+            bool dup = false;
+            for (int j = 0; j < p->nproviders; j++)
+                if (p->providers[j].pred == name) {
+                    dup = true;
+                    if (p->providers[j].nargs != 1 || p->providers[j].argsort[0] != esort)
+                        serr(p, a->sets[s].line, a->sets[s].col,
+                             "set parameter '%s' clashes with another declaration "
+                             "of the same name", intern_name(p->syms, name));
+                    break;
+                }
+            if (dup) continue;
+            if (p->nproviders >= MAX_FLUENTS) {
+                serr(p, a->sets[s].line, a->sets[s].col,
+                     "too many providers (max %d)", MAX_FLUENTS);
+                return;
+            }
+            ast_fluent *pr = &p->providers[p->nproviders++];
+            memset(pr, 0, sizeof *pr);
+            pr->pred = name;
+            pr->nargs = 1;
+            pr->argsort[0] = esort;
+            pr->line = a->sets[s].line;
+            pr->col = a->sets[s].col;
+        }
+    }
+}
+
 static void semantic_pass(parser *p)
 {
     resolve_entities(p);
+    register_set_providers(p);
     build_pred_registry(p);
     check_fluent_bounds(p);
 
