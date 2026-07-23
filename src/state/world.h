@@ -102,6 +102,14 @@ void world_add_expr_guard(world *w, uint32_t guard,
                           const expr_ins *lhs, int nlhs,
                           const expr_ins *rhs, int nrhs, world_cmp op);
 
+/* Attach dynamic clamp bounds to a numeric fluent (§5.8): `int in 0..hp_max(X)`
+ * compiles each bound to effect-VM bytecode, evaluated per-commit against the
+ * value store. NULL/0 on a side leaves it on the constant min/max from
+ * world_declare_num. Bytecode is copied. Requires the fluent to have a range. */
+void world_set_num_clamp(world *w, uint32_t atom,
+                         const expr_ins *lo, int nlo,
+                         const expr_ins *hi, int nhi);
+
 /* Judgment rules (query layer). Returns rule handle for world_add_sup. */
 int  world_add_rule(world *w, const char *name, dl_rule_kind kind,
                     dl_lit head, const dl_lit *body, int nbody);
