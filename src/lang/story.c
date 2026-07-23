@@ -149,7 +149,8 @@ typedef struct {
     int      nvalues;
     bool     is_num;              /* declared `: int` (§5.8) */
     bool     has_range;           /* declared `in lo..hi` — the clamp range */
-    long     rmin, rmax;
+    long     rmin, rmax;          /* constant bounds (when each side folds) */
+    int      rmin_expr, rmax_expr;/* dynamic bound ex_node root, else -1 (§5.8) */
     int      line, col;
 } ast_fluent;
 
@@ -532,6 +533,8 @@ static int alloc_expr(parser *p, ex_kind k, int line, int col)
 }
 
 static int parse_expr(parser *p);
+static bool expr_fold(parser *p, int e, long *out);
+static bool expr_reads_roll(parser *p, int e);
 
 static int parse_factor(parser *p)
 {
@@ -850,6 +853,7 @@ static void parse_enum(parser *p)
 static bool parse_fdecl(parser *p, ast_fluent *f)
 {
     memset(f, 0, sizeof *f);
+    f->rmin_expr = f->rmax_expr = -1;
     token id = p->cur;
     f->pred = intern_tok(p, id);
     f->line = id.line;
@@ -882,13 +886,30 @@ static bool parse_fdecl(parser *p, ast_fluent *f)
             advance(p);
             if (p->cur.kind == TK_IN) {            /* `in lo..hi` clamp range */
                 advance(p);
-                if (!parse_int(p, &f->rmin)) return false;
+                /* Each bound is an expression (§5.8): a literal folds to a
+                 * constant; `hp_max(X)` stays dynamic, resolved per entity at
+                 * commit. A folded bound's AST nodes are reclaimed (nexprs
+                 * rewound) so a constant range perturbs no downstream node
+                 * indices — keeping roll-site keys (§5.10) stable. The fluent's
+                 * key sort name is the implicit key. */
+                long lc, hc;
+                int e0 = p->nexprs;
+                int lo = parse_expr(p);
+                if (lo < 0) return false;
+                bool lo_const = expr_fold(p, lo, &lc);
+                if (lo_const) { f->rmin = lc; p->nexprs = e0; }
+                else f->rmin_expr = lo;
                 if (!expect(p, TK_DOTDOT)) return false;
-                if (!parse_int(p, &f->rmax)) return false;
-                if (f->rmax < f->rmin) {
+                int e1 = p->nexprs;
+                int hi = parse_expr(p);
+                if (hi < 0) return false;
+                bool hi_const = expr_fold(p, hi, &hc);
+                if (hi_const) { f->rmax = hc; p->nexprs = e1; }
+                else f->rmax_expr = hi;
+                if (lo_const && hi_const && hc < lc) {
                     fail(p, f->line, f->col,
                          "numeric range is empty: hi (%ld) is below lo (%ld)",
-                         f->rmax, f->rmin);
+                         hc, lc);
                     return false;
                 }
                 f->has_range = true;
@@ -1688,6 +1709,35 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
     }
 }
 
+/* Validate dynamic clamp bounds (`int in 0 .. hp_max(X)`, §5.8): the bound
+ * expression's fluent reads must resolve to declared numeric fluents, keyed by
+ * the declaring fluent's own sort(s) — the key sort name is the implicit key,
+ * so it is offered as an in-scope variable. A `roll()` in a bound would make
+ * the clamp non-deterministic across reads, so it is rejected. */
+static void check_fluent_bounds(parser *p)
+{
+    for (int i = 0; i < p->nfluents; i++) {
+        ast_fluent *f = &p->fluents[i];
+        if (f->rmin_expr < 0 && f->rmax_expr < 0) continue;
+        var_bind kv[MAX_ARGS];
+        for (int k = 0; k < f->nargs; k++) {
+            kv[k].name = f->argsort[k];
+            kv[k].sort = find_sort(p, f->argsort[k]);
+            kv[k].line = f->line;
+            kv[k].col = f->col;
+        }
+        int roots[2] = { f->rmin_expr, f->rmax_expr };
+        for (int r = 0; r < 2; r++) {
+            if (roots[r] < 0) continue;
+            check_expr(p, roots[r], kv, f->nargs);
+            if (expr_reads_roll(p, roots[r]))
+                serr(p, p->exprs[roots[r]].line, p->exprs[roots[r]].col,
+                     "a clamp bound may not use `roll()` — the range must be a "
+                     "stable value, not a fresh draw");
+        }
+    }
+}
+
 /* Validate one atom against the schema: predicate known, arity matches, and
  * every argument is a bound variable or a declared entity (with a sort check
  * for fluent atoms). `note` records condition refs for orphan analysis;
@@ -1815,6 +1865,19 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
     check_pred_args(p, at->pred, pi, at->args, at->nargs, vars, nvars, ctx);
 }
 
+/* Does expression tree e contain a `roll()` (an EX_ROLL draw)? */
+static bool expr_reads_roll(parser *p, int e)
+{
+    if (e < 0) return false;
+    ex_node *n = &p->exprs[e];
+    switch (n->kind) {
+    case EX_CONST: case EX_LOAD: return false;
+    case EX_ROLL: return true;
+    case EX_NEG:  return expr_reads_roll(p, n->lhs);
+    default:      return expr_reads_roll(p, n->lhs) || expr_reads_roll(p, n->rhs);
+    }
+}
+
 /* Does expression tree e read variable `name` (in an EX_LOAD fluent read)? */
 static bool expr_uses_var(parser *p, int e, uint32_t name)
 {
@@ -1899,6 +1962,7 @@ static void semantic_pass(parser *p)
 {
     resolve_entities(p);
     build_pred_registry(p);
+    check_fluent_bounds(p);
 
     for (int i = 0; i < p->nrules; i++) {
         ast_rule *r = &p->rules[i];
@@ -2243,9 +2307,28 @@ static void declare_ground_fluents(parser *p)
         const char *decl = prov_str(p, f->line, pbuf, sizeof pbuf);
         for (long idx = 0; idx < total; idx++) {
             decode_binding(p, vb, f->nargs, idx, binding);
-            if (f->is_num)                         /* value-store slot, not an atom */
-                world_declare_num(p->w, ground_pred(p, f->pred, binding, f->nargs),
-                                  f->rmin, f->rmax, f->has_range);
+            if (f->is_num) {                       /* value-store slot, not an atom */
+                uint32_t atom = ground_pred(p, f->pred, binding, f->nargs);
+                world_declare_num(p->w, atom, f->rmin, f->rmax, f->has_range);
+                if (f->rmin_expr >= 0 || f->rmax_expr >= 0) {
+                    /* dynamic clamp: compile each bound per entity, the key sort
+                     * name resolving to this instance's binding (§5.8) */
+                    var_bind kv[MAX_ARGS];
+                    for (int k = 0; k < f->nargs; k++) {
+                        kv[k].name = f->argsort[k];
+                        kv[k].sort = vb[k].sort;
+                    }
+                    expr_ins lo[MAX_CODE], hi[MAX_CODE];
+                    int nlo = 0, nhi = 0;
+                    if (f->rmin_expr >= 0)
+                        emit_expr(p, f->rmin_expr, kv, f->nargs, binding, lo, &nlo);
+                    if (f->rmax_expr >= 0)
+                        emit_expr(p, f->rmax_expr, kv, f->nargs, binding, hi, &nhi);
+                    world_set_num_clamp(p->w, atom,
+                                        f->rmin_expr >= 0 ? lo : NULL, nlo,
+                                        f->rmax_expr >= 0 ? hi : NULL, nhi);
+                }
+            }
             else if (f->is_mv) {                   /* one boolean atom per value */
                 for (int v = 0; v < f->nvalues; v++) {
                     uint32_t a = ground_mv_atom(p, f->pred, binding, f->nargs,

@@ -126,8 +126,13 @@ struct world {
     jsup *jsups; int njs, capjs;
     srule *srules; int nsr, capsr;
 
-    /* numeric value store + comparison guards (§5.8, read side) */
-    struct { uint32_t atom; long value, min, max; bool has_range; } *nums;
+    /* numeric value store + comparison guards (§5.8, read side). A clamp bound
+     * may be dynamic (`int in 0 .. hp_max(X)`): lo_code/hi_code hold effect-VM
+     * bytecode evaluated per-commit against the value store, NULL = use the
+     * constant min/max. */
+    struct { uint32_t atom; long value, min, max; bool has_range;
+             const expr_ins *lo_code; int n_lo;
+             const expr_ins *hi_code; int n_hi; } *nums;
     int nnum, capnum;
     struct { uint32_t guard, num; world_cmp op; long threshold; } *guards;
     int ng, capg;
@@ -346,8 +351,32 @@ void world_declare_num(world *w, uint32_t atom, long min, long max, bool has_ran
     w->nums[w->nnum].min = min;
     w->nums[w->nnum].max = max;
     w->nums[w->nnum].has_range = has_range;
+    w->nums[w->nnum].lo_code = NULL; w->nums[w->nnum].n_lo = 0;
+    w->nums[w->nnum].hi_code = NULL; w->nums[w->nnum].n_hi = 0;
     atom_map_set(&w->num_of, &w->num_of_cap, atom, w->nnum);
     w->nnum++;
+}
+
+/* Attach dynamic clamp bounds to an already-declared numeric fluent (§5.8):
+ * `int in 0 .. hp_max(X)` compiles the bound to effect-VM bytecode, evaluated
+ * per-commit against the value store. NULL/0 leaves that side on its constant
+ * min/max. Bytecode is arena-copied. Requires has_range (a declared range). */
+void world_set_num_clamp(world *w, uint32_t atom,
+                         const expr_ins *lo, int nlo,
+                         const expr_ins *hi, int nhi)
+{
+    int i = num_index(w, atom);
+    if (i < 0) return;
+    if (lo && nlo > 0) {
+        expr_ins *c = arena_alloc(&w->a, (size_t)nlo * sizeof *c);
+        memcpy(c, lo, (size_t)nlo * sizeof *c);
+        w->nums[i].lo_code = c; w->nums[i].n_lo = nlo;
+    }
+    if (hi && nhi > 0) {
+        expr_ins *c = arena_alloc(&w->a, (size_t)nhi * sizeof *c);
+        memcpy(c, hi, (size_t)nhi * sizeof *c);
+        w->nums[i].hi_code = c; w->nums[i].n_hi = nhi;
+    }
 }
 
 void world_set_num(world *w, uint32_t atom, long value)
@@ -1274,6 +1303,18 @@ static long eval_expr(const world *w, const expr_ins *code, int n)
     return sp ? st[sp-1] : 0;
 }
 
+/* Effective clamp bounds for numeric fluent `idx`: a dynamic bound
+ * (`int in 0 .. hp_max(X)`) evaluates its bytecode against the value store; a
+ * static bound uses the declared constant. Read against pre-step values (the
+ * store double-buffers and swaps once), consistent with effect reads. */
+static void num_clamp_bounds(const world *w, int idx, long *lo, long *hi)
+{
+    *lo = w->nums[idx].lo_code ? eval_expr(w, w->nums[idx].lo_code, w->nums[idx].n_lo)
+                               : w->nums[idx].min;
+    *hi = w->nums[idx].hi_code ? eval_expr(w, w->nums[idx].hi_code, w->nums[idx].n_hi)
+                               : w->nums[idx].max;
+}
+
 /* A step rule fires this step iff its action occurred (or it is a ramification)
  * and every body literal holds in the settled step theory. Numeric effects run
  * in the commit phase, so their firing is read off the solved columns rather
@@ -1418,8 +1459,9 @@ static int compute_step_lane_numerics(world *w, step_lane_family *sf,
             long base = have[c] ? aval[c] : w->nums[idx].value;
             long val = base + delta[c];
             if (w->nums[idx].has_range) {
-                if (val < w->nums[idx].min) val = w->nums[idx].min;
-                if (val > w->nums[idx].max) val = w->nums[idx].max;
+                long lo, hi; num_clamp_bounds(w, idx, &lo, &hi);
+                if (val < lo) val = lo;
+                if (val > hi) val = hi;
             }
             nextcol[c] = val;
         }
@@ -1595,8 +1637,9 @@ int world_step(world *w, const uint32_t *actions, int nactions,
             rcp->base = base;
             long val = base + acc[i].delta;
             if (w->nums[i].has_range) {
-                if (val < w->nums[i].min) val = w->nums[i].min;
-                if (val > w->nums[i].max) val = w->nums[i].max;
+                long lo, hi; num_clamp_bounds(w, i, &lo, &hi);
+                if (val < lo) val = lo;
+                if (val > hi) val = hi;
             }
             nextnum[i] = val;
         }
