@@ -68,3 +68,9 @@ target_compile_options(bench_step PRIVATE -O2)
 add_executable(bench_5e tests/bench_5e.c)
 target_link_libraries(bench_5e PRIVATE infeasible_core)
 target_compile_options(bench_5e PRIVATE -O2)
+
+# Grounding-cost benchmark (§5.2/§8, EPIC #26): eager grounder over a synthetic
+# nᵏ cross product — compile time, ground atoms, peak memory, MAX_INSTANCES cliff.
+add_executable(bench_ground tests/bench_ground.c)
+target_link_libraries(bench_ground PRIVATE infeasible_core)
+target_compile_options(bench_ground PRIVATE -O2)

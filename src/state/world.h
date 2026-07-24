@@ -160,6 +160,12 @@ void world_add_lane_family(world *w, dlcol *fam, int natoms, int nent, int niter
                            const bool *is_import);
 int  world_lane_family_count(const world *w);
 
+/* Grounded-theory size introspection (bench/debug — §5.2 grounding cost). A
+ * judgment/step rule count *below* what the source rules should ground to
+ * signals the grounder hit its MAX_INSTANCES cliff and dropped instances. */
+int  world_judgment_rule_count(const world *w);
+int  world_step_rule_count(const world *w);
+
 /* Differential pin (mirrors test_col's dl-vs-dl_col): load current state into
  * every lane family, solve, and compare each (predicate, entity) verdict to
  * world_query on the equivalent ground atom. Returns the number of comparisons;
