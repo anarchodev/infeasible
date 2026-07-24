@@ -167,7 +167,10 @@ typedef struct {
     uint32_t val_sort;            /* `: cell` — valued in an entity sort's entities
                                    * (§5.6 functional fluent); 0 if not. Values are
                                    * populated from the sort after resolve_entities. */
-    bool     is_num;              /* declared `: int` (§5.8) */
+    bool     is_num;              /* declared `: int` (§5.8) — or store-backed cell */
+    bool     is_cell;             /* `: <domain>` — store-backed opaque handle (§5.6):
+                                   * one uint32/entity in the value store, host-set/read,
+                                   * copied with `:=`; no arithmetic, no int guards */
     bool     has_range;           /* declared `in lo..hi` — the clamp range */
     long     rmin, rmax;          /* constant bounds (when each side folds) */
     int      rmin_expr, rmax_expr;/* dynamic bound ex_node root, else -1 (§5.8) */
@@ -211,6 +214,7 @@ typedef struct {
     int      val_sort;            /* value sort index for `: cell` fluents, else -1;
                                    * lets `at(X) = c` bind `c` as a join variable */
     bool     is_num;              /* a numeric fluent (§5.8) */
+    bool     is_cell;             /* a store-backed opaque-domain fluent (§5.6) */
     bool     is_provider;         /* a computed relation, host-answered (§5.6) */
 } pred_info;
 
@@ -1027,17 +1031,27 @@ static bool parse_fdecl(parser *p, ast_fluent *f)
             if (si >= 0 && !p->sorts[si].is_domain) {
                 /* `: cell` — a functional fluent valued in an entity sort (§5.6):
                  * exactly one entity per tick, logic-backed over §5.7 (values =
-                 * the sort's entities, filled after resolve_entities). The
-                 * store-backed representation for large domains is a follow-up. */
+                 * the sort's entities, filled after resolve_entities). */
                 f->is_mv = true;
                 f->val_sort = intern_tok(p, p->cur);
                 advance(p);
                 return true;
             }
+            if (si >= 0 && p->sorts[si].is_domain) {
+                /* `: cell` where cell is a `domain` (§5.6) — a STORE-BACKED
+                 * functional fluent: one opaque uint32 handle per entity in the
+                 * value store (never |cells| atoms). Host-set and host-read;
+                 * copied with `:=`; equality is read through a provider. Reuses
+                 * the numeric store, tagged is_cell to forbid arithmetic. */
+                f->is_num = true;
+                f->is_cell = true;
+                f->val_sort = intern_tok(p, p->cur);
+                advance(p);
+                return true;
+            }
             fail(p, p->cur.line, p->cur.col,
-                 "'%.*s' is not a declared enum or sort; a fluent value type is "
-                 "`: int`, `: { … }`, an `enum`, or a `sort` (an opaque `domain` "
-                 "value needs store-backing, not yet — #19)",
+                 "'%.*s' is not a declared enum, sort, or domain; a fluent value "
+                 "type is `: int`, `: { … }`, an `enum`, a `sort`, or a `domain`",
                  p->cur.len, p->cur.start);
             return false;
         }
@@ -1750,6 +1764,7 @@ static void build_pred_registry(parser *p)
                      "only", intern_name(p->syms, f->pred), p->sorts[pi->argsort[k]].name);
         }
         pi->is_num = f->is_num;
+        pi->is_cell = f->is_cell;
         pi->is_mv = f->is_mv;
         pi->val_sort = f->val_sort ? find_sort(p, f->val_sort) : -1;
         pi->nvalues = f->nvalues;
@@ -1934,6 +1949,17 @@ static void check_fluent_bounds(parser *p)
     }
 }
 
+/* Is expr `e` a bare read of a store-backed cell fluent? (a valid `:=` RHS for
+ * a cell move — `at(X) := at(Y)`.) */
+static bool expr_is_cell_load(parser *p, int e)
+{
+    if (e < 0) return false;
+    ex_node *n = &p->exprs[e];
+    if (n->kind != EX_LOAD) return false;
+    pred_info *pi = find_pred(p, n->pred);
+    return pi && pi->is_cell;
+}
+
 /* Validate one atom against the schema: predicate known, arity matches, and
  * every argument is a bound variable or a declared entity (with a sort check
  * for fluent atoms). `note` records condition refs for orphan analysis;
@@ -2006,8 +2032,28 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
                  intern_name(p->syms, at->pred), intern_name(p->syms, at->pred));
             return;
         }
+        if (pi->is_cell) {
+            /* a store-backed cell fluent takes only `:=` from another cell fluent
+             * (a move/copy) — no arithmetic on an opaque handle (§5.6) */
+            if (at->numop != WORLD_OP_ASSIGN)
+                serr(p, at->line, at->col,
+                     "'%s' is a store-backed cell fluent — it takes `:=` (a copy), "
+                     "not `+=`/`-=`; there is no arithmetic on an opaque cell handle",
+                     intern_name(p->syms, at->pred));
+            else if (!expr_is_cell_load(p, at->expr_root))
+                serr(p, at->line, at->col,
+                     "'%s :=' must copy another cell fluent (e.g. `at(Y)`), not an "
+                     "arithmetic or literal expression", intern_name(p->syms, at->pred));
+        }
         check_pred_args(p, at->pred, pi, at->args, at->nargs, vars, nvars, ctx);
         check_expr(p, at->expr_root, vars, nvars);
+        return;
+    }
+    if (pi && pi->is_cell) {   /* read side: cells are read through providers only */
+        serr(p, at->line, at->col,
+             "a store-backed cell fluent '%s' can't be read in a rule guard; "
+             "read positions through a provider (e.g. same_cell(X,Y), adjacent, "
+             "near) — §5.6", intern_name(p->syms, at->pred));
         return;
     }
     /* in a `causes` clause a numeric fluent is *written*, never compared:
@@ -2209,7 +2255,7 @@ static void populate_sort_valued_fluents(parser *p)
 {
     for (int i = 0; i < p->nfluents; i++) {
         ast_fluent *f = &p->fluents[i];
-        if (!f->val_sort) continue;
+        if (!f->val_sort || f->is_cell) continue;   /* is_cell: store-backed, not MV */
         int si = find_sort(p, f->val_sort);
         if (si < 0) continue;                      /* checked at parse */
         int n = p->domain_n[si];
