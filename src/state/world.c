@@ -747,6 +747,9 @@ void world_add_lane_family(world *w, dlcol *fam, int natoms, int nent, int niter
 
 int world_lane_family_count(const world *w) { return w->nlanes; }
 
+int world_judgment_rule_count(const world *w) { return w->njr; }
+int world_step_rule_count(const world *w) { return w->nsr; }
+
 /* Load one iteration's fact slice into a lane family and solve it (all lanes at
  * once). For niter==1 (single-variable) `it` is 0 and the solve is the whole
  * family; for a join it is the current non-lane entity. */
