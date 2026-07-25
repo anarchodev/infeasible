@@ -2143,28 +2143,111 @@ static bool expr_uses_var(parser *p, int e, uint32_t name)
     }
 }
 
-/* Every rule variable must occur in the body — the safety / range-restriction
- * discipline (§5.2 item 1). Typed vars bound the domain (item 2), so an unused
- * var is a probable authoring slip, not an unsafe grounding: warn, don't fail. */
-static void check_safety(parser *p, ast_rule *r)
+/* Does variable `v` occur in `at` at all (any arg position, or the value slot
+ * of a `f(X) = v` value-join, or inside an expr guard)? */
+static bool atom_uses_var(parser *p, const ast_atom *at, uint32_t v)
 {
-    for (int i = 0; i < r->nvars; i++) {
-        bool used = false;
-        for (int b = 0; b < r->nbody && !used; b++) {
-            if (r->body[b].is_expr_guard) {          /* variables live in the exprs */
-                if (expr_uses_var(p, r->body[b].lhs_root, r->vars[i].name) ||
-                    expr_uses_var(p, r->body[b].rhs_root, r->vars[i].name)) used = true;
+    if (at->is_expr_guard)
+        return expr_uses_var(p, at->lhs_root, v) || expr_uses_var(p, at->rhs_root, v);
+    for (int k = 0; k < at->nargs; k++)
+        if (at->args[k].name == v) return true;
+    return at->value == v;                        /* value-join var (§5.6) */
+}
+
+/* Is arg `a` already bound — an entity constant / int literal, or a var the
+ * fixpoint has marked bound? (Constants are always bound; a var is bound once
+ * some generator produces it.) */
+static bool arg_is_bound(ast_rule *r, ast_arg a, const bool *vbound)
+{
+    if (a.is_int) return true;
+    int vi = var_index(r->vars, r->nvars, a.name);
+    return vi < 0 || vbound[vi];                  /* vi < 0 => an entity constant */
+}
+
+/* Range restriction with sideways information passing (§5.2 item 1). A variable
+ * is *bindable* if some positive generator produces it under a feasible
+ * evaluation order — computed as a fixpoint into `vbound[nvars]`:
+ *   - a positive fluent/derived atom, and a numeric guard/expr (`hp(X) <= 0` —
+ *     the value store has a row per entity), generate their arg vars outright;
+ *   - a PROVIDER generates its args only once at least one of its own args is
+ *     already bound (a constant anchor like `wiz`, or a var another generator
+ *     produced): the "who is in range of X" mode (§5.2 disc. 3). A provider with
+ *     nothing bound cannot enumerate and binds nothing;
+ *   - negation binds nothing (a filter).
+ * The join planner (#28) consumes the same bound-set as its binding order. */
+static void compute_bound_vars(parser *p, ast_rule *r, bool *vbound)
+{
+    for (int i = 0; i < r->nvars; i++) vbound[i] = false;
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int b = 0; b < r->nbody; b++) {
+            ast_atom *at = &r->body[b];
+            if (at->neg) continue;                /* filter */
+
+            if (at->is_expr_guard) {              /* reads the value store */
+                for (int i = 0; i < r->nvars; i++)
+                    if (!vbound[i] && atom_uses_var(p, at, r->vars[i].name))
+                        { vbound[i] = true; changed = true; }
                 continue;
             }
-            for (int k = 0; k < r->body[b].nargs; k++)
-                if (r->body[b].args[k].name == r->vars[i].name) { used = true; break; }
+
+            pred_info *pi = find_pred(p, at->pred);
+            bool provider = pi && pi->is_provider && !at->is_guard;
+            if (provider) {                       /* needs an anchor to enumerate */
+                bool anchored = false;
+                for (int k = 0; k < at->nargs; k++)
+                    if (arg_is_bound(r, at->args[k], vbound)) { anchored = true; break; }
+                if (!anchored) continue;
+            }
+            /* fluent / derived / numeric-guard, or an anchored provider: binds args */
+            for (int k = 0; k < at->nargs; k++) {
+                int vi = var_index(r->vars, r->nvars, at->args[k].name);
+                if (vi >= 0 && !vbound[vi]) { vbound[vi] = true; changed = true; }
+            }
+            if (at->value != INTERN_NONE) {
+                int vi = var_index(r->vars, r->nvars, at->value);
+                if (vi >= 0 && !vbound[vi]) { vbound[vi] = true; changed = true; }
+            }
         }
-        if (!used)
+    }
+}
+
+/* Every rule variable must be range-restricted (bindable by compute_bound_vars).
+ * An unbindable var grounds over its whole declared sort — the nᵏ blow-up
+ * bench_ground measures — and the tick-time matcher (#28) has no extension to
+ * enumerate it from. Typed sorts (item 2) still make the grounding finite, so
+ * today this is a WARNING, not a failure; once #28's router exists a
+ * matcher-routed rule upgrades it to an error. The diagnostic distinguishes
+ * "never occurs" from "only in filters / an unanchored provider" so the fix
+ * (add a positive anchor) is obvious. */
+static void check_safety(parser *p, ast_rule *r)
+{
+    bool vbound[MAX_ARGS];
+    compute_bound_vars(p, r, vbound);
+
+    for (int i = 0; i < r->nvars; i++) {
+        if (vbound[i]) continue;                  /* range-restricted */
+
+        uint32_t v = r->vars[i].name;
+        bool occurs = false;
+        for (int b = 0; b < r->nbody && !occurs; b++)
+            occurs = atom_uses_var(p, &r->body[b], v);
+        const char *sort = r->vars[i].sort >= 0 ? p->sorts[r->vars[i].sort].name : "?";
+
+        if (occurs)
+            warn(p, r->vars[i].line, r->vars[i].col,
+                 "variable '%s' of rule '%s' has no positive generator — it "
+                 "appears only in negation or an unanchored provider, so it "
+                 "grounds over the whole '%s' sort and a tick-time matcher "
+                 "cannot enumerate it (§5.2 item 1)",
+                 intern_name(p->syms, v), r->label, sort);
+        else
             warn(p, r->vars[i].line, r->vars[i].col,
                  "variable '%s' of rule '%s' does not occur in the body — "
                  "it grounds over the whole '%s' sort",
-                 intern_name(p->syms, r->vars[i].name), r->label,
-                 r->vars[i].sort >= 0 ? p->sorts[r->vars[i].sort].name : "?");
+                 intern_name(p->syms, v), r->label, sort);
     }
 }
 
