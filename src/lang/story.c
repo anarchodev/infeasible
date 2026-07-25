@@ -1,5 +1,6 @@
 #include "lang/story.h"
 #include "lang/lexer.h"
+#include "state/factindex.h"
 
 #include <stdarg.h>
 #include <stdbool.h>
@@ -227,6 +228,10 @@ typedef struct {
     story_diags *diags;
     int          nerrors;
     bool         err_flag;        /* an error hit in the current declaration */
+    bool         ground_matched;  /* ground eligible rules via the join matcher
+                                   * (#28) rather than the eager odometer */
+    factindex   *fidx;            /* base-fluent extension index, built from init
+                                   * facts when ground_matched (the matcher scans it) */
     int          ndecls;          /* declarations parsed so far (header must be first) */
 
     /* Flat top-level `scene NAME` header (§4.1/§6.4). A single scene is one
@@ -2837,6 +2842,137 @@ static void ground_rule(parser *p, ast_rule *r)
     }
 }
 
+/* ---- the join matcher (§5.2 item 4, #28): ground a rule from the fact-store
+ * extension index rather than the sort cross product. Slice 1 kernel: rules
+ * whose body is a conjunction of positive base-BOOLEAN-fluent atoms (no
+ * negation, guards, providers, mv, numeric, `unless`, or superiority). Anything
+ * outside the kernel falls back to eager ground_rule, so every story still
+ * compiles both ways and the two theories differ only where the matcher runs.
+ * The equivalence (identical query verdicts + why-traces) is pinned by
+ * test_matcher: eager grounds every sort^k instance (most inert); the matcher
+ * grounds only the body-satisfying ones — an omitted inert instance concludes
+ * nothing, so no verdict moves. Later slices add derived-body stratification,
+ * per-tick re-matching, and the remaining atom kinds. */
+
+static bool rule_in_sup(parser *p, ast_rule *r)
+{
+    for (int i = 0; i < p->nsups; i++)
+        if (!strcmp(p->sups[i].a, r->label) || !strcmp(p->sups[i].b, r->label))
+            return true;
+    return false;
+}
+
+static bool rule_matchable(parser *p, ast_rule *r)
+{
+    if (r->nvars < 1 || r->nbody < 1) return false;
+    if (r->has_guard) return false;                /* `unless` defeater — later */
+    if (r->head.is_num_effect) return false;
+    if (rule_in_sup(p, r)) return false;           /* per-instance `>` edges — later */
+    for (int b = 0; b < r->nbody; b++) {
+        ast_atom *at = &r->body[b];
+        if (at->neg || at->is_guard || at->is_expr_guard || at->primed) return false;
+        if (at->value != INTERN_NONE) return false;        /* mv value-join — later */
+        pred_info *pi = find_pred(p, at->pred);
+        if (!pi || !pi->is_fluent || pi->is_provider || pi->is_num || pi->is_mv)
+            return false;                                  /* base boolean fluent only */
+    }
+    bool vb[MAX_ARGS];                             /* every var must be body-bound */
+    compute_bound_vars(p, r, vb);
+    for (int i = 0; i < r->nvars; i++) if (!vb[i]) return false;
+    return true;
+}
+
+typedef struct { int *h; int n, cap; } inst_list;
+static void inst_push(inst_list *L, int handle)
+{
+    if (L->n == L->cap) {
+        L->cap = L->cap ? L->cap * 2 : 16;
+        L->h = realloc(L->h, (size_t)L->cap * sizeof *L->h);
+    }
+    L->h[L->n++] = handle;
+}
+
+/* Emit one matched instance — the same head/body/name/provenance ground_rule
+ * writes per odometer step, but for a binding the join proved satisfiable. */
+static void emit_matched(parser *p, ast_rule *r, const uint32_t *bind, inst_list *L)
+{
+    dl_lit head = ground_lit(p, &r->head, r->vars, r->nvars, bind);
+    dl_lit body[MAX_BODY];
+    for (int b = 0; b < r->nbody; b++)
+        body[b] = ground_lit(p, &r->body[b], r->vars, r->nvars, bind);
+    char name[MAX_GROUND];
+    inst_name(p, name, sizeof name, r->label, r->vars, r->nvars, bind);
+    int h = world_add_rule(p->w, name, r->kind, head, body, r->nbody);
+    char pbuf[MAX_NAME + 24];
+    world_set_rule_prov(p->w, h, prov_str(p, r->line, pbuf, sizeof pbuf));
+    inst_push(L, h);
+}
+
+/* Semi-naïve nested-loop join: probe body atom `b`'s extension with the
+ * positions already bound (constants and vars bound by earlier atoms), bind its
+ * free vars from each matching tuple, recurse. At the leaf every var is bound. */
+static void match_rec(parser *p, ast_rule *r, int b, uint32_t *bind, inst_list *L)
+{
+    if (b == r->nbody) { emit_matched(p, r, bind, L); return; }
+    ast_atom *at = &r->body[b];
+    int n = at->nargs;
+
+    bool     filt[FACTINDEX_MAXARGS];
+    uint32_t want[FACTINDEX_MAXARGS];
+    int      freevar[FACTINDEX_MAXARGS];           /* var this position binds, or -1 */
+    for (int k = 0; k < n; k++) {
+        int vi = var_index(r->vars, r->nvars, at->args[k].name);
+        if (vi < 0)                       { filt[k] = true;  want[k] = at->args[k].name; freevar[k] = -1; }
+        else if (bind[vi] != INTERN_NONE) { filt[k] = true;  want[k] = bind[vi];         freevar[k] = -1; }
+        else                              { filt[k] = false; want[k] = 0;                freevar[k] = vi; }
+    }
+
+    factindex_cursor c;
+    factindex_scan(p->fidx, at->pred, filt, want, &c);
+    uint32_t tup[FACTINDEX_MAXARGS];
+    while (factindex_next(&c, tup)) {
+        int set[FACTINDEX_MAXARGS], nset = 0;
+        bool ok = true;
+        for (int k = 0; k < n; k++) {
+            int vi = freevar[k];
+            if (vi < 0) continue;
+            if (bind[vi] == INTERN_NONE) { bind[vi] = tup[k]; set[nset++] = vi; }
+            else if (bind[vi] != tup[k]) { ok = false; break; }   /* repeated var must agree */
+        }
+        if (ok) match_rec(p, r, b + 1, bind, L);
+        for (int s = 0; s < nset; s++) bind[set[s]] = INTERN_NONE; /* backtrack */
+    }
+}
+
+static void ground_rule_matched(parser *p, ast_rule *r)
+{
+    inst_list L = { 0, 0, 0 };
+    uint32_t bind[MAX_ARGS];
+    for (int i = 0; i < r->nvars; i++) bind[i] = INTERN_NONE;
+    match_rec(p, r, 0, bind, &L);
+
+    if (L.n == 0) { r->insts = NULL; r->ninst = 0; free(L.h); return; }
+    r->insts = malloc((size_t)L.n * sizeof *r->insts);
+    for (int i = 0; i < L.n; i++) r->insts[i].handle = L.h[i];
+    r->ninst = L.n;
+    free(L.h);
+}
+
+/* Base-boolean-fluent extension index from the init facts — the matcher scans
+ * this instead of enumerating sorts. Numeric/mv inits are not boolean
+ * extensions and are skipped (the kernel never matches over them). */
+static void build_fact_index(parser *p)
+{
+    p->fidx = factindex_new();
+    for (int i = 0; i < p->ninits; i++) {
+        ast_atom *a = &p->inits[i];
+        if (a->is_guard || a->value != INTERN_NONE) continue;
+        uint32_t args[MAX_ARGS];
+        for (int k = 0; k < a->nargs; k++) args[k] = a->args[k].name;
+        factindex_add(p->fidx, a->pred, args, a->nargs);
+    }
+}
+
 static void ground_action(parser *p, ast_action *a)
 {
     bool of = false;
@@ -4013,10 +4149,11 @@ static void build_lane_families(parser *p)
             emit_join_family(p, &p->rules[i]);
 }
 
-world *story_compile(const char *src, const char *srcname, intern *syms,
-                     story_diags *diags)
+static world *compile_impl(const char *src, const char *srcname, intern *syms,
+                           story_diags *diags, bool matched)
 {
     parser *p = calloc(1, sizeof *p);
+    p->ground_matched = matched;
     p->rules = calloc(MAX_RULES, sizeof *p->rules);
     p->actions = calloc(MAX_ACTIONS, sizeof *p->actions);
     p->binders = calloc(MAX_BINDERS, sizeof *p->binders);
@@ -4068,7 +4205,13 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
             desugar_bands(p);                     /* band ladders → pairwise `>` (§6.2) */
             declare_ground_fluents(p);
             ground_inits(p);
-            for (int i = 0; i < p->nrules; i++)   ground_rule(p, &p->rules[i]);
+            if (p->ground_matched) build_fact_index(p);
+            for (int i = 0; i < p->nrules; i++) {
+                if (p->ground_matched && rule_matchable(p, &p->rules[i]))
+                    ground_rule_matched(p, &p->rules[i]);
+                else
+                    ground_rule(p, &p->rules[i]);
+            }
             for (int i = 0; i < p->nactions; i++) ground_action(p, &p->actions[i]);
             for (int i = 0; i < p->nsups; i++)    ground_sup(p, &p->sups[i]);
             check_orphans(p);
@@ -4088,6 +4231,22 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
     free(p->ent_of);
     free(p->ent_pos);
     for (int s = 0; s < p->nsorts; s++) free(p->domain_ents[s]);
+    if (p->fidx) factindex_free(p->fidx);
     free(p);
     return result;
+}
+
+world *story_compile(const char *src, const char *srcname, intern *syms,
+                     story_diags *diags)
+{
+    return compile_impl(src, srcname, syms, diags, false);
+}
+
+/* Same grammar and world, but ground rules in the join-matcher kernel via the
+ * fact-store extension index (§5.2 item 4, #28) where eligible. Verdicts and
+ * why-traces are identical to story_compile (pinned by test_matcher). */
+world *story_compile_matched(const char *src, const char *srcname, intern *syms,
+                             story_diags *diags)
+{
+    return compile_impl(src, srcname, syms, diags, true);
 }
