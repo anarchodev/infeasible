@@ -285,12 +285,55 @@ propagation sweep.
   5. Cardinality warnings: any rule ranging over a large cross product with no
      sparse anchor is a compile-time warning with the estimated count.
 
-**Scaffold status**: the current C engine implements the standard semantics
+**Scaffold status.** The current C engine implements the standard semantics
 with a straightforward tri-valued fixpoint (correct, O(n·rules) worst case)
-over pre-ground rules. Maher's counter-based linear algorithm and the
-transformation pipeline are planned optimizations behind the same API; the
-golden tests pin the semantics so the swap is safe. Cyclic rule graphs may
-leave literals undecided; the compiler will stratify/reject cycles.
+over pre-ground rules, evaluated by a sequential *sweep* (the default
+`dl_solve`; an order-independent worklist `dl_solve_wl` exists as a differential
+oracle — `test_drivers_agree` — and a cliff-free fallback). The linear-time path
+(M3) is deliberately factored into a build-time half and a run-time half, both
+behind the same API, with the golden tests pinning the semantics so the swap is
+safe:
+
+1. *Transformation + stratification (build time).* The size-preserving
+   Antoniou transformation (TOCL 2001) eliminates defeaters and compiles away
+   the superiority relation, reducing the theory to *basic* form (strict +
+   defeasible rules only); the compiler condenses the rule-dependency graph into
+   its strongly-connected components and rejects/stratifies cycles (bands and
+   scope-depth priorities have already erased to `>` upstream, §6.2, so the
+   transformation never sees them). This is Maher's own normal form — the
+   load-bearing half, shared by *any* linear evaluator.
+2. *SCC-ordered sweep (run time).* Rather than Maher's counter-and-worklist
+   algorithm (Delores, TPLP 2001), the evaluator is a single
+   *weak-topologically ordered* sweep: solve the SCC condensation in topological
+   order, iterating only within a genuine component to a local fixpoint. On a
+   transformed, near-acyclic theory the components collapse toward singletons and
+   one ordered pass decides everything in O(N) — the same linear bound, reached
+   by *scheduling* the sweep rather than by dynamic counters. Chosen for
+   engineering fit, not theory: it keeps the branchless sequential scan that
+   already wins the dense/shallow scene-tier workload and the entity-indexed
+   bitvector lift of the columnar backing (both §8), pays none of the worklist's
+   random-access dependency-chasing, and confines residual iteration to the SCCs
+   where cycles actually remain. (A robustness-only variant — SCC scan order over
+   the *untransformed* theory — already removes the sweep's sole weakness, an
+   O(n²) scan-order cliff on adversarial deep chains, without the transformation.)
+
+**Precedent and honest status.** SCC-decomposed evaluation of a monotone
+fixpoint is a standard, independently-rediscovered technique in the fields
+adjacent to this one: *SCC-recursiveness* for abstract-argumentation semantics
+(Baroni, Giacomin & Guida, AIJ 2005 — Dung's semantics computed
+component-by-component, on the principle that an argument's status depends only
+on its ancestors), *weak topological ordering* for abstract-interpretation
+fixpoints (Bourdoncle 1993, the de-facto iteration strategy), and stratified/SCC
+evaluation in bottom-up Datalog (semi-naive per component, topological over the
+condensation). The DL-specific *linear* implementations of record (Maher's
+Delores; SPINdle) instead take the counter route, so wiring the SCC schedule to
+defeasible logic's proof conditions is our synthesis, not a published DL
+result — it is validated by the differential golden tests, not by an external
+theorem, and it must be *measured* to earn the swap (Delores is the cautionary
+case: its transformation, linear in theory, did not behave linearly in the
+shipped system). Consistent with §8 this is a conditional optimization — the
+sweep already clears frame budget at scale, the counter form's real prize is
+incremental cone re-solve (M4), and the compiler is free to pick per workload.
 
 ### 5.3 State and time: defeasible inertia
 
@@ -893,7 +936,7 @@ structurally identical rule instances differing only in the entity index.
 When a family is *homogeneous* — one rule-graph shape, same attackers, same
 superiority edges, only the fact bits differing per instance — the fixpoint
 can run set-at-a-time instead of tuple-at-a-time (semi-naive Datalog's move):
-lift the M3 counters to vectors indexed by entity id, pack boolean fluents
+lift the M3 SCC-ordered sweep to vectors indexed by entity id, pack boolean fluents
 over the sort into bitvectors, and a propagation round over the family
 becomes word-wide AND/OR/NOT over proved⁺/proved⁻/undecided masks — 64
 entities per instruction, the RTS-crowd regime, on the entity-indexed arrays
@@ -1715,8 +1758,10 @@ recovery at declaration boundaries so one error doesn't cascade.
    golden tests pin semantics — with no reference client, this test is the
    *only* thing keeping the client boundary honest, so it is a hard
    deliverable, not a nice-to-have.
-4. **M3 — engine hardening**: Maher linear algorithm + transformation
-   pipeline behind the same API; tick-time join matcher for variables/typed
+4. **M3 — engine hardening**: linear evaluation behind the same API — the
+   Antoniou transformation + a stratifying/SCC-condensing compiler, then an
+   SCC-ordered ("weak-topological") sweep as the evaluator, not Maher's
+   counter/worklist route (see §5.2); tick-time join matcher for variables/typed
    entities (until then: ground rules per entity by hand/codegen).
 5. **M4 — scale spine**: global tier (subscriptions, dependency cones —
    wake-ups recompute only the reachable ∩ demanded set, per §4.1; the demand
