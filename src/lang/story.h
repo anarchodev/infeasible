@@ -118,4 +118,12 @@ typedef struct {
 world *story_compile(const char *src, const char *srcname, intern *syms,
                      story_diags *diags);
 
+/* Same result as story_compile, but grounds eligible rules via the semi-naïve
+ * join matcher over the fact-store extension index (§5.2 item 4, #28) instead
+ * of the eager sort cross product. Query verdicts and why-traces are identical
+ * (test_matcher pins the equivalence); it grounds only body-satisfying rule
+ * instances rather than every sort^k possibility. */
+world *story_compile_matched(const char *src, const char *srcname, intern *syms,
+                             story_diags *diags);
+
 #endif
