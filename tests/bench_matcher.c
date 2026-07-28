@@ -4,15 +4,15 @@
  * Facts are loaded via world_set (as a host does), so we aren't bound by the
  * init-list size. Metrics, eager vs. matcher:
  *   - compile time      (eager materializes N^2 rules; matcher captures 1, defers)
- *   - ground rules      (SPACE: eager N^2; matcher ~= matches)
- *   - arena bytes        (SPACE: rule storage)
+ *   - rules+rows        (SPACE: eager N^2 rules; matcher ~= matches — as view
+ *                        ROWS for island preds (#80), ground rules otherwise)
+ *   - arena+view bytes   (SPACE: rule storage + the view store)
  *   - per-update time    (change one fact, requery: the judgment-layer refresh)
  *
- * Expected shape — and the point of the §8.1 router: the matcher's SPACE win is
- * decisive when sparse. Its TIME today is dragged by a per-reground schema
- * rebuild (world_matched_reset dirties the cached columnar schema), so it can be
- * SLOWER per update even when sparse — the cost the schema-rebuild optimization
- * and the router both address. NOT a ctest; build -O2 (Release) for real numbers.
+ * Expected shape: the matcher's SPACE win is decisive when sparse, and with
+ * the island/view path (#80) its per-update TIME is the join + view refill —
+ * no rule churn, no schema rebuild, no solve for view-answered queries.
+ * NOT a ctest; build -O2 (Release) for real numbers.
  *
  *   ./bench_matcher              density sweep + scale sweep
  *   ./bench_matcher <N> <permil> one point (density in per-mille of N^2)
@@ -107,8 +107,11 @@ static result run(const char *src, int matched, intern *sy, int N, int permil,
     snprintf(nm, sizeof nm, "linked(a%d,a%d)", fi, fj);
     dl_lit q = dl_pos(intern_id(sy, nm));
     (void)world_query(w, q);                 /* build the initial (matched) layer */
-    r.rules = world_judgment_rule_count(w);
-    r.bytes = (long)world_arena_bytes(w);
+    /* SPACE: island matches live as view ROWS, not ground rules (#80), so the
+     * matched layer's footprint is rules + view rows and arena + view bytes —
+     * counting rules alone would read as an (unreal) infinite space win. */
+    r.rules = world_judgment_rule_count(w) + world_view_row_count(w);
+    r.bytes = (long)(world_arena_bytes(w) + world_view_bytes(w));
 
     double t0 = now_ms();
     for (int k = 0; k < updates; k++) {
@@ -162,9 +165,9 @@ int main(int argc, char **argv)
     int Ns[] = { 40, 80, 160, 240 };
     for (size_t i = 0; i < sizeof Ns / sizeof *Ns; i++) bench_one(Ns[i], 20, 100);
 
-    printf("\nReading: SPACE — matcher grounds far fewer rules when sparse (rules ratio >> 1),\n"
-           "converging to eager at 100%%. TIME — the matcher re-grounds + rebuilds the cached\n"
-           "schema every update, so update-time can be WORSE even when sparse (ratio < 1); that\n"
-           "is the schema-rebuild cost the optimization issue + the §8.1 router address.\n");
+    printf("\nReading: SPACE — the matcher's matched layer (view rows here, since the link\n"
+           "rule is an island, #80) tracks the anchor relation's density, converging to eager\n"
+           "at 100%%. TIME — a matcher update is the join + view refill; a view-answered query\n"
+           "runs no solve, so update time scales with matches, not the fluent universe.\n");
     return 0;
 }
