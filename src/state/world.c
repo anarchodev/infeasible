@@ -129,6 +129,9 @@ struct world {
      * Grown geometrically; slot value -1 = absent. Fluents/nums are append-only. */
     int *fluent_of; uint32_t fluent_of_cap;
     int *num_of;    uint32_t num_of_cap;
+    int *guard_of;  uint32_t guard_of_cap;   /* guard atom  -> guards index  */
+    int *prov_of;   uint32_t prov_of_cap;    /* provider atom -> provs index */
+    int *eguard_of; uint32_t eguard_of_cap;  /* expr-guard atom -> eguards index */
     jrule *jrules; int njr, capjr;
     jsup *jsups; int njs, capjs;
     int jr_matched_base;                   /* watermark: static | matched rules (#28) */
@@ -295,6 +298,9 @@ void world_free(world *w)
     free(w->fl_args);
     free(w->fluent_of);
     free(w->num_of);
+    free(w->guard_of);
+    free(w->prov_of);
+    free(w->eguard_of);
     free(w->jrules);
     free(w->jsups);
     free(w->srules);
@@ -499,11 +505,16 @@ long world_get_num(const world *w, uint32_t atom)
     return i >= 0 ? w->nums[i].value : 0;
 }
 
+static int guard_index(const world *w, uint32_t atom)
+{
+    return atom < w->guard_of_cap ? w->guard_of[atom] : -1;
+}
+
 void world_add_guard(world *w, uint32_t guard, uint32_t num,
                      world_cmp op, long threshold)
 {
-    for (int i = 0; i < w->ng; i++)          /* dedup: one atom per (fluent,op,thr) */
-        if (w->guards[i].guard == guard) return;
+    if (guard_index(w, guard) >= 0) return;  /* dedup: one atom per (fluent,op,thr) */
+    atom_map_set(&w->guard_of, &w->guard_of_cap, guard, w->ng);
     GROW(w->guards, w->ng, w->capg);
     w->guards[w->ng].guard = guard;
     w->guards[w->ng].num = num;
@@ -526,12 +537,17 @@ void world_set_fn_provider_fn(world *w, world_fn_provider_fn fn, void *ctx)
     w->fn_provider_ctx = ctx;
 }
 
+static int prov_index(const world *w, uint32_t atom)
+{
+    return atom < w->prov_of_cap ? w->prov_of[atom] : -1;
+}
+
 void world_declare_provider_atom(world *w, uint32_t atom, uint32_t pred,
                                  const uint32_t *args, int nargs)
 {
     if (nargs > 4) nargs = 4;
-    for (int i = 0; i < w->nprov; i++)       /* dedup: one entry per ground atom */
-        if (w->provs[i].atom == atom) return;
+    if (prov_index(w, atom) >= 0) return;    /* dedup: one entry per ground atom */
+    atom_map_set(&w->prov_of, &w->prov_of_cap, atom, w->nprov);
     GROW(w->provs, w->nprov, w->capprov);
     w->provs[w->nprov].atom = atom;
     w->provs[w->nprov].pred = pred;
@@ -550,13 +566,15 @@ static bool provider_holds(const world *w, int i)
 
 /* Load every ground provider atom as a closed-world fact from the callback —
  * mirrors the numeric-guard load; consulted fresh each solve (positions/state may
- * have changed), constant within the solve so the fixpoint's re-reads agree. */
-static void load_providers(world *w, dlcol *f)
+ * have changed), constant within the solve so the fixpoint's re-reads agree.
+ * `of`/`cap` name the target family's location map (the shared dense map today;
+ * the jfam-only sparse map once the judgment family stops sweeping fluents). */
+static void load_providers(world *w, dlcol *f, const uint32_t *of, uint32_t cap)
 {
     for (int i = 0; i < w->nprov; i++) {
         uint32_t pa = w->provs[i].atom;
-        if (pa < w->loc_cap && w->loc_of[pa] != LOC_NONE)
-            dlcol_add_fact(f, (dl_lit){ w->loc_of[pa], !provider_holds(w, i) }, 0);
+        if (pa < cap && of[pa] != LOC_NONE)
+            dlcol_add_fact(f, (dl_lit){ of[pa], !provider_holds(w, i) }, 0);
     }
 }
 
@@ -605,12 +623,17 @@ static bool guard_holds(const world *w, int g)
 
 static long eval_expr(const world *w, const expr_ins *code, int n);
 
+static int eguard_index(const world *w, uint32_t atom)
+{
+    return atom < w->eguard_of_cap ? w->eguard_of[atom] : -1;
+}
+
 void world_add_expr_guard(world *w, uint32_t guard,
                           const expr_ins *lhs, int nlhs,
                           const expr_ins *rhs, int nrhs, world_cmp op)
 {
-    for (int i = 0; i < w->neguard; i++)     /* dedup: one entry per ground atom */
-        if (w->eguards[i].guard == guard) return;
+    if (eguard_index(w, guard) >= 0) return; /* dedup: one entry per ground atom */
+    atom_map_set(&w->eguard_of, &w->eguard_of_cap, guard, w->neguard);
     GROW(w->eguards, w->neguard, w->capeguard);
     expr_ins *l = arena_alloc(&w->a, (size_t)(nlhs ? nlhs : 1) * sizeof *l);
     expr_ins *r = arena_alloc(&w->a, (size_t)(nrhs ? nrhs : 1) * sizeof *r);
@@ -633,12 +656,22 @@ static bool guard_holds_expr(const world *w, int i)
 }
 
 /* Load every ground expression guard as a closed-world fact (like numeric guards). */
-static void load_eguards(world *w, dlcol *f)
+static void load_eguards(world *w, dlcol *f, const uint32_t *of, uint32_t cap)
 {
     for (int i = 0; i < w->neguard; i++) {
         uint32_t ga = w->eguards[i].guard;
-        if (ga < w->loc_cap && w->loc_of[ga] != LOC_NONE)
-            dlcol_add_fact(f, (dl_lit){ w->loc_of[ga], !guard_holds_expr(w, i) }, 0);
+        if (ga < cap && of[ga] != LOC_NONE)
+            dlcol_add_fact(f, (dl_lit){ of[ga], !guard_holds_expr(w, i) }, 0);
+    }
+}
+
+/* Load every ground numeric-comparison guard the same way. */
+static void load_guards(world *w, dlcol *f, const uint32_t *of, uint32_t cap)
+{
+    for (int g = 0; g < w->ng; g++) {
+        uint32_t ga = w->guards[g].guard;
+        if (ga < cap && of[ga] != LOC_NONE)
+            dlcol_add_fact(f, (dl_lit){ of[ga], !guard_holds(w, g) }, 0);
     }
 }
 
@@ -1244,9 +1277,10 @@ static uint32_t assign_loc(world *w, uint32_t atom, uint32_t *n)
     return w->loc_of[atom];
 }
 
-static dl_lit loc_lit(const world *w, dl_lit l)
+/* Rewrite a literal into a family's location space (`of` = its atom->loc map). */
+static dl_lit map_lit(const uint32_t *of, dl_lit l)
 {
-    dl_lit m = { w->loc_of[l.atom], l.neg };
+    dl_lit m = { of[l.atom], l.neg };
     return m;
 }
 
@@ -1325,14 +1359,17 @@ static void emit_atom_names(dlcol *f, const world *w)
 /* Name only the schema locations [from,to) — the atoms a re-ground newly added
  * (#68). Append-only locations (#67) guarantee an atom's location is fixed, so a
  * name set once is never wrong; only the new tail needs naming. */
-static void emit_atom_names_range(dlcol *f, const world *w, uint32_t from, uint32_t to)
+static void emit_atom_names_range(dlcol *f, const world *w, const uint32_t *atomv,
+                                  uint32_t from, uint32_t to)
 {
     for (uint32_t loc = from; loc < to; loc++)
-        dlcol_set_atom_name(f, loc, intern_name(w->syms, w->loc_atom[loc]));
+        dlcol_set_atom_name(f, loc, intern_name(w->syms, atomv[loc]));
 }
 
-/* Add jrules[from,to) as columnar rules (no superiority — that is added once). */
-static void emit_judgment_rule_range(dlcol *f, const world *w, int from, int to)
+/* Add jrules[from,to) as columnar rules (no superiority — that is added once),
+ * rewritten through the target family's location map `of`. */
+static void emit_judgment_rule_range(dlcol *f, const world *w, const uint32_t *of,
+                                     int from, int to)
 {
     dl_lit lbuf[64];
     dl_lit *body = lbuf;
@@ -1345,8 +1382,8 @@ static void emit_judgment_rule_range(dlcol *f, const world *w, int from, int to)
             bodycap = r->nbody;
         }
         for (int i = 0; i < r->nbody; i++)
-            body[i] = loc_lit(w, r->body[i]);
-        int h = dlcol_add_rule(f, r->name, r->kind, loc_lit(w, r->head),
+            body[i] = map_lit(of, r->body[i]);
+        int h = dlcol_add_rule(f, r->name, r->kind, map_lit(of, r->head),
                                body, r->nbody);
         if (r->prov)
             dlcol_set_prov(f, h, r->prov);
@@ -1359,7 +1396,7 @@ static void emit_judgment_rule_range(dlcol *f, const world *w, int from, int to)
  * leading slice of the step family (primed bodies may read these conclusions). */
 static void emit_judgment_rules(dlcol *f, const world *w)
 {
-    emit_judgment_rule_range(f, w, 0, w->njr);
+    emit_judgment_rule_range(f, w, w->loc_of, 0, w->njr);
     for (int j = 0; j < w->njs; j++)
         dlcol_add_sup(f, w->jsups[j].winner, w->jsups[j].loser);
 }
@@ -1380,14 +1417,14 @@ static void emit_judgment_family(world *w)
         assign_locs_matched(w);        /* only the matched jrules — no O(fluents) rescan */
         dlcol_truncate_rules(w->jfam, w->jfam_wm_rules, w->jfam_wm_body, w->jfam_wm_sups);
         dlcol_ensure_atoms(w->jfam, (int)w->nloc);
-        emit_atom_names_range(w->jfam, w, w->jfam_named, w->nloc);
+        emit_atom_names_range(w->jfam, w, w->loc_atom, w->jfam_named, w->nloc);
         w->jfam_named = w->nloc;
     } else {
         assign_locs(w);                /* full: fluents + static rules + step rules */
         if (w->jfam) dlcol_free(w->jfam);
         w->jfam = dlcol_new((int)w->nloc, 1);
-        emit_atom_names_range(w->jfam, w, 0, w->nloc);
-        emit_judgment_rule_range(w->jfam, w, 0, w->jr_matched_base);   /* static */
+        emit_atom_names_range(w->jfam, w, w->loc_atom, 0, w->nloc);
+        emit_judgment_rule_range(w->jfam, w, w->loc_of, 0, w->jr_matched_base); /* static */
         for (int j = 0; j < w->njs; j++)                              /* static sups */
             dlcol_add_sup(w->jfam, w->jsups[j].winner, w->jsups[j].loser);
         w->jfam_wm_rules = dlcol_rule_count(w->jfam);
@@ -1396,7 +1433,7 @@ static void emit_judgment_family(world *w)
         w->jfam_named    = w->nloc;
         w->jfam_static_ver = w->static_ver;
     }
-    emit_judgment_rule_range(w->jfam, w, w->jr_matched_base, w->njr); /* matched suffix */
+    emit_judgment_rule_range(w->jfam, w, w->loc_of, w->jr_matched_base, w->njr); /* matched suffix */
     w->jfam_solved = false;
 }
 
@@ -1448,12 +1485,12 @@ static void emit_step_family(world *w)
         }
         int bi = 0;
         for (int i = 0; i < r->nbody; i++)
-            body[bi++] = loc_lit(w, r->body[i].primed
+            body[bi++] = map_lit(w->loc_of, r->body[i].primed
                                         ? primed_lit(w, r->body[i].lit)
                                         : r->body[i].lit);
         if (r->action != INTERN_NONE) {
             dl_lit act = { r->action, false };
-            body[bi++] = loc_lit(w, act);
+            body[bi++] = map_lit(w->loc_of, act);
         }
         for (int e = 0; e < r->neffects; e++) {
             dl_lit eff = r->effects[e];
@@ -1529,15 +1566,9 @@ static void solve_judgment_family(world *w)
         dl_lit l = { w->fl_loc[i], !w->vals[i] };   /* f if true, ~f if false */
         dlcol_add_fact(f, l, 0);
     }
-    for (int g = 0; g < w->ng; g++) {
-        uint32_t ga = w->guards[g].guard;
-        if (ga < w->loc_cap && w->loc_of[ga] != LOC_NONE) {
-            dl_lit l = { w->loc_of[ga], !guard_holds(w, g) };
-            dlcol_add_fact(f, l, 0);
-        }
-    }
-    load_providers(w, f);
-    load_eguards(w, f);
+    load_guards(w, f, w->loc_of, w->loc_cap);
+    load_providers(w, f, w->loc_of, w->loc_cap);
+    load_eguards(w, f, w->loc_of, w->loc_cap);
     dlcol_solve(f);
     w->jfam_solved = true;
 }
@@ -1654,15 +1685,9 @@ static void solve_step_family_vals(world *w, const bool *vals,
         }
     }
     /* numeric guard atoms feed judgment rules inside the step theory too */
-    for (int g = 0; g < w->ng; g++) {
-        uint32_t ga = w->guards[g].guard;
-        if (ga < w->loc_cap && w->loc_of[ga] != LOC_NONE) {
-            dl_lit l = { w->loc_of[ga], !guard_holds(w, g) };
-            dlcol_add_fact(f, l, 0);
-        }
-    }
-    load_providers(w, f);
-    load_eguards(w, f);
+    load_guards(w, f, w->loc_of, w->loc_cap);
+    load_providers(w, f, w->loc_of, w->loc_cap);
+    load_eguards(w, f, w->loc_of, w->loc_cap);
     dlcol_solve(f);
 }
 
