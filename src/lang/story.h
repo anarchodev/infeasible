@@ -160,6 +160,8 @@ story_matcher *story_compile_matcher(const char *src, const char *srcname,
  * drop the previous matched rules, refresh the extension index, re-run the join. */
 void   story_matcher_reground(story_matcher *m);
 world *story_matcher_world(const story_matcher *m);
+/* Fact-tuples the last reground walked (#46 selectivity instrumentation). */
+long   story_matcher_last_probes(const story_matcher *m);
 void   story_matcher_free(story_matcher *m);
 
 #endif

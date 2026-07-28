@@ -3420,6 +3420,7 @@ struct story_matcher {
     world  *w;
     m_rule *rules;
     int     nrules, caprules;
+    long    probes;            /* fact-tuples visited in the last reground (#46) */
 };
 
 static char *m_dup(const char *s)
@@ -3496,13 +3497,62 @@ static bool m_atom_present(const factindex *ix, const m_rule *r, const m_atom *a
     return factindex_next(&c, tup);
 }
 
-/* The same semi-naïve nested-loop join as match_rec, over the compact plan and a
- * caller-supplied (live) fact index: positive atoms generate, negated atoms are
- * deferred to the leaf and applied as closed-world filters. */
-static void m_match_rec(story_matcher *m, m_rule *r, int b, uint32_t *bind,
-                        const factindex *ix)
+static bool m_is_generator(const m_atom *a)   /* a positive fluent — scannable */
 {
-    if (b == r->nbody) {
+    return !a->neg && !a->is_guard && !a->is_provider;
+}
+
+/* Selectivity-ordered join plan (#46): visit the generator atoms smallest live
+ * extension first (factindex_count), each connected to an already-bound var so we
+ * never form an accidental cartesian sub-join. The order is a deterministic
+ * function of the current extension sizes (I4). Reordering is semantically
+ * invisible — the join commutes, so the same instance set is produced — it only
+ * shrinks the intermediate bindings walked. `gorder` gets the body indices of the
+ * generators in visitation order; filters (negation, guards, providers) are not
+ * ordered here — they apply at the leaf / to the solver. */
+static void plan_generators(m_rule *r, const factindex *ix, int *gorder, int *pngen)
+{
+    bool used[MAX_BODY] = { 0 };
+    bool vb[MAX_ARGS]   = { 0 };            /* vars bound by already-ordered generators */
+    int  ngen = 0, ncand = 0;
+    for (int b = 0; b < r->nbody; b++)
+        if (m_is_generator(&r->body[b])) ncand++;
+
+    for (int step = 0; step < ncand; step++) {
+        int  best = -1; long bestcnt = 0; bool best_conn = false;
+        for (int b = 0; b < r->nbody; b++) {
+            m_atom *at = &r->body[b];
+            if (used[b] || !m_is_generator(at)) continue;
+            bool conn = (ngen == 0);        /* the first pick is unconstrained */
+            for (int k = 0; k < at->nargs && !conn; k++) {
+                int vi = m_var_index(r, at->arg[k]);
+                if (vi >= 0 && vb[vi]) conn = true;
+            }
+            long cnt = factindex_count(ix, at->pred);
+            /* prefer a connected atom; among equal connectivity, the smaller
+             * extension; ties break on body order (deterministic). */
+            bool better = best < 0 ||
+                          (conn != best_conn ? conn : cnt < bestcnt);
+            if (better) { best = b; bestcnt = cnt; best_conn = conn; }
+        }
+        gorder[ngen++] = best;
+        used[best] = true;
+        for (int k = 0; k < r->body[best].nargs; k++) {
+            int vi = m_var_index(r, r->body[best].arg[k]);
+            if (vi >= 0) vb[vi] = true;
+        }
+    }
+    *pngen = ngen;
+}
+
+/* Semi-naïve nested-loop join over the compact plan and a live fact index,
+ * visiting generators in the selectivity order `gorder` (see plan_generators).
+ * At the leaf every var is bound; the negated fluent filters are applied, then
+ * the instance is emitted with its full body. */
+static void m_match_rec(story_matcher *m, m_rule *r, const int *gorder, int ngen,
+                        int gi, uint32_t *bind, const factindex *ix)
+{
+    if (gi == ngen) {
         for (int f = 0; f < r->nbody; f++)
             if (r->body[f].neg && !r->body[f].is_guard && !r->body[f].is_provider &&
                 m_atom_present(ix, r, &r->body[f], bind))
@@ -3510,10 +3560,7 @@ static void m_match_rec(story_matcher *m, m_rule *r, int b, uint32_t *bind,
         m_emit(m, r, bind);
         return;
     }
-    m_atom *at = &r->body[b];
-    if (at->neg || at->is_guard || at->is_provider) {  /* filter, not a generator: defer */
-        m_match_rec(m, r, b + 1, bind, ix); return;
-    }
+    m_atom *at = &r->body[gorder[gi]];
     int n = at->nargs;
     bool     filt[FACTINDEX_MAXARGS];
     uint32_t want[FACTINDEX_MAXARGS];
@@ -3528,6 +3575,7 @@ static void m_match_rec(story_matcher *m, m_rule *r, int b, uint32_t *bind,
     factindex_scan(ix, at->pred, filt, want, &c);
     uint32_t tup[FACTINDEX_MAXARGS];
     while (factindex_next(&c, tup)) {
+        m->probes++;                                   /* one intermediate binding walked */
         int set[FACTINDEX_MAXARGS], nset = 0;
         bool ok = true;
         for (int k = 0; k < n; k++) {
@@ -3536,7 +3584,7 @@ static void m_match_rec(story_matcher *m, m_rule *r, int b, uint32_t *bind,
             if (bind[vi] == INTERN_NONE) { bind[vi] = tup[k]; set[nset++] = vi; }
             else if (bind[vi] != tup[k]) { ok = false; break; }   /* repeated var agrees */
         }
-        if (ok) m_match_rec(m, r, b + 1, bind, ix);
+        if (ok) m_match_rec(m, r, gorder, ngen, gi + 1, bind, ix);
         for (int s = 0; s < nset; s++) bind[set[s]] = INTERN_NONE; /* backtrack */
     }
 }
@@ -3578,12 +3626,21 @@ void story_matcher_reground(story_matcher *m)
 {
     world_matched_reset(m->w);                       /* drop the previous layer */
     const factindex *ix = world_fact_index(m->w);    /* refresh from live vals  */
+    m->probes = 0;
     uint32_t bind[MAX_ARGS];
     for (int i = 0; i < m->nrules; i++) {
-        for (int v = 0; v < m->rules[i].nvars; v++) bind[v] = INTERN_NONE;
-        m_match_rec(m, &m->rules[i], 0, bind, ix);
+        m_rule *r = &m->rules[i];
+        for (int v = 0; v < r->nvars; v++) bind[v] = INTERN_NONE;
+        int gorder[MAX_BODY], ngen = 0;
+        plan_generators(r, ix, gorder, &ngen);       /* selectivity order for THIS tick */
+        m_match_rec(m, r, gorder, ngen, 0, bind, ix);
     }
 }
+
+/* Fact-tuples the last reground walked — the join's intermediate work. With
+ * selectivity ordering this tracks the smallest generator's extension, not the
+ * largest (#46). */
+long story_matcher_last_probes(const story_matcher *m) { return m->probes; }
 
 world *story_matcher_world(const story_matcher *m) { return m->w; }
 
