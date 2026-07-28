@@ -62,6 +62,11 @@
     "state ( ax )\n" \
     "rule r: /* \xC3\xA9 */ ax => bx"
 
+/* Cache-invalidation fixture: `foo`'s declaration moves from L0 to L2 across an
+ * edit; a stale cached model would keep pointing at L0. */
+#define SRC_V1 "state ( foo )\nrule r: foo => bar"
+#define SRC_V2 "\n\nstate ( foo )\nrule r: foo => bar"
+
 /* Capture sink: accumulate every emitted body, newline-separated, for strstr. */
 static void cap_emit(void *ud, const char *body, size_t len)
 {
@@ -450,6 +455,42 @@ static int test_utf16(void)
     return 0;
 }
 
+/* The span model is cached per document and reused across navigation requests;
+ * a didChange must invalidate it so navigation reflects the new text, not the
+ * stale compile. `foo`'s decl moves L0 -> L2 across the edit. */
+static int test_cache_invalidation(void)
+{
+    lsp_server *s = lsp_new();
+    strbuf cap; sb_init(&cap);
+    strbuf msg; sb_init(&msg);
+    const char *uri = "file:///cache.story";
+
+    build_open(&msg, uri, SRC_V1);
+    dispatch(s, &cap, msg.buf);
+    sb_reset(&cap);
+
+    /* definition on foo's body use (L1) -> its decl at L0. */
+    build_pos_req(&msg, "textDocument/definition", uri, 1, 8, 50);
+    dispatch(s, &cap, msg.buf);
+    CHECK(strstr(cap.buf, "\"line\":0,\"character\":8") != NULL);
+    sb_reset(&cap);
+
+    /* edit: two blank lines pushed in front. */
+    build_change(&msg, uri, SRC_V2);
+    dispatch(s, &cap, msg.buf);
+    sb_reset(&cap);
+
+    /* definition on foo's body (now L3) -> its decl at L2, never the stale L0. */
+    build_pos_req(&msg, "textDocument/definition", uri, 3, 8, 51);
+    dispatch(s, &cap, msg.buf);
+    CHECK(strstr(cap.buf, "\"line\":2,\"character\":8") != NULL);
+    CHECK(strstr(cap.buf, "\"line\":0") == NULL);
+
+    sb_free(&msg); sb_free(&cap);
+    lsp_free(s);
+    return 0;
+}
+
 /* The minimal JSON layer: parse a nested object, typed accessors, escapes,
  * and rejection of malformed input. */
 static int test_json(void)
@@ -495,6 +536,7 @@ int main(void)
     if (test_hover())       return 1;
     if (test_call_hierarchy()) return 1;
     if (test_utf16())       return 1;
+    if (test_cache_invalidation()) return 1;
     printf("test_lsp: all passed\n");
     return 0;
 }

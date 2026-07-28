@@ -31,7 +31,10 @@ static char *xstrdup(const char *s)
     return d;
 }
 
-typedef struct { char *uri; char *text; } lsp_doc;
+/* `model` is the cached span model for the current `text` — compiled once per
+ * edit (in refresh) and reused by every navigation request until the next
+ * didChange invalidates it. NULL when stale/unbuilt. */
+typedef struct { char *uri; char *text; story_model *model; } lsp_doc;
 
 struct lsp_server {
     lsp_doc *docs;
@@ -51,6 +54,7 @@ void lsp_free(lsp_server *s)
     for (size_t i = 0; i < s->ndocs; i++) {
         free(s->docs[i].uri);
         free(s->docs[i].text);
+        story_model_free(s->docs[i].model);
     }
     free(s->docs);
     free(s);
@@ -71,14 +75,17 @@ static void doc_put(lsp_server *s, const char *uri, const char *text)
     if (d) {
         free(d->text);
         d->text = xstrdup(text);
+        story_model_free(d->model);   /* text changed -> the cached model is stale */
+        d->model = NULL;
         return;
     }
     if (s->ndocs == s->cap) {
         s->cap = s->cap ? s->cap * 2 : 8;
         s->docs = realloc(s->docs, s->cap * sizeof *s->docs);
     }
-    s->docs[s->ndocs].uri  = xstrdup(uri);
-    s->docs[s->ndocs].text = xstrdup(text);
+    s->docs[s->ndocs].uri   = xstrdup(uri);
+    s->docs[s->ndocs].text  = xstrdup(text);
+    s->docs[s->ndocs].model = NULL;
     s->ndocs++;
 }
 
@@ -88,6 +95,7 @@ static void doc_remove(lsp_server *s, const char *uri)
         if (strcmp(s->docs[i].uri, uri) == 0) {
             free(s->docs[i].uri);
             free(s->docs[i].text);
+            story_model_free(s->docs[i].model);
             s->docs[i] = s->docs[--s->ndocs];
             return;
         }
@@ -196,37 +204,47 @@ static void emit_diagnostic(strbuf *sb, const story_diag *d, const char *text)
     sb_char(sb, '}');
 }
 
-/* Compile `text` and push a publishDiagnostics notification for `uri`. A NULL
- * text (closed document) publishes an empty list, clearing the editor. */
-static void publish(lsp_server *s, const char *uri, const char *text,
-                    lsp_emit_fn emit, void *ud)
+/* Emit a publishDiagnostics for `uri` from an already-collected `diags`. */
+static void emit_diagnostics(const char *uri, const char *text,
+                             const story_diags *diags, lsp_emit_fn emit, void *ud)
 {
-    (void)s;
     strbuf sb;
     sb_init(&sb);
     sb_raw(&sb, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\""
                 ",\"params\":{\"uri\":");
     sb_jstr(&sb, uri);
     sb_raw(&sb, ",\"diagnostics\":[");
-
-    if (text) {
-        story_diag di[256];
-        story_diags diags = { di, (int)(sizeof di / sizeof di[0]), 0, 0 };
-        intern *syms = intern_new();
-        world *w = story_compile(text, "<lsp>", syms, &diags);
-
-        int shown = diags.count < diags.cap ? diags.count : diags.cap;
-        for (int i = 0; i < shown; i++) {
-            if (i) sb_char(&sb, ',');
-            emit_diagnostic(&sb, &di[i], text);
-        }
-        if (w) world_free(w);
-        intern_free(syms);
+    int shown = diags->count < diags->cap ? diags->count : diags->cap;
+    for (int i = 0; i < shown; i++) {
+        if (i) sb_char(&sb, ',');
+        emit_diagnostic(&sb, &diags->items[i], text);
     }
-
     sb_raw(&sb, "]}}");
     emit(ud, sb.buf, sb.len);
     sb_free(&sb);
+}
+
+/* Recompile `d` ONCE per edit: cache the fresh span model on it (which every
+ * navigation request then reuses) and publish diagnostics from the same
+ * compile — replacing the former recompile-per-request. */
+static void refresh(lsp_doc *d, lsp_emit_fn emit, void *ud)
+{
+    story_model_free(d->model);
+    d->model = NULL;
+    story_diag di[256];
+    story_diags diags = { di, (int)(sizeof di / sizeof di[0]), 0, 0 };
+    intern *syms = intern_new();
+    world *w = story_compile_model(d->text, "<lsp>", syms, &diags, &d->model);
+    if (w) world_free(w);
+    intern_free(syms);                 /* the model copied its names */
+    emit_diagnostics(d->uri, d->text, &diags, emit, ud);
+}
+
+/* Clear diagnostics for a uri with no live document (after didClose). */
+static void publish_empty(const char *uri, lsp_emit_fn emit, void *ud)
+{
+    story_diags empty = { NULL, 0, 0, 0 };
+    emit_diagnostics(uri, NULL, &empty, emit, ud);
 }
 
 /* ------------------------------------------------------------------ replies */
@@ -282,18 +300,18 @@ static const char *INITIALIZE_RESULT =
 
 /* ---------------------------------------------------------------- navigation */
 
-/* Compile `text` for its span model only (diagnostics dropped); the model
- * copies names, so `syms` is freed immediately. NULL on allocation failure.
- * TODO: cache per document — recompiling on every navigation request is fine
- * for editor-sized files but wasteful; invalidate on didChange. */
-static story_model *model_for(const char *text)
+/* The document's cached span model — compiled once per edit in refresh() and
+ * reused across navigation requests. Lazily built here only if a request
+ * somehow precedes the refresh; freed with the document / on didChange. */
+static const story_model *doc_model(lsp_doc *d)
 {
-    story_model *m = NULL;
-    intern *syms = intern_new();
-    world *w = story_compile_model(text, "<lsp>", syms, NULL, &m);
-    if (w) world_free(w);
-    intern_free(syms);
-    return m;
+    if (d && !d->model && d->text) {
+        intern *syms = intern_new();
+        world *w = story_compile_model(d->text, "<lsp>", syms, NULL, &d->model);
+        if (w) world_free(w);
+        intern_free(syms);
+    }
+    return d ? d->model : NULL;
 }
 
 /* The occurrence whose token covers 1-based (line, col), or NULL. */
@@ -366,7 +384,7 @@ static void on_definition(lsp_server *s, const json *msg, const json *id,
     const char *uri = nav_uri(msg);
     strbuf rb; sb_init(&rb); sb_char(&rb, '[');
     if (d) {
-        story_model *m = model_for(d->text);
+        const story_model *m = doc_model(d);
         const story_occ *hit = occ_at(m, line, col);
         if (hit) {
             int n; const story_occ *occs = story_model_occs(m, &n);
@@ -380,7 +398,6 @@ static void on_definition(lsp_server *s, const json *msg, const json *id,
                 }
             }
         }
-        story_model_free(m);
     }
     sb_char(&rb, ']');
     reply_result(emit, ud, id, rb.buf);
@@ -400,7 +417,7 @@ static void on_references(lsp_server *s, const json *msg, const json *id,
                  "includeDeclaration"), true);
     strbuf rb; sb_init(&rb); sb_char(&rb, '[');
     if (d) {
-        story_model *m = model_for(d->text);
+        const story_model *m = doc_model(d);
         const story_occ *hit = occ_at(m, line, col);
         if (hit) {
             int n; const story_occ *occs = story_model_occs(m, &n);
@@ -412,7 +429,6 @@ static void on_references(lsp_server *s, const json *msg, const json *id,
                 write_location(&rb, uri, d->text, &occs[i]);
             }
         }
-        story_model_free(m);
     }
     sb_char(&rb, ']');
     reply_result(emit, ud, id, rb.buf);
@@ -463,7 +479,7 @@ static void on_hover(lsp_server *s, const json *msg, const json *id,
     bool have = false;
 
     if (d) {
-        story_model *m = model_for(d->text);
+        const story_model *m = doc_model(d);
         const story_occ *hit = occ_at(m, line, col);
         if (hit) {
             have = true;
@@ -512,7 +528,6 @@ static void on_hover(lsp_server *s, const json *msg, const json *id,
             sb_char(&rb, '}');
             sb_free(&md);
         }
-        story_model_free(m);
     }
 
     reply_result(emit, ud, id, have ? rb.buf : "null");
@@ -598,7 +613,7 @@ static void on_prepare_call_hierarchy(lsp_server *s, const json *msg, const json
     strbuf rb; sb_init(&rb);
     bool have = false;
     if (d) {
-        story_model *m = model_for(d->text);
+        const story_model *m = doc_model(d);
         const story_occ *hit = occ_at(m, line, col);
         if (hit) {
             have = true;
@@ -606,7 +621,6 @@ static void on_prepare_call_hierarchy(lsp_server *s, const json *msg, const json
             write_ch_item(&rb, uri, d->text, m, hit->name);
             sb_char(&rb, ']');
         }
-        story_model_free(m);
     }
     reply_result(emit, ud, id, have ? rb.buf : "null");
     sb_free(&rb);
@@ -631,7 +645,7 @@ static void on_incoming_calls(lsp_server *s, const json *msg, const json *id,
     lsp_doc *d = uri ? doc_find(s, uri) : NULL;
     strbuf rb; sb_init(&rb); sb_char(&rb, '[');
     if (d && name) {
-        story_model *m = model_for(d->text);
+        const story_model *m = doc_model(d);
         int nr; story_model_rules(m, &nr);
         char *seen = nr ? calloc((size_t)nr, 1) : NULL;   /* one edge per rule */
         int no; const story_occ *occs = story_model_occs(m, &no);
@@ -651,7 +665,6 @@ static void on_incoming_calls(lsp_server *s, const json *msg, const json *id,
             sb_raw(&rb, "]}");
         }
         free(seen);
-        story_model_free(m);
     }
     sb_char(&rb, ']');
     reply_result(emit, ud, id, rb.buf);
@@ -668,7 +681,7 @@ static void on_outgoing_calls(lsp_server *s, const json *msg, const json *id,
     lsp_doc *d = uri ? doc_find(s, uri) : NULL;
     strbuf rb; sb_init(&rb); sb_char(&rb, '[');
     if (d && name) {
-        story_model *m = model_for(d->text);
+        const story_model *m = doc_model(d);
         int no; const story_occ *occs = story_model_occs(m, &no);
         const char **seen = calloc((size_t)no + 1, sizeof *seen);
         int nseen = 0, emitted = 0;
@@ -693,7 +706,6 @@ static void on_outgoing_calls(lsp_server *s, const json *msg, const json *id,
             }
         }
         free(seen);
-        story_model_free(m);
     }
     sb_char(&rb, ']');
     reply_result(emit, ud, id, rb.buf);
@@ -708,7 +720,7 @@ static void on_document_symbol(lsp_server *s, const json *msg, const json *id,
     lsp_doc *d = uri ? doc_find(s, uri) : NULL;
     strbuf rb; sb_init(&rb); sb_char(&rb, '[');
     if (d) {
-        story_model *m = model_for(d->text);
+        const story_model *m = doc_model(d);
         int n; const story_symbol *syms = story_model_symbols(m, &n);
         for (int i = 0; i < n; i++) {
             if (i) sb_char(&rb, ',');
@@ -726,7 +738,6 @@ static void on_document_symbol(lsp_server *s, const json *msg, const json *id,
             write_range(&rb, d->text, syms[i].line, syms[i].col, syms[i].len);
             sb_char(&rb, '}');
         }
-        story_model_free(m);
     }
     sb_char(&rb, ']');
     reply_result(emit, ud, id, rb.buf);
@@ -749,7 +760,7 @@ static void on_did_open(lsp_server *s, const json *msg, lsp_emit_fn emit, void *
     const char *text = json_str(json_get(td, "text"));
     if (!uri || !text) return;
     doc_put(s, uri, text);
-    publish(s, uri, doc_find(s, uri)->text, emit, ud);
+    refresh(doc_find(s, uri), emit, ud);
 }
 
 static void on_did_change(lsp_server *s, const json *msg, lsp_emit_fn emit, void *ud)
@@ -763,7 +774,7 @@ static void on_did_change(lsp_server *s, const json *msg, lsp_emit_fn emit, void
     const char *text = json_str(json_get(json_arr_at(changes, n - 1), "text"));
     if (!text) return;
     doc_put(s, uri, text);
-    publish(s, uri, doc_find(s, uri)->text, emit, ud);
+    refresh(doc_find(s, uri), emit, ud);
 }
 
 static void on_did_close(lsp_server *s, const json *msg, lsp_emit_fn emit, void *ud)
@@ -771,7 +782,7 @@ static void on_did_close(lsp_server *s, const json *msg, lsp_emit_fn emit, void 
     const char *uri = doc_uri(msg);
     if (!uri) return;
     doc_remove(s, uri);
-    publish(s, uri, NULL, emit, ud);   /* clear diagnostics */
+    publish_empty(uri, emit, ud);   /* clear diagnostics */
 }
 
 bool lsp_dispatch(lsp_server *s, const char *body, size_t len,
