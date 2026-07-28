@@ -12,6 +12,10 @@
  * the semantic pass, so it is grounding-path independent — this test compiles via
  * the join matcher (no init facts => it grounds nothing) to keep it fast while
  * still exercising the check.
+ *
+ * It also pins the *hard* cap one tier up: a cross product past MAX_INSTANCES
+ * (2²⁰) is a compile ERROR, not a warning and not a silent nᵏ drop (#27) — a
+ * rule the author wrote must never vanish from the theory unremarked.
  */
 
 #include "lang/story.h"
@@ -47,6 +51,32 @@ static int expect(const char *src, int nwarn, const char *needle)
         for (int i = 0; i < d.count; i++) fprintf(stderr, "  [%d] %s\n", i, di[i].msg);
         rc = 1;
     } else if (needle) {
+        int found = 0;
+        for (int i = 0; i < d.count; i++) if (strstr(di[i].msg, needle)) found = 1;
+        if (!found) {
+            fprintf(stderr, "no diag contains '%s':\n", needle);
+            for (int i = 0; i < d.count; i++) fprintf(stderr, "  [%d] %s\n", i, di[i].msg);
+            rc = 1;
+        }
+    }
+    if (w) world_free(w);
+    intern_free(sy);
+    return rc;
+}
+
+/* Compile via the EAGER path (story_compile, where the odometer materializes
+ * the cross product); assert the compile FAILED and some error diag carries
+ * `needle`. This is the hard 2²⁰ cap, distinct from the anchor-aware warning. */
+static int expect_cap_error(const char *src, const char *needle)
+{
+    intern *sy = intern_new();
+    story_diag di[32];
+    story_diags d = { di, 32, 0, 0 };
+    world *w = story_compile(src, "cap.story", sy, &d);
+    int rc = 0;
+    if (w) { fprintf(stderr, "expected compile to FAIL past the cap, but it succeeded\n"); rc = 1; }
+    else if (d.nerrors == 0) { fprintf(stderr, "compile returned NULL but no error diag\n"); rc = 1; }
+    else {
         int found = 0;
         for (int i = 0; i < d.count; i++) if (strstr(di[i].msg, needle)) found = 1;
         if (!found) {
@@ -102,6 +132,21 @@ int main(void)
         "rule flag(X: actor): awake(X) => flagged(X)\n",
         ENTS);
     if (expect(src, 0, NULL)) return 1;
+
+    /* --- errors: past the 2²⁰ hard cap it's a compile ERROR, not a warning and
+     *     not a silent drop (#27). 1025² = 1050625 > MAX_INSTANCES (2²⁰). --- */
+    {
+        static char big[12288];
+        gen_entities(big, sizeof big, 1025);
+        static char cap[24576];
+        snprintf(cap, sizeof cap,
+            "sort actor\n"
+            "state ( awake(actor) )\n"
+            "entity ( %s : actor )\n"
+            "rule pair(X: actor, Y: actor): awake(X) & awake(Y) => paired(X, Y)\n",
+            big);
+        if (expect_cap_error(cap, "cardinality cap")) return 1;
+    }
 
     printf("test_cardinality: all passed\n");
     return 0;

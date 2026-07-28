@@ -3086,9 +3086,15 @@ static void ground_rule(parser *p, ast_rule *r)
     bool of = false;
     long total = instance_count(p, r->vars, r->nvars, &of);
     if (of) {
-        warn(p, r->line, r->col,
+        /* Hard error, not a warning: a rule the author wrote silently vanishing
+         * from the theory is a correctness hole (missing conclusions, no
+         * failure) — "loud failures, no silent caps". Until the M3 tick-time
+         * matcher (#26/#28) can absorb an un-anchored cross product, an author
+         * must add a sparser anchor rather than ship a dropped rule. When the
+         * matcher/router lands this cap becomes a routing threshold, not a stop. */
+        serr(p, r->line, r->col,
              "rule '%s' grounds to more than %d instances — add a sparser "
-             "anchor or split the sorts (§5.2 cardinality warning)",
+             "anchor or split the sorts (§5.2 cardinality cap)",
              r->label, MAX_INSTANCES);
         return;
     }
@@ -3862,6 +3868,15 @@ static bool join_atom_ok(parser *p, const ast_atom *a, const var_bind *vars,
 
 static void emit_join_family(parser *p, ast_rule *r)
 {
+    /* Honor the same cardinality cap the eager path enforces: the lane builder
+     * below allocates npred×niter×nent uint32 for the ground map, so an
+     * over-cap cross product would burn multi-GB (N^arity) to build a lane for
+     * a rule that never grounded. Silent: the eager path already reported it. */
+    bool of = false;
+    (void)instance_count(p, r->vars, r->nvars, &of);
+    if (of)
+        return;
+
     int Sl = r->vars[0].sort;
     int nent = domain_size(p, Sl);
     if (nent == 0)
@@ -4432,7 +4447,8 @@ static void build_lane_families(parser *p)
     for (int S = 0; S < p->nsorts; S++)
         emit_sort_lanes(p, S, taint);
     for (int i = 0; i < p->nrules; i++)
-        if (p->rules[i].nvars >= 2)                /* the join matcher (2+ vars) */
+        if (p->rules[i].nvars >= 2 &&              /* the join matcher (2+ vars) */
+            p->rules[i].ninst > 0)                 /* skip rules that never ground */
             emit_join_family(p, &p->rules[i]);
 }
 
