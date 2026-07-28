@@ -135,7 +135,11 @@ typedef enum {
                    * function pred (<<8) and its argument count (low 8 bits); the
                    * top `nargs` stack cells are the (already-evaluated) call args,
                    * replaced by the returned value */
-    EXPR_ADD, EXPR_SUB, EXPR_MUL, EXPR_NEG, EXPR_MIN, EXPR_MAX
+    EXPR_ADD, EXPR_SUB, EXPR_MUL, EXPR_NEG, EXPR_MIN, EXPR_MAX,
+    EXPR_DIV      /* floored: quotient rounds toward -inf (5e "round down", so
+                   * -7/2 = -4 — NOT C truncation), pinned by golden test (I4).
+                   * Division by zero yields 0 (defined; a constant-0 divisor is
+                   * rejected at compile time by the .story front end). */
 } expr_op;
 typedef struct { expr_op op; long arg; } expr_ins;
 

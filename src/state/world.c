@@ -1944,6 +1944,14 @@ static long eval_expr(const world *w, const expr_ins *code, int n)
         case EXPR_MUL:   sp--; st[sp-1] *= st[sp]; break;
         case EXPR_MIN:   sp--; if (st[sp] < st[sp-1]) st[sp-1] = st[sp]; break;
         case EXPR_MAX:   sp--; if (st[sp] > st[sp-1]) st[sp-1] = st[sp]; break;
+        case EXPR_DIV: { /* floored (round toward -inf); x/0 = 0 — see world.h */
+            sp--;
+            long a = st[sp-1], b = st[sp];
+            long q = b == 0 ? 0 : a / b;
+            if (b != 0 && a % b != 0 && (a < 0) != (b < 0)) q--;
+            st[sp-1] = q;
+            break;
+        }
         }
     }
     return sp ? st[sp-1] : 0;

@@ -71,7 +71,8 @@ typedef struct {
  * nodes are the closed arithmetic set. Grounding walks the tree per instance,
  * folding constant subtrees and emitting VM bytecode for the rest. */
 typedef enum {
-    EX_CONST, EX_LOAD, EX_ROLL, EX_CALL, EX_ADD, EX_SUB, EX_MUL, EX_NEG, EX_MIN, EX_MAX
+    EX_CONST, EX_LOAD, EX_ROLL, EX_CALL, EX_ADD, EX_SUB, EX_MUL, EX_DIV, EX_NEG,
+    EX_MIN, EX_MAX
 } ex_kind;
 /* EX_CALL (§5.6): a value-returning function-provider call `f(e1, …, ek)`.
  * `pred` = the function name; `nargs` = k; `cargs[0..k)` = child expr indices. */
@@ -603,8 +604,9 @@ static void parse_entity(parser *p)
 /* ---- effect-expression parser (§5.8) --------------------------------
  *
  *   expr   := term (('+'|'-') term)*
- *   term   := factor ('*' factor)*
- *   factor := '-' factor | INT | ('min'|'max') '(' expr ',' expr ')'
+ *   term   := factor (('*'|'/') factor)*      -- '/' floors (rounds toward -inf)
+ *   factor := '-' factor | INT
+ *           | ('min'|'max'|'divup') '(' expr ',' expr ')'  -- divup = ceiling div
  *           | IDENT [ '(' arg (',' arg)* ')' ]        -- a numeric fluent read
  *           | '(' expr ')'
  * Returns a node index into p->exprs, or -1 on error. */
@@ -657,6 +659,7 @@ static int parse_factor(parser *p)
     if (p->cur.kind == TK_IDENT) {
         token id = p->cur;
         bool ismin = ident_is(id, "min"), ismax = ident_is(id, "max");
+        bool isdivup = ident_is(id, "divup");
         advance(p);
         if (ident_is(id, "roll") && p->cur.kind == TK_LPAREN) {   /* roll(sides[, tag]) */
             advance(p);
@@ -671,7 +674,8 @@ static int parse_factor(parser *p)
             p->exprs[n].lhs = (int)tag;
             return n;
         }
-        if ((ismin || ismax) && p->cur.kind == TK_LPAREN) {   /* min/max(a, b) */
+        if ((ismin || ismax || isdivup) && p->cur.kind == TK_LPAREN) {
+            /* min/max(a, b), divup(a, b) */
             advance(p);
             int a = parse_expr(p);
             if (a < 0) return -1;
@@ -679,6 +683,28 @@ static int parse_factor(parser *p)
             int b = parse_expr(p);
             if (b < 0) return -1;
             if (!expect(p, TK_RPAREN)) return -1;
+            if (isdivup) {
+                /* ceiling division ("rounded up", the 5e per-feature exception
+                 * to the global round-down rule): desugar to -((-a) / b) — the
+                 * floor/ceil identity, so the dual semantics can never drift
+                 * from EXPR_DIV and fold/VM agree by construction. */
+                long dv;
+                if (expr_fold(p, b, &dv) && dv == 0) {
+                    fail(p, id.line, id.col, "division by a constant zero");
+                    return -1;
+                }
+                int na = alloc_expr(p, EX_NEG, id.line, id.col);
+                if (na < 0) return -1;
+                p->exprs[na].lhs = a;
+                int nd = alloc_expr(p, EX_DIV, id.line, id.col);
+                if (nd < 0) return -1;
+                p->exprs[nd].lhs = na;
+                p->exprs[nd].rhs = b;
+                int nn = alloc_expr(p, EX_NEG, id.line, id.col);
+                if (nn < 0) return -1;
+                p->exprs[nn].lhs = nd;
+                return nn;
+            }
             int n = alloc_expr(p, ismin ? EX_MIN : EX_MAX, id.line, id.col);
             if (n < 0) return -1;
             p->exprs[n].lhs = a;
@@ -746,11 +772,17 @@ static int parse_term(parser *p)
 {
     int l = parse_factor(p);
     if (l < 0) return -1;
-    while (p->cur.kind == TK_STAR) {
+    while (p->cur.kind == TK_STAR || p->cur.kind == TK_SLASH) {
+        bool isdiv = p->cur.kind == TK_SLASH;
         token o = p->cur; advance(p);
         int r = parse_factor(p);
         if (r < 0) return -1;
-        int n = alloc_expr(p, EX_MUL, o.line, o.col);
+        long dv;
+        if (isdiv && expr_fold(p, r, &dv) && dv == 0) {
+            fail(p, o.line, o.col, "division by a constant zero");
+            return -1;
+        }
+        int n = alloc_expr(p, isdiv ? EX_DIV : EX_MUL, o.line, o.col);
         if (n < 0) return -1;
         p->exprs[n].lhs = l; p->exprs[n].rhs = r; l = n;
     }
@@ -779,10 +811,11 @@ static bool parse_atom(parser *p, ast_atom *out)
     memset(out, 0, sizeof *out);
     if (p->cur.kind == TK_TILDE) { out->neg = true; advance(p); }
     /* An expression guard `expr <cmp> expr` (§5.8/§5.10) — recognised when the
-     * conjunct starts with something a boolean atom can't: a `roll`/`min`/`max`
-     * function call, an int, `(`, or `-`. Covers the d20:
+     * conjunct starts with something a boolean atom can't: a `roll`/`min`/`max`/
+     * `divup` function call, an int, `(`, or `-`. Covers the d20:
      * `roll(20) + atk(A) >= ac(T)` and `max(roll(20,1), roll(20,2)) + atk >= ac`. */
     if (ident_is(p->cur, "roll") || ident_is(p->cur, "min") || ident_is(p->cur, "max") ||
+        ident_is(p->cur, "divup") ||
         p->cur.kind == TK_INT || p->cur.kind == TK_LPAREN || p->cur.kind == TK_MINUS) {
         token lead = p->cur;
         int lhs = parse_expr(p);
@@ -2888,6 +2921,10 @@ static bool expr_fold(parser *p, int e, long *out)
         case EX_ADD: *out = a + b; break;
         case EX_SUB: *out = a - b; break;
         case EX_MUL: *out = a * b; break;
+        case EX_DIV:                       /* floored, matching EXPR_DIV exactly */
+            if (b == 0) return false;      /* stays dynamic: the VM defines x/0 = 0 */
+            *out = a / b - ((a % b != 0 && (a < 0) != (b < 0)) ? 1 : 0);
+            break;
         case EX_MIN: *out = a < b ? a : b; break;
         case EX_MAX: *out = a > b ? a : b; break;
         default: return false;
@@ -2945,8 +2982,8 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
     emit_expr(p, n->lhs, vars, nvars, binding, code, pos);
     emit_expr(p, n->rhs, vars, nvars, binding, code, pos);
     expr_op op = n->kind == EX_ADD ? EXPR_ADD : n->kind == EX_SUB ? EXPR_SUB
-               : n->kind == EX_MUL ? EXPR_MUL : n->kind == EX_MIN ? EXPR_MIN
-                                                                  : EXPR_MAX;
+               : n->kind == EX_MUL ? EXPR_MUL : n->kind == EX_DIV ? EXPR_DIV
+               : n->kind == EX_MIN ? EXPR_MIN                     : EXPR_MAX;
     if (*pos < MAX_CODE) { code[*pos].op = op; code[(*pos)++].arg = 0; }
 }
 
