@@ -88,7 +88,13 @@
  *                                          -- a static grounding filter over a var's
  *                                          -- finite domain; never in the fixpoint
  *   cmp     := '<=' | '<' | '>=' | '>' | '='
- *   numop   := ':=' | '+=' | '-='                        -- numeric effect (§5.8)
+ *   numop   := ':=' | '+=' | '-='                        -- numeric effect (§5.8);
+ *                                          -- a `+=`/`-=` RHS may end `'as' IDENT`
+ *                                          -- (#83): the delta accumulates in that
+ *                                          -- enum value's damage-type bucket and the
+ *                                          -- commit consults resistant/vulnerable/
+ *                                          -- immune(<subject>, <type>) judgments
+ *                                          -- after summation, before the clamp (#84)
  *   expr    := term (('+'|'-') term)*                    -- effect RHS, int-only
  *   term    := factor (('*'|'/') factor)*   -- '/' floors (rounds toward -inf, §5.8)
  *   factor  := '-' factor | INT

@@ -26,6 +26,7 @@ typedef enum {
     TK_FOR, TK_EACH, TK_WHERE, TK_WHEN, TK_LIMIT,
     /* first-class value domains (§13): `enum school { … }`, `set of actor` */
     TK_ENUM, TK_SET, TK_OF,
+    TK_AS,         /* typed contribution (#83): `hp(T) -= e as fire` */
 
     TK_LPAREN, TK_RPAREN, TK_LBRACE, TK_RBRACE,
     TK_COLON, TK_COMMA, TK_AMP, TK_TILDE,

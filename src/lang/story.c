@@ -71,6 +71,8 @@ typedef struct {
                                 * mempool, `neg` = `not in`. A static grounding
                                 * filter — never emitted, never in the fixpoint. */
     int         mem_ix, mem_n;
+    uint32_t    as_value;      /* `-= e as fire` (#83): the damage-type enum value
+                                * this contribution accumulates under; 0 = untyped */
     int       line, col;
 } ast_atom;
 
@@ -300,6 +302,8 @@ typedef struct {
     int nfunctions;
     ast_fluent  valuedecls[MAX_FLUENTS];  /* engine-derived values (#82): `value v(…) : int` */
     int nvaluedecls;
+    int dtype_sort;               /* #83: the ONE enum-sort damage types come from
+                                   * (-1 until an `as` typed contribution is seen) */
     int value_def[MAX_FLUENTS];           /* per value: defining rule index, -1 = none */
     int vdepth;                           /* value-inline recursion depth (cycle backstop) */
     ast_rule   *rules;            /* heap; MAX_RULES */
@@ -1038,6 +1042,17 @@ static bool parse_atom(parser *p, ast_atom *out)
         if (e < 0) return false;
         out->is_num_effect = true;
         out->expr_root = e;
+        if (p->cur.kind == TK_AS) {            /* typed contribution (#83) */
+            advance(p);
+            if (p->cur.kind != TK_IDENT) {
+                char d[64]; tok_desc(p->cur, d, sizeof d);
+                fail(p, p->cur.line, p->cur.col,
+                     "expected a damage-type value after `as`, found %s", d);
+                return false;
+            }
+            out->as_value = intern_tok(p, p->cur);
+            advance(p);
+        }
     }
     return true;
 }
@@ -2595,6 +2610,44 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
         }
         check_pred_args(p, at->pred, pi, at->args, at->nargs, vars, nvars, ctx);
         check_expr(p, at->expr_root, vars, nvars);
+        if (at->as_value != INTERN_NONE) {          /* typed contribution (#83) */
+            if (at->numop == WORLD_OP_ASSIGN) {
+                serr(p, at->line, at->col,
+                     "`as` types a contribution (`+=`/`-=`), not a `:=` "
+                     "assignment — an assigned value has no damage type");
+                return;
+            }
+            int ei = find_entity(p, at->as_value);
+            int es = ei >= 0 ? p->ents[ei].sort : -1;
+            if (es < 0 || !p->sorts[es].is_enum) {
+                serr(p, at->line, at->col,
+                     "'%s' after `as` is not a declared enum value — damage "
+                     "types are a closed `enum` (#83)",
+                     intern_name(p->syms, at->as_value));
+                return;
+            }
+            if (p->dtype_sort >= 0 && p->dtype_sort != es) {
+                serr(p, at->line, at->col,
+                     "typed contributions must draw from ONE enum per world — "
+                     "'%s' is from '%s' but damage types were already '%s'",
+                     intern_name(p->syms, at->as_value), p->sorts[es].name,
+                     p->sorts[p->dtype_sort].name);
+                return;
+            }
+            p->dtype_sort = es;
+            /* the response is per SUBJECT (resistant(subject, type)): the
+             * target fluent's first argument must be an entity */
+            if (pi->arity < 1 || pi->argsort[0] < 0 ||
+                p->sorts[pi->argsort[0]].is_enum) {
+                serr(p, at->line, at->col,
+                     "a typed contribution needs a subject — '%s' must be "
+                     "keyed by an entity first argument (e.g. `hp(actor)`) so "
+                     "`resistant(<subject>, %s)` has someone to be about",
+                     intern_name(p->syms, at->pred),
+                     intern_name(p->syms, at->as_value));
+                return;
+            }
+        }
         return;
     }
     if (pi && pi->is_cell) {   /* read side: cells are read through providers only */
@@ -4484,6 +4537,30 @@ void story_matcher_free(story_matcher *m)
     free(m);
 }
 
+/* Emit one grounded numeric effect. A typed contribution (#83, `as fire`)
+ * routes to its enum bucket and registers the response atoms for this target
+ * instance — resistant/vulnerable/immune(<subject>, <type>), the fixed
+ * response vocabulary — which the commit pipeline consults after summation and
+ * before the clamp (#84). Registration is per (instance, type) and idempotent;
+ * types never mentioned by an effect need no response. */
+static void emit_num_effect(parser *p, int rule, const ast_atom *e,
+                            uint32_t num, uint32_t subject,
+                            const expr_ins *code, int nc)
+{
+    if (e->as_value == INTERN_NONE) {
+        world_add_num_effect(p->w, rule, num, e->numop, code, nc);
+        return;
+    }
+    int ei = find_entity(p, e->as_value);
+    int dt = ei >= 0 ? p->ent_pos[ei] : -1;        /* position within the enum sort */
+    world_add_num_effect_typed(p->w, rule, num, e->numop, code, nc, dt);
+    uint32_t rargs[2] = { subject, e->as_value };
+    world_set_num_response(p->w, num, dt,
+        ground_pred(p, intern_id(p->syms, "resistant"),  rargs, 2),
+        ground_pred(p, intern_id(p->syms, "vulnerable"), rargs, 2),
+        ground_pred(p, intern_id(p->syms, "immune"),     rargs, 2));
+}
+
 static void ground_action(parser *p, ast_action *a)
 {
     bool of = false;
@@ -4569,7 +4646,7 @@ static void ground_action(parser *p, ast_action *a)
             expr_ins code[MAX_CODE];
             int nc = 0;
             emit_expr(p, e->expr_root, a->vars, a->nvars, binding, code, &nc);
-            world_add_num_effect(p->w, h, num, e->numop, code, nc);
+            emit_num_effect(p, h, e, num, nargs[0], code, nc);
         }
 
         /* set-quantified effect binders (§13). The bound var(s) extend this
@@ -4660,7 +4737,7 @@ static void ground_action(parser *p, ast_action *a)
                         expr_ins code[MAX_CODE];
                         int nc = 0;
                         emit_expr(p, e->expr_root, cv, ncv, cb, code, &nc);
-                        world_add_num_effect(p->w, h2, num, e->numop, code, nc);
+                        emit_num_effect(p, h2, e, num, narg[0], code, nc);
                     }
                 }
             }
@@ -5300,6 +5377,12 @@ static bool num_eff_ok(parser *p, const ast_atom *e, int S, uint32_t var, long *
 
 static void emit_step_lanes(parser *p)
 {
+    /* #83/#84: the routed lane numerics don't run the per-type response stage
+     * yet — a typed world stays on the N=1 step path (correctness first; the
+     * lane-side response is #84's remaining slice). */
+    if (p->dtype_sort >= 0)
+        return;
+
     /* Judgment rules do not block the transition: a judgment never changes a
      * fluent (I1), so the next-state fluents are judgment-independent, and a step
      * rule that *reads* a judgment head is rejected by step_atom_ok below (not a
@@ -6008,6 +6091,7 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
                            story_model **out, story_matcher **mret)
 {
     parser *p = calloc(1, sizeof *p);
+    p->dtype_sort = -1;           /* #83: no damage-type enum until an `as` is seen */
     p->ground_matched = matched || mret != NULL;
     p->sparse = mret != NULL;     /* #92: dense universe only for eager +
                                    * compile-time-matched modes */
@@ -6065,6 +6149,9 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
         semantic_pass(p);
         if (p->nerrors == 0) {
             desugar_bands(p);                     /* band ladders → pairwise `>` (§6.2) */
+            if (p->dtype_sort >= 0)               /* #83: size the closed type domain
+                                                   * before any response registers */
+                world_set_dtypes(p->w, p->domain_n[p->dtype_sort]);
             declare_ground_fluents(p);
             ground_inits(p);
             if (p->ground_matched && !mret) build_fact_index(p);
