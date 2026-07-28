@@ -163,6 +163,51 @@ void dlcol_set_prov(dlcol *f, int rule_id, const char *prov)
     f->rules[rule_id].prov = prov ? xstrdup(prov) : NULL;
 }
 
+/* Incremental maintenance (#66): drop the rules/bodies/sups above a watermark so
+ * the caller can re-add a changed suffix (e.g. the tick-time matcher's matched
+ * rules) without rebuilding the whole family. Frees the truncated rule names (they
+ * are xstrdup'd — else they leak per re-ground). The compiled indices + app rows
+ * rebuild from the new counts on the next dlcol_solve. */
+void dlcol_truncate_rules(dlcol *f, int nrules, int nbody, int nsups)
+{
+    if (nrules < 0 || nrules > f->nrules) return;
+    for (int r = nrules; r < f->nrules; r++) {
+        free(f->rules[r].name);
+        free(f->rules[r].prov);
+    }
+    f->nrules = nrules;
+    f->nbody  = nbody;
+    f->nsups  = nsups;
+    f->dirty  = true;
+}
+
+/* Incremental maintenance (#66): grow the atom columns to hold `natoms` atoms,
+ * so a re-ground that introduces new matched atoms can reuse the family. Existing
+ * columns keep their offsets (row r lives at r*W; lit_idx is unchanged), so no
+ * verdict or fact bit moves; new rows are zeroed. No-op when already large enough. */
+void dlcol_ensure_atoms(dlcol *f, int natoms)
+{
+    if (natoms <= f->natoms) return;
+    size_t oldnm = (size_t)f->nlits * f->W;
+    int    new_nlits = natoms * 2;
+    size_t newnm = (size_t)new_nlits * f->W;
+#define REGROW(col) do { \
+        f->col = realloc(f->col, newnm * sizeof *f->col); \
+        memset(f->col + oldnm, 0, (newnm - oldnm) * sizeof *f->col); \
+    } while (0)
+    REGROW(fact); REGROW(delta_t); REGROW(delta_f); REGROW(part_t); REGROW(part_f);
+#undef REGROW
+    f->aname = realloc(f->aname, (size_t)natoms * sizeof *f->aname);
+    for (int a = f->natoms; a < natoms; a++) f->aname[a] = NULL;
+    f->natoms = natoms;
+    f->nlits  = new_nlits;      /* head_off is sized to nlits -> recompile */
+    f->dirty  = true;
+}
+
+int dlcol_rule_count(const dlcol *f) { return f->nrules; }
+int dlcol_body_count(const dlcol *f) { return f->nbody; }
+int dlcol_sup_count(const dlcol *f)  { return f->nsups; }
+
 void dlcol_set_atom_name(dlcol *f, uint32_t atom, const char *name)
 {
     if ((int)atom >= f->natoms)

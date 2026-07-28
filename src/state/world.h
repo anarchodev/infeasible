@@ -223,6 +223,11 @@ int  world_step_rule_count(const world *w);
  * story_matcher_reground calls rather than growing per tick (#48). Leak test. */
 size_t world_arena_bytes(const world *w);
 
+/* The dense schema location assigned to `atom`, or ~0u if it has none yet. Valid
+ * after a query/step has built a family. Append-only (#67): once assigned, an
+ * atom's location never changes across re-grounds — pinned by test_locstable. */
+uint32_t world_atom_loc(const world *w, uint32_t atom);
+
 /* Differential pin (mirrors test_col's dl-vs-dl_col): load current state into
  * every lane family, solve, and compare each (predicate, entity) verdict to
  * world_query on the equivalent ground atom. Returns the number of comparisons;
