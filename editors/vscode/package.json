@@ -1,0 +1,55 @@
+{
+  "name": "infeasible-story",
+  "displayName": "infeasible .story",
+  "description": "Language support for the infeasible .story surface language: diagnostics, go-to-definition, find-references, outline, and dependency/attacker-cone hovers — served by the native story-lsp server.",
+  "version": "0.1.0",
+  "publisher": "infeasible",
+  "license": "SEE LICENSE IN ../../LICENSE",
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Programming Languages"],
+  "main": "./extension.js",
+  "activationEvents": ["onLanguage:story"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "story",
+        "aliases": ["infeasible story", "Story"],
+        "extensions": [".story"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "story",
+        "scopeName": "source.story",
+        "path": "./syntaxes/story.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "story.restartServer",
+        "title": "Restart Server",
+        "category": "infeasible .story"
+      }
+    ],
+    "configuration": {
+      "title": "infeasible .story",
+      "properties": {
+        "story.serverPath": {
+          "type": "string",
+          "default": "story-lsp",
+          "markdownDescription": "Path to the `story-lsp` executable. A bare name is looked up on `PATH`; a relative path resolves against the workspace root. When left at the default, a `build/story-lsp` under the workspace is preferred if present (the CMake build output)."
+        },
+        "story.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Trace the JSON-RPC traffic between VS Code and story-lsp (in the '.story' output channel)."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^8.1.0"
+  }
+}

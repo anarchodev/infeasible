@@ -23,6 +23,8 @@ add_library(infeasible_core STATIC
   src/state/factindex.c
   src/lang/lexer.c
   src/lang/story.c
+  src/lsp/json.c
+  src/lsp/lsp.c
 )
 target_include_directories(infeasible_core PUBLIC src)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
@@ -30,7 +32,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 enable_testing()
-foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse test_scene test_bands test_clamp test_setparam test_domain test_intargs test_functional test_store test_fnprovider test_ground test_mv test_numeric test_numpipe test_numeff test_ramif test_prov test_lanes test_binder test_numlane test_binderlane test_judgstep test_provider test_safety test_cardinality test_spatial test_factindex test_matcher test_ticktime)
+foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse test_scene test_bands test_clamp test_setparam test_domain test_intargs test_functional test_store test_fnprovider test_ground test_mv test_numeric test_numpipe test_numeff test_ramif test_prov test_lanes test_binder test_numlane test_binderlane test_judgstep test_provider test_safety test_cardinality test_spatial test_factindex test_matcher test_ticktime test_model test_lsp)
   add_executable(${t} tests/${t}.c)
   target_link_libraries(${t} PRIVATE infeasible_core)
   add_test(NAME ${t} COMMAND ${t})
@@ -41,6 +43,15 @@ foreach(t IN ITEMS test_parse test_ground test_mv test_numeric test_numeff test_
   target_compile_definitions(${t} PRIVATE
     STORY_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples")
 endforeach()
+
+# The native .story language server (DESIGN.md §6.1 item 7): JSON-RPC over
+# stdio, pushing compiler diagnostics to an editor. Not a test — a shipped
+# binary; the server logic is covered by test_lsp.
+add_executable(story-lsp src/lsp/main.c)
+target_link_libraries(story-lsp PRIVATE infeasible_core)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(story-lsp PRIVATE -Wall -Wextra)
+endif()
 
 # Solver micro-benchmark (not a test). Built -O2 regardless of build type so
 # the numbers reflect release codegen: `./build/bench_dl [natoms] [fanin] [iters]`.

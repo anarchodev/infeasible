@@ -1,0 +1,51 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "infeasible story",
+  "scopeName": "source.story",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#keywords" },
+    { "include": "#call" },
+    { "include": "#numbers" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.story",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.story",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.story",
+          "match": "\\b(rule|action|requires|causes|unless|for|each|where|when|limit)\\b"
+        },
+        {
+          "name": "storage.type.story",
+          "match": "\\b(sort|domain|enum|entity|state|init|provider|function|module|extend|scene|bands|set|of|in|int)\\b"
+        }
+      ]
+    },
+    "call": {
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(?=\\s*\\()",
+      "name": "entity.name.function.story"
+    },
+    "numbers": {
+      "name": "constant.numeric.story",
+      "match": "\\b[0-9]+\\b"
+    },
+    "operators": {
+      "name": "keyword.operator.story",
+      "match": "->|=>|~>|:=|\\+=|-=|>=|<=|\\.\\.|&|~|>|<|=|\\+|-|\\*|@|'"
+    }
+  }
+}

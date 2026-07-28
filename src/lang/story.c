@@ -4754,11 +4754,194 @@ static void build_lane_families(parser *p)
             emit_join_family(p, &p->rules[i]);
 }
 
-/* When `mret` is non-NULL, retain a tick-time matcher plan (#28): matched rules
+/* ---- symbol/occurrence model (story_model.h) ------------------------ */
+
+/* The model is a first-class compiler output, harvested from the parser's own
+ * spanned tables — never a second parse. Names are copied so the model can
+ * outlive `syms` and `src`. */
+struct story_model {
+    story_symbol *syms;  int nsyms,  capsyms;
+    story_occ    *occs;  int noccs,  capoccs;
+    story_rule   *rules; int nrules, caprules;
+};
+
+static char *sm_dup(const char *s)
+{
+    if (!s) s = "";
+    size_t n = strlen(s) + 1;
+    char *d = malloc(n);
+    if (d) memcpy(d, s, n);
+    return d;
+}
+
+static void sm_add_sym(story_model *m, const char *name, story_sym_kind k,
+                       int line, int col)
+{
+    if (!name || !name[0]) return;             /* anonymous rule / empty label */
+    if (m->nsyms == m->capsyms) {
+        m->capsyms = m->capsyms ? m->capsyms * 2 : 32;
+        m->syms = realloc(m->syms, (size_t)m->capsyms * sizeof *m->syms);
+    }
+    story_symbol *s = &m->syms[m->nsyms++];
+    s->name = sm_dup(name);
+    s->kind = k;
+    s->line = line; s->col = col; s->len = (int)strlen(name);
+}
+
+static void sm_add_occ(story_model *m, const char *name, story_occ_role r,
+                       int line, int col, bool neg, int rule)
+{
+    if (!name || !name[0]) return;
+    if (line <= 0) return;                     /* synthetic node, no source span */
+    if (m->noccs == m->capoccs) {
+        m->capoccs = m->capoccs ? m->capoccs * 2 : 64;
+        m->occs = realloc(m->occs, (size_t)m->capoccs * sizeof *m->occs);
+    }
+    story_occ *o = &m->occs[m->noccs++];
+    o->name = sm_dup(name);
+    o->role = r;
+    o->line = line; o->col = col; o->len = (int)strlen(name);
+    o->neg = neg; o->rule = rule;
+}
+
+/* A DECL/arg/init/sup occurrence: no rule owner, no meaningful polarity. */
+static void sm_add_ref(story_model *m, const char *name, story_occ_role r,
+                       int line, int col)
+{
+    sm_add_occ(m, name, r, line, col, false, -1);
+}
+
+/* Harvest one atom of rule `rule` (-1 for non-rule contexts): the predicate
+ * occurrence (carrying its `~` polarity) plus its entity/var arguments. Skips
+ * synthetic predicate-less atoms (expr guards like `roll(20)+atk >= ac`, whose
+ * fluent reads live in expr trees — a later slice). */
+static void sm_atom(story_model *m, parser *p, const ast_atom *a,
+                    story_occ_role role, int rule)
+{
+    if (a->pred != INTERN_NONE)
+        sm_add_occ(m, intern_name(p->syms, a->pred), role, a->line, a->col,
+                   a->neg, rule);
+    for (int i = 0; i < a->nargs; i++) {
+        if (a->args[i].is_int) continue;
+        sm_add_occ(m, intern_name(p->syms, a->args[i].name), STORY_OCC_ARG,
+                   a->args[i].line, a->args[i].col, false, rule);
+    }
+}
+
+static story_model *harvest_model(parser *p)
+{
+    story_model *m = calloc(1, sizeof *m);
+
+    /* rules first — story_occ.rule indexes this list, and it must line up with
+     * p->rules[i] so a rule's head/body occurrences share one owner id. */
+    if (p->nrules > 0) {
+        m->rules = calloc((size_t)p->nrules, sizeof *m->rules);
+        m->caprules = p->nrules;
+        for (int i = 0; i < p->nrules; i++) {
+            m->rules[i].label = sm_dup(p->rules[i].label);   /* "" if anonymous */
+            m->rules[i].line  = p->rules[i].line;
+            m->rules[i].col   = p->rules[i].col;
+        }
+        m->nrules = p->nrules;
+    }
+
+    /* declaration symbols (the document outline) + a DECL occurrence each, so
+     * a references query can surface the declaring site alongside the uses. */
+    for (int i = 0; i < p->nsorts; i++) {
+        story_sym_kind k = p->sorts[i].is_domain ? STORY_SYM_DOMAIN : STORY_SYM_SORT;
+        sm_add_sym(m, p->sorts[i].name, k, p->sorts[i].line, p->sorts[i].col);
+        sm_add_ref(m, p->sorts[i].name, STORY_OCC_DECL, p->sorts[i].line, p->sorts[i].col);
+    }
+    for (int i = 0; i < p->nents; i++) {
+        const char *nm = intern_name(p->syms, p->ents[i].atom);
+        sm_add_sym(m, nm, STORY_SYM_ENTITY, p->ents[i].line, p->ents[i].col);
+        sm_add_ref(m, nm, STORY_OCC_DECL, p->ents[i].line, p->ents[i].col);
+    }
+    for (int i = 0; i < p->nfluents; i++) {
+        const char *nm = intern_name(p->syms, p->fluents[i].pred);
+        sm_add_sym(m, nm, STORY_SYM_FLUENT, p->fluents[i].line, p->fluents[i].col);
+        sm_add_ref(m, nm, STORY_OCC_DECL, p->fluents[i].line, p->fluents[i].col);
+    }
+    for (int i = 0; i < p->nproviders; i++) {
+        const char *nm = intern_name(p->syms, p->providers[i].pred);
+        sm_add_sym(m, nm, STORY_SYM_PROVIDER, p->providers[i].line, p->providers[i].col);
+        sm_add_ref(m, nm, STORY_OCC_DECL, p->providers[i].line, p->providers[i].col);
+    }
+    for (int i = 0; i < p->nfunctions; i++) {
+        const char *nm = intern_name(p->syms, p->functions[i].name);
+        sm_add_sym(m, nm, STORY_SYM_FUNCTION, p->functions[i].line, p->functions[i].col);
+        sm_add_ref(m, nm, STORY_OCC_DECL, p->functions[i].line, p->functions[i].col);
+    }
+    for (int i = 0; i < p->nenums; i++) {
+        sm_add_sym(m, p->enums[i].name, STORY_SYM_ENUM, p->enums[i].line, p->enums[i].col);
+        sm_add_ref(m, p->enums[i].name, STORY_OCC_DECL, p->enums[i].line, p->enums[i].col);
+    }
+    for (int i = 0; i < p->nactions; i++)
+        sm_add_sym(m, p->actions[i].name, STORY_SYM_ACTION,
+                   p->actions[i].line, p->actions[i].col);
+    for (int i = 0; i < p->nrules; i++)
+        sm_add_sym(m, p->rules[i].label, STORY_SYM_RULE,
+                   p->rules[i].line, p->rules[i].col);
+
+    /* rule heads (conclusions) / bodies / guards — tagged with the rule id */
+    for (int i = 0; i < p->nrules; i++) {
+        ast_rule *r = &p->rules[i];
+        sm_atom(m, p, &r->head, STORY_OCC_HEAD, i);
+        for (int b = 0; b < r->nbody; b++)  sm_atom(m, p, &r->body[b],  STORY_OCC_BODY, i);
+        for (int g = 0; g < r->nguard; g++) sm_atom(m, p, &r->guard[g], STORY_OCC_BODY, i);
+    }
+    /* actions: requires (conditions) + effects (writes) — not logic rules */
+    for (int i = 0; i < p->nactions; i++) {
+        ast_action *a = &p->actions[i];
+        for (int q = 0; q < a->nreq; q++) sm_atom(m, p, &a->requires[q], STORY_OCC_BODY, -1);
+        for (int e = 0; e < a->neff; e++) sm_atom(m, p, &a->effects[e],  STORY_OCC_EFFECT, -1);
+    }
+    for (int i = 0; i < p->ninits; i++)
+        sm_atom(m, p, &p->inits[i], STORY_OCC_BODY, -1);
+    for (int i = 0; i < p->nsups; i++) {   /* `a > b` — references two rule labels */
+        sm_add_ref(m, p->sups[i].a, STORY_OCC_BODY, p->sups[i].aline, p->sups[i].acol);
+        sm_add_ref(m, p->sups[i].b, STORY_OCC_BODY, p->sups[i].bline, p->sups[i].bcol);
+    }
+    return m;
+}
+
+const story_symbol *story_model_symbols(const story_model *m, int *n)
+{
+    if (n) *n = m ? m->nsyms : 0;
+    return m ? m->syms : NULL;
+}
+
+const story_occ *story_model_occs(const story_model *m, int *n)
+{
+    if (n) *n = m ? m->noccs : 0;
+    return m ? m->occs : NULL;
+}
+
+const story_rule *story_model_rules(const story_model *m, int *n)
+{
+    if (n) *n = m ? m->nrules : 0;
+    return m ? m->rules : NULL;
+}
+
+void story_model_free(story_model *m)
+{
+    if (!m) return;
+    for (int i = 0; i < m->nsyms; i++)  free((char *)m->syms[i].name);
+    for (int i = 0; i < m->noccs; i++)  free((char *)m->occs[i].name);
+    for (int i = 0; i < m->nrules; i++) free((char *)m->rules[i].label);
+    free(m->syms);
+    free(m->occs);
+    free(m->rules);
+    free(m);
+}
+
+/* `out` (when non-NULL) receives the harvested span model (story_model.h).
+ * `mret` (when non-NULL) retains a tick-time matcher plan (#28): matched rules
  * are captured (not eagerly ground) into `*mret`, and the judgment layer is left
- * for the caller's first story_matcher_reground. Implies matched grounding. */
+ * for the caller's first story_matcher_reground; implies matched grounding. */
 static world *compile_impl(const char *src, const char *srcname, intern *syms,
-                           story_diags *diags, bool matched, story_matcher **mret)
+                           story_diags *diags, bool matched,
+                           story_model **out, story_matcher **mret)
 {
     parser *p = calloc(1, sizeof *p);
     p->ground_matched = matched || mret != NULL;
@@ -4853,6 +5036,10 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
     if (p->nerrors == 0) { result = p->w; if (mret) *mret = m; }
     else { world_free(p->w); story_matcher_free(m); if (mret) *mret = NULL; }
 
+    /* Harvest the span model before the parser tables are torn down —
+     * best-effort, so navigation works even on a file that failed to compile. */
+    if (out) *out = harvest_model(p);
+
     for (int i = 0; i < p->nrules; i++) free(p->rules[i].insts);
     free(p->rules);
     free(p->actions);
@@ -4870,7 +5057,13 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
 world *story_compile(const char *src, const char *srcname, intern *syms,
                      story_diags *diags)
 {
-    return compile_impl(src, srcname, syms, diags, false, NULL);
+    return compile_impl(src, srcname, syms, diags, false, NULL, NULL);
+}
+
+world *story_compile_model(const char *src, const char *srcname, intern *syms,
+                           story_diags *diags, story_model **out)
+{
+    return compile_impl(src, srcname, syms, diags, false, out, NULL);
 }
 
 /* Same grammar and world, but ground rules in the join-matcher kernel via the
@@ -4879,7 +5072,7 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
 world *story_compile_matched(const char *src, const char *srcname, intern *syms,
                              story_diags *diags)
 {
-    return compile_impl(src, srcname, syms, diags, true, NULL);
+    return compile_impl(src, srcname, syms, diags, true, NULL, NULL);
 }
 
 /* Tick-time matcher: compile, retain the matchable-rule plan, and materialize the
@@ -4889,7 +5082,7 @@ story_matcher *story_compile_matcher(const char *src, const char *srcname,
                                      intern *syms, story_diags *diags, world **out)
 {
     story_matcher *m = NULL;
-    world *w = compile_impl(src, srcname, syms, diags, true, &m);
+    world *w = compile_impl(src, srcname, syms, diags, true, NULL, &m);
     if (out) *out = w;
     if (!w) return NULL;                 /* compile failed; m already NULL/freed */
     story_matcher_reground(m);           /* build the initial matched layer */

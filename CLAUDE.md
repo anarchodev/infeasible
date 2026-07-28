@@ -40,11 +40,12 @@ src/core/    arena allocator, string interning         (no deps)
 src/logic/   defeasible engine: theory, solve, why      (deps: core)
 src/state/   fact store, step function, inertia gen      (deps: core, logic)
 src/lang/    .story compiler: lexer → parse → grounder    (deps: core, state)
+src/lsp/     native .story language server (JSON-RPC/stdio)  (deps: core, lang)
 src/wasm/    emcc-only JS↔C shim over world_* (not in CMake)
 tests/       golden semantic tests + benchmarks (ctest)
 ```
 
-`core`, `logic`, `state`, and `lang` link into one static lib `infeasible_core`; tests link against it. `src/wasm/bindings.c` compiles **only** under `emcc` (see `scripts/build_wasm.sh`) — it is not part of the CMake library. There is no native renderer tier — the shipped presentation is a web client over a WASM build.
+`core`, `logic`, `state`, `lang`, and `lsp` link into one static lib `infeasible_core`; tests link against it. The `story-lsp` binary (`src/lsp/main.c`) links that lib — a shipped executable, not a test. `src/wasm/bindings.c` compiles **only** under `emcc` (see `scripts/build_wasm.sh`) — it is not part of the CMake library. There is no native renderer tier — the shipped presentation is a web client over a WASM build.
 
 ### The logic engine (`src/logic/dl.h`)
 
@@ -69,7 +70,15 @@ Beyond boolean fluents, `world.h` also carries the M1 richer state model — **n
 
 ### The .story compiler (`src/lang/`)
 
-`story_compile(src, srcname, syms, diags)` is the front half of the M1 pipeline (`story.h`): a hand-written **lexer** (`lexer.c` — maximal-munch, tracks line/col for diagnostics; keywords for the full §6 surface are reserved even where the parser doesn't yet handle them) feeds a recursive-descent **parser** into an arena AST, then a semantic + **build-time grounder** emits ground rules into the `world_*` API. Typed variables (`X : actor`) are grounded up front over declared finite sorts, so `holding(actor,item)` expands to ground atoms interned as `"holding(a,b)"` — a host querying the equivalent ground atom sees the same id. The grammar handled by the current slice is documented at the top of `story.h`; read it before touching the parser. Diagnostics collect into a caller sink with panic-mode recovery at declaration boundaries; a compile fails only on error-severity diagnostics (warnings like orphan/typo detection never fail it).
+`story_compile(src, srcname, syms, diags)` is the front half of the M1 pipeline (`story.h`): a hand-written **lexer** (`lexer.c` — maximal-munch, tracks line/col for diagnostics; keywords for the full §6 surface are reserved even where the parser doesn't yet handle them) feeds a recursive-descent **parser** into an arena AST, then a semantic + **build-time grounder** emits ground rules into the `world_*` API. Typed variables (`X : actor`) are grounded up front over declared finite sorts, so `holding(actor,item)` expands to ground atoms interned as `"holding(a,b)"` — a host querying the equivalent ground atom sees the same id. The grammar handled by the current slice is documented at the top of `story.h`; read it before touching the parser. Diagnostics collect into a caller sink with panic-mode recovery at declaration boundaries; a compile fails only on error-severity diagnostics (warnings like orphan/typo detection never fail it). Beyond the world and diagnostics, `story_compile_model` emits a **span model** (`src/lang/story_model.h`) — symbols + occurrences with source spans, harvested from the parser's already-spanned tables (best-effort even on a failed compile). It is a tier-neutral `lang` output and the single source of truth for span-based tooling (the LSP, hover, §6.3 interface artifact, §6.1 cones); consumers must read it rather than re-parsing.
+
+### The language server (`src/lsp/`)
+
+A native LSP for `.story` (DESIGN.md §6.1 item 7), JSON-RPC 2.0 over stdio. It links the compiler directly, so an editor sees the **same `story_diags`** an author gets at build time. `lsp_dispatch` is the pure core — feed it one message body, capture replies through a sink — so behaviour is tested without a process (`test_lsp`); `lsp_run` wires it to framed stdio, and `main.c` is just `stdin`/`stdout`. `json.c` is a small zero-dependency JSON parser (arena value tree) + a self-escaping `strbuf` writer — no external LSP/JSON deps, matching the repo's no-hidden-allocation ethos. Features: lifecycle (`initialize`/`shutdown`/`exit`), full-text sync (`didOpen`/`didChange`/`didClose`), push diagnostics, **navigation** (go-to-definition, find-references, documentSymbol), and **hover** — a dependency/attacker cone summary (which rules conclude the atom vs. which attack it — a `~p` head — and how many bodies read it).
+
+**Everything reads the compiler's span model, never a re-parse.** The parser already tracks `line, col` on every AST node; `story_compile_model` harvests that into a `story_model` (see `src/lang/story_model.h`) — a tier-neutral **`lang` output**: `symbols` (declarations + kind + span), `occurrences` (atom, role ∈ decl/head/body/effect/arg, span, **`neg` polarity**, and the owning **`rule` index**), and `rules` (label + span). Head polarity + rule grouping are what the §6.1/§9 cone is built over: a HEAD occ with `neg=true` **attacks** its pred, one with `neg=false` **concludes** it. One source of truth, shared with the §6.3 interface artifact. **Do not re-lex/re-parse in the LSP** — a second grammar walker drifts.
+
+A thin **VS Code client** lives in `editors/vscode/` (buildless CommonJS, matching the repo's no-build-step JS ethos — not in CMake): it only spawns `story-lsp` over stdio via `vscode-languageclient` and contributes the `.story` file association, comment/bracket config, and a TextMate grammar. Any language logic belongs in the server, so every editor benefits — the shim stays dumb. `npm install` + F5 to run (see its README). Diagnostic/navigation columns are byte offsets (correct for ASCII; the UTF-16-code-unit remap LSP wants is deferred). **Next:** navigable cones via callHierarchy, documentSymbol `detail`/icons (#50), per-document model caching, effect-expr-tree traversal in the harvest.
 
 ### Core (`src/core/`)
 
