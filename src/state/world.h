@@ -78,6 +78,16 @@ typedef bool (*world_provider_fn)(void *ctx, uint32_t pred,
 void world_set_provider_fn(world *w, world_provider_fn fn, void *ctx);
 void world_declare_provider_atom(world *w, uint32_t atom, uint32_t pred,
                                  const uint32_t *args, int nargs);
+/* Ask the provider callback directly (no callback -> closed-world false) —
+ * the match-time filter evaluation for island rules (#80), identical to what
+ * the solver's provider fact-load would conclude for the same state. */
+bool world_provider_holds_at(const world *w, uint32_t pred,
+                             const uint32_t *args, int nargs);
+/* Does `num_atom <op> threshold` hold for the numeric fluent's current value
+ * (undeclared reads 0, like world_get_num)? The match-time analog of a
+ * registered guard atom's closed-world fact (#80). */
+bool world_num_cmp_holds(const world *w, uint32_t num_atom,
+                         world_cmp op, long threshold);
 
 /* Value-returning function providers (§5.6): a host function that returns a
  * value (a cell handle / int), not a relation — e.g. `neighbor(at(X), dir)` for

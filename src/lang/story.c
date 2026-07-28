@@ -3265,9 +3265,12 @@ static bool pred_in_refs(parser *p, uint32_t pred)
  * rule bodies, `unless` guards, action/ramification `requires`, and binder
  * `where`/`when` (heads, effects and inits deliberately don't note). Called
  * after desugar_bands, so band-synthesized `>` edges are visible via nsups.
- * Phase 1: bodies must be pure fluent generators / negated filters —
- * guard/provider filters keep the jfam path until match-time evaluation
- * lands. */
+ * Guard/provider FILTERS are fine: the matcher evaluates them at the match
+ * leaf (world_num_cmp_holds / world_provider_holds_at) — the same values the
+ * solver's fact-load would read, at the same freshness (both run under one
+ * matched_stale trigger). A guard-filtered head answers UNDECIDED instead of
+ * eager's vacuous REFUTED — the documented provability-contract asymmetry the
+ * matcher already has for unsatisfiable instances. */
 static bool rule_island(parser *p, ast_rule *r)
 {
     if (r->kind == DL_DEFEATER) return false;
@@ -3279,11 +3282,6 @@ static bool rule_island(parser *p, ast_rule *r)
     for (int j = 0; j < p->nrules; j++)
         if (&p->rules[j] != r && p->rules[j].head.pred == r->head.pred)
             return false;
-    for (int b = 0; b < r->nbody; b++) {
-        pred_info *pi = find_pred(p, r->body[b].pred);
-        if (r->body[b].is_guard || (pi && pi->is_provider))
-            return false;                          /* phase 2 lifts this */
-    }
     return true;
 }
 
@@ -3537,6 +3535,30 @@ static void m_emit_rule(story_matcher *m, m_rule *r, const uint32_t *bind)
 static void m_emit(story_matcher *m, m_rule *r, const uint32_t *bind)
 {
     if (r->island) {                               /* #80: membership, not rules */
+        /* Guard/provider FILTERS evaluate here, at the leaf, instead of being
+         * carried into a rule body for the solver: same values, same
+         * matched_stale freshness. A failing filter emits nothing — the head
+         * stays unmatched (UNDECIDED), where eager's inapplicable ground rule
+         * would refute it: the documented provability-contract asymmetry.
+         * Nothing is registered — landmark atoms appear only if a why
+         * materializes the instance (m_emit_rule runs m_ground_lit then). */
+        for (int b = 0; b < r->nbody; b++) {
+            const m_atom *a = &r->body[b];
+            if (!a->is_guard && !a->is_provider)
+                continue;
+            uint32_t args[MAX_ARGS];
+            for (int k = 0; k < a->nargs; k++) {
+                int vi = m_var_index(r, a->arg[k]);
+                args[k] = vi >= 0 ? bind[vi] : a->arg[k];
+            }
+            if (a->is_guard) {
+                uint32_t term = ground_pred_s(m->syms, a->pred, args, a->nargs);
+                if (!world_num_cmp_holds(m->w, term, a->cmp, a->threshold))
+                    return;
+            } else if (!world_provider_holds_at(m->w, a->pred, args, a->nargs)) {
+                return;
+            }
+        }
         dl_lit head = m_ground_lit(m, r, &r->head, bind);
         world_view_add(m->w, r->view, head.atom, bind, r->nvars);
         return;

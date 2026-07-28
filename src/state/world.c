@@ -600,6 +600,13 @@ static bool provider_holds(const world *w, int i)
                           w->provs[i].args, w->provs[i].nargs);
 }
 
+bool world_provider_holds_at(const world *w, uint32_t pred,
+                             const uint32_t *args, int nargs)
+{
+    if (!w->provider_fn) return false;
+    return w->provider_fn(w->provider_ctx, pred, args, nargs);
+}
+
 /* Load every ground provider atom as a closed-world fact from the callback —
  * mirrors the numeric-guard load; consulted fresh each solve (positions/state may
  * have changed), constant within the solve so the fixpoint's re-reads agree.
@@ -655,6 +662,12 @@ static bool guard_holds(const world *w, int g)
 {
     return cmp_ok(world_get_num(w, w->guards[g].num), w->guards[g].threshold,
                   w->guards[g].op);
+}
+
+bool world_num_cmp_holds(const world *w, uint32_t num_atom,
+                         world_cmp op, long threshold)
+{
+    return cmp_ok(world_get_num(w, num_atom), threshold, op);
 }
 
 static long eval_expr(const world *w, const expr_ins *code, int n);

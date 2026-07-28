@@ -254,10 +254,93 @@ static int story_half(void)
     return 1;
 }
 
+/* ---- Part 3: guard/provider FILTER islands (phase 2) ---- */
+
+static const char *GRD_STORY =
+    "scene grd\n"
+    "sort actor\n"
+    "entity ( a, b : actor )\n"
+    "provider sees(actor, actor)\n"
+    "state (\n"
+    "  awake(actor)\n"
+    "  hp(actor) : int in 0 .. 10\n"
+    ")\n"
+    "init (\n"
+    "  awake(a)\n"
+    "  awake(b)\n"
+    "  hp(a) = 3\n"
+    "  hp(b) = 8\n"
+    ")\n"
+    "rule weak(X: actor): awake(X) & hp(X) <= 5 => weak(X)\n"
+    "rule spot(X: actor, Y: actor): awake(X) & awake(Y) & sees(X, Y) => spotted(X, Y)\n";
+
+static bool grd_sees_cb(void *ctx, uint32_t pred, const uint32_t *args, int nargs)
+{
+    (void)pred;
+    const uint32_t *pair = ctx;                    /* sees(a,b) only */
+    return nargs >= 2 && args[0] == pair[0] && args[1] == pair[1];
+}
+
+static int guard_half(void)
+{
+    intern *sy = intern_new();
+    story_diag da[16]; story_diags dga = { da, 16, 0, 0 };
+    story_diag db[16]; story_diags dgb = { db, 16, 0, 0 };
+
+    world *A = story_compile(GRD_STORY, "grd.story", sy, &dga);
+    world *B = NULL;
+    story_matcher *M = story_compile_matcher(GRD_STORY, "grd.story", sy, &dgb, &B);
+    CHECK(A && M && B && dga.nerrors == 0 && dgb.nerrors == 0);
+
+    uint32_t pair[2] = { intern_id(sy, "a"), intern_id(sy, "b") };
+    world_set_provider_fn(A, grd_sees_cb, pair);
+    world_set_provider_fn(B, grd_sees_cb, pair);
+
+    /* guard filter: hp(a)=3 <= 5 passes, hp(b)=8 fails. The failed filter is
+     * the documented provability asymmetry: eager refutes the inapplicable
+     * instance, the island simply never matched it. */
+    CHECK(world_query(B, dl_pos(intern_id(sy, "weak(a)"))) == DL_PROVED);
+    CHECK(world_query(A, dl_pos(intern_id(sy, "weak(a)"))) == DL_PROVED);
+    CHECK(world_query(B, dl_pos(intern_id(sy, "weak(b)"))) == DL_UNDECIDED);
+    CHECK(world_query(A, dl_pos(intern_id(sy, "weak(b)"))) == DL_REFUTED);
+
+    /* provider filter: sees(a,b) holds, sees(b,a) does not */
+    CHECK(world_query(B, dl_pos(intern_id(sy, "spotted(a,b)"))) == DL_PROVED);
+    CHECK(world_query(B, dl_pos(intern_id(sy, "spotted(b,a)"))) == DL_UNDECIDED);
+
+    /* materialize-on-why re-runs the FULL body incl. landmark registration, so
+     * guard/provider island traces are byte-identical to eager's */
+    {
+        dl_lit q = dl_pos(intern_id(sy, "weak(a)"));
+        char *wa = why_str(A, q), *wb = why_str(B, q);
+        if (strcmp(wa, wb) != 0)
+            fprintf(stderr, "guard why differs:\n--- eager ---\n%s\n--- island ---\n%s\n",
+                    wa, wb);
+        CHECK(strcmp(wa, wb) == 0);
+        free(wa); free(wb);
+    }
+    {
+        dl_lit q = dl_pos(intern_id(sy, "spotted(a,b)"));
+        char *wa = why_str(A, q), *wb = why_str(B, q);
+        CHECK(strcmp(wa, wb) == 0);
+        free(wa); free(wb);
+    }
+
+    /* the guard tracks numeric state across a re-solve: hp(a) := 9 drops weak(a) */
+    world_set_num(B, intern_id(sy, "hp(a)"), 9);
+    CHECK(world_query(B, dl_pos(intern_id(sy, "weak(a)"))) == DL_REFUTED); /* dropped */
+
+    story_matcher_free(M);
+    world_free(A); world_free(B);
+    intern_free(sy);
+    return 1;
+}
+
 int main(void)
 {
     if (!world_api_half()) return 1;
     if (!story_half()) return 1;
+    if (!guard_half()) return 1;
     printf("test_matchview: all passed\n");
     return 0;
 }
