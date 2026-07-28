@@ -1,6 +1,8 @@
 #include "state/world.h"
+#include "state/factindex.h"
 #include "core/arena.h"
 #include "core/grow.h"
+#include "core/intern.h"
 #include "logic/dl_col.h"
 
 #include <stdlib.h>
@@ -117,6 +119,11 @@ struct world {
     uint32_t *fluents; bool *vals; uint32_t *primed;
     const char **fl_prov;         /* decl span per fluent (§6.3), or NULL */
     int nfl, capfl;
+    /* Structured view per fluent for the tick-time extension index (#28):
+     * fl_pred[i]=INTERN_NONE means "no structure" (absent from the index).
+     * fl_args is flat, FACTINDEX_MAXARGS per fluent. */
+    uint32_t *fl_pred; int *fl_nargs; uint32_t *fl_args;
+    factindex *fidx; bool fidx_dirty;   /* extension index over the live vals */
     /* atom -> index maps, so declare/lookup is O(1) not a linear scan (interns
      * are dense uint32, so a direct-indexed array is the natural perfect hash).
      * Grown geometrically; slot value -1 = absent. Fluents/nums are append-only. */
@@ -124,6 +131,7 @@ struct world {
     int *num_of;    uint32_t num_of_cap;
     jrule *jrules; int njr, capjr;
     jsup *jsups; int njs, capjs;
+    int jr_matched_base;                   /* watermark: static | matched rules (#28) */
     srule *srules; int nsr, capsr;
 
     /* numeric value store + comparison guards (§5.8, read side). A clamp bound
@@ -214,6 +222,7 @@ world *world_new(intern *syms)
 static void invalidate_state_solved(world *w)
 {
     w->jfam_solved = false;
+    w->fidx_dirty = true;              /* the extension index tracks the vals */
     for (int i = 0; i < w->nlanes; i++)
         w->lanes[i].solved = false;
 }
@@ -249,10 +258,15 @@ void world_free(world *w)
     free(w->fl_loc);
     free(w->pr_loc);
     arena_release(&w->a);
+    if (w->fidx)
+        factindex_free(w->fidx);
     free(w->fluents);
     free(w->vals);
     free(w->primed);
     free(w->fl_prov);
+    free(w->fl_pred);
+    free(w->fl_nargs);
+    free(w->fl_args);
     free(w->fluent_of);
     free(w->num_of);
     free(w->jrules);
@@ -301,6 +315,10 @@ void world_declare_fluent(world *w, uint32_t atom)
         w->vals = realloc(w->vals, (size_t)w->capfl * sizeof *w->vals);
         w->primed = realloc(w->primed, (size_t)w->capfl * sizeof *w->primed);
         w->fl_prov = realloc(w->fl_prov, (size_t)w->capfl * sizeof *w->fl_prov);
+        w->fl_pred = realloc(w->fl_pred, (size_t)w->capfl * sizeof *w->fl_pred);
+        w->fl_nargs = realloc(w->fl_nargs, (size_t)w->capfl * sizeof *w->fl_nargs);
+        w->fl_args = realloc(w->fl_args,
+                             (size_t)w->capfl * FACTINDEX_MAXARGS * sizeof *w->fl_args);
     }
 
     char buf[256];
@@ -309,6 +327,8 @@ void world_declare_fluent(world *w, uint32_t atom)
     w->vals[w->nfl] = false;
     w->primed[w->nfl] = intern_id(w->syms, buf);
     w->fl_prov[w->nfl] = NULL;
+    w->fl_pred[w->nfl] = INTERN_NONE;          /* no structure until set (#28) */
+    w->fl_nargs[w->nfl] = 0;
     atom_map_set(&w->fluent_of, &w->fluent_of_cap, atom, w->nfl);
     w->nfl++;
     w->fam_dirty = true;
@@ -337,6 +357,40 @@ bool world_get(const world *w, uint32_t atom)
 {
     int i = fluent_index(w, atom);
     return i >= 0 && w->vals[i];
+}
+
+/* Record a boolean fluent's (pred, arg-entities) so the extension index can be
+ * rebuilt from w->vals (#28). No-op for an unknown atom or arity over the index
+ * bound (such a fluent simply stays out of the index). */
+void world_set_fluent_struct(world *w, uint32_t atom, uint32_t pred,
+                             const uint32_t *args, int nargs)
+{
+    int i = fluent_index(w, atom);
+    if (i < 0 || nargs < 0 || nargs > FACTINDEX_MAXARGS)
+        return;
+    w->fl_pred[i] = pred;
+    w->fl_nargs[i] = nargs;
+    for (int k = 0; k < nargs; k++)
+        w->fl_args[(size_t)i * FACTINDEX_MAXARGS + k] = args[k];
+    w->fidx_dirty = true;
+}
+
+const struct factindex *world_fact_index(world *w)
+{
+    if (!w->fidx) {
+        w->fidx = factindex_new();
+        w->fidx_dirty = true;
+    }
+    if (w->fidx_dirty) {
+        factindex_clear(w->fidx);
+        for (int i = 0; i < w->nfl; i++)   /* declaration order -> deterministic */
+            if (w->vals[i] && w->fl_pred[i] != INTERN_NONE)
+                factindex_add(w->fidx, w->fl_pred[i],
+                              &w->fl_args[(size_t)i * FACTINDEX_MAXARGS],
+                              w->fl_nargs[i]);
+        w->fidx_dirty = false;
+    }
+    return w->fidx;
 }
 
 /* ---- numeric value store & guards (§5.8, read side) ---------------- */
@@ -567,6 +621,27 @@ void world_add_sup(world *w, int winner, int loser)
     w->njs++;
     w->fam_dirty = true;
     w->lanes_ok = false;          /* a structural edit stales the lane families */
+}
+
+/* Tick-time matcher watermark (#28): the judgment rules added after a checkpoint
+ * are re-materialized matched rules, dropped wholesale before the next re-ground.
+ * Only the RULE array is watermarked, never the superiority array: matched-kernel
+ * rules carry no `>` (the rule_in_sup gate in rule_matchable), so njs is invariant
+ * across a re-ground and the static superiority relation must stay intact — the
+ * checkpoint can therefore precede ground_sup safely. Truncation leaks the
+ * arena-copied names/bodies until world_free (a bump allocator has no per-item
+ * free) — acceptable for the host-driven prototype; adoption routes matched rules
+ * through a resettable region. */
+void world_matched_checkpoint(world *w)
+{
+    w->jr_matched_base = w->njr;
+}
+
+void world_matched_reset(world *w)
+{
+    w->njr = w->jr_matched_base;
+    w->fam_dirty = true;
+    w->lanes_ok = false;
 }
 
 int world_add_step_rule(world *w, const char *name, uint32_t action,
