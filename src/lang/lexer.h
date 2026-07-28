@@ -17,6 +17,7 @@ typedef enum {
      * subset (state/init/rule/action/requires/causes/unless). */
     TK_SORT, TK_ENTITY, TK_STATE, TK_INIT, TK_PROVIDER,
     TK_FUNCTION,   /* value-returning host function (§5.6): `function f(…) : type` */
+    TK_VALUE,      /* engine-derived value (#82): `value v(…) : int` + definition rules */
     TK_RULE, TK_ACTION, TK_REQUIRES, TK_CAUSES, TK_UNLESS,
     TK_MODULE, TK_EXTEND, TK_SCENE, TK_IN,
     TK_BANDS,      /* priority-ladder declaration (§6.2) */

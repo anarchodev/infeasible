@@ -52,7 +52,7 @@ static void skip_trivia(lexer *lx)
 static const struct { const char *word; tok_kind kind; } keywords[] = {
     { "sort", TK_SORT },       { "entity", TK_ENTITY }, { "state", TK_STATE },
     { "init", TK_INIT },       { "provider", TK_PROVIDER },
-    { "function", TK_FUNCTION },
+    { "function", TK_FUNCTION }, { "value", TK_VALUE },
     { "rule", TK_RULE },       { "action", TK_ACTION }, { "requires", TK_REQUIRES },
     { "causes", TK_CAUSES },   { "unless", TK_UNLESS }, { "module", TK_MODULE },
     { "extend", TK_EXTEND },   { "scene", TK_SCENE },   { "in", TK_IN },
@@ -158,6 +158,7 @@ const char *tok_kind_name(tok_kind k)
     case TK_INIT:     return "'init'";
     case TK_PROVIDER: return "'provider'";
     case TK_FUNCTION: return "'function'";
+    case TK_VALUE:    return "'value'";
     case TK_RULE:     return "'rule'";
     case TK_ACTION:   return "'action'";
     case TK_REQUIRES: return "'requires'";
