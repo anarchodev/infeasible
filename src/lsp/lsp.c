@@ -17,6 +17,10 @@
 /* JSON-RPC error codes */
 #define RPC_METHOD_NOT_FOUND (-32601)
 
+/* A degenerate LSP Range at the origin — fallback when an atom has no span. */
+#define ZERO_RANGE \
+    "{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}}"
+
 /* Local dup — the codebase avoids POSIX strdup to stay warning-clean under
  * strict C17 (mirrors dl_col.c's xstrdup). */
 static char *xstrdup(const char *s)
@@ -217,7 +221,8 @@ static void reply_error(lsp_emit_fn emit, void *ud, const json *id,
 static const char *INITIALIZE_RESULT =
     "{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":1}"
     ",\"definitionProvider\":true,\"referencesProvider\":true"
-    ",\"documentSymbolProvider\":true,\"hoverProvider\":true}"
+    ",\"documentSymbolProvider\":true,\"hoverProvider\":true"
+    ",\"callHierarchyProvider\":true}"
     ",\"serverInfo\":{\"name\":\"infeasible-story-lsp\",\"version\":\"0.1.0\"}}";
 
 /* ---------------------------------------------------------------- navigation */
@@ -470,6 +475,187 @@ static void on_hover(lsp_server *s, const json *msg, const json *id,
     sb_free(&rb);
 }
 
+/* ---- call hierarchy: the navigable dependency cone (§6.1 item 7, §9) ----
+ *
+ * The "call" relation models a conclusion using its premises: concluding H
+ * "calls" each body atom of a rule with head H. So expanding an atom shows the
+ * cone the author asked for:
+ *   outgoingCalls(p) — what p is affected by: the premises of every rule that
+ *                      concludes p (walk backward through the support graph).
+ *   incomingCalls(p) — what p affects: the head of every rule that reads p in
+ *                      its body (walk forward). Polarity-agnostic — a `~p` head
+ *                      still depends on its body; attackers live in hover. */
+
+/* A representative occurrence to anchor an atom's item: its declaration, else
+ * a head site, else any occurrence. */
+static const story_occ *repr_occ(const story_model *m, const char *name)
+{
+    int n; const story_occ *o = story_model_occs(m, &n);
+    const story_occ *decl = NULL, *head = NULL, *any = NULL;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(o[i].name, name) != 0) continue;
+        if (!any) any = &o[i];
+        if (o[i].role == STORY_OCC_DECL && !decl) decl = &o[i];
+        if (o[i].role == STORY_OCC_HEAD && !head) head = &o[i];
+    }
+    return decl ? decl : head ? head : any;
+}
+
+static const story_occ *head_of_rule(const story_model *m, int rule)
+{
+    int n; const story_occ *o = story_model_occs(m, &n);
+    for (int i = 0; i < n; i++)
+        if (o[i].role == STORY_OCC_HEAD && o[i].rule == rule) return &o[i];
+    return NULL;
+}
+
+static int atom_kind_int(const story_model *m, const char *name)
+{
+    int n; const story_symbol *s = story_model_symbols(m, &n);
+    for (int i = 0; i < n; i++)
+        if (strcmp(s[i].name, name) == 0) return symbol_kind(s[i].kind);
+    return 24;   /* Event — an undeclared conclusion */
+}
+
+static const char *atom_kind_word(const story_model *m, const char *name)
+{
+    int n; const story_symbol *s = story_model_symbols(m, &n);
+    for (int i = 0; i < n; i++)
+        if (strcmp(s[i].name, name) == 0) return sym_kind_word(s[i].kind);
+    return "conclusion";
+}
+
+static void write_ch_item(strbuf *sb, const char *uri, const story_model *m,
+                          const char *name)
+{
+    const story_occ *r = repr_occ(m, name);
+    sb_raw(sb, "{\"name\":");
+    sb_jstr(sb, name);
+    sb_raw(sb, ",\"kind\":");
+    sb_int(sb, atom_kind_int(m, name));
+    sb_raw(sb, ",\"detail\":");
+    sb_jstr(sb, atom_kind_word(m, name));
+    sb_raw(sb, ",\"uri\":");
+    sb_jstr(sb, uri);
+    sb_raw(sb, ",\"range\":");
+    if (r) write_range(sb, r->line, r->col, r->len); else sb_raw(sb, ZERO_RANGE);
+    sb_raw(sb, ",\"selectionRange\":");
+    if (r) write_range(sb, r->line, r->col, r->len); else sb_raw(sb, ZERO_RANGE);
+    sb_char(sb, '}');
+}
+
+/* prepareCallHierarchy: the atom under the cursor becomes the root item. */
+static void on_prepare_call_hierarchy(lsp_server *s, const json *msg, const json *id,
+                                      lsp_emit_fn emit, void *ud)
+{
+    int line, col;
+    lsp_doc *d = nav_target(s, msg, &line, &col);
+    const char *uri = nav_uri(msg);
+    strbuf rb; sb_init(&rb);
+    bool have = false;
+    if (d) {
+        story_model *m = model_for(d->text);
+        const story_occ *hit = occ_at(m, line, col);
+        if (hit) {
+            have = true;
+            sb_char(&rb, '[');
+            write_ch_item(&rb, uri, m, hit->name);
+            sb_char(&rb, ']');
+        }
+        story_model_free(m);
+    }
+    reply_result(emit, ud, id, have ? rb.buf : "null");
+    sb_free(&rb);
+}
+
+/* The item's atom + document, shared by incoming/outgoing. */
+static const char *ch_item_name(const json *msg)
+{
+    return json_str(json_get(json_get(json_get(msg, "params"), "item"), "name"));
+}
+static const char *ch_item_uri(const json *msg)
+{
+    return json_str(json_get(json_get(json_get(msg, "params"), "item"), "uri"));
+}
+
+/* incomingCalls(p): the head of every rule whose body reads p — what p feeds. */
+static void on_incoming_calls(lsp_server *s, const json *msg, const json *id,
+                              lsp_emit_fn emit, void *ud)
+{
+    const char *uri = ch_item_uri(msg);
+    const char *name = ch_item_name(msg);
+    lsp_doc *d = uri ? doc_find(s, uri) : NULL;
+    strbuf rb; sb_init(&rb); sb_char(&rb, '[');
+    if (d && name) {
+        story_model *m = model_for(d->text);
+        int nr; story_model_rules(m, &nr);
+        char *seen = nr ? calloc((size_t)nr, 1) : NULL;   /* one edge per rule */
+        int no; const story_occ *occs = story_model_occs(m, &no);
+        int emitted = 0;
+        for (int i = 0; i < no; i++) {
+            if (occs[i].role != STORY_OCC_BODY || occs[i].rule < 0) continue;
+            if (strcmp(occs[i].name, name) != 0) continue;
+            if (seen && seen[occs[i].rule]) continue;
+            const story_occ *h = head_of_rule(m, occs[i].rule);
+            if (!h) continue;
+            if (seen) seen[occs[i].rule] = 1;
+            if (emitted++) sb_char(&rb, ',');
+            sb_raw(&rb, "{\"from\":");
+            write_ch_item(&rb, uri, m, h->name);
+            sb_raw(&rb, ",\"fromRanges\":[");
+            write_range(&rb, occs[i].line, occs[i].col, occs[i].len);
+            sb_raw(&rb, "]}");
+        }
+        free(seen);
+        story_model_free(m);
+    }
+    sb_char(&rb, ']');
+    reply_result(emit, ud, id, rb.buf);
+    sb_free(&rb);
+}
+
+/* outgoingCalls(p): the premises of every rule that concludes p — what p is
+ * affected by. Deduplicated by premise name so the tree stays clean. */
+static void on_outgoing_calls(lsp_server *s, const json *msg, const json *id,
+                              lsp_emit_fn emit, void *ud)
+{
+    const char *uri = ch_item_uri(msg);
+    const char *name = ch_item_name(msg);
+    lsp_doc *d = uri ? doc_find(s, uri) : NULL;
+    strbuf rb; sb_init(&rb); sb_char(&rb, '[');
+    if (d && name) {
+        story_model *m = model_for(d->text);
+        int no; const story_occ *occs = story_model_occs(m, &no);
+        const char **seen = calloc((size_t)no + 1, sizeof *seen);
+        int nseen = 0, emitted = 0;
+        for (int i = 0; i < no; i++) {
+            /* p is the head of this rule (a rule concluding p) */
+            if (occs[i].role != STORY_OCC_HEAD || occs[i].rule < 0) continue;
+            if (strcmp(occs[i].name, name) != 0) continue;
+            int rule = occs[i].rule;
+            for (int j = 0; j < no; j++) {
+                if (occs[j].role != STORY_OCC_BODY || occs[j].rule != rule) continue;
+                bool dup = false;
+                for (int k = 0; k < nseen; k++)
+                    if (strcmp(seen[k], occs[j].name) == 0) { dup = true; break; }
+                if (dup) continue;
+                seen[nseen++] = occs[j].name;
+                if (emitted++) sb_char(&rb, ',');
+                sb_raw(&rb, "{\"to\":");
+                write_ch_item(&rb, uri, m, occs[j].name);
+                sb_raw(&rb, ",\"fromRanges\":[");
+                write_range(&rb, occs[j].line, occs[j].col, occs[j].len);
+                sb_raw(&rb, "]}");
+            }
+        }
+        free(seen);
+        story_model_free(m);
+    }
+    sb_char(&rb, ']');
+    reply_result(emit, ud, id, rb.buf);
+    sb_free(&rb);
+}
+
 /* Document outline: every declaration, as a flat DocumentSymbol[]. */
 static void on_document_symbol(lsp_server *s, const json *msg, const json *id,
                                lsp_emit_fn emit, void *ud)
@@ -577,6 +763,12 @@ bool lsp_dispatch(lsp_server *s, const char *body, size_t len,
         on_document_symbol(s, msg, id, emit, ud);
     } else if (strcmp(method, "textDocument/hover") == 0) {
         on_hover(s, msg, id, emit, ud);
+    } else if (strcmp(method, "textDocument/prepareCallHierarchy") == 0) {
+        on_prepare_call_hierarchy(s, msg, id, emit, ud);
+    } else if (strcmp(method, "callHierarchy/incomingCalls") == 0) {
+        on_incoming_calls(s, msg, id, emit, ud);
+    } else if (strcmp(method, "callHierarchy/outgoingCalls") == 0) {
+        on_outgoing_calls(s, msg, id, emit, ud);
     } else if (id) {
         /* An unknown *request* must be answered; notifications are dropped. */
         reply_error(emit, ud, id, RPC_METHOD_NOT_FOUND, "method not found");
