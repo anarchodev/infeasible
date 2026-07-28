@@ -70,7 +70,7 @@ static int test_harvest(void)
     const char *src =
         "sort actor\n"                       /* L1 */
         "entity hero : actor\n"              /* L2 */
-        "state ( alive(actor) )\n"             /* L3 */
+        "state ( alive(actor) hp(actor) : int in 0 .. 5 )\n" /* L3 */
         "rule r: alive(hero) => happy(hero)\n" /* L4: concludes happy      */
         "rule no: alive(hero) => ~happy(hero)\n" /* L5: attacks happy       */
         "action wake(X: actor): causes alive(X)"; /* L6 */
@@ -94,6 +94,14 @@ static int test_harvest(void)
     const story_symbol *al = find_sym(m, "alive", STORY_SYM_FLUENT);
     CHECK(al->line == 3);
     CHECK(al->len  == 5);
+
+    /* detail signatures — the concept word the closed SymbolKind enum can't carry */
+    CHECK(strcmp(al->detail, "fluent(actor)") == 0);
+    CHECK(strcmp(find_sym(m, "actor", STORY_SYM_SORT)->detail, "sort") == 0);
+    CHECK(strcmp(find_sym(m, "hero", STORY_SYM_ENTITY)->detail, "entity : actor") == 0);
+    CHECK(strcmp(find_sym(m, "wake", STORY_SYM_ACTION)->detail, "action(actor)") == 0);
+    CHECK(strcmp(find_sym(m, "hp", STORY_SYM_FLUENT)->detail,
+                 "fluent(actor) : int in 0..5") == 0);
 
     /* occurrences: head vs. body vs. effect vs. decl are distinguished */
     CHECK(has_occ(m, "happy", STORY_OCC_HEAD));    /* r concludes happy */

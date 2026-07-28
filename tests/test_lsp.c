@@ -317,6 +317,7 @@ static int test_navigation(void)
     dispatch(s, &cap, msg.buf);
     CHECK(strstr(cap.buf, "\"name\":\"alive\"") != NULL);
     CHECK(strstr(cap.buf, "\"kind\":8") != NULL);
+    CHECK(strstr(cap.buf, "\"detail\":\"fluent\"") != NULL);   /* concept in detail */
     CHECK(strstr(cap.buf, "\"name\":\"mk\"") != NULL);
     CHECK(strstr(cap.buf, "\"name\":\"br\"") != NULL);
     sb_reset(&cap);
