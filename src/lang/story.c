@@ -4859,7 +4859,7 @@ static char *sm_dup(const char *s)
 }
 
 static void sm_add_sym(story_model *m, const char *name, story_sym_kind k,
-                       int line, int col)
+                       int line, int col, const char *detail)
 {
     if (!name || !name[0]) return;             /* anonymous rule / empty label */
     if (m->nsyms == m->capsyms) {
@@ -4870,6 +4870,64 @@ static void sm_add_sym(story_model *m, const char *name, story_sym_kind k,
     s->name = sm_dup(name);
     s->kind = k;
     s->line = line; s->col = col; s->len = (int)strlen(name);
+    s->detail = sm_dup(detail ? detail : "");
+}
+
+/* Bounded string appender for building `detail` signatures. */
+static void dapp(char *buf, size_t *off, size_t cap, const char *s)
+{
+    while (*s && *off + 1 < cap) buf[(*off)++] = *s++;
+    buf[*off] = '\0';
+}
+
+static void dapp_int(char *buf, size_t *off, size_t cap, long v)
+{
+    char t[24];
+    snprintf(t, sizeof t, "%ld", v);
+    dapp(buf, off, cap, t);
+}
+
+/* "(sort1, sort2)" from a list of sort-name atoms; nothing when arity 0.
+ * INTERN_NONE renders as "int" (a function's `int` arg/return type). */
+static void dapp_args(char *buf, size_t *off, size_t cap, parser *p,
+                      const uint32_t *argsort, int nargs)
+{
+    if (nargs <= 0) return;
+    dapp(buf, off, cap, "(");
+    for (int i = 0; i < nargs; i++) {
+        if (i) dapp(buf, off, cap, ", ");
+        dapp(buf, off, cap, argsort[i] ? intern_name(p->syms, argsort[i]) : "int");
+    }
+    dapp(buf, off, cap, ")");
+}
+
+/* Concept word + signature for a base/provider fluent: "fluent(actor) : int
+ * in 0..40", "provider(actor, actor)", "fluent : {locked, closed, open}". */
+static void build_fluent_detail(char *buf, size_t cap, parser *p,
+                                const ast_fluent *f, const char *concept)
+{
+    size_t off = 0; buf[0] = '\0';
+    dapp(buf, &off, cap, concept);
+    dapp_args(buf, &off, cap, p, f->argsort, f->nargs);
+    if (f->is_num) {
+        dapp(buf, &off, cap, " : int");
+        if (f->has_range && f->rmin_expr < 0 && f->rmax_expr < 0) {
+            dapp(buf, &off, cap, " in ");
+            dapp_int(buf, &off, cap, f->rmin);
+            dapp(buf, &off, cap, "..");
+            dapp_int(buf, &off, cap, f->rmax);
+        }
+    } else if (f->is_mv) {
+        dapp(buf, &off, cap, " : {");
+        for (int i = 0; i < f->nvalues; i++) {
+            if (i) dapp(buf, &off, cap, ", ");
+            dapp(buf, &off, cap, intern_name(p->syms, f->values[i]));
+        }
+        dapp(buf, &off, cap, "}");
+    } else if (f->is_cell && f->val_sort) {
+        dapp(buf, &off, cap, " : ");
+        dapp(buf, &off, cap, intern_name(p->syms, f->val_sort));
+    }
 }
 
 static void sm_add_occ(story_model *m, const char *name, story_occ_role r,
@@ -4912,9 +4970,29 @@ static void sm_atom(story_model *m, parser *p, const ast_atom *a,
     }
 }
 
+static const char *sort_name(parser *p, int sidx)
+{
+    return (sidx >= 0 && sidx < p->nsorts) ? p->sorts[sidx].name : "?";
+}
+
+/* "(sort1, sort2)" from a var-binding list (entities/params carry sort indices,
+ * unlike fluent argsorts which are name atoms). */
+static void dapp_varsorts(char *buf, size_t *off, size_t cap, parser *p,
+                          const var_bind *v, int n)
+{
+    if (n <= 0) return;
+    dapp(buf, off, cap, "(");
+    for (int i = 0; i < n; i++) {
+        if (i) dapp(buf, off, cap, ", ");
+        dapp(buf, off, cap, sort_name(p, v[i].sort));
+    }
+    dapp(buf, off, cap, ")");
+}
+
 static story_model *harvest_model(parser *p)
 {
     story_model *m = calloc(1, sizeof *m);
+    char det[512];
 
     /* rules first — story_occ.rule indexes this list, and it must line up with
      * p->rules[i] so a rule's head/body occurrences share one owner id. */
@@ -4932,40 +5010,67 @@ static story_model *harvest_model(parser *p)
     /* declaration symbols (the document outline) + a DECL occurrence each, so
      * a references query can surface the declaring site alongside the uses. */
     for (int i = 0; i < p->nsorts; i++) {
-        story_sym_kind k = p->sorts[i].is_domain ? STORY_SYM_DOMAIN : STORY_SYM_SORT;
-        sm_add_sym(m, p->sorts[i].name, k, p->sorts[i].line, p->sorts[i].col);
+        bool dom = p->sorts[i].is_domain;
+        sm_add_sym(m, p->sorts[i].name, dom ? STORY_SYM_DOMAIN : STORY_SYM_SORT,
+                   p->sorts[i].line, p->sorts[i].col, dom ? "domain" : "sort");
         sm_add_ref(m, p->sorts[i].name, STORY_OCC_DECL, p->sorts[i].line, p->sorts[i].col);
     }
     for (int i = 0; i < p->nents; i++) {
         const char *nm = intern_name(p->syms, p->ents[i].atom);
-        sm_add_sym(m, nm, STORY_SYM_ENTITY, p->ents[i].line, p->ents[i].col);
+        size_t off = 0; det[0] = '\0';
+        dapp(det, &off, sizeof det, "entity : ");
+        dapp(det, &off, sizeof det, sort_name(p, p->ents[i].sort));
+        sm_add_sym(m, nm, STORY_SYM_ENTITY, p->ents[i].line, p->ents[i].col, det);
         sm_add_ref(m, nm, STORY_OCC_DECL, p->ents[i].line, p->ents[i].col);
     }
     for (int i = 0; i < p->nfluents; i++) {
         const char *nm = intern_name(p->syms, p->fluents[i].pred);
-        sm_add_sym(m, nm, STORY_SYM_FLUENT, p->fluents[i].line, p->fluents[i].col);
+        build_fluent_detail(det, sizeof det, p, &p->fluents[i], "fluent");
+        sm_add_sym(m, nm, STORY_SYM_FLUENT, p->fluents[i].line, p->fluents[i].col, det);
         sm_add_ref(m, nm, STORY_OCC_DECL, p->fluents[i].line, p->fluents[i].col);
     }
     for (int i = 0; i < p->nproviders; i++) {
         const char *nm = intern_name(p->syms, p->providers[i].pred);
-        sm_add_sym(m, nm, STORY_SYM_PROVIDER, p->providers[i].line, p->providers[i].col);
+        build_fluent_detail(det, sizeof det, p, &p->providers[i], "provider");
+        sm_add_sym(m, nm, STORY_SYM_PROVIDER, p->providers[i].line, p->providers[i].col, det);
         sm_add_ref(m, nm, STORY_OCC_DECL, p->providers[i].line, p->providers[i].col);
     }
     for (int i = 0; i < p->nfunctions; i++) {
         const char *nm = intern_name(p->syms, p->functions[i].name);
-        sm_add_sym(m, nm, STORY_SYM_FUNCTION, p->functions[i].line, p->functions[i].col);
+        size_t off = 0; det[0] = '\0';
+        dapp(det, &off, sizeof det, "function");
+        dapp_args(det, &off, sizeof det, p, p->functions[i].argsort, p->functions[i].nargs);
+        dapp(det, &off, sizeof det, " : ");
+        dapp(det, &off, sizeof det,
+             p->functions[i].ret ? intern_name(p->syms, p->functions[i].ret) : "int");
+        sm_add_sym(m, nm, STORY_SYM_FUNCTION, p->functions[i].line, p->functions[i].col, det);
         sm_add_ref(m, nm, STORY_OCC_DECL, p->functions[i].line, p->functions[i].col);
     }
     for (int i = 0; i < p->nenums; i++) {
-        sm_add_sym(m, p->enums[i].name, STORY_SYM_ENUM, p->enums[i].line, p->enums[i].col);
+        size_t off = 0; det[0] = '\0';
+        dapp(det, &off, sizeof det, "enum : {");
+        for (int v = 0; v < p->enums[i].nvalues; v++) {
+            if (v) dapp(det, &off, sizeof det, ", ");
+            dapp(det, &off, sizeof det, intern_name(p->syms, p->enums[i].values[v]));
+        }
+        dapp(det, &off, sizeof det, "}");
+        sm_add_sym(m, p->enums[i].name, STORY_SYM_ENUM, p->enums[i].line, p->enums[i].col, det);
         sm_add_ref(m, p->enums[i].name, STORY_OCC_DECL, p->enums[i].line, p->enums[i].col);
     }
-    for (int i = 0; i < p->nactions; i++)
+    for (int i = 0; i < p->nactions; i++) {
+        size_t off = 0; det[0] = '\0';
+        dapp(det, &off, sizeof det, "action");
+        dapp_varsorts(det, &off, sizeof det, p, p->actions[i].vars, p->actions[i].nvars);
         sm_add_sym(m, p->actions[i].name, STORY_SYM_ACTION,
-                   p->actions[i].line, p->actions[i].col);
-    for (int i = 0; i < p->nrules; i++)
+                   p->actions[i].line, p->actions[i].col, det);
+    }
+    for (int i = 0; i < p->nrules; i++) {
+        size_t off = 0; det[0] = '\0';
+        dapp(det, &off, sizeof det, "rule");
+        dapp_varsorts(det, &off, sizeof det, p, p->rules[i].vars, p->rules[i].nvars);
         sm_add_sym(m, p->rules[i].label, STORY_SYM_RULE,
-                   p->rules[i].line, p->rules[i].col);
+                   p->rules[i].line, p->rules[i].col, det);
+    }
 
     /* rule heads (conclusions) / bodies / guards — tagged with the rule id */
     for (int i = 0; i < p->nrules; i++) {
@@ -5010,7 +5115,10 @@ const story_rule *story_model_rules(const story_model *m, int *n)
 void story_model_free(story_model *m)
 {
     if (!m) return;
-    for (int i = 0; i < m->nsyms; i++)  free((char *)m->syms[i].name);
+    for (int i = 0; i < m->nsyms; i++) {
+        free((char *)m->syms[i].name);
+        free((char *)m->syms[i].detail);
+    }
     for (int i = 0; i < m->noccs; i++)  free((char *)m->occs[i].name);
     for (int i = 0; i < m->nrules; i++) free((char *)m->rules[i].label);
     free(m->syms);

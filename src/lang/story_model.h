@@ -46,6 +46,11 @@ typedef struct {
     const char    *name;   /* NUL-terminated, model-owned */
     story_sym_kind kind;
     int            line, col, len;
+    const char    *detail; /* a compact signature the concept word can't carry
+                            * in the closed LSP SymbolKind enum — e.g.
+                            * "provider(actor, actor)", "fluent : int in 0..40",
+                            * "function(cell, int) : cell". Model-owned, never
+                            * NULL (empty string when there's nothing to add). */
 } story_symbol;
 
 typedef struct {

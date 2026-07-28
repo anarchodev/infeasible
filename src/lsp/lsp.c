@@ -716,6 +716,10 @@ static void on_document_symbol(lsp_server *s, const json *msg, const json *id,
             sb_jstr(&rb, syms[i].name);
             sb_raw(&rb, ",\"kind\":");
             sb_int(&rb, symbol_kind(syms[i].kind));
+            if (syms[i].detail && syms[i].detail[0]) {
+                sb_raw(&rb, ",\"detail\":");
+                sb_jstr(&rb, syms[i].detail);
+            }
             sb_raw(&rb, ",\"range\":");
             write_range(&rb, d->text, syms[i].line, syms[i].col, syms[i].len);
             sb_raw(&rb, ",\"selectionRange\":");
