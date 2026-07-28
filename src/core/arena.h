@@ -12,9 +12,10 @@ typedef struct arena {
     arena_block *head;
 } arena;
 
-void  arena_init(arena *a);
-void *arena_alloc(arena *a, size_t n);          /* 16-byte aligned, zeroed */
-char *arena_strdup(arena *a, const char *s);
-void  arena_release(arena *a);
+void   arena_init(arena *a);
+void  *arena_alloc(arena *a, size_t n);         /* 16-byte aligned, zeroed */
+char  *arena_strdup(arena *a, const char *s);
+void   arena_release(arena *a);
+size_t arena_bytes(const arena *a);             /* bytes currently handed out (leak tests) */
 
 #endif

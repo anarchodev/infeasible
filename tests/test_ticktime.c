@@ -244,6 +244,15 @@ int main(void)
     CHECK(provability_diffs(A, B, sy) == 0);
     CHECK(why_same(A, B, t_bc));
 
+    /* Memory is BOUNDED across re-grounds (#48): each reground frees the previous
+     * matched layer's arena region, so re-materializing the same instances many
+     * times does not grow the world's arenas. Before the resettable region the
+     * matched names/bodies leaked into w->a and this would climb per tick. */
+    size_t bytes0 = world_arena_bytes(B);
+    for (int i = 0; i < 500; i++) story_matcher_reground(M);
+    CHECK(world_arena_bytes(B) == bytes0);           /* same instances -> identical, not growing */
+    CHECK(world_query(B, t_bc) == DL_PROVED);        /* still correct after 500 regrounds */
+
     story_matcher_free(M);
     world_free(A); world_free(B);
     intern_free(sy);

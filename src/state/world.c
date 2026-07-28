@@ -132,6 +132,11 @@ struct world {
     jrule *jrules; int njr, capjr;
     jsup *jsups; int njs, capjs;
     int jr_matched_base;                   /* watermark: static | matched rules (#28) */
+    /* Matched rules' arena-copied names/bodies/prov live in their OWN arena so a
+     * re-ground can free the previous layer instead of leaking it into w->a
+     * (#48). `in_matched` (set at the checkpoint) routes world_add_rule /
+     * world_set_rule_prov allocations there for every add past the boundary. */
+    arena matched_a; bool in_matched;
     srule *srules; int nsr, capsr;
 
     /* numeric value store + comparison guards (§5.8, read side). A clamp bound
@@ -214,6 +219,7 @@ world *world_new(intern *syms)
 {
     world *w = calloc(1, sizeof *w);
     arena_init(&w->a);
+    arena_init(&w->matched_a);
     w->syms = syms;
     return w;
 }
@@ -258,6 +264,7 @@ void world_free(world *w)
     free(w->fl_loc);
     free(w->pr_loc);
     arena_release(&w->a);
+    arena_release(&w->matched_a);
     if (w->fidx)
         factindex_free(w->fidx);
     free(w->fluents);
@@ -598,14 +605,15 @@ static void load_eguards(world *w, dlcol *f)
 int world_add_rule(world *w, const char *name, dl_rule_kind kind,
                    dl_lit head, const dl_lit *body, int nbody)
 {
+    arena *ra = w->in_matched ? &w->matched_a : &w->a;   /* matched rules: own arena (#48) */
     GROW(w->jrules, w->njr, w->capjr);
     jrule *r = &w->jrules[w->njr];
-    r->name = arena_strdup(&w->a, name);
+    r->name = arena_strdup(ra, name);
     r->prov = NULL;
     r->kind = kind;
     r->head = head;
     r->nbody = nbody;
-    r->body = arena_alloc(&w->a, (size_t)(nbody ? nbody : 1) * sizeof(dl_lit));
+    r->body = arena_alloc(ra, (size_t)(nbody ? nbody : 1) * sizeof(dl_lit));
     if (nbody)
         memcpy(r->body, body, (size_t)nbody * sizeof(dl_lit));
     w->fam_dirty = true;
@@ -628,18 +636,20 @@ void world_add_sup(world *w, int winner, int loser)
  * Only the RULE array is watermarked, never the superiority array: matched-kernel
  * rules carry no `>` (the rule_in_sup gate in rule_matchable), so njs is invariant
  * across a re-ground and the static superiority relation must stay intact — the
- * checkpoint can therefore precede ground_sup safely. Truncation leaks the
- * arena-copied names/bodies until world_free (a bump allocator has no per-item
- * free) — acceptable for the host-driven prototype; adoption routes matched rules
- * through a resettable region. */
+ * checkpoint can therefore precede ground_sup safely. The checkpoint also flips
+ * `in_matched`, routing every subsequent rule's arena-copied name/body/prov into
+ * matched_a, which world_matched_reset frees — so a re-ground per tick is bounded
+ * in memory rather than leaking into w->a (#48). */
 void world_matched_checkpoint(world *w)
 {
     w->jr_matched_base = w->njr;
+    w->in_matched = true;
 }
 
 void world_matched_reset(world *w)
 {
     w->njr = w->jr_matched_base;
+    arena_release(&w->matched_a);   /* free the previous matched layer's strings/bodies */
     w->fam_dirty = true;
     w->lanes_ok = false;
 }
@@ -670,8 +680,9 @@ int world_add_step_rule(world *w, const char *name, uint32_t action,
 
 void world_set_rule_prov(world *w, int rule, const char *prov)
 {
+    arena *ra = w->in_matched ? &w->matched_a : &w->a;   /* match world_add_rule (#48) */
     if (rule >= 0 && rule < w->njr)
-        w->jrules[rule].prov = prov ? arena_strdup(&w->a, prov) : NULL;
+        w->jrules[rule].prov = prov ? arena_strdup(ra, prov) : NULL;
 }
 
 void world_set_step_prov(world *w, int rule, const char *prov)
@@ -834,6 +845,11 @@ int world_lane_family_count(const world *w) { return w->nlanes; }
 
 int world_judgment_rule_count(const world *w) { return w->njr; }
 int world_step_rule_count(const world *w) { return w->nsr; }
+
+size_t world_arena_bytes(const world *w)
+{
+    return arena_bytes(&w->a) + arena_bytes(&w->matched_a);
+}
 
 /* Load one iteration's fact slice into a lane family and solve it (all lanes at
  * once). For niter==1 (single-variable) `it` is 0 and the solve is the whole
