@@ -68,3 +68,11 @@ void arena_release(arena *a)
     }
     a->head = NULL;
 }
+
+size_t arena_bytes(const arena *a)
+{
+    size_t total = 0;
+    for (arena_block *b = a->head; b; b = b->next)
+        total += b->used;
+    return total;
+}

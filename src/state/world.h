@@ -207,6 +207,11 @@ int  world_lane_family_count(const world *w);
 int  world_judgment_rule_count(const world *w);
 int  world_step_rule_count(const world *w);
 
+/* Total bytes handed out by the world's arenas (static + matched-rule region).
+ * A re-ground releases the matched region, so this stays BOUNDED across
+ * story_matcher_reground calls rather than growing per tick (#48). Leak test. */
+size_t world_arena_bytes(const world *w);
+
 /* Differential pin (mirrors test_col's dl-vs-dl_col): load current state into
  * every lane family, solve, and compare each (predicate, entity) verdict to
  * world_query on the equivalent ground atom. Returns the number of comparisons;
