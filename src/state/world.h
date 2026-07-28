@@ -41,9 +41,11 @@ void world_set_fluent_struct(world *w, uint32_t atom, uint32_t pred,
 
 /* The fact-store extension index over the CURRENT boolean state (the inverse of
  * "is this atom true?": a predicate -> its true argument tuples). Refreshed
- * lazily from w->vals on any state edit, in fluent-declaration order (so
- * enumeration is deterministic — replay-exact, I4). The tick-time matcher scans
- * this instead of the sort cross product. Owned by the world; the returned
+ * lazily from w->vals on any state edit, in fluent-declaration order — under
+ * the sparse universe (#92) that is FIRST-TOUCH order, a pure function of the
+ * source text plus the host's call sequence, so enumeration stays
+ * deterministic and replay-exact (I4). The tick-time matcher scans this
+ * instead of the sort cross product. Owned by the world; the returned
  * pointer is valid until the next state edit. */
 struct factindex;
 const struct factindex *world_fact_index(world *w);
