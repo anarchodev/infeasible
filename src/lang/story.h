@@ -45,7 +45,10 @@
  *   file    := decl*
  *   decl    := sort | enum | entity | state | function | value | init | rule | action | sup
  *   sort    := 'sort'   ( IDENT | '(' IDENT (','? IDENT)* ')' )
- *   enum    := 'enum' IDENT '{' IDENT (',' IDENT)* '}'  -- named value domain (§13)
+ *   enum    := 'enum' IDENT '{' IDENT (',' IDENT)* '}'  -- named value domain (§13);
+ *                                          -- also legal as an argument sort and a
+ *                                          -- rule-var type (#96): values ground like
+ *                                          -- a sort's entities but are not entities
  *   entity  := 'entity' ( ebind | '(' ebind* ')' )
  *   ebind   := IDENT (',' IDENT)* ':' IDENT            -- names : sort
  *   state   := 'state'  ( fdecl | '(' fdecl* ')' )
@@ -81,6 +84,9 @@
  *   sup     := IDENT '>' IDENT                          -- label > label
  *   conj    := eatom ( '&' eatom )*
  *   eatom   := atom [ cmp INT | '=' IDENT | numop expr ] -- guard / MV / effect
+ *            | IDENT ['not'] 'in' '{' IDENT (',' IDENT)* '}'  -- membership (#95):
+ *                                          -- a static grounding filter over a var's
+ *                                          -- finite domain; never in the fixpoint
  *   cmp     := '<=' | '<' | '>=' | '>' | '='
  *   numop   := ':=' | '+=' | '-='                        -- numeric effect (§5.8)
  *   expr    := term (('+'|'-') term)*                    -- effect RHS, int-only
