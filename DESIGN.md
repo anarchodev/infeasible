@@ -1679,6 +1679,84 @@ preservation-time native player (§13).
   per step — judgments recompute on base-fact change (wake-ups), so frames
   read cached conclusions and pay nothing while nothing changes.
 
+### 8.1 Mean, tail, and who decides
+
+The bullets above say *what* each tier costs. This says *who chooses* when a
+subsystem trades average cost for worst-case cost — and the answer is the game
+programmer, not the engine. Optimizing the mean where you have slack and the
+tail where you have a deadline is the ordinary discipline of systems
+engineering; most engines fail it not by choosing wrong but by *hiding* the
+choice — a garbage collector, a query planner, an allocator each picks
+mean-vs-tail for you and won't say. In a game the frame budget is a hard wall
+and different subsystems have opposite needs — per-frame movement/collision
+must be flat-tail (one spike blows the 16 ms wall); an off-critical-path AI
+judgment can run low-mean/high-tail. The engine cannot know which is which:
+that knowledge is the frame budget and the critical path, both the
+programmer's. So the tradeoff is made *local, explicit, and visible*.
+
+- **Two classes of decision; only one gets a lever.** *Semantic invariants* —
+  the defeasible semantics itself, determinism (I4), no-write-back (I1),
+  actions-only-mutation (I2), and the extensional equivalence of all evaluation
+  strategies — the engine fixes these, with no author lever, because one would
+  permit incorrectness and silently break the lockstep/replay guarantees the
+  netcode stands on (§12). *Operational policy* — eager-vs-matcher grounding
+  (§5.2), full-recompute-vs-demand-cone (§4.1), lane-vs-scalar (§5.8),
+  pinned-vs-adaptive plans, budget/ceiling — the programmer controls these,
+  because the right answer is a function of *their* frame budget and variance
+  tolerance in *this* subsystem, which the engine structurally cannot have.
+
+- **Equivalence is the license.** A performance lever is safe to hand over only
+  if turning it cannot produce a wrong answer. Every evaluation backing —
+  scalar N=1, columnar lanes, eager grounding, the tick-time matcher — is
+  pinned extensionally identical by the differential golden tests (same
+  verdicts, byte-identical why-traces; §5.4, `test_col` / `test_drivers_agree`).
+  So an operational lever selects among provably-equal-answer strategies: **a
+  performance choice can never become a correctness bug.** The multi-backing
+  architecture is not only how the engine goes fast — it is what makes the cost
+  surface author-facing *without risk*. The equivalence discipline, sold
+  internally as "so the M3 algorithm swap stays safe," earns its real keep here.
+
+- **The same axis recurs at every layer,** controllable at the granularity it
+  lives at: *grounding* — materialize (flat nᵏ) vs matcher (∝ matches), per
+  rule; *recompute scope* — scene-tier full recompute vs demand-cone wake-up
+  (M4), per scope/fluent; *family evaluation* — lanes (pay the full width each
+  tick) vs scalar sparse wake, per family; *plan stability* — pinned vs adaptive
+  re-plan, per rule. Scenes (§5.5/§6.4) scope the policy to the state it governs
+  — materialize the threat rules *inside* the combat scene where density is high
+  and the frame is tight, match them in the overworld where they are sparse.
+
+- **Hints advise; overrides direct.** A *hint* is a claim about the data
+  ("usually sparse") that feeds the measured cost model — wrong costs a
+  suboptimal plan, nothing worse. An *override* is a claim about the
+  *performance policy required* ("materialize always; do not trade my flat tail
+  for a spiky mean") that removes the decision — wrong means the author eats
+  exactly the cost they asked for. They are distinct in kind: a hint the router
+  may overrule cannot deliver the guarantee an override exists to make. Keep
+  both. Overrides move a *soft routing threshold*; they never silently defeat
+  the *hard absolute ceiling* (the §5.2 cardinality cap, a memory backstop),
+  which an override may only raise with an explicit stated budget — preserving
+  loud-failures-no-silent-caps.
+
+- **The flat path has a *provable* tail.** Because entities are declared up
+  front (§5.2), the eager/materialize cost is a compile-time constant — the
+  cross product of sort sizes, paid every tick, density-independent. That is a
+  *guaranteed* worst case, not a profiled p99: the compiler can state a rule's
+  materialized cost before the game runs, and re-checks it when a sort grows (so
+  an override cannot silently rot into an out-of-budget blow-up — it trips a
+  build error instead). Choosing the flat path deliberately requires that
+  number, so the tooling obligation follows (§9): surface, per rule/family, the
+  static worst case (free, from declared domains) *and* the measured per-tick
+  distribution. Exposing a lever without its cost only relocates the guessing.
+
+- **Default auto; the lever is a scalpel.** The measured cost model carries the
+  common case. Overrides are for the parts the author has reasoned about, where
+  they know something about policy — variance tolerance, critical-path
+  membership, rollback re-sim budget — that no measurement conveys. Mandatory
+  hand-tuning would recreate the DBA-does-everything world the provider
+  mechanism (§5.2, "the logic consumes the broadphase, it is never the
+  broadphase") already refuses: the provider is itself the first author-supplied
+  physical-design decision; these levers are the second.
+
 ## 9. Tooling (first-class, built early)
 
 - `why <literal>?` — proof/defeat trace: which rules supported, which
