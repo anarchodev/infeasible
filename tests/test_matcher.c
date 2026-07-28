@@ -49,7 +49,11 @@ static const char *STORY =
     /* matchable WITH a negated filter: awake(X) generates, ~marked(X) prunes
      * (no marked facts, so ~marked holds for all — ready tracks awake) */
     "rule ready(X: actor): awake(X) & ~marked(X) => ready(X)\n"
-    /* NOT matchable (numeric guard) — eager fallback in both worlds */
+    /* matchable WITH a numeric guard filter: awake(X) generates, hp(X) <= 5 is
+     * carried into the rule and solver-evaluated (hp(a)=3 passes) */
+    "rule critical(X: actor): awake(X) & hp(X) <= 5 => critical(X)\n"
+    /* NOT matchable: guard-ONLY body, no positive generator to enumerate X from
+     * (compute_bound_vars would bind X via the guard, but the matcher can't) */
     "rule hurt(X: actor): hp(X) <= 5 => hurt(X)\n"
     /* an action, so lanes are skipped and queries hit the judgment family */
     "action mark(X: actor): requires awake(X) causes marked(X)\n";
@@ -86,6 +90,8 @@ int main(void)
     /* negated filter: ready(a) fires (awake(a) & ~marked(a)); c never awake */
     CHECK(world_query(B, dl_pos(intern_id(sy, "ready(a)"))) == DL_PROVED);
     CHECK(world_query(B, dl_pos(intern_id(sy, "ready(c)"))) != DL_PROVED);
+    /* numeric-guard filter: critical(a) fires (awake(a) & hp(a)=3 <= 5) */
+    CHECK(world_query(B, dl_pos(intern_id(sy, "critical(a)"))) == DL_PROVED);
 
     /* The equivalence: the two worlds PROVE exactly the same literals — every
      * atom, both polarities. Provability is the guarantee the matcher owes and
@@ -96,10 +102,17 @@ int main(void)
      * the matcher grounds no such rule, and the scaffold solver leaves an atom
      * with no rules UNDECIDED rather than refuting it by vacuous defeat.
      * Judgments are not closed-world (only fluents are), so nothing that is
-     * PROVED ever moves — that is the theorem, and it holds exactly. */
+     * PROVED ever moves — that is the theorem, and it holds exactly.
+     *
+     * Internal numeric-guard landmark atoms ("hp(b)<=5") are excluded: they are
+     * closed-world only once world_add_guard registers them, which happens per
+     * EMITTED instance, so an unregistered guard is proved in eager but undecided
+     * in the matcher. It never reaches a judgment (no emitted rule references it),
+     * so it is a compiler-internal atom, not part of the host-visible contract. */
     uint32_t n = intern_count(sy);
     int diffs = 0;
     for (uint32_t id = 1; id < n; id++) {
+        if (strpbrk(intern_name(sy, id), "<>")) continue;   /* guard landmark */
         for (int neg = 0; neg < 2; neg++) {
             dl_lit q = neg ? dl_neg(id) : dl_pos(id);
             bool pa = world_query(A, q) == DL_PROVED;

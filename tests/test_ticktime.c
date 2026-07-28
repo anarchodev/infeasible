@@ -48,6 +48,7 @@ static const char *STORY =
     "  awake(actor)\n"
     "  bird(actor)\n"
     "  penguin(actor)\n"
+    "  hp(actor) : int in 0 .. 20\n"
     ")\n"
     "init (\n"
     "  adj(a, b)\n"
@@ -55,12 +56,19 @@ static const char *STORY =
     "  awake(a)\n"
     "  bird(a)\n"
     "  penguin(a)\n"
+    "  hp(a) = 3\n"
+    "  hp(b) = 8\n"
     ")\n"
     /* matchable: a 2-var join over two base boolean fluents (head keeps both) */
     "rule alarm(X: actor, Y: actor): adj(X, Y) & awake(X) => threatens(X, Y)\n"
     /* matchable WITH a negated filter: awake(X) generates, ~penguin(X) prunes.
      * a is a penguin, so hunts(a) never holds; hunts(b) tracks awake(b). */
     "rule hostile(X: actor): awake(X) & ~penguin(X) => hunts(X)\n"
+    /* matchable WITH a numeric guard filter: awake(X) generates, hp(X) <= 5 is
+     * carried into the rule and solver-evaluated. hp(a)=3 passes; hp(b)=8 fails,
+     * so weak(b) never holds even once b wakes. Exercises the tick-time guard
+     * emit path (m_ground_lit guard branch + world_add_guard) across regrounds. */
+    "rule weak(X: actor): awake(X) & hp(X) <= 5 => weak(X)\n"
     /* STATIC superiority (Tweety): both rules are non-matchable (in a `>` pair),
      * so they are ground once — and the `>` must SURVIVE every re-ground. If the
      * matched-layer reset truncated the superiority array (the bug the watermark
@@ -82,13 +90,27 @@ static char *why_str(world *w, dl_lit q)
     return buf;
 }
 
-/* Every atom, both polarities: the two worlds must PROVE exactly the same
- * literals (same provability contract as test_matcher). Returns the diff count. */
+/* An internal numeric-guard landmark atom ("hp(b)<=5"), not a host-queried
+ * judgment. Its closed-world truth is asserted only once world_add_guard has
+ * registered it — which happens per EMITTED instance. Eager grounds every
+ * sort^k instance (registering the guard for all bindings), the matcher only the
+ * generator-satisfying ones, so an unregistered guard is PROVED in eager but
+ * UNDECIDED in the matcher. That divergence never reaches a judgment: an
+ * unregistered guard is referenced by no emitted rule, so it changes no verdict
+ * a host can query. Excluded from the sweep like the judgment-head artifact. */
+static int is_guard_atom(const char *name)
+{
+    return strpbrk(name, "<>") != NULL;   /* <=, <, >=, > — never in a normal atom */
+}
+
+/* Every (non-guard) atom, both polarities: the two worlds must PROVE exactly the
+ * same literals (same provability contract as test_matcher). Returns diff count. */
 static int provability_diffs(world *A, world *B, intern *sy)
 {
     uint32_t n = intern_count(sy);
     int diffs = 0;
-    for (uint32_t id = 1; id < n; id++)
+    for (uint32_t id = 1; id < n; id++) {
+        if (is_guard_atom(intern_name(sy, id))) continue;
         for (int neg = 0; neg < 2; neg++) {
             dl_lit q = neg ? dl_neg(id) : dl_pos(id);
             bool pa = world_query(A, q) == DL_PROVED;
@@ -99,6 +121,7 @@ static int provability_diffs(world *A, world *B, intern *sy)
                 diffs++;
             }
         }
+    }
     return diffs;
 }
 
@@ -133,6 +156,8 @@ int main(void)
     dl_lit not_flies_a = dl_neg(intern_id(sy, "flies(a)"));   /* nofly > fly decides it */
     dl_lit hunts_a = dl_pos(intern_id(sy, "hunts(a)"));       /* ~penguin filter: a is penguin */
     dl_lit hunts_b = dl_pos(intern_id(sy, "hunts(b)"));       /* tracks awake(b) */
+    dl_lit weak_a = dl_pos(intern_id(sy, "weak(a)"));         /* hp(a)=3 <= 5: guard passes */
+    dl_lit weak_b = dl_pos(intern_id(sy, "weak(b)"));         /* hp(b)=8 > 5: guard fails */
 
     /* t=0: only awake(a). alarm(a,b) fires -> threatens(a,b); threatens(b,c) needs awake(b). */
     CHECK(world_query(A, t_ab) == DL_PROVED);
@@ -142,8 +167,11 @@ int main(void)
     CHECK(world_query(B, not_flies_a) == DL_PROVED);   /* static `>` present */
     CHECK(world_query(B, hunts_a) != DL_PROVED);       /* ~penguin(a) fails: a is a penguin */
     CHECK(world_query(B, hunts_b) != DL_PROVED);       /* b not awake yet */
+    CHECK(world_query(B, weak_a) == DL_PROVED);        /* awake(a) & hp(a)=3 <= 5 */
+    CHECK(world_query(B, weak_b) != DL_PROVED);        /* b not awake yet */
     CHECK(provability_diffs(A, B, sy) == 0);
     CHECK(why_same(A, B, t_ab));
+    CHECK(why_same(A, B, weak_a));                     /* guard landmark atom in the trace */
 
     char err[64];
     uint32_t wake_b = intern_id(sy, "wake(b)");
@@ -161,6 +189,8 @@ int main(void)
     CHECK(world_query(B, not_flies_a) == DL_PROVED); /* static `>` survived reground */
     CHECK(world_query(B, hunts_b) == DL_PROVED);     /* awake(b) & ~penguin(b): fires now */
     CHECK(world_query(B, hunts_a) != DL_PROVED);     /* ~penguin(a) still prunes it */
+    CHECK(world_query(B, weak_b) != DL_PROVED);      /* awake(b) now, but hp(b)=8 > 5: guard prunes */
+    CHECK(world_query(B, weak_a) == DL_PROVED);      /* still awake, hp(a) still 3 */
     CHECK(provability_diffs(A, B, sy) == 0);
     CHECK(why_same(A, B, t_bc));                     /* freshly-materialized trace */
     CHECK(why_same(A, B, hunts_b));                  /* negated body literal in the trace */
@@ -178,6 +208,7 @@ int main(void)
     CHECK(world_query(A, t_bc) == DL_PROVED);
     CHECK(world_query(B, t_bc) == DL_PROVED);        /* awake(b) still true */
     CHECK(world_query(B, not_flies_a) == DL_PROVED); /* `>` still intact after 2 regrounds */
+    CHECK(world_query(B, weak_a) != DL_PROVED);      /* awake(a) gone: guard rule drops too */
     CHECK(provability_diffs(A, B, sy) == 0);
     CHECK(why_same(A, B, t_bc));
 
