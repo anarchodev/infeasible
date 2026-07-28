@@ -167,6 +167,39 @@ void world_matched_reset(world *w);
 typedef void (*world_reground_fn)(void *ctx, world *w);
 void world_set_reground_fn(world *w, world_reground_fn fn, void *ctx);
 
+/* Matched views (#80): an ISLAND judgment — one matchable rule whose head
+ * predicate is concluded by no other rule, attacked by nothing, and read
+ * nowhere (no rule body, unless-guard, step-rule body, or superiority mentions
+ * it) — has no defeat structure: every matched instance is an all-true-body
+ * rule with no competitors, so its head's verdict is a pure function of match
+ * membership. Its matched layer is therefore a SET, not rules: the re-ground
+ * fills rows of (head atom, variable bindings); world_query answers from
+ * membership without touching the judgment family at all.
+ *   present        -> PROVED for the head polarity, REFUTED for the complement
+ *   seen-but-absent-> REFUTED both polarities (a dropped match, exactly like a
+ *                     located rule-less atom in the family)
+ *   never seen     -> not in the theory (UNDECIDED via the normal fallthrough)
+ * A view creator MUST register a materialize hook: world_why on a present view
+ * atom re-emits just that atom's instances as ordinary matched rules (the hook
+ * is called once per row, in insertion order) so the one shared trace renderer
+ * runs — traces stay byte-identical to full emission. Rows are cleared by
+ * world_views_reset (allocations kept, #48-style bounded memory); the ever-seen
+ * registry is append-only. `bind` in world_view_add may have at most
+ * WORLD_VIEW_MAXBIND entries. */
+#define WORLD_VIEW_MAXBIND 6
+typedef void (*world_materialize_fn)(void *ctx, world *w, uint32_t atom,
+                                     int view, const uint32_t *bind, int nvars);
+int  world_view_new(world *w, uint32_t head_pred, bool head_neg,
+                    dl_rule_kind kind);
+void world_views_reset(world *w);
+void world_view_add(world *w, int view, uint32_t atom,
+                    const uint32_t *bind, int nvars);
+void world_set_materialize_fn(world *w, world_materialize_fn fn, void *ctx);
+/* Introspection (bench/tests): rows currently present; bytes held by the view
+ * store (rows + maps) — the space the matched layer occupies instead of rules. */
+int    world_view_row_count(const world *w);
+size_t world_view_bytes(const world *w);
+
 /* Attach a provenance suffix (source span + generation reason, §6.3) to a rule
  * by its world_add_rule / world_add_step_rule handle; rendered by world_why /
  * the step trace after the rule kind. Copied; NULL clears it. */
