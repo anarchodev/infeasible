@@ -45,6 +45,23 @@
     "rule can: strong => open\n" \
     "rule blk: weak => ~open"
 
+/* Call-hierarchy fixture — a two-hop support chain a -> x -> y:
+ *   L1: "rule r1: a => x"        x HEAD at char 14
+ *   L2: "rule r2: x & b => y"    x feeds y
+ * outgoing(x) = {a} (its premise); incoming(x) = {y} (what it feeds).      */
+#define SRC_CH \
+    "state ( a b )\n" \
+    "rule r1: a => x\n" \
+    "rule r2: x & b => y"
+
+/* UTF-16 position fixture: a mid-line block comment with a 2-byte character
+ * (é = C3 A9) sits before `ax` on L1, so `ax`'s BYTE column (17) and its
+ * UTF-16 column (16) differ by one. Pins that the protocol boundary reports /
+ * accepts UTF-16, not bytes.  L1: rule r: /* é *​/ ax => bx                 */
+#define SRC_UTF8 \
+    "state ( ax )\n" \
+    "rule r: /* \xC3\xA9 */ ax => bx"
+
 /* Capture sink: accumulate every emitted body, newline-separated, for strstr. */
 static void cap_emit(void *ud, const char *body, size_t len)
 {
@@ -110,6 +127,27 @@ static void build_docsym(strbuf *m, const char *uri, int id)
               "\"params\":{\"textDocument\":{\"uri\":");
     sb_jstr(m, uri);
     sb_raw(m, "}}}");
+}
+
+/* A callHierarchy/{incoming,outgoing}Calls request. The server reads only
+ * item.name and item.uri; range fields are filler to look spec-shaped. */
+static void build_ch_req(strbuf *m, const char *method, const char *uri,
+                         const char *name, int id)
+{
+    sb_reset(m);
+    sb_raw(m, "{\"jsonrpc\":\"2.0\",\"id\":");
+    sb_int(m, id);
+    sb_raw(m, ",\"method\":");
+    sb_jstr(m, method);
+    sb_raw(m, ",\"params\":{\"item\":{\"name\":");
+    sb_jstr(m, name);
+    sb_raw(m, ",\"uri\":");
+    sb_jstr(m, uri);
+    sb_raw(m, ",\"kind\":24,"
+              "\"range\":{\"start\":{\"line\":0,\"character\":0},"
+              "\"end\":{\"line\":0,\"character\":0}},"
+              "\"selectionRange\":{\"start\":{\"line\":0,\"character\":0},"
+              "\"end\":{\"line\":0,\"character\":0}}}}}");
 }
 
 static bool dispatch(lsp_server *s, strbuf *cap, const char *body)
@@ -326,6 +364,91 @@ static int test_hover(void)
     return 0;
 }
 
+/* Call hierarchy: the navigable cone. prepare roots on the atom; outgoing
+ * walks to premises (affected-by), incoming walks to dependents (affects). */
+static int test_call_hierarchy(void)
+{
+    lsp_server *s = lsp_new();
+    strbuf cap; sb_init(&cap);
+    strbuf msg; sb_init(&msg);
+    const char *uri = "file:///ch.story";
+
+    build_open(&msg, uri, SRC_CH);
+    dispatch(s, &cap, msg.buf);
+    sb_reset(&cap);
+
+    /* prepare on the head `x` (L1 char 14) -> a root item named x. */
+    build_pos_req(&msg, "textDocument/prepareCallHierarchy", uri, 1, 14, 30);
+    dispatch(s, &cap, msg.buf);
+    CHECK(strstr(cap.buf, "\"name\":\"x\"") != NULL);
+    sb_reset(&cap);
+
+    /* outgoing(x) -> its premise `a`, and NOT the downstream `y`. */
+    build_ch_req(&msg, "callHierarchy/outgoingCalls", uri, "x", 31);
+    dispatch(s, &cap, msg.buf);
+    CHECK(strstr(cap.buf, "\"to\":") != NULL);
+    CHECK(strstr(cap.buf, "\"name\":\"a\"") != NULL);
+    CHECK(strstr(cap.buf, "\"name\":\"y\"") == NULL);
+    sb_reset(&cap);
+
+    /* incoming(x) -> what it feeds: the head `y` of r2. */
+    build_ch_req(&msg, "callHierarchy/incomingCalls", uri, "x", 32);
+    dispatch(s, &cap, msg.buf);
+    CHECK(strstr(cap.buf, "\"from\":") != NULL);
+    CHECK(strstr(cap.buf, "\"name\":\"y\"") != NULL);
+    sb_reset(&cap);
+
+    /* outgoing(y) -> both premises of r2: `x` and `b`. */
+    build_ch_req(&msg, "callHierarchy/outgoingCalls", uri, "y", 33);
+    dispatch(s, &cap, msg.buf);
+    CHECK(strstr(cap.buf, "\"name\":\"x\"") != NULL);
+    CHECK(strstr(cap.buf, "\"name\":\"b\"") != NULL);
+    sb_reset(&cap);
+
+    /* prepare off any atom -> null. */
+    build_pos_req(&msg, "textDocument/prepareCallHierarchy", uri, 1, 0, 34);
+    dispatch(s, &cap, msg.buf);
+    CHECK(strstr(cap.buf, "\"result\":null") != NULL);
+
+    sb_free(&msg); sb_free(&cap);
+    lsp_free(s);
+    return 0;
+}
+
+/* Position encoding: LSP characters are UTF-16 code units, but the compiler
+ * emits byte columns. A 2-byte char before `ax` on L1 makes them differ (byte
+ * 17 vs UTF-16 16); check both the outgoing and incoming remap. */
+static int test_utf16(void)
+{
+    lsp_server *s = lsp_new();
+    strbuf cap; sb_init(&cap);
+    strbuf msg; sb_init(&msg);
+    const char *uri = "file:///u.story";
+
+    build_open(&msg, uri, SRC_UTF8);
+    dispatch(s, &cap, msg.buf);
+    sb_reset(&cap);
+
+    /* OUTGOING: references from ax's (ASCII) decl includes its L1 body use,
+     * whose reported character must be the UTF-16 column 16, not the byte 17. */
+    build_pos_req(&msg, "textDocument/references", uri, 0, 8, 40);
+    dispatch(s, &cap, msg.buf);
+    CHECK(strstr(cap.buf, "\"line\":1,\"character\":16") != NULL);
+    CHECK(strstr(cap.buf, "\"line\":1,\"character\":17") == NULL);
+    sb_reset(&cap);
+
+    /* INCOMING: a position at UTF-16 column 16 on L1 must resolve to `ax`
+     * (byte 17 in the model) -> definition returns its decl. Without the
+     * remap, column 16 would land on the space before `ax` and miss. */
+    build_pos_req(&msg, "textDocument/definition", uri, 1, 16, 41);
+    dispatch(s, &cap, msg.buf);
+    CHECK(strstr(cap.buf, "\"line\":0,\"character\":8") != NULL);
+
+    sb_free(&msg); sb_free(&cap);
+    lsp_free(s);
+    return 0;
+}
+
 /* The minimal JSON layer: parse a nested object, typed accessors, escapes,
  * and rejection of malformed input. */
 static int test_json(void)
@@ -369,6 +492,8 @@ int main(void)
     if (test_lifecycle())   return 1;
     if (test_navigation())  return 1;
     if (test_hover())       return 1;
+    if (test_call_hierarchy()) return 1;
+    if (test_utf16())       return 1;
     printf("test_lsp: all passed\n");
     return 0;
 }
