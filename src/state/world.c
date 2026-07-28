@@ -736,6 +736,10 @@ void world_matched_checkpoint(world *w)
 
 void world_matched_reset(world *w)
 {
+    if (w->njr == w->jr_matched_base)
+        return;                  /* empty suffix: dropping nothing is not an edit —
+                                  * an all-view re-ground (#80) must not force a
+                                  * jfam re-emit every tick via struct_ver */
     w->njr = w->jr_matched_base;
     arena_release(&w->matched_a);   /* free the previous matched layer's strings/bodies */
     w->struct_ver++;             /* structural edit (#63) */
