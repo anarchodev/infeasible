@@ -2332,8 +2332,30 @@ semantics. Names are working names.
 - **Ambiguity propagation**: blocked for now, for predictability. Revisit if
   authors want "conflicting rumours" semantics where an undecided premise
   should taint downstream conclusions.
-- **Team defeat**: on, matching "several weak reasons jointly outweighed."
-  Needs author-facing docs either way.
+- **Team defeat**: **decided — keep it** (2026-07-28; a removal was drafted on
+  a since-dropped branch and reconsidered). The distinguishing case is the
+  criss-cross — supporters `r1, r2`, attackers `s1, s2`, `r1>s1`, `r2>s2`, no
+  single champion — and team defeat decides it the way layered content needs:
+  independent reasons, each carrying its own trump over its own exception,
+  compose *across authors* — `r > s` keeps its local meaning ("my rule
+  overrides that exception") no matter what else exists. Single-champion
+  defeat does not remove the global-knowledge problem, it relocates it: a
+  support is impotent unless it dominates *every* attacker, so pairwise `>`
+  edges silently stop meaning what they say, and the failure class it
+  manufactures is the *silently-REFUTED* conclusion — exactly §6.2 Tier-1
+  #2's non-monotonic null deref. Two language facts seal it: band-derived
+  superiority is uniform across teams, so the two semantics coincide wherever
+  bands resolve the conflict; and automatic specificity (below) *organically
+  generates* criss-crosses — two specific supports each trumping its own
+  general exception — which must compose, not refuse. The original objection
+  (an emergent team win is unpredictable without global knowledge) is
+  epistemic and is answered by visibility, not semantics: the `why?` trace
+  already renders which team member beat which attacker, and the
+  conflictable-pair compile check (a planned lint surfacing every
+  complementary-head pair and how it resolves, team wins loudly) moves that
+  knowledge to build time. Pinned by the criss-cross golden in `test_dl`
+  (verdict-level, not just the dl↔dl_col differential). Still needs
+  author-facing docs.
 - **Cross-scope entity identity** (§5.5, §6.4): scope-qualified atoms give a
   spawned instance identity *within* its scope, but escalation fires an
   action onto an outer fluent (§5.5 rule 5), and if that fluent must name a
