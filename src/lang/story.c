@@ -1995,6 +1995,9 @@ static void check_pred_args(parser *p, uint32_t pred, pred_info *pi,
     }
 }
 
+static int expr_value_sort(parser *p, int e);      /* defined below check_atom */
+static const char *value_sort_name(parser *p, int s);
+
 /* Validate an effect-RHS expression tree (§5.8): every fluent read resolves to
  * a declared numeric fluent of matching arity with in-scope args. */
 static void check_expr(parser *p, int e, var_bind *vars, int nvars)
@@ -2039,8 +2042,25 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
                  fn->nargs == 1 ? "" : "s", n->nargs);
             return;
         }
-        for (int k = 0; k < n->nargs; k++)     /* args are ordinary RHS expressions */
+        for (int k = 0; k < n->nargs; k++) {   /* args are ordinary RHS expressions */
             check_expr(p, n->cargs[k], vars, nvars);
+            /* type-check each argument against the declared parameter. An `int`
+             * parameter (argsort == INTERN_NONE) wants an integer expression; a
+             * sort/domain parameter wants a value of that type (a cell read of
+             * that domain, or a nested call returning it). An unresolved declared
+             * type is skipped — check_functions already flagged it. */
+            int want = -1;
+            if (fn->argsort[k] != INTERN_NONE) {
+                want = find_sort(p, fn->argsort[k]);
+                if (want < 0) continue;
+            }
+            int got = expr_value_sort(p, n->cargs[k]);
+            if (got != want)
+                serr(p, n->line, n->col,
+                     "function '%s' argument %d expects %s but got %s",
+                     intern_name(p->syms, n->pred), k + 1,
+                     value_sort_name(p, want), value_sort_name(p, got));
+        }
         return;
     }
     case EX_NEG:
@@ -2100,6 +2120,31 @@ static bool expr_is_cell_rhs(parser *p, int e, int val_sort)
         return fi >= 0 && find_sort(p, p->functions[fi].ret) == val_sort;
     }
     return false;
+}
+
+/* The value type of an effect expression, for function-argument type-checking:
+ * a sort/domain index (a cell/domain-valued expr), or -1 for a plain integer. A
+ * cell-fluent read carries its value domain; a function call carries its return
+ * type; a numeric read, constant, roll, or any arithmetic node is an int. */
+static int expr_value_sort(parser *p, int e)
+{
+    if (e < 0) return -1;
+    ex_node *n = &p->exprs[e];
+    if (n->kind == EX_CALL) {
+        int fi = find_function(p, n->pred);
+        return fi >= 0 ? find_sort(p, p->functions[fi].ret) : -1;
+    }
+    if (n->kind == EX_LOAD) {
+        pred_info *pi = find_pred(p, n->pred);
+        return (pi && pi->is_cell) ? pi->val_sort : -1;
+    }
+    return -1;                                  /* const / roll / arithmetic -> int */
+}
+
+/* Render a value type for a diagnostic: -1 is `int`, else the sort/domain name. */
+static const char *value_sort_name(parser *p, int s)
+{
+    return s < 0 ? "int" : p->sorts[s].name;
 }
 
 /* Validate one atom against the schema: predicate known, arity matches, and

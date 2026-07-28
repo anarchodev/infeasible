@@ -183,6 +183,20 @@ static int test_errors(void)
             "function at(cell) : cell\n",
             "clashes with a fluent"))
         return 1;
+    /* an int passed where a cell parameter is expected */
+    if (expect_error_msg(
+            "domain cell\nsort actor\nfunction neighbor(cell, int) : cell\n"
+            "state ( at(actor):cell )\n"
+            "action m(X:actor): causes at(X) := neighbor(5, 1)\n",
+            "argument 1 expects cell but got int"))
+        return 1;
+    /* a cell passed where an int parameter is expected */
+    if (expect_error_msg(
+            "domain cell\nsort actor\nfunction neighbor(cell, int) : cell\n"
+            "state ( at(actor):cell )\n"
+            "action m(X:actor): causes at(X) := neighbor(at(X), at(X))\n",
+            "argument 2 expects int but got cell"))
+        return 1;
     return 0;
 }
 
