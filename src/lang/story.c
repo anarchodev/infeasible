@@ -15,6 +15,7 @@
 #define MAX_DOMAIN     32      /* values in a multi-valued fluent domain */
 #define MAX_SORTS      32
 #define MAX_ENTS       (1 << 20)   /* sanity ceiling; entities grow on the heap */
+#define MAX_MEMPOOL    1024    /* membership-list values across a file (#95) */
 #define MAX_FLUENTS    256     /* fluent *predicate* schemas */
 #define MAX_PREDS      512     /* predicate registry (fluents + heads) */
 #define MAX_RULES      256
@@ -65,6 +66,11 @@ typedef struct {
     int         lhs_root, rhs_root;   /* the two expr trees, when is_expr_guard */
     bool        is_valuedef;   /* head only: `v(args) = expr` defines a declared
                                 * `value` (#82); lhs_root holds the definition expr */
+    bool        is_member;     /* `X in { v, … }` finite-domain membership (#95):
+                                * args[0] = the element var, mem_ix/mem_n index the
+                                * mempool, `neg` = `not in`. A static grounding
+                                * filter — never emitted, never in the fixpoint. */
+    int         mem_ix, mem_n;
     int       line, col;
 } ast_atom;
 
@@ -270,10 +276,15 @@ typedef struct {
      * cannot be grounded over; its values are host-minted handles that appear
      * only as provider/action-param arg types. Sharing the sort table lets the
      * arity/sort checks treat a domain arg like any other. */
-    struct { char name[MAX_NAME]; int line, col; bool is_domain; } sorts[MAX_SORTS];
+    /* `is_enum`: a sort synthesized from an `enum` (#96) — a finite, declared,
+     * ground domain whose "entities" are the enum's values, so enum-typed
+     * arguments, rule variables, and membership ride the existing odometer.
+     * Values are not entities: `entity x : <enum>` is rejected. */
+    struct { char name[MAX_NAME]; int line, col; bool is_domain; bool is_enum; } sorts[MAX_SORTS];
     int nsorts;
     struct ent_rec { uint32_t atom; int sort; int line, col; } *ents;  /* heap, grown */
     int nents, capents;
+    int nuserents;                /* ents[0..nuserents) authored; rest = enum values (#96) */
     /* O(1) entity lookups (built in resolve_entities), so grounding is not O(n^2):
      * ent_of maps an entity atom -> its p->ents index (interns are dense, so the
      * direct-indexed array is a perfect hash); ent_pos is that entity's position
@@ -308,6 +319,9 @@ typedef struct {
 
     ex_node    *exprs;            /* heap; MAX_EXPRS effect-expression nodes */
     int nexprs;
+
+    uint32_t    mempool[MAX_MEMPOOL];   /* membership-list values (#95), atoms */
+    int nmempool;
 
     pred_info   preds[MAX_PREDS];
     int npreds;
@@ -908,10 +922,42 @@ static bool parse_atom(parser *p, ast_atom *out)
             notin = true;
         }
         advance(p);                                /* 'in' */
+        if (p->cur.kind == TK_LBRACE) {            /* finite-domain membership (#95) */
+            advance(p);
+            out->args[0].name = out->pred;         /* the element var */
+            out->args[0].line = id.line;
+            out->args[0].col = id.col;
+            out->nargs = 1;
+            out->pred = INTERN_NONE;               /* not a predicate — a filter */
+            out->is_member = true;
+            out->neg ^= notin;
+            out->mem_ix = p->nmempool;
+            for (;;) {
+                if (p->cur.kind != TK_IDENT) {
+                    char d[64]; tok_desc(p->cur, d, sizeof d);
+                    fail(p, p->cur.line, p->cur.col,
+                         "expected a value name in a membership list, found %s", d);
+                    return false;
+                }
+                if (p->nmempool >= MAX_MEMPOOL) {
+                    fail(p, p->cur.line, p->cur.col,
+                         "too many membership-list values in this file (max %d)",
+                         MAX_MEMPOOL);
+                    return false;
+                }
+                p->mempool[p->nmempool++] = intern_tok(p, p->cur);
+                out->mem_n++;
+                advance(p);
+                if (p->cur.kind == TK_COMMA) { advance(p); continue; }
+                break;
+            }
+            return expect(p, TK_RBRACE);
+        }
         if (p->cur.kind != TK_IDENT) {
             char d[64]; tok_desc(p->cur, d, sizeof d);
             fail(p, p->cur.line, p->cur.col,
-                 "expected a `set of` parameter name after `in`, found %s", d);
+                 "expected a `set of` parameter name after `in` (or '{' for a "
+                 "membership list), found %s", d);
             return false;
         }
         out->args[0].name = out->pred;             /* the element var T */
@@ -1404,6 +1450,11 @@ static void parse_init(parser *p)
             fail(p, a.line, a.col,
                  "init lists facts that start true; a negated init is redundant "
                  "(everything unlisted is closed-world false)");
+            return;
+        }
+        if (a.is_member || a.is_expr_guard) {
+            fail(p, a.line, a.col,
+                 "init lists ground facts — a membership/comparison test is not a fact");
             return;
         }
         p->inits[p->ninits++] = a;
@@ -1938,12 +1989,63 @@ static void atom_map_set(int **map, uint32_t *cap, uint32_t key, int val)
     (*map)[key] = val;
 }
 
+/* #96: an enum is a finite, declared, ground domain — the same property that
+ * makes a sort groundable. Synthesize a sort per enum whose "entities" are the
+ * enum's values, so `resistant(actor, damage_type)`, `D : damage_type` rule
+ * variables, and `D in { … }` all ride the existing odometer, arg checks, and
+ * lane machinery with no new grounding shape. The distinction preserved:
+ * values are NOT entities — `entity x : <enum>` is rejected below, and a value
+ * name colliding with an entity (or another enum's value) is a duplicate
+ * error, because an atom must resolve to exactly one domain. */
+static void synthesize_enum_sorts(parser *p)
+{
+    p->nuserents = p->nents;
+    for (int i = 0; i < p->nenums; i++) {
+        enum_dom *e = &p->enums[i];
+        if (find_sort(p, intern_id(p->syms, e->name)) >= 0) {
+            serr(p, e->line, e->col,
+                 "'%s' is declared as both a sort and an enum", e->name);
+            continue;
+        }
+        if (p->nsorts >= MAX_SORTS) {
+            serr(p, e->line, e->col, "too many sorts (max %d)", MAX_SORTS);
+            return;
+        }
+        int s = p->nsorts++;
+        snprintf(p->sorts[s].name, MAX_NAME, "%s", e->name);
+        p->sorts[s].line = e->line;
+        p->sorts[s].col = e->col;
+        p->sorts[s].is_domain = false;
+        p->sorts[s].is_enum = true;
+        for (int k = 0; k < e->nvalues; k++) {
+            if (p->nents >= MAX_ENTS) {
+                serr(p, e->line, e->col, "too many entities (max %d)", MAX_ENTS);
+                return;
+            }
+            if (p->nents == p->capents) {
+                p->capents = p->capents ? p->capents * 2 : 64;
+                p->ents = realloc(p->ents, (size_t)p->capents * sizeof *p->ents);
+            }
+            p->ents[p->nents].atom = e->values[k];
+            p->ents[p->nents].sort = s;            /* already resolved */
+            p->ents[p->nents].line = e->line;
+            p->ents[p->nents].col = e->col;
+            p->nents++;
+        }
+    }
+}
+
 static void resolve_entities(parser *p)
 {
     for (int i = 0; i < p->nents; i++) {
         int s = decode_sort(p, p->ents[i].sort, p->ents[i].line, p->ents[i].col,
                             "an entity declaration");
         p->ents[i].sort = s;                       /* may be -1 on error */
+        if (i < p->nuserents && s >= 0 && p->sorts[s].is_enum)
+            serr(p, p->ents[i].line, p->ents[i].col,
+                 "cannot declare an entity of the enum '%s' — enum values are "
+                 "not entities (#96); add the name to the enum instead",
+                 p->sorts[s].name);
     }
 
     /* atom -> first-occurrence index (also an O(n) duplicate check) */
@@ -2387,6 +2489,34 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
         }
         check_expr(p, at->lhs_root, vars, nvars);
         check_expr(p, at->rhs_root, vars, nvars);
+        return;
+    }
+    if (at->is_member) {                            /* `X in { … }` (#95) */
+        if (in_effect) {
+            serr(p, at->line, at->col,
+                 "a membership test can't appear in a `causes` clause");
+            return;
+        }
+        int vi = var_index(vars, nvars, at->args[0].name);
+        if (vi < 0) {
+            serr(p, at->args[0].line, at->args[0].col,
+                 "'%s' in a membership test must be a bound variable",
+                 intern_name(p->syms, at->args[0].name));
+            return;
+        }
+        int vs = vars[vi].sort;
+        for (int k = 0; k < at->mem_n; k++) {
+            uint32_t val = p->mempool[at->mem_ix + k];
+            int ei = find_entity(p, val);
+            int got = ei >= 0 ? p->ents[ei].sort : -1;
+            if (ei < 0 || (vs >= 0 && got >= 0 && got != vs))
+                serr(p, at->line, at->col,
+                     "'%s' is not a value of '%s' (the sort of '%s') — this "
+                     "membership test could never match it",
+                     intern_name(p->syms, val),
+                     vs >= 0 ? p->sorts[vs].name : "?",
+                     intern_name(p->syms, at->args[0].name));
+        }
         return;
     }
     if (note) note_ref(p, at->pred, at->line, at->col);
@@ -2990,6 +3120,7 @@ static bool value_cycle_dfs(parser *p, int vi, bool *onstack, bool *done)
 
 static void semantic_pass(parser *p)
 {
+    synthesize_enum_sorts(p);          /* #96: before entities resolve */
     resolve_entities(p);
     populate_sort_valued_fluents(p);
     register_set_providers(p);
@@ -3575,6 +3706,29 @@ static void ground_inits(parser *p)
     }
 }
 
+/* #95: evaluate a membership conjunct under a concrete binding. Pure grounding
+ * filter — statically decided per instance, zero runtime cost, no fixpoint
+ * effect: sugar over hand-writing one rule per alternative. */
+static bool member_ok(parser *p, const ast_atom *at, var_bind *vars, int nvars,
+                      const uint32_t *binding)
+{
+    uint32_t v = resolve_arg(vars, nvars, binding, at->args[0]);
+    bool in = false;
+    for (int k = 0; k < at->mem_n && !in; k++)
+        in = p->mempool[at->mem_ix + k] == v;
+    return at->neg ? !in : in;
+}
+
+/* All membership conjuncts of `body[0..n)` hold under `binding`? */
+static bool members_ok(parser *p, ast_atom *body, int n, var_bind *vars,
+                       int nvars, const uint32_t *binding)
+{
+    for (int b = 0; b < n; b++)
+        if (body[b].is_member && !member_ok(p, &body[b], vars, nvars, binding))
+            return false;
+    return true;
+}
+
 static void ground_rule(parser *p, ast_rule *r)
 {
     if (r->head.is_valuedef) return;   /* #82: inlined at read sites, never a dl rule */
@@ -3605,26 +3759,40 @@ static void ground_rule(parser *p, ast_rule *r)
     char name[MAX_GROUND];
     for (long idx = 0; idx < total; idx++) {
         decode_binding(p, r->vars, r->nvars, idx, binding);
+        /* #95: a failed membership conjunct statically kills this instance —
+         * exactly the rule the author would not have hand-written */
+        if (!members_ok(p, r->body, r->nbody, r->vars, r->nvars, binding)) {
+            r->insts[idx].handle = -1;
+            continue;
+        }
         dl_lit head = ground_lit(p, &r->head, r->vars, r->nvars, binding);
         dl_lit body[MAX_BODY];
+        int nb = 0;
         for (int b = 0; b < r->nbody; b++)
-            body[b] = ground_lit(p, &r->body[b], r->vars, r->nvars, binding);
+            if (!r->body[b].is_member)             /* held: drop the conjunct */
+                body[nb++] = ground_lit(p, &r->body[b], r->vars, r->nvars, binding);
         inst_name(p, name, sizeof name, r->label, r->vars, r->nvars, binding);
-        r->insts[idx].handle = world_add_rule(p->w, name, r->kind, head, body, r->nbody);
+        r->insts[idx].handle = world_add_rule(p->w, name, r->kind, head, body, nb);
         char pbuf[MAX_NAME + 24];
         world_set_rule_prov(p->w, r->insts[idx].handle,
                             prov_str(p, r->line, pbuf, sizeof pbuf));
 
         /* `unless G` sugars to a defeater blocking this instance's head:
-         * G ~> ~head (DESIGN.md §6), reinstated whenever the guard fails. */
-        if (r->has_guard) {
+         * G ~> ~head (DESIGN.md §6), reinstated whenever the guard fails. A
+         * failed membership in G makes the defeater unsatisfiable — skip it; a
+         * held one drops out (an all-membership guard is an unconditional
+         * defeat, which is the correct reading of `unless D in { … }`). */
+        if (r->has_guard &&
+            members_ok(p, r->guard, r->nguard, r->vars, r->nvars, binding)) {
             dl_lit guard[MAX_BODY];
+            int ng = 0;
             for (int b = 0; b < r->nguard; b++)
-                guard[b] = ground_lit(p, &r->guard[b], r->vars, r->nvars, binding);
+                if (!r->guard[b].is_member)
+                    guard[ng++] = ground_lit(p, &r->guard[b], r->vars, r->nvars, binding);
             char gname[MAX_GROUND + 8];
             snprintf(gname, sizeof gname, "%s.unless", name);
             int gh = world_add_rule(p->w, gname, DL_DEFEATER, dl_complement(head),
-                                    guard, r->nguard);
+                                    guard, ng);
             world_set_rule_prov(p->w, gh, prov_str(p, r->line, pbuf, sizeof pbuf));
         }
     }
@@ -3666,6 +3834,8 @@ static bool rule_matchable(parser *p, ast_rule *r)
     for (int b = 0; b < r->nbody; b++) {
         ast_atom *at = &r->body[b];
         if (at->is_expr_guard || at->primed) return false;  /* roll/expr, primed — later */
+        if (at->is_member) return false;   /* #95: a static filter the tick-time
+                                            * re-ground path can't yet apply */
         pred_info *pi = find_pred(p, at->pred);
         if (at->is_guard) {                        /* numeric comparison FILTER */
             if (!pi || !pi->is_num) return false;  /* guards read a numeric fluent */
@@ -4328,6 +4498,9 @@ static void ground_action(parser *p, ast_action *a)
     uint32_t binding[MAX_ARGS];
     for (long idx = 0; idx < total; idx++) {
         decode_binding(p, a->vars, a->nvars, idx, binding);
+        /* #95: a failed membership in `requires` kills this instance statically */
+        if (!members_ok(p, a->requires, a->nreq, a->vars, a->nvars, binding))
+            continue;
         char aname[MAX_GROUND];
         inst_name(p, aname, sizeof aname, a->name, a->vars, a->nvars, binding);
         /* A ramification has no trigger (act = INTERN_NONE): it fires in any
@@ -4341,12 +4514,16 @@ static void ground_action(parser *p, ast_action *a)
             act = ground_pred(p, nameatom, actargs, a->nvars);
         }
         step_cond conds[MAX_BODY];
+        int ncond = 0;
         for (int b = 0; b < a->nreq; b++) {
-            conds[b].lit = ground_lit(p, &a->requires[b], a->vars, a->nvars, binding);
+            if (a->requires[b].is_member)          /* #95: held — drop the conjunct */
+                continue;
+            conds[ncond].lit = ground_lit(p, &a->requires[b], a->vars, a->nvars, binding);
             /* Bare atom = current state; a postfix `'` (ramification bodies
              * only) reads the next state (§5.4). Action `requires` are always
              * current-state — the parser forbids `'` there. */
-            conds[b].primed = a->requires[b].primed;
+            conds[ncond].primed = a->requires[b].primed;
+            ncond++;
         }
         /* A multi-valued assignment `f = v` expands to the whole family: the
          * chosen value plus a negation of every sibling, so exactly one value
@@ -4376,7 +4553,7 @@ static void ground_action(parser *p, ast_action *a)
                     eff[ne++] = dl_neg(ground_mv_atom(p, e->pred, args, e->nargs,
                                                       pi->values[v]));
         }
-        int h = world_add_step_rule(p->w, aname, act, conds, a->nreq, eff, ne);
+        int h = world_add_step_rule(p->w, aname, act, conds, ncond, eff, ne);
         char pbuf[MAX_NAME + 24];
         world_set_step_prov(p->w, h, prov_str(p, a->line, pbuf, sizeof pbuf));
 
@@ -4421,20 +4598,29 @@ static void ground_action(parser *p, ast_action *a)
                 decode_binding(p, bnd->vars, bnd->nvars, j, ib);
                 for (int k = 0; k < bnd->nvars; k++) cb[a->nvars + k] = ib[k];
 
+                /* #95: membership in `where` (or `when`, below) is statically
+                 * decided per inner binding — a failed one skips the instance */
+                if (!members_ok(p, bnd->where, bnd->nwhere, cv, ncv, cb))
+                    continue;
                 for (int it = 0; it < bnd->nitems; it++) {
                     binder_item *item = &bnd->items[it];
+                    if (!members_ok(p, item->when, item->nwhen, cv, ncv, cb))
+                        continue;
                     /* conds = action requires + binder where + item when */
                     step_cond bc[MAX_BODY];
                     int nbc = 0;
                     for (int b = 0; b < a->nreq && nbc < MAX_BODY; b++) {
+                        if (a->requires[b].is_member) continue;   /* held (#95) */
                         bc[nbc].lit = ground_lit(p, &a->requires[b], cv, ncv, cb);
                         bc[nbc++].primed = a->requires[b].primed;
                     }
                     for (int b = 0; b < bnd->nwhere && nbc < MAX_BODY; b++) {
+                        if (bnd->where[b].is_member) continue;    /* held (#95) */
                         bc[nbc].lit = ground_lit(p, &bnd->where[b], cv, ncv, cb);
                         bc[nbc++].primed = false;
                     }
                     for (int b = 0; b < item->nwhen && nbc < MAX_BODY; b++) {
+                        if (item->when[b].is_member) continue;    /* held (#95) */
                         bc[nbc].lit = ground_lit(p, &item->when[b], cv, ncv, cb);
                         bc[nbc++].primed = false;
                     }
@@ -4546,6 +4732,8 @@ static void emit_sup_edges(parser *p, ast_rule *ra, ast_rule *rb, int line, int 
         long ai = encode_rule_index(p, ra, abind);
         long bi = encode_rule_index(p, rb, bbind);
         if (ai < 0 || bi < 0 || ai >= ra->ninst || bi >= rb->ninst) continue;
+        if (ra->insts[ai].handle < 0 || rb->insts[bi].handle < 0)
+            continue;                              /* #95: membership-dropped instance */
         world_add_sup(p->w, ra->insts[ai].handle, rb->insts[bi].handle);
     }
 }
@@ -5682,12 +5870,18 @@ static story_model *harvest_model(parser *p)
     /* declaration symbols (the document outline) + a DECL occurrence each, so
      * a references query can surface the declaring site alongside the uses. */
     for (int i = 0; i < p->nsorts; i++) {
+        if (p->sorts[i].is_enum) continue;         /* #96: the enum symbol covers it */
         bool dom = p->sorts[i].is_domain;
         sm_add_sym(m, p->sorts[i].name, dom ? STORY_SYM_DOMAIN : STORY_SYM_SORT,
                    p->sorts[i].line, p->sorts[i].col, dom ? "domain" : "sort");
         sm_add_ref(m, p->sorts[i].name, STORY_OCC_DECL, p->sorts[i].line, p->sorts[i].col);
     }
     for (int i = 0; i < p->nents; i++) {
+        /* #96: skip enum-value pseudo-entities — the enum symbol covers them
+         * (robust on failed compiles, where nuserents may not be set yet) */
+        if (p->ents[i].sort >= 0 && p->ents[i].sort < p->nsorts &&
+            p->sorts[p->ents[i].sort].is_enum)
+            continue;
         const char *nm = intern_name(p->syms, p->ents[i].atom);
         size_t off = 0; det[0] = '\0';
         dapp(det, &off, sizeof det, "entity : ");
