@@ -33,6 +33,12 @@ void       factindex_free(factindex *ix);
 void       factindex_add(factindex *ix, uint32_t pred,
                          const uint32_t *args, int nargs);
 
+/* Remove one occurrence of pred(args) — the incremental counterpart of add, so
+ * the index is maintained per fact change instead of rebuilt (#73). Swap-remove:
+ * O(1), deterministic by add/remove sequence (I4). Returns whether it was present. */
+bool       factindex_remove(factindex *ix, uint32_t pred,
+                            const uint32_t *args, int nargs);
+
 /* Drop every tuple but keep the allocation, so the index can be refilled each
  * tick without realloc churn. */
 void       factindex_clear(factindex *ix);

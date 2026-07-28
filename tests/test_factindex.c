@@ -109,6 +109,19 @@ int main(void)
     factindex_add(ix, ADJ, (uint32_t[]){8, 8}, 2);
     CHECK(factindex_count(ix, ADJ) == 1);
 
+    /* incremental remove (#73): drop a present tuple, leave others; a missing
+     * tuple / absent predicate is a no-op */
+    factindex_add(ix, ADJ, (uint32_t[]){1, 2}, 2);
+    factindex_add(ix, ADJ, (uint32_t[]){3, 4}, 2);
+    CHECK(factindex_count(ix, ADJ) == 3);                  /* {8,8},{1,2},{3,4} */
+    CHECK(factindex_remove(ix, ADJ, (uint32_t[]){1, 2}, 2));
+    CHECK(factindex_count(ix, ADJ) == 2);
+    CHECK(!factindex_remove(ix, ADJ, (uint32_t[]){1, 2}, 2)); /* already gone */
+    CHECK(!factindex_remove(ix, 42, (uint32_t[]){0, 0}, 2));  /* absent pred */
+    /* the survivors are still probeable (order may differ after swap-remove) */
+    CHECK(collect(ix, ADJ, (bool[]){true, false}, (uint32_t[]){3, 0}, 2, rows, 8) == 1);
+    CHECK(collect(ix, ADJ, (bool[]){true, false}, (uint32_t[]){8, 0}, 2, rows, 8) == 1);
+
     factindex_free(ix);
     printf("test_factindex: all passed\n");
     return 0;
