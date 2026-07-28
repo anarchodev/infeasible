@@ -95,6 +95,33 @@ void factindex_add(factindex *ix, uint32_t pred, const uint32_t *args, int nargs
     b->count++;
 }
 
+/* Remove one occurrence of pred(args) from its extension. Swap-remove (O(1)):
+ * the order among survivors is no longer insertion order, but it stays a
+ * deterministic function of the add/remove SEQUENCE — replay-exact (I4) — which
+ * is what the matcher's enumeration needs. Returns whether a tuple was removed. */
+bool factindex_remove(factindex *ix, uint32_t pred, const uint32_t *args, int nargs)
+{
+    if (nargs < 0) nargs = 0;
+    if (nargs > FACTINDEX_MAXARGS) nargs = FACTINDEX_MAXARGS;
+    if (pred >= ix->pred_of_cap || ix->pred_of[pred] < 0) return false;
+    bucket *b = &ix->buckets[ix->pred_of[pred]];
+    for (int i = 0; i < b->count; i++) {
+        uint32_t *row = &b->tuples[(size_t)i * (size_t)b->nargs];
+        bool match = true;
+        for (int k = 0; k < b->nargs; k++)
+            if (row[k] != (args ? args[k] : 0)) { match = false; break; }
+        if (match) {
+            int last = b->count - 1;
+            if (i != last && b->nargs > 0)
+                memcpy(row, &b->tuples[(size_t)last * (size_t)b->nargs],
+                       (size_t)b->nargs * sizeof(uint32_t));
+            b->count--;
+            return true;
+        }
+    }
+    return false;
+}
+
 int factindex_count(const factindex *ix, uint32_t pred)
 {
     const bucket *b = find_bucket(ix, pred);

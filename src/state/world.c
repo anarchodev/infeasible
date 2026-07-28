@@ -123,7 +123,7 @@ struct world {
      * fl_pred[i]=INTERN_NONE means "no structure" (absent from the index).
      * fl_args is flat, FACTINDEX_MAXARGS per fluent. */
     uint32_t *fl_pred; int *fl_nargs; uint32_t *fl_args;
-    factindex *fidx; bool fidx_dirty;   /* extension index over the live vals */
+    factindex *fidx;              /* extension index; built once, maintained live (#73) */
     /* atom -> index maps, so declare/lookup is O(1) not a linear scan (interns
      * are dense uint32, so a direct-indexed array is the natural perfect hash).
      * Grown geometrically; slot value -1 = absent. Fluents/nums are append-only. */
@@ -246,7 +246,6 @@ world *world_new(intern *syms)
 static void invalidate_state_solved(world *w)
 {
     w->jfam_solved = false;
-    w->fidx_dirty = true;              /* the extension index tracks the vals */
     w->matched_stale = true;           /* the matched layer must be re-ground (#45) */
     for (int i = 0; i < w->nlanes; i++)
         w->lanes[i].solved = false;
@@ -371,10 +370,36 @@ void world_set_fluent_prov(world *w, uint32_t atom, const char *at)
         w->fl_prov[i] = at ? arena_strdup(&w->a, at) : NULL;
 }
 
+/* Maintain the extension index for fluent `i` flipping to `now` (#73), so the
+ * index is updated per fact change instead of rebuilt from all fluents per
+ * re-ground. No-op until the index exists (built lazily from the initial state)
+ * and only for structured base boolean fluents. */
+static void fidx_update(world *w, int i, bool now)
+{
+    if (w->fidx && w->fl_pred[i] != INTERN_NONE) {
+        const uint32_t *args = &w->fl_args[(size_t)i * FACTINDEX_MAXARGS];
+        if (now) factindex_add(w->fidx, w->fl_pred[i], args, w->fl_nargs[i]);
+        else     factindex_remove(w->fidx, w->fl_pred[i], args, w->fl_nargs[i]);
+    }
+}
+
+/* Apply a step's fluent changes to the extension index (#73). Called with the
+ * NEXT state, while w->vals still holds the current one, so it diffs and updates
+ * only the changed fluents. O(fluents), but a step is O(fluents) anyway; the win
+ * is that a query after the step finds the index current, no full rebuild. */
+static void reindex_commit(world *w, const bool *next)
+{
+    if (!w->fidx) return;              /* not built yet — the first query builds it */
+    for (int i = 0; i < w->nfl; i++)
+        if (next[i] != w->vals[i])
+            fidx_update(w, i, next[i]);
+}
+
 void world_set(world *w, uint32_t atom, bool value)
 {
     int i = fluent_index(w, atom);
     if (i >= 0) {
+        if (w->vals[i] != value) fidx_update(w, i, value);   /* index tracks the change */
         w->vals[i] = value;
         invalidate_state_solved(w);                /* judgments now stale */
     }
@@ -399,23 +424,18 @@ void world_set_fluent_struct(world *w, uint32_t atom, uint32_t pred,
     w->fl_nargs[i] = nargs;
     for (int k = 0; k < nargs; k++)
         w->fl_args[(size_t)i * FACTINDEX_MAXARGS + k] = args[k];
-    w->fidx_dirty = true;
+    /* structure recorded at compile; the index is built lazily from it (#73) */
 }
 
 const struct factindex *world_fact_index(world *w)
 {
-    if (!w->fidx) {
-        w->fidx = factindex_new();
-        w->fidx_dirty = true;
-    }
-    if (w->fidx_dirty) {
-        factindex_clear(w->fidx);
-        for (int i = 0; i < w->nfl; i++)   /* declaration order -> deterministic */
+    if (!w->fidx) {                        /* build once from the current state; */
+        w->fidx = factindex_new();         /* thereafter maintained incrementally */
+        for (int i = 0; i < w->nfl; i++)   /* (world_set / the step commit, #73)  */
             if (w->vals[i] && w->fl_pred[i] != INTERN_NONE)
                 factindex_add(w->fidx, w->fl_pred[i],
                               &w->fl_args[(size_t)i * FACTINDEX_MAXARGS],
                               w->fl_nargs[i]);
-        w->fidx_dirty = false;
     }
     return w->fidx;
 }
@@ -1775,6 +1795,7 @@ static int world_step_lanes(world *w, const uint32_t *actions, int nactions,
 
     if (rc == 0) {
         save_step_snapshot(w, actions, nactions);   /* before overwriting vals */
+        reindex_commit(w, next);                     /* index diff (before vals move) */
         if (w->nfl)
             memcpy(w->vals, next, (size_t)w->nfl * sizeof *next);
         for (int s = 0; s < sf->numsc; s++)          /* commit numeric columns */
@@ -1906,6 +1927,7 @@ int world_step(world *w, const uint32_t *actions, int nactions,
     }
 
     if (rc == 0) {
+        reindex_commit(w, next);                     /* index diff (before vals move) */
         if (w->nfl)
             memcpy(w->vals, next, (size_t)w->nfl * sizeof *next);
         for (int i = 0; i < w->nnum; i++)
