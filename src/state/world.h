@@ -200,6 +200,7 @@ void world_set_schema_fn(world *w, world_schema_fn fn, void *ctx);
 /* Introspection (bench/tests): declared boolean fluent count — under #92 this
  * is O(touched), where the dense universe was the full cross-product. */
 int  world_fluent_count(const world *w);
+bool world_has_fluent(const world *w, uint32_t atom);
 
 /* Matched views (#80): an ISLAND judgment — one matchable rule whose head
  * predicate is concluded by no other rule, attacked by nothing, and read

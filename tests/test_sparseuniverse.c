@@ -74,7 +74,7 @@ static world *mk(intern *sy, schema_tab *t, bool extra_decl)
     return w;
 }
 
-int main(void)
+static int world_api_half(void)
 {
     intern *sy = intern_new();
     uint32_t rel = intern_id(sy, "rel");
@@ -154,6 +154,109 @@ int main(void)
 
     world_free(w);
     intern_free(sy);
+    return 1;
+}
+
+/* ---- Part 2: story-driven, tick-time matcher vs eager ---- */
+
+static const char *STORY =
+    "scene su\n"
+    "sort actor\n"
+    "entity ( a, b, c, d : actor )\n"
+    "state (\n"
+    "  rel(actor, actor)\n"
+    "  awake(actor)\n"
+    ")\n"
+    "init (\n"
+    "  rel(a, b)\n"
+    "  awake(a)\n"
+    ")\n"
+    "rule link(X: actor, Y: actor): rel(X, Y) & awake(X) => linked(X, Y)\n"
+    "action wake(X: actor): causes awake(X)\n"
+    "action sleep(X: actor): causes ~awake(X)\n";
+
+static int story_half(void)
+{
+    intern *sy = intern_new();
+    story_diag da[16]; story_diags dga = { da, 16, 0, 0 };
+    story_diag db[16]; story_diags dgb = { db, 16, 0, 0 };
+
+    world *A = story_compile(STORY, "su.story", sy, &dga);
+    world *B = NULL;
+    story_matcher *M = story_compile_matcher(STORY, "su.story", sy, &dgb, &B);
+    CHECK(A && M && B && dga.nerrors == 0 && dgb.nerrors == 0);
+
+    /* THE ECONOMY: eager declared the 4x4 rel cross-product + 4 awake (+ their
+     * ground-action-touched atoms); the sparse world declared only what inits
+     * and ground actions touch. This also proves sparse mode actually engaged. */
+    CHECK(world_fluent_count(A) == 20);            /* 16 rel + 4 awake */
+    CHECK(world_fluent_count(B) < 8);              /* init rel(a,b) + action-touched awake */
+    int b0 = world_fluent_count(B);
+
+    /* query-before-touch: closed-world, both polarities, pure */
+    uint32_t r_cd = intern_id(sy, "rel(c,d)");
+    CHECK(world_query(B, dl_pos(r_cd)) == DL_REFUTED);
+    CHECK(world_query(B, dl_neg(r_cd)) == DL_PROVED);
+    CHECK(world_query(A, dl_pos(r_cd)) == DL_REFUTED);
+    CHECK(world_fluent_count(B) == b0);            /* queries declare nothing */
+
+    /* why on the diverging (negative) polarity: byte-equal to eager */
+    {
+        char *wa = why_str(A, dl_neg(r_cd)), *wb = why_str(B, dl_neg(r_cd));
+        if (strcmp(wa, wb) != 0)
+            fprintf(stderr, "why differs:\n--- eager ---\n%s--- sparse ---\n%s", wa, wb);
+        CHECK(strcmp(wa, wb) == 0);
+        CHECK(strstr(wb, "it is a base fact") != NULL);
+        free(wa); free(wb);
+        CHECK(world_fluent_count(B) == b0 + 1);    /* why declared it */
+        CHECK(world_query(B, dl_pos(r_cd)) == DL_REFUTED);   /* stable across why */
+    }
+
+    /* host world_set on a never-declared fluent: lazy declare + match */
+    dl_lit l_cd = dl_pos(intern_id(sy, "linked(c,d)"));
+    CHECK(world_query(B, l_cd) == DL_UNDECIDED);   /* never matched */
+    world_set(A, r_cd, true);
+    world_set(A, intern_id(sy, "awake(c)"), true);
+    world_set(B, r_cd, true);
+    world_set(B, intern_id(sy, "awake(c)"), true);
+    CHECK(world_query(A, l_cd) == DL_PROVED);
+    CHECK(world_query(B, l_cd) == DL_PROVED);      /* the lazily-declared fact matched */
+
+    /* step through it: sleep(c) drops the match in both worlds */
+    char err[64];
+    uint32_t sleep_c = intern_id(sy, "sleep(c)");
+    CHECK(world_step(A, &sleep_c, 1, err, sizeof err) == 0);
+    CHECK(world_step(B, &sleep_c, 1, err, sizeof err) == 0);
+    CHECK(world_query(A, l_cd) != DL_PROVED);
+    CHECK(world_query(B, l_cd) != DL_PROVED);
+
+    /* full-intern PROVED sweep (the equivalence license, incl. the shared
+     * intern's eager-only atoms answered by the schema fallback) */
+    int diffs = 0;
+    uint32_t n = intern_count(sy);
+    for (uint32_t id = 1; id < n; id++)
+        for (int neg = 0; neg < 2; neg++) {
+            dl_lit q = neg ? dl_neg(id) : dl_pos(id);
+            bool pa = world_query(A, q) == DL_PROVED;
+            bool pb = world_query(B, q) == DL_PROVED;
+            if (pa != pb) {
+                fprintf(stderr, "provability differs: %s%s eager=%d sparse=%d\n",
+                        neg ? "~" : "", intern_name(sy, id), pa, pb);
+                diffs++;
+            }
+        }
+    CHECK(diffs == 0);
+
+    story_matcher_free(M);
+    world_free(A); world_free(B);
+    intern_free(sy);
+    return 1;
+}
+
+int main(void)
+{
+    if (!world_api_half()) return 1;
+    if (!story_half()) return 1;
     printf("test_sparseuniverse: all passed\n");
     return 0;
 }

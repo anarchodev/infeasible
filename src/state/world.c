@@ -862,6 +862,11 @@ void world_set_schema_fn(world *w, world_schema_fn fn, void *ctx)
 
 int world_fluent_count(const world *w) { return w->nfl; }
 
+bool world_has_fluent(const world *w, uint32_t atom)
+{
+    return fluent_index(w, atom) >= 0;
+}
+
 /* Pure schema probe (#92): recognized-but-undeclared fluent atom? No declare,
  * no mutation — the query path's closed-world fallback. */
 static bool schema_knows(const world *w, uint32_t atom)
