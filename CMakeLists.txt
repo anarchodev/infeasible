@@ -86,3 +86,8 @@ target_compile_options(bench_5e PRIVATE -O2)
 add_executable(bench_ground tests/bench_ground.c)
 target_link_libraries(bench_ground PRIVATE infeasible_core)
 target_compile_options(bench_ground PRIVATE -O2)
+
+# Matcher-vs-eager benchmark (EPIC #43 / §8.1): time + space across density/scale.
+add_executable(bench_matcher tests/bench_matcher.c)
+target_link_libraries(bench_matcher PRIVATE infeasible_core)
+target_compile_options(bench_matcher PRIVATE -O2)
