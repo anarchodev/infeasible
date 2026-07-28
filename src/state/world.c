@@ -137,9 +137,9 @@ struct world {
      * (#48). `in_matched` (set at the checkpoint) routes world_add_rule /
      * world_set_rule_prov allocations there for every add past the boundary. */
     arena matched_a; bool in_matched;
-    /* auto re-ground hook (#45): fired from ensure_families when matched_stale,
-     * to refresh the matched layer against current facts before a solve.
-     * `regrounding` guards the callback against re-entering ensure_families. */
+    /* auto re-ground hook (#45): fired from ensure_jfam/ensure_fam when
+     * matched_stale, to refresh the matched layer against current facts before a
+     * solve. `regrounding` guards the callback against re-entering a rebuild. */
     world_reground_fn reground_fn; void *reground_ctx; bool matched_stale, regrounding;
     srule *srules; int nsr, capsr;
 
@@ -196,7 +196,12 @@ struct world {
     dlcol *jfam;                  /* judgment family: judgments only (the query
                                    * layer — DESIGN.md §6.3, one columnar engine
                                    * for both "what's true" and "what happens") */
-    bool fam_dirty;               /* structure stale: rebuild both families      */
+    /* Structure version (#63): bumped on any structural edit (rule/fluent add,
+     * a matcher re-ground). Each family caches the version it was built at, so a
+     * query rebuilds ONLY the judgment family and a step ONLY the step family —
+     * a re-ground no longer forces the O(fluents) step-family (inertia) rebuild
+     * onto the query path. fam_ver/jfam_ver == struct_ver means "up to date". */
+    uint64_t struct_ver, fam_ver, jfam_ver;
     bool jfam_solved;             /* jfam holds the current state's judgments     */
     uint32_t *loc_of;             /* intern atom -> schema atom, ~0u = absent    */
     uint32_t loc_cap, nloc;       /* loc_of size; # assigned schema locations    */
@@ -343,7 +348,7 @@ void world_declare_fluent(world *w, uint32_t atom)
     w->fl_nargs[w->nfl] = 0;
     atom_map_set(&w->fluent_of, &w->fluent_of_cap, atom, w->nfl);
     w->nfl++;
-    w->fam_dirty = true;
+    w->struct_ver++;             /* structural edit (#63) */
     w->lanes_ok = false;          /* a structural edit stales the lane families */
 }
 
@@ -621,7 +626,7 @@ int world_add_rule(world *w, const char *name, dl_rule_kind kind,
     r->body = arena_alloc(ra, (size_t)(nbody ? nbody : 1) * sizeof(dl_lit));
     if (nbody)
         memcpy(r->body, body, (size_t)nbody * sizeof(dl_lit));
-    w->fam_dirty = true;
+    w->struct_ver++;             /* structural edit (#63) */
     w->lanes_ok = false;          /* a structural edit stales the lane families */
     return w->njr++;
 }
@@ -632,7 +637,7 @@ void world_add_sup(world *w, int winner, int loser)
     w->jsups[w->njs].winner = winner;
     w->jsups[w->njs].loser = loser;
     w->njs++;
-    w->fam_dirty = true;
+    w->struct_ver++;             /* structural edit (#63) */
     w->lanes_ok = false;          /* a structural edit stales the lane families */
 }
 
@@ -655,7 +660,7 @@ void world_matched_reset(world *w)
 {
     w->njr = w->jr_matched_base;
     arena_release(&w->matched_a);   /* free the previous matched layer's strings/bodies */
-    w->fam_dirty = true;
+    w->struct_ver++;             /* structural edit (#63) */
     w->lanes_ok = false;
 }
 
@@ -685,7 +690,7 @@ int world_add_step_rule(world *w, const char *name, uint32_t action,
         memcpy(r->effects, effects, (size_t)neffects * sizeof(dl_lit));
     r->neffs = NULL;
     r->nneff = r->capneff = 0;
-    w->fam_dirty = true;
+    w->struct_ver++;             /* structural edit (#63) */
     w->lanes_ok = false;          /* a structural edit stales the lane families */
     return w->nsr++;
 }
@@ -701,7 +706,7 @@ void world_set_step_prov(world *w, int rule, const char *prov)
 {
     if (rule >= 0 && rule < w->nsr) {
         w->srules[rule].prov = prov ? arena_strdup(&w->a, prov) : NULL;
-        w->fam_dirty = true;
+        w->struct_ver++;             /* structural edit (#63) */
     w->lanes_ok = false;          /* a structural edit stales the lane families */
     }
 }
@@ -734,7 +739,8 @@ void world_add_num_effect(world *w, int rule, uint32_t num_atom,
 /* Both families (step + judgment) are built from one location map; the query
  * layer runs on the columnar engine too (DESIGN.md §6.3 — one production
  * engine, the scalar dl kept only as test_col's differential oracle). */
-static void ensure_families(world *w);
+static void ensure_jfam(world *w);
+static void ensure_fam(world *w);
 static void solve_judgment_family(world *w);
 static void solve_lane_iter(world *w, lane_family *lf, int it);
 static void solve_step_family(world *w, const uint32_t *actions, int nactions);
@@ -745,7 +751,7 @@ static void solve_step_family_vals(world *w, const bool *vals,
  * measures the lane families against. */
 static dl_verdict query_jfam(world *w, dl_lit q)
 {
-    ensure_families(w);
+    ensure_jfam(w);
     if (!w->jfam_solved)
         solve_judgment_family(w);
     if (q.atom >= w->loc_cap || w->loc_of[q.atom] == LOC_NONE)
@@ -756,7 +762,7 @@ static dl_verdict query_jfam(world *w, dl_lit q)
 
 dl_verdict world_query(world *w, dl_lit q)
 {
-    ensure_families(w);
+    ensure_jfam(w);
     /* the hot path: if this atom is a lane cell, answer from the bit-parallel
      * family (all lanes solved at once) instead of the N=1 judgment family. For
      * a join family the cell names an iteration too; solve that iteration's fact
@@ -778,7 +784,7 @@ dl_verdict world_query(world *w, dl_lit q)
 
 void world_why(world *w, dl_lit q, FILE *out)
 {
-    ensure_families(w);
+    ensure_jfam(w);
     if (!w->jfam_solved)
         solve_judgment_family(w);
     if (q.atom >= w->loc_cap || w->loc_of[q.atom] == LOC_NONE) {
@@ -1104,7 +1110,7 @@ int world_step_lanes_check(world *w, const uint32_t *actions, int nactions,
 {
     int checks = 0;
     if (ok) *ok = true;
-    ensure_families(w);
+    ensure_fam(w);
     solve_step_family(w, actions, nactions);       /* the N=1 oracle */
 
     for (int i = 0; i < w->nsteplanes; i++) {
@@ -1148,11 +1154,12 @@ void world_step_why(world *w, dl_lit q, bool next, FILE *out)
         if (i >= 0)
             atom = w->primed[i];
     }
-    if (!w->fam || w->fam_dirty ||
+    bool fam_stale = w->fam_ver != w->struct_ver;
+    if (!w->fam || fam_stale ||
         atom >= w->loc_cap || w->loc_of[atom] == LOC_NONE) {
         fprintf(out, "why %s%s? not in the step theory%s\n",
                 q.neg ? "~" : "", intern_name(w->syms, atom),
-                w->fam_dirty ? " (no step taken since the last edit)" : "");
+                fam_stale ? " (no step taken since the last edit)" : "");
         return;
     }
     /* if the last step was answered on the lanes, w->fam does not hold that
@@ -1356,28 +1363,45 @@ static void emit_step_family(world *w)
     w->fam = f;
 }
 
-/* Rebuild both families when the theory structure is stale (a rule or fluent
- * was added). Facts are set later — per step for `fam`, per query for `jfam`. */
-static void ensure_families(world *w)
+/* Refresh the matched judgment layer against current facts before (re)building a
+ * solve family (#45). The callback (world_matched_reset + re-match) bumps
+ * struct_ver, so the family rebuilds below pick up the fresh layer. `regrounding`
+ * blocks re-entry — the callback touches only the index and jrules, never a
+ * solve, but the guard makes that contract explicit. */
+static void refresh_matched(world *w)
 {
-    /* Refresh the matched judgment layer against current facts before (re)building
-     * the solve families (#45). The callback (world_matched_reset + re-match) sets
-     * fam_dirty, so the rebuild below picks up the fresh layer. `regrounding`
-     * blocks re-entry — the callback touches only the index and jrules, never a
-     * solve, but the guard makes that contract explicit. */
     if (w->reground_fn && w->matched_stale && !w->regrounding) {
         w->regrounding = true;
         w->reground_fn(w->reground_ctx, w);
         w->matched_stale = false;
         w->regrounding = false;
     }
-    if (w->fam && w->jfam && !w->fam_dirty)
+}
+
+/* Ensure the judgment family reflects the current structure — the QUERY path.
+ * Rebuilt only when its cached version lags struct_ver, so a re-ground that only
+ * changed judgment rules does NOT drag the O(fluents) step-family rebuild onto a
+ * query (#63). assign_locs is deterministic over the atom set, so jfam and fam
+ * built at the same struct_ver share one location map. */
+static void ensure_jfam(world *w)
+{
+    refresh_matched(w);
+    if (w->jfam && w->jfam_ver == w->struct_ver)
+        return;
+    assign_locs(w);
+    emit_judgment_family(w);       /* clears jfam_solved */
+    w->jfam_ver = w->struct_ver;
+}
+
+/* Ensure the step family reflects the current structure — the STEP path. */
+static void ensure_fam(world *w)
+{
+    refresh_matched(w);
+    if (w->fam && w->fam_ver == w->struct_ver)
         return;
     assign_locs(w);
     emit_step_family(w);
-    emit_judgment_family(w);
-    w->fam_dirty = false;
-    w->jfam_solved = false;
+    w->fam_ver = w->struct_ver;
 }
 
 /* Load current-state facts (closed-world fluents + numeric guard atoms) into the
@@ -1674,7 +1698,7 @@ static int world_step_lanes(world *w, const uint32_t *actions, int nactions,
 int world_step(world *w, const uint32_t *actions, int nactions,
                char *err, size_t errsz)
 {
-    ensure_families(w);
+    ensure_fam(w);
 
     /* the hot path: a homogeneous step world lanes its whole transition, so solve
      * it bit-parallel across entities. Numerics ride when the family covers them
