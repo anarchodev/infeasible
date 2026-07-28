@@ -158,6 +158,8 @@ struct world {
     uint32_t vseq;                 /* bumped by world_views_reset; 0 = pre-first */
     int *vseen_of; uint32_t vseen_cap;
     int *vmark_of; uint32_t vmark_cap;
+    int *vmat_of;  uint32_t vmat_cap;   /* atom -> vseq it was last why-materialized
+                                         * under (rules live until that re-ground) */
     world_materialize_fn materialize_fn; void *materialize_ctx;
 
     srule *srules; int nsr, capsr;
@@ -334,6 +336,7 @@ void world_free(world *w)
     free(w->vrows);
     free(w->vseen_of);
     free(w->vmark_of);
+    free(w->vmat_of);
     free(w->jrules);
     free(w->jsups);
     free(w->srules);
@@ -821,7 +824,8 @@ size_t world_view_bytes(const world *w)
     return (size_t)w->capviews * sizeof *w->views
          + (size_t)w->capvrow * sizeof *w->vrows
          + (size_t)w->vseen_cap * sizeof *w->vseen_of
-         + (size_t)w->vmark_cap * sizeof *w->vmark_of;
+         + (size_t)w->vmark_cap * sizeof *w->vmark_of
+         + (size_t)w->vmat_cap * sizeof *w->vmat_of;
 }
 
 /* Is `atom` view-owned, and is it present this tick? -1 = not view-owned. */
@@ -1000,19 +1004,24 @@ void world_why(world *w, dl_lit q, FILE *out)
      * atom's instances as ordinary matched rules through the registered hook,
      * so the one shared renderer produces the same trace full emission would
      * (world_add_rule bumps struct_ver, so the ensure below re-emits the
-     * suffix; the next re-ground truncates these transients). A dropped view
-     * atom emits nothing and falls through to the lazy jloc materialization —
-     * the located-rule-less two-line REFUTED trace, exactly as a dropped
-     * matched rule rendered before views. */
-    if (q.atom >= w->jloc_cap || w->jloc_of[q.atom] == LOC_NONE) {
+     * suffix; the next re-ground truncates these transients). NOT gated on the
+     * jloc — a view atom keeps its (append-only) jloc from an earlier
+     * materialization long after those rules were truncated; the vmat stamp is
+     * what says "this generation's rules are in the family", making repeated
+     * whys idempotent. A dropped view atom emits nothing and falls through to
+     * the lazy jloc materialization — the located-rule-less two-line REFUTED
+     * trace, exactly as a dropped matched rule rendered before views. */
+    {
         bool present;
         if (view_of_atom(w, q.atom, &present) >= 0
-            && present && w->materialize_fn) {
+            && present && w->materialize_fn
+            && !(q.atom < w->vmat_cap && w->vmat_of[q.atom] == (int)w->vseq)) {
             for (int i = 0; i < w->nvrow; i++)
                 if (w->vrows[i].atom == q.atom)
                     w->materialize_fn(w->materialize_ctx, w, q.atom,
                                       w->vrows[i].view, w->vrows[i].bind,
                                       w->vrows[i].nvars);
+            atom_map_set(&w->vmat_of, &w->vmat_cap, q.atom, (int)w->vseq);
             ensure_jfam(w);
         }
     }

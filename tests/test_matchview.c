@@ -146,9 +146,118 @@ static int world_api_half(void)
     return 1;
 }
 
+/* ---- Part 2: story-driven islands, eager vs tick-time matcher ----
+ * The head PROJECTS the join var away, so one head atom can carry several
+ * bindings — the view keeps a row list and materialize-on-why must render
+ * every supporting instance. (Eager additionally grounds inert instances, so
+ * eager-vs-matcher trace equality doesn't hold for projected heads even
+ * before views — see test_ticktime's header; provability is the contract.) */
+static const char *ISL_STORY =
+    "scene isl\n"
+    "sort actor\n"
+    "entity ( a, b, c : actor )\n"
+    "state (\n"
+    "  adj(actor, actor)\n"
+    "  awake(actor)\n"
+    ")\n"
+    "init (\n"
+    "  adj(a, b)\n"
+    "  adj(a, c)\n"
+    "  awake(b)\n"
+    "  awake(c)\n"
+    ")\n"
+    "rule danger(X: actor, Y: actor): adj(X, Y) & awake(Y) => danger(X)\n"
+    "action sleep(X: actor): causes ~awake(X)\n";
+
+static int proved_diffs(world *A, world *B, intern *sy)
+{
+    int diffs = 0;
+    uint32_t n = intern_count(sy);
+    for (uint32_t id = 1; id < n; id++)
+        for (int neg = 0; neg < 2; neg++) {
+            dl_lit q = neg ? dl_neg(id) : dl_pos(id);
+            bool pa = world_query(A, q) == DL_PROVED;
+            bool pb = world_query(B, q) == DL_PROVED;
+            if (pa != pb) {
+                fprintf(stderr, "provability differs: %s%s eager=%d matched=%d\n",
+                        neg ? "~" : "", intern_name(sy, id), pa, pb);
+                diffs++;
+            }
+        }
+    return diffs;
+}
+
+static int story_half(void)
+{
+    intern *sy = intern_new();
+    story_diag da[16]; story_diags dga = { da, 16, 0, 0 };
+    story_diag db[16]; story_diags dgb = { db, 16, 0, 0 };
+
+    world *A = story_compile(ISL_STORY, "isl.story", sy, &dga);
+    world *B = NULL;
+    story_matcher *M = story_compile_matcher(ISL_STORY, "isl.story", sy, &dgb, &B);
+    CHECK(A && M && B && dga.nerrors == 0 && dgb.nerrors == 0);
+
+    dl_lit da_a = dl_pos(intern_id(sy, "danger(a)"));
+    dl_lit da_b = dl_pos(intern_id(sy, "danger(b)"));
+
+    /* two bindings support danger(a): (a,b) and (a,c) */
+    CHECK(world_query(B, da_a) == DL_PROVED);
+    CHECK(world_query(B, dl_neg(intern_id(sy, "danger(a)"))) == DL_REFUTED);
+    CHECK(world_query(B, da_b) == DL_UNDECIDED);      /* never matched */
+    CHECK(proved_diffs(A, B, sy) == 0);
+
+    /* why on the multi-bind head materializes BOTH instances */
+    {
+        dl_verdict v1 = world_query(B, da_a);
+        char *t = why_str(B, da_a);
+        CHECK(strstr(t, "danger[X=a,Y=b]") != NULL);
+        CHECK(strstr(t, "danger[X=a,Y=c]") != NULL);
+        CHECK(strstr(t, "defeasible: PROVED") != NULL);
+        free(t);
+        CHECK(world_query(B, da_a) == v1);            /* why changed nothing */
+        char *t2 = why_str(B, da_a);                  /* idempotent: no duped rules */
+        char *first = strstr(t2, "danger[X=a,Y=b]");
+        CHECK(first && strstr(first + 1, "danger[X=a,Y=b]") == NULL);
+        free(t2);
+    }
+
+    /* shrink to one support: still proved (team of one) */
+    char err[64];
+    uint32_t sleep_b = intern_id(sy, "sleep(b)");
+    CHECK(world_step(A, &sleep_b, 1, err, sizeof err) == 0);
+    CHECK(world_step(B, &sleep_b, 1, err, sizeof err) == 0);
+    CHECK(world_query(B, da_a) == DL_PROVED);
+    CHECK(proved_diffs(A, B, sy) == 0);
+
+    /* drop the last support: seen-but-absent -> REFUTED, two-line trace */
+    uint32_t sleep_c = intern_id(sy, "sleep(c)");
+    CHECK(world_step(A, &sleep_c, 1, err, sizeof err) == 0);
+    CHECK(world_step(B, &sleep_c, 1, err, sizeof err) == 0);
+    CHECK(world_query(B, da_a) == DL_REFUTED);
+    CHECK(world_query(B, dl_neg(intern_id(sy, "danger(a)"))) == DL_REFUTED);
+    CHECK(world_query(B, da_b) == DL_UNDECIDED);      /* still never seen */
+    CHECK(proved_diffs(A, B, sy) == 0);
+    {
+        char *t = why_str(B, da_a);
+        CHECK(strstr(t, "defeasible: REFUTED") != NULL);
+        CHECK(strstr(t, "rules for it") == NULL);
+        free(t);
+        char *tn = why_str(B, da_b);
+        CHECK(strstr(tn, "not in the theory") != NULL);
+        free(tn);
+    }
+
+    story_matcher_free(M);
+    world_free(A); world_free(B);
+    intern_free(sy);
+    return 1;
+}
+
 int main(void)
 {
     if (!world_api_half()) return 1;
+    if (!story_half()) return 1;
     printf("test_matchview: all passed\n");
     return 0;
 }
