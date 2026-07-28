@@ -177,6 +177,30 @@ void world_matched_reset(world *w);
 typedef void (*world_reground_fn)(void *ctx, world *w);
 void world_set_reground_fn(world *w, world_reground_fn fn, void *ctx);
 
+/* Fluent schema hook (#92, the sparse fluent universe): under tick-time
+ * compilation the grounder no longer declares the sort cross-product of every
+ * boolean state predicate — ground fluents come into existence when TOUCHED.
+ * The hook answers, for a bare atom id, "is this a well-formed ground instance
+ * of a declared boolean state predicate?" and returns its (pred, args)
+ * decomposition so the fact index can be maintained. Dependency inversion as
+ * above: the state tier declares the interface, the .story compiler supplies
+ * the retained schema as `ctx` (the world never learns the term grammar).
+ * MUST be pure and deterministic over the world's lifetime (I4) — a schema
+ * answer is part of replay. With it set:
+ *   - world_set on an unknown-but-recognized atom lazily declares it (with
+ *     structure) and proceeds — on ANY touch, true or false, since a false
+ *     assertion still means "closed-world false, and judgments are stale";
+ *   - a query on a never-touched recognized atom answers closed-world false
+ *     WITHOUT declaring (the pure lazy path);
+ *   - world_why on such an atom declares it first, so the rendered trace is
+ *     byte-identical to a dense world's (base-fact line included). */
+typedef bool (*world_schema_fn)(void *ctx, uint32_t atom, uint32_t *pred,
+                                uint32_t *args, int *nargs);
+void world_set_schema_fn(world *w, world_schema_fn fn, void *ctx);
+/* Introspection (bench/tests): declared boolean fluent count — under #92 this
+ * is O(touched), where the dense universe was the full cross-product. */
+int  world_fluent_count(const world *w);
+
 /* Matched views (#80): an ISLAND judgment — one matchable rule whose head
  * predicate is concluded by no other rule, attacked by nothing, and read
  * nowhere (no rule body, unless-guard, step-rule body, or superiority mentions

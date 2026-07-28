@@ -162,6 +162,11 @@ struct world {
                                          * under (rules live until that re-ground) */
     world_materialize_fn materialize_fn; void *materialize_ctx;
 
+    /* Fluent schema hook (#92): recognizes ground instances of declared
+     * boolean state predicates by atom id, so touched fluents can be declared
+     * lazily and never-touched ones answered closed-world. */
+    world_schema_fn schema_fn; void *schema_ctx;
+
     srule *srules; int nsr, capsr;
 
     /* numeric value store + comparison guards (§5.8, read side). A clamp bound
@@ -437,9 +442,28 @@ static void reindex_commit(world *w, const bool *next)
             fidx_update(w, i, next[i]);
 }
 
+/* Lazily declare a schema-recognized fluent atom (#92): declare + attach its
+ * (pred, args) structure in the same breath — a structureless declare would be
+ * invisible to the fact index, and thus to the matcher, forever. Returns the
+ * fluent index, or -1 when no hook is set / the atom isn't recognized. */
+static int schema_declare(world *w, uint32_t atom)
+{
+    uint32_t pred, args[FACTINDEX_MAXARGS];
+    int nargs;
+    if (!w->schema_fn ||
+        !w->schema_fn(w->schema_ctx, atom, &pred, args, &nargs))
+        return -1;
+    world_declare_fluent(w, atom);
+    world_set_fluent_struct(w, atom, pred, args, nargs);
+    return fluent_index(w, atom);
+}
+
 void world_set(world *w, uint32_t atom, bool value)
 {
     int i = fluent_index(w, atom);
+    if (i < 0)
+        i = schema_declare(w, atom);   /* #92: first touch — true OR false (a
+                                        * false assertion still stales judgments) */
     if (i >= 0) {
         if (w->vals[i] != value) fidx_update(w, i, value);   /* index tracks the change */
         w->vals[i] = value;
@@ -830,6 +854,24 @@ void world_set_materialize_fn(world *w, world_materialize_fn fn, void *ctx)
     w->materialize_ctx = ctx;
 }
 
+void world_set_schema_fn(world *w, world_schema_fn fn, void *ctx)
+{
+    w->schema_fn = fn;
+    w->schema_ctx = ctx;
+}
+
+int world_fluent_count(const world *w) { return w->nfl; }
+
+/* Pure schema probe (#92): recognized-but-undeclared fluent atom? No declare,
+ * no mutation — the query path's closed-world fallback. */
+static bool schema_knows(const world *w, uint32_t atom)
+{
+    uint32_t pred, args[FACTINDEX_MAXARGS];
+    int nargs;
+    return w->schema_fn &&
+           w->schema_fn(w->schema_ctx, atom, &pred, args, &nargs);
+}
+
 int world_view_row_count(const world *w) { return w->nvrow; }
 
 size_t world_view_bytes(const world *w)
@@ -949,6 +991,10 @@ static dl_verdict lazy_judgment_verdict(const world *w, dl_lit q)
     int i = fluent_index(w, q.atom);
     if (i >= 0)
         return q.neg != w->vals[i] ? DL_PROVED : DL_REFUTED;
+    if (schema_knows(w, q.atom))                   /* #92: never-touched fluent —
+                                                    * closed-world false, and pure
+                                                    * (world_why declares instead) */
+        return q.neg ? DL_PROVED : DL_REFUTED;
     if (q.atom >= w->loc_cap || w->loc_of[q.atom] == LOC_NONE)
         return DL_UNDECIDED;                       /* absent: unmentioned atom */
     int g = guard_index(w, q.atom);
@@ -1012,6 +1058,15 @@ dl_verdict world_query(world *w, dl_lit q)
 
 void world_why(world *w, dl_lit q, FILE *out)
 {
+    /* Never-touched schema fluent (#92): DECLARE it — a jloc alone is not
+     * enough, because the fact loader keys on fluent_index, and the dense
+     * world's trace for the negative polarity includes the base-fact line.
+     * Declaring first makes every gate below see an ordinary declared-false
+     * fluent, so the trace is byte-identical by construction. The struct_ver
+     * bump is fine on this slow path: matched_stale is untouched (no
+     * re-ground) and the jfam re-emit takes the #68 incremental branch. */
+    if (fluent_index(w, q.atom) < 0)
+        (void)schema_declare(w, q.atom);
     ensure_jfam(w);
     /* Matched view atoms (#80) have no rules in the family; re-emit just this
      * atom's instances as ordinary matched rules through the registered hook,
@@ -1837,6 +1892,10 @@ static void solve_judgment_family(world *w)
         int i = fluent_index(w, w->jloc_atom[loc]);
         if (i >= 0)
             dlcol_add_fact(f, (dl_lit){ loc, !w->vals[i] }, 0);  /* f or ~f */
+        else if (schema_knows(w, w->jloc_atom[loc]))
+            dlcol_add_fact(f, (dl_lit){ loc, true }, 0);
+            /* #92: a rule references a never-touched fluent — closed-world
+             * false, exactly the fact the dense universe would have loaded */
     }
     load_guards(w, f, w->jloc_of, w->jloc_cap);
     load_providers(w, f, w->jloc_of, w->jloc_cap);
