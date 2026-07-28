@@ -20,7 +20,7 @@
 #define MAX_RULES      256
 #define MAX_ACTIONS    128
 #define MAX_SUPS       256
-#define MAX_INITS      256
+#define MAX_INITS      (1 << 24)   /* runaway ceiling only — the list grows to fit */
 #define MAX_GROUND     256     /* ground atom name buffer */
 #define MAX_EXPRS      4096    /* effect-expression AST node pool */
 #define MAX_CODE       64      /* VM bytecode per ground effect */
@@ -292,8 +292,8 @@ typedef struct {
     int nsups;
     ast_ladder  ladders[MAX_LADDERS];   /* priority ladders (`bands …`, §6.2) */
     int nladders;
-    ast_atom    inits[MAX_INITS];
-    int ninits;
+    ast_atom   *inits;                  /* grown geometrically (§ loud failures) */
+    int ninits, capinits;
 
     ex_node    *exprs;            /* heap; MAX_EXPRS effect-expression nodes */
     int nexprs;
@@ -1269,9 +1269,15 @@ static void parse_init(parser *p)
             fail(p, p->cur.line, p->cur.col, "expected a fluent name, found %s", d);
             return;
         }
-        if (p->ninits >= MAX_INITS) {
-            fail(p, p->cur.line, p->cur.col, "too many init facts (max %d)", MAX_INITS);
-            return;
+        if (p->ninits == p->capinits) {            /* grow to fit — no fixed cap */
+            if (p->capinits >= MAX_INITS) {        /* runaway ceiling: scream loudly */
+                fail(p, p->cur.line, p->cur.col,
+                     "more than %d init facts — this is almost certainly a runaway, "
+                     "not real content", MAX_INITS);
+                return;
+            }
+            p->capinits *= 2;
+            p->inits = realloc(p->inits, (size_t)p->capinits * sizeof *p->inits);
         }
         ast_atom a;
         if (!parse_atom(p, &a)) return;
@@ -5141,6 +5147,8 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
     p->actions = calloc(MAX_ACTIONS, sizeof *p->actions);
     p->binders = calloc(MAX_BINDERS, sizeof *p->binders);
     p->exprs = calloc(MAX_EXPRS, sizeof *p->exprs);
+    p->capinits = 64;                              /* grows geometrically as needed */
+    p->inits = malloc((size_t)p->capinits * sizeof *p->inits);
     lexer_init(&p->lx, src);
     p->syms = syms;
     p->srcname = srcname;
@@ -5237,6 +5245,7 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
     free(p->actions);
     free(p->binders);
     free(p->exprs);
+    free(p->inits);
     free(p->ents);
     free(p->ent_of);
     free(p->ent_pos);
