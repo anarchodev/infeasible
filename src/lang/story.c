@@ -3165,9 +3165,11 @@ static void ground_rule(parser *p, ast_rule *r)
 }
 
 /* ---- the join matcher (§5.2 item 4, #28): ground a rule from the fact-store
- * extension index rather than the sort cross product. Slice 1 kernel: rules
- * whose body is a conjunction of positive base-BOOLEAN-fluent atoms (no
- * negation, guards, providers, mv, numeric, `unless`, or superiority). Anything
+ * extension index rather than the sort cross product. Kernel: rules whose body
+ * is base-BOOLEAN-fluent atoms — positive ones GENERATE (scanned from the
+ * extension), negated ones FILTER (closed-world membership test once their vars
+ * are bound by a positive generator, §5.2 range restriction). Guards, providers,
+ * mv, numeric, `unless`, and superiority still fall back to eager (#44). Anything
  * outside the kernel falls back to eager ground_rule, so every story still
  * compiles both ways and the two theories differ only where the matcher runs.
  * The equivalence (identical query verdicts + why-traces) is pinned by
@@ -3192,11 +3194,14 @@ static bool rule_matchable(parser *p, ast_rule *r)
     if (rule_in_sup(p, r)) return false;           /* per-instance `>` edges — later */
     for (int b = 0; b < r->nbody; b++) {
         ast_atom *at = &r->body[b];
-        if (at->neg || at->is_guard || at->is_expr_guard || at->primed) return false;
+        if (at->is_guard || at->is_expr_guard || at->primed) return false;
         if (at->value != INTERN_NONE) return false;        /* mv value-join — later */
         pred_info *pi = find_pred(p, at->pred);
         if (!pi || !pi->is_fluent || pi->is_provider || pi->is_num || pi->is_mv)
             return false;                                  /* base boolean fluent only */
+        /* a negated atom is allowed: it is a closed-world FILTER, not a generator.
+         * compute_bound_vars binds nothing through it (§5.2 range restriction), so
+         * a positive body atom must still bind every var — checked below. */
     }
     bool vb[MAX_ARGS];                             /* every var must be body-bound */
     compute_bound_vars(p, r, vb);
@@ -3230,13 +3235,44 @@ static void emit_matched(parser *p, ast_rule *r, const uint32_t *bind, inst_list
     inst_push(L, h);
 }
 
-/* Semi-naïve nested-loop join: probe body atom `b`'s extension with the
+/* Membership test for a body FILTER atom whose vars are all bound: is the ground
+ * fluent currently true? Closed-world, so a negated body literal `~atom` holds
+ * iff this returns false. (§5.2 discipline 1: range restriction guarantees a
+ * positive generator bound the vars before any filter sees them.) */
+static bool atom_present(factindex *ix, ast_atom *at, var_bind *vars, int nvars,
+                         const uint32_t *bind)
+{
+    bool     filt[FACTINDEX_MAXARGS];
+    uint32_t want[FACTINDEX_MAXARGS];
+    for (int k = 0; k < at->nargs; k++) {
+        int vi = var_index(vars, nvars, at->args[k].name);
+        filt[k] = true;
+        want[k] = vi >= 0 ? bind[vi] : at->args[k].name;
+    }
+    factindex_cursor c;
+    factindex_scan(ix, at->pred, filt, want, &c);
+    uint32_t tup[FACTINDEX_MAXARGS];
+    return factindex_next(&c, tup);
+}
+
+/* Semi-naïve nested-loop join: probe positive body atom `b`'s extension with the
  * positions already bound (constants and vars bound by earlier atoms), bind its
- * free vars from each matching tuple, recurse. At the leaf every var is bound. */
+ * free vars from each matching tuple, recurse. Negated atoms bind nothing, so
+ * they are deferred to the leaf and applied as closed-world filters once every
+ * var is bound. At the leaf the emitted rule still carries the full body (incl.
+ * the negated literals), so it is byte-identical to the eager instance. */
 static void match_rec(parser *p, ast_rule *r, int b, uint32_t *bind, inst_list *L)
 {
-    if (b == r->nbody) { emit_matched(p, r, bind, L); return; }
+    if (b == r->nbody) {
+        for (int f = 0; f < r->nbody; f++)
+            if (r->body[f].neg &&
+                atom_present(p->fidx, &r->body[f], r->vars, r->nvars, bind))
+                return;                                /* ~atom fails: atom is true */
+        emit_matched(p, r, bind, L);
+        return;
+    }
     ast_atom *at = &r->body[b];
+    if (at->neg) { match_rec(p, r, b + 1, bind, L); return; }   /* filter: checked at leaf */
     int n = at->nargs;
 
     bool     filt[FACTINDEX_MAXARGS];
@@ -3300,8 +3336,9 @@ static void build_fact_index(parser *p)
  * world's LIVE fact index each tick. Owns deep copies (no parser-lifetime
  * dependency) and reuses the syms-only cores (ground_pred_s / ground_mv_atom_s /
  * inst_name_s), so re-materialized atoms and why-traces are byte-identical to the
- * eager path. Kernel-only (rule_matchable): body atoms are positive base boolean
- * fluents, so the emit path never needs the guard/provider/expr branches.
+ * eager path. Kernel-only (rule_matchable): body atoms are base boolean fluents
+ * (positive generate, negated filter), so the emit path never needs the
+ * guard/provider/expr branches.
  *
  * m_match_rec / m_ground_lit / m_var_index deliberately mirror the compile-time
  * match_rec / ground_lit / var_index over the retained plan instead of the parser
@@ -3386,13 +3423,38 @@ static void m_emit(story_matcher *m, m_rule *r, const uint32_t *bind)
     world_set_rule_prov(m->w, h, r->prov);
 }
 
+/* atom_present over the compact plan + a live index (mirrors atom_present). */
+static bool m_atom_present(const factindex *ix, const m_rule *r, const m_atom *a,
+                           const uint32_t *bind)
+{
+    bool     filt[FACTINDEX_MAXARGS];
+    uint32_t want[FACTINDEX_MAXARGS];
+    for (int k = 0; k < a->nargs; k++) {
+        int vi = m_var_index(r, a->arg[k]);
+        filt[k] = true;
+        want[k] = vi >= 0 ? bind[vi] : a->arg[k];
+    }
+    factindex_cursor c;
+    factindex_scan(ix, a->pred, filt, want, &c);
+    uint32_t tup[FACTINDEX_MAXARGS];
+    return factindex_next(&c, tup);
+}
+
 /* The same semi-naïve nested-loop join as match_rec, over the compact plan and a
- * caller-supplied (live) fact index. */
+ * caller-supplied (live) fact index: positive atoms generate, negated atoms are
+ * deferred to the leaf and applied as closed-world filters. */
 static void m_match_rec(story_matcher *m, m_rule *r, int b, uint32_t *bind,
                         const factindex *ix)
 {
-    if (b == r->nbody) { m_emit(m, r, bind); return; }
+    if (b == r->nbody) {
+        for (int f = 0; f < r->nbody; f++)
+            if (r->body[f].neg && m_atom_present(ix, r, &r->body[f], bind))
+                return;                                /* ~atom fails: atom is true */
+        m_emit(m, r, bind);
+        return;
+    }
     m_atom *at = &r->body[b];
+    if (at->neg) { m_match_rec(m, r, b + 1, bind, ix); return; }  /* filter at leaf */
     int n = at->nargs;
     bool     filt[FACTINDEX_MAXARGS];
     uint32_t want[FACTINDEX_MAXARGS];

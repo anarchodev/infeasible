@@ -58,6 +58,9 @@ static const char *STORY =
     ")\n"
     /* matchable: a 2-var join over two base boolean fluents (head keeps both) */
     "rule alarm(X: actor, Y: actor): adj(X, Y) & awake(X) => threatens(X, Y)\n"
+    /* matchable WITH a negated filter: awake(X) generates, ~penguin(X) prunes.
+     * a is a penguin, so hunts(a) never holds; hunts(b) tracks awake(b). */
+    "rule hostile(X: actor): awake(X) & ~penguin(X) => hunts(X)\n"
     /* STATIC superiority (Tweety): both rules are non-matchable (in a `>` pair),
      * so they are ground once — and the `>` must SURVIVE every re-ground. If the
      * matched-layer reset truncated the superiority array (the bug the watermark
@@ -128,6 +131,8 @@ int main(void)
     dl_lit t_ab = dl_pos(intern_id(sy, "threatens(a,b)"));
     dl_lit t_bc = dl_pos(intern_id(sy, "threatens(b,c)"));
     dl_lit not_flies_a = dl_neg(intern_id(sy, "flies(a)"));   /* nofly > fly decides it */
+    dl_lit hunts_a = dl_pos(intern_id(sy, "hunts(a)"));       /* ~penguin filter: a is penguin */
+    dl_lit hunts_b = dl_pos(intern_id(sy, "hunts(b)"));       /* tracks awake(b) */
 
     /* t=0: only awake(a). alarm(a,b) fires -> threatens(a,b); threatens(b,c) needs awake(b). */
     CHECK(world_query(A, t_ab) == DL_PROVED);
@@ -135,6 +140,8 @@ int main(void)
     CHECK(world_query(A, t_bc) != DL_PROVED);
     CHECK(world_query(B, t_bc) != DL_PROVED);
     CHECK(world_query(B, not_flies_a) == DL_PROVED);   /* static `>` present */
+    CHECK(world_query(B, hunts_a) != DL_PROVED);       /* ~penguin(a) fails: a is a penguin */
+    CHECK(world_query(B, hunts_b) != DL_PROVED);       /* b not awake yet */
     CHECK(provability_diffs(A, B, sy) == 0);
     CHECK(why_same(A, B, t_ab));
 
@@ -152,8 +159,11 @@ int main(void)
     CHECK(world_query(B, t_bc) == DL_PROVED);        /* the tick-time payoff */
     CHECK(world_query(B, t_ab) == DL_PROVED);        /* still holds (awake(a)) */
     CHECK(world_query(B, not_flies_a) == DL_PROVED); /* static `>` survived reground */
+    CHECK(world_query(B, hunts_b) == DL_PROVED);     /* awake(b) & ~penguin(b): fires now */
+    CHECK(world_query(B, hunts_a) != DL_PROVED);     /* ~penguin(a) still prunes it */
     CHECK(provability_diffs(A, B, sy) == 0);
     CHECK(why_same(A, B, t_bc));                     /* freshly-materialized trace */
+    CHECK(why_same(A, B, hunts_b));                  /* negated body literal in the trace */
 
     /* step 2 — sleep(a): the matched set SHRINKS. awake(a) is now false, so the
      * only support for threatens(a,b) is gone; re-grounding must DROP that

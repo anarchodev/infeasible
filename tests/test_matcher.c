@@ -46,6 +46,9 @@ static const char *STORY =
     "rule threat(X: actor, Y: actor): adj(X, Y) & awake(X) => threat(X, Y)\n"
     /* matchable: a 1-var rule */
     "rule alert(X: actor): awake(X) => alert(X)\n"
+    /* matchable WITH a negated filter: awake(X) generates, ~marked(X) prunes
+     * (no marked facts, so ~marked holds for all — ready tracks awake) */
+    "rule ready(X: actor): awake(X) & ~marked(X) => ready(X)\n"
     /* NOT matchable (numeric guard) — eager fallback in both worlds */
     "rule hurt(X: actor): hp(X) <= 5 => hurt(X)\n"
     /* an action, so lanes are skipped and queries hit the judgment family */
@@ -80,6 +83,9 @@ int main(void)
     /* a possible-but-unsatisfied instance: proved in NEITHER (no adj(a,c) fact) */
     CHECK(world_query(A, dl_pos(intern_id(sy, "threat(a,c)"))) != DL_PROVED);
     CHECK(world_query(B, dl_pos(intern_id(sy, "threat(a,c)"))) != DL_PROVED);
+    /* negated filter: ready(a) fires (awake(a) & ~marked(a)); c never awake */
+    CHECK(world_query(B, dl_pos(intern_id(sy, "ready(a)"))) == DL_PROVED);
+    CHECK(world_query(B, dl_pos(intern_id(sy, "ready(c)"))) != DL_PROVED);
 
     /* The equivalence: the two worlds PROVE exactly the same literals — every
      * atom, both polarities. Provability is the guarantee the matcher owes and
