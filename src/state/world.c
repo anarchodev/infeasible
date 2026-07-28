@@ -202,10 +202,19 @@ struct world {
      * a re-ground no longer forces the O(fluents) step-family (inertia) rebuild
      * onto the query path. fam_ver/jfam_ver == struct_ver means "up to date". */
     uint64_t struct_ver, fam_ver, jfam_ver;
+    /* static_ver bumps only on a NON-matcher structural edit (a host rule/sup);
+     * a matcher re-ground bumps struct_ver but not static_ver, so the jfam cache
+     * can be reused incrementally when only the matched suffix changed (#68). */
+    uint64_t static_ver, jfam_static_ver;
     bool jfam_solved;             /* jfam holds the current state's judgments     */
     uint32_t *loc_of;             /* intern atom -> schema atom, ~0u = absent    */
     uint32_t loc_cap, nloc;       /* loc_of size; # assigned schema locations    */
+    uint32_t *loc_atom;           /* reverse: schema loc -> intern atom (#68 names)*/
+    uint32_t loc_atom_cap;
     uint32_t *fl_loc, *pr_loc;    /* per fluent: schema ids of f and f'          */
+    /* jfam incremental reuse (#68): the static-rule watermark in the cached jfam
+     * dlcol, and how far its atom names have been emitted. */
+    int jfam_wm_rules, jfam_wm_body, jfam_wm_sups; uint32_t jfam_named;
 
     lane_family *lanes;           /* per-sort N-lane families (DoD thesis)       */
     int nlanes, caplanes;
@@ -271,6 +280,7 @@ void world_free(world *w)
     free(w->last_actions);
     free(w->lane_map);
     free(w->loc_of);
+    free(w->loc_atom);
     free(w->fl_loc);
     free(w->pr_loc);
     arena_release(&w->a);
@@ -627,6 +637,7 @@ int world_add_rule(world *w, const char *name, dl_rule_kind kind,
     if (nbody)
         memcpy(r->body, body, (size_t)nbody * sizeof(dl_lit));
     w->struct_ver++;             /* structural edit (#63) */
+    if (!w->in_matched) w->static_ver++;   /* a STATIC judgment rule changed (#68) */
     w->lanes_ok = false;          /* a structural edit stales the lane families */
     return w->njr++;
 }
@@ -638,6 +649,7 @@ void world_add_sup(world *w, int winner, int loser)
     w->jsups[w->njs].loser = loser;
     w->njs++;
     w->struct_ver++;             /* structural edit (#63) */
+    if (!w->in_matched) w->static_ver++;   /* matched rules carry no sup (#68) */
     w->lanes_ok = false;          /* a structural edit stales the lane families */
 }
 
@@ -1198,8 +1210,17 @@ static dl_lit primed_lit(const world *w, dl_lit l)
 
 static uint32_t assign_loc(world *w, uint32_t atom, uint32_t *n)
 {
-    if (w->loc_of[atom] == LOC_NONE)
-        w->loc_of[atom] = (*n)++;
+    if (w->loc_of[atom] == LOC_NONE) {
+        uint32_t loc = (*n)++;
+        w->loc_of[atom] = loc;
+        if (loc >= w->loc_atom_cap) {   /* grow the reverse loc->atom map (#68) */
+            uint32_t nc = w->loc_atom_cap ? w->loc_atom_cap : 64;
+            while (nc <= loc) nc *= 2;
+            w->loc_atom = realloc(w->loc_atom, (size_t)nc * sizeof *w->loc_atom);
+            w->loc_atom_cap = nc;
+        }
+        w->loc_atom[loc] = atom;
+    }
     return w->loc_of[atom];
 }
 
@@ -1220,7 +1241,7 @@ static dl_lit loc_lit(const world *w, dl_lit l)
  * columns are indexed by location, so a shifted location would misread every
  * verdict. Tradeoff: a location freed by a dropped match is not reclaimed until a
  * compaction pass, so nloc is bounded by the distinct atoms ever seen (#63). */
-static void assign_locs(world *w)
+static void grow_loc_of(world *w)
 {
     uint32_t na = intern_count(w->syms);
     if (na > w->loc_cap) {                          /* new interned atoms -> unassigned */
@@ -1228,6 +1249,27 @@ static void assign_locs(world *w)
         for (uint32_t k = w->loc_cap; k < na; k++) w->loc_of[k] = LOC_NONE;
         w->loc_cap = na;
     }
+}
+
+/* Assign the locations of only the matched jrules[jr_matched_base, njr) (#68).
+ * Fluent + static-rule + step-rule locations are already assigned (append-only,
+ * #67) and never re-scanned per re-ground — that O(fluents) rescan was the fixed
+ * per-update cost. */
+static void assign_locs_matched(world *w)
+{
+    grow_loc_of(w);
+    uint32_t n = w->nloc;
+    for (int j = w->jr_matched_base; j < w->njr; j++) {
+        assign_loc(w, w->jrules[j].head.atom, &n);
+        for (int i = 0; i < w->jrules[j].nbody; i++)
+            assign_loc(w, w->jrules[j].body[i].atom, &n);
+    }
+    w->nloc = n;
+}
+
+static void assign_locs(world *w)
+{
+    grow_loc_of(w);
     uint32_t n = w->nloc;                           /* resume from the high-water mark */
     w->fl_loc = realloc(w->fl_loc, (size_t)(w->nfl ? w->nfl : 1) * sizeof *w->fl_loc);
     w->pr_loc = realloc(w->pr_loc, (size_t)(w->nfl ? w->nfl : 1) * sizeof *w->pr_loc);
@@ -1260,14 +1302,22 @@ static void emit_atom_names(dlcol *f, const world *w)
             dlcol_set_atom_name(f, w->loc_of[a], intern_name(w->syms, a));
 }
 
-/* Judgment rules + their superiority — the whole judgment family, and the
- * leading slice of the step family (primed bodies may read these conclusions). */
-static void emit_judgment_rules(dlcol *f, const world *w)
+/* Name only the schema locations [from,to) — the atoms a re-ground newly added
+ * (#68). Append-only locations (#67) guarantee an atom's location is fixed, so a
+ * name set once is never wrong; only the new tail needs naming. */
+static void emit_atom_names_range(dlcol *f, const world *w, uint32_t from, uint32_t to)
+{
+    for (uint32_t loc = from; loc < to; loc++)
+        dlcol_set_atom_name(f, loc, intern_name(w->syms, w->loc_atom[loc]));
+}
+
+/* Add jrules[from,to) as columnar rules (no superiority — that is added once). */
+static void emit_judgment_rule_range(dlcol *f, const world *w, int from, int to)
 {
     dl_lit lbuf[64];
     dl_lit *body = lbuf;
     int bodycap = 64;
-    for (int j = 0; j < w->njr; j++) {
+    for (int j = from; j < to; j++) {
         const jrule *r = &w->jrules[j];
         if (r->nbody > bodycap) {
             if (body != lbuf) free(body);
@@ -1283,20 +1333,50 @@ static void emit_judgment_rules(dlcol *f, const world *w)
     }
     if (body != lbuf)
         free(body);
+}
+
+/* Judgment rules + their superiority — the whole judgment family, and the
+ * leading slice of the step family (primed bodies may read these conclusions). */
+static void emit_judgment_rules(dlcol *f, const world *w)
+{
+    emit_judgment_rule_range(f, w, 0, w->njr);
     for (int j = 0; j < w->njs; j++)
         dlcol_add_sup(f, w->jsups[j].winner, w->jsups[j].loser);
 }
 
 /* The judgment (query-layer) family: judgment rules only, over current-state
- * facts. Same location space as the step family, just without inertia/causal. */
+ * facts. Same location space as the step family, just without inertia/causal.
+ *
+ * Incremental (#68): when the STATIC judgment rules are unchanged (a matcher
+ * re-ground only churned the matched suffix, jfam_static_ver == static_ver),
+ * REUSE the cached dlcol — truncate to the static-rule watermark, grow the atom
+ * columns for any new atoms, name only those, and re-add the matched rules —
+ * instead of a from-scratch `dlcol_new` + O(atoms) name emit + all rules. This is
+ * sound because atom locations are append-only (#67), so the cached columns still
+ * mean what they meant. Falls back to a full build when the static rules change. */
 static void emit_judgment_family(world *w)
 {
-    if (w->jfam)
-        dlcol_free(w->jfam);
-    dlcol *f = dlcol_new((int)w->nloc, 1);
-    emit_atom_names(f, w);
-    emit_judgment_rules(f, w);
-    w->jfam = f;
+    if (w->jfam && w->jfam_static_ver == w->static_ver) {
+        assign_locs_matched(w);        /* only the matched jrules — no O(fluents) rescan */
+        dlcol_truncate_rules(w->jfam, w->jfam_wm_rules, w->jfam_wm_body, w->jfam_wm_sups);
+        dlcol_ensure_atoms(w->jfam, (int)w->nloc);
+        emit_atom_names_range(w->jfam, w, w->jfam_named, w->nloc);
+        w->jfam_named = w->nloc;
+    } else {
+        assign_locs(w);                /* full: fluents + static rules + step rules */
+        if (w->jfam) dlcol_free(w->jfam);
+        w->jfam = dlcol_new((int)w->nloc, 1);
+        emit_atom_names_range(w->jfam, w, 0, w->nloc);
+        emit_judgment_rule_range(w->jfam, w, 0, w->jr_matched_base);   /* static */
+        for (int j = 0; j < w->njs; j++)                              /* static sups */
+            dlcol_add_sup(w->jfam, w->jsups[j].winner, w->jsups[j].loser);
+        w->jfam_wm_rules = dlcol_rule_count(w->jfam);
+        w->jfam_wm_body  = dlcol_body_count(w->jfam);
+        w->jfam_wm_sups  = dlcol_sup_count(w->jfam);
+        w->jfam_named    = w->nloc;
+        w->jfam_static_ver = w->static_ver;
+    }
+    emit_judgment_rule_range(w->jfam, w, w->jr_matched_base, w->njr); /* matched suffix */
     w->jfam_solved = false;
 }
 
@@ -1403,8 +1483,7 @@ static void ensure_jfam(world *w)
     refresh_matched(w);
     if (w->jfam && w->jfam_ver == w->struct_ver)
         return;
-    assign_locs(w);
-    emit_judgment_family(w);       /* clears jfam_solved */
+    emit_judgment_family(w);       /* assigns locs (full or matched-only) + clears jfam_solved */
     w->jfam_ver = w->struct_ver;
 }
 
