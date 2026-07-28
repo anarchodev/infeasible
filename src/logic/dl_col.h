@@ -42,6 +42,19 @@ void dlcol_set_atom_name(dlcol *f, uint32_t atom, const char *name);
  * dlcol_why after the rule kind. Copied; NULL clears it. */
 void dlcol_set_prov(dlcol *f, int rule_id, const char *prov);
 
+/* Incremental maintenance (#66, EPIC #63). Reuse a family across re-grounds
+ * instead of rebuilding it: drop the rule/body/sup arrays back to a watermark
+ * (freeing truncated rule names), then re-add the changed suffix; grow the atom
+ * columns on demand when a re-ground introduces new atoms (existing columns keep
+ * their offsets — no verdict/fact moves). The compiled indices rebuild from the
+ * new counts on the next dlcol_solve. Read the counts after the static rules to
+ * record the watermark. */
+void dlcol_truncate_rules(dlcol *f, int nrules, int nbody, int nsups);
+void dlcol_ensure_atoms(dlcol *f, int natoms);
+int  dlcol_rule_count(const dlcol *f);
+int  dlcol_body_count(const dlcol *f);
+int  dlcol_sup_count(const dlcol *f);
+
 /* Fact columns. A row is ceil(nentities/64) words; the host may write words
  * directly (bits >= nentities are ignored). dlcol_add_fact sets one bit;
  * dlcol_clear_facts zeroes every fact column (start of a fresh assembly). */

@@ -869,6 +869,11 @@ size_t world_arena_bytes(const world *w)
     return arena_bytes(&w->a) + arena_bytes(&w->matched_a);
 }
 
+uint32_t world_atom_loc(const world *w, uint32_t atom)
+{
+    return atom < w->loc_cap ? w->loc_of[atom] : LOC_NONE;
+}
+
 /* Load one iteration's fact slice into a lane family and solve it (all lanes at
  * once). For niter==1 (single-variable) `it` is 0 and the solve is the whole
  * family; for a join it is the current non-lane entity. */
@@ -1206,14 +1211,24 @@ static dl_lit loc_lit(const world *w, dl_lit l)
 
 /* pass 1, shared: assign dense schema ids to every atom either family touches
  * (both are sized to the same location space; the judgment family simply leaves
- * the primed/action columns unused). Sets w->nloc. */
+ * the primed/action columns unused). Sets w->nloc.
+ *
+ * APPEND-ONLY (#67): an atom that already has a location KEEPS it — never memset
+ * + reassigned — so a re-ground that changes the matched rule set does not shift
+ * the locations of surviving atoms. This is the correctness prerequisite for
+ * reusing a cached columnar family across re-grounds (#68): the cached dlcol's
+ * columns are indexed by location, so a shifted location would misread every
+ * verdict. Tradeoff: a location freed by a dropped match is not reclaimed until a
+ * compaction pass, so nloc is bounded by the distinct atoms ever seen (#63). */
 static void assign_locs(world *w)
 {
     uint32_t na = intern_count(w->syms);
-    w->loc_of = realloc(w->loc_of, (size_t)na * sizeof *w->loc_of);
-    memset(w->loc_of, 0xff, (size_t)na * sizeof *w->loc_of);
-    w->loc_cap = na;
-    uint32_t n = 0;
+    if (na > w->loc_cap) {                          /* new interned atoms -> unassigned */
+        w->loc_of = realloc(w->loc_of, (size_t)na * sizeof *w->loc_of);
+        for (uint32_t k = w->loc_cap; k < na; k++) w->loc_of[k] = LOC_NONE;
+        w->loc_cap = na;
+    }
+    uint32_t n = w->nloc;                           /* resume from the high-water mark */
     w->fl_loc = realloc(w->fl_loc, (size_t)(w->nfl ? w->nfl : 1) * sizeof *w->fl_loc);
     w->pr_loc = realloc(w->pr_loc, (size_t)(w->nfl ? w->nfl : 1) * sizeof *w->pr_loc);
     for (int i = 0; i < w->nfl; i++) {
