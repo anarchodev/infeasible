@@ -40,11 +40,12 @@ src/core/    arena allocator, string interning         (no deps)
 src/logic/   defeasible engine: theory, solve, why      (deps: core)
 src/state/   fact store, step function, inertia gen      (deps: core, logic)
 src/lang/    .story compiler: lexer → parse → grounder    (deps: core, state)
+src/lsp/     native .story language server (JSON-RPC/stdio)  (deps: core, lang)
 src/wasm/    emcc-only JS↔C shim over world_* (not in CMake)
 tests/       golden semantic tests + benchmarks (ctest)
 ```
 
-`core`, `logic`, `state`, and `lang` link into one static lib `infeasible_core`; tests link against it. `src/wasm/bindings.c` compiles **only** under `emcc` (see `scripts/build_wasm.sh`) — it is not part of the CMake library. There is no native renderer tier — the shipped presentation is a web client over a WASM build.
+`core`, `logic`, `state`, `lang`, and `lsp` link into one static lib `infeasible_core`; tests link against it. The `story-lsp` binary (`src/lsp/main.c`) links that lib — a shipped executable, not a test. `src/wasm/bindings.c` compiles **only** under `emcc` (see `scripts/build_wasm.sh`) — it is not part of the CMake library. There is no native renderer tier — the shipped presentation is a web client over a WASM build.
 
 ### The logic engine (`src/logic/dl.h`)
 
@@ -70,6 +71,10 @@ Beyond boolean fluents, `world.h` also carries the M1 richer state model — **n
 ### The .story compiler (`src/lang/`)
 
 `story_compile(src, srcname, syms, diags)` is the front half of the M1 pipeline (`story.h`): a hand-written **lexer** (`lexer.c` — maximal-munch, tracks line/col for diagnostics; keywords for the full §6 surface are reserved even where the parser doesn't yet handle them) feeds a recursive-descent **parser** into an arena AST, then a semantic + **build-time grounder** emits ground rules into the `world_*` API. Typed variables (`X : actor`) are grounded up front over declared finite sorts, so `holding(actor,item)` expands to ground atoms interned as `"holding(a,b)"` — a host querying the equivalent ground atom sees the same id. The grammar handled by the current slice is documented at the top of `story.h`; read it before touching the parser. Diagnostics collect into a caller sink with panic-mode recovery at declaration boundaries; a compile fails only on error-severity diagnostics (warnings like orphan/typo detection never fail it).
+
+### The language server (`src/lsp/`)
+
+A native LSP for `.story` (DESIGN.md §6.1 item 7), JSON-RPC 2.0 over stdio. It links the compiler directly, so an editor sees the **same `story_diags`** an author gets at build time. `lsp_dispatch` is the pure core — feed it one message body, capture replies through a sink — so behaviour is tested without a process (`test_lsp`); `lsp_run` wires it to framed stdio, and `main.c` is just `stdin`/`stdout`. `json.c` is a small zero-dependency JSON parser (arena value tree) + a self-escaping `strbuf` writer — no external LSP/JSON deps, matching the repo's no-hidden-allocation ethos. Current slice: lifecycle (`initialize`/`shutdown`/`exit`), full-text sync (`didOpen`/`didChange`/`didClose`), and push diagnostics. Diagnostic ranges use byte columns (correct for ASCII; the UTF-16-code-unit remap LSP wants is deferred). **Navigation is the next slice on this same loop** — go-to-definition on an atom, "rules that conclude `p`", attacker/dependency cones (§6.1 item 7), reading the grounded vocabulary rather than re-parsing.
 
 ### Core (`src/core/`)
 
