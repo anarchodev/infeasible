@@ -11,8 +11,10 @@
  *
  * It answers the decision gate the epic hinges on: how do compile time, ground
  * atoms, and peak memory scale with entity count and rule arity — and WHERE
- * does the MAX_INSTANCES (2²⁰) cliff land in entity-count terms, silently
- * dropping rules (visible here as actual rule count < expected N^arity)?
+ * does the MAX_INSTANCES (2²⁰) cliff land in entity-count terms? Past the cliff
+ * the grounder now rejects the rule with a hard compile error (story_compile
+ * returns NULL) rather than dropping it silently (#27); those rows show
+ * rules=0 and, since the fix, a flat/cheap compile instead of a multi-GB spike.
  *
  *   ./bench_ground              full arity×N sweep
  *   ./bench_ground <arity> <N>  one point
@@ -158,8 +160,10 @@ int main(int argc, char **argv)
     int a3[] = { 30, 64, 100, 128, 256 };
     for (size_t i = 0; i < sizeof a3 / sizeof *a3; i++) bench_one(3, a3[i]);
 
-    printf("\nReading: 'DROPPED' rows are rules the grounder silently discards "
-           "past the 2²⁰ cap —\nthe MAX_INSTANCES cliff, and the case the M3 "
-           "tick-time matcher (#26) exists to catch.\n");
+    printf("\nReading: 'DROPPED' rows are rules past the 2²⁰ cap — the grounder "
+           "now rejects them\nwith a hard compile error (#27) instead of "
+           "silently dropping them, at a flat cost\ninstead of the old N^arity "
+           "spike; the M3 tick-time matcher (#26) is what will let\nthese "
+           "un-anchored cross products ground affordably.\n");
     return 0;
 }
