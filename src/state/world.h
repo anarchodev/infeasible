@@ -78,6 +78,16 @@ typedef bool (*world_provider_fn)(void *ctx, uint32_t pred,
 void world_set_provider_fn(world *w, world_provider_fn fn, void *ctx);
 void world_declare_provider_atom(world *w, uint32_t atom, uint32_t pred,
                                  const uint32_t *args, int nargs);
+/* Ask the provider callback directly (no callback -> closed-world false) —
+ * the match-time filter evaluation for island rules (#80), identical to what
+ * the solver's provider fact-load would conclude for the same state. */
+bool world_provider_holds_at(const world *w, uint32_t pred,
+                             const uint32_t *args, int nargs);
+/* Does `num_atom <op> threshold` hold for the numeric fluent's current value
+ * (undeclared reads 0, like world_get_num)? The match-time analog of a
+ * registered guard atom's closed-world fact (#80). */
+bool world_num_cmp_holds(const world *w, uint32_t num_atom,
+                         world_cmp op, long threshold);
 
 /* Value-returning function providers (§5.6): a host function that returns a
  * value (a cell handle / int), not a relation — e.g. `neighbor(at(X), dir)` for
@@ -166,6 +176,39 @@ void world_matched_reset(world *w);
  * Registering marks the layer stale so the first solve re-grounds. */
 typedef void (*world_reground_fn)(void *ctx, world *w);
 void world_set_reground_fn(world *w, world_reground_fn fn, void *ctx);
+
+/* Matched views (#80): an ISLAND judgment — one matchable rule whose head
+ * predicate is concluded by no other rule, attacked by nothing, and read
+ * nowhere (no rule body, unless-guard, step-rule body, or superiority mentions
+ * it) — has no defeat structure: every matched instance is an all-true-body
+ * rule with no competitors, so its head's verdict is a pure function of match
+ * membership. Its matched layer is therefore a SET, not rules: the re-ground
+ * fills rows of (head atom, variable bindings); world_query answers from
+ * membership without touching the judgment family at all.
+ *   present        -> PROVED for the head polarity, REFUTED for the complement
+ *   seen-but-absent-> REFUTED both polarities (a dropped match, exactly like a
+ *                     located rule-less atom in the family)
+ *   never seen     -> not in the theory (UNDECIDED via the normal fallthrough)
+ * A view creator MUST register a materialize hook: world_why on a present view
+ * atom re-emits just that atom's instances as ordinary matched rules (the hook
+ * is called once per row, in insertion order) so the one shared trace renderer
+ * runs — traces stay byte-identical to full emission. Rows are cleared by
+ * world_views_reset (allocations kept, #48-style bounded memory); the ever-seen
+ * registry is append-only. `bind` in world_view_add may have at most
+ * WORLD_VIEW_MAXBIND entries. */
+#define WORLD_VIEW_MAXBIND 6
+typedef void (*world_materialize_fn)(void *ctx, world *w, uint32_t atom,
+                                     int view, const uint32_t *bind, int nvars);
+int  world_view_new(world *w, uint32_t head_pred, bool head_neg,
+                    dl_rule_kind kind);
+void world_views_reset(world *w);
+void world_view_add(world *w, int view, uint32_t atom,
+                    const uint32_t *bind, int nvars);
+void world_set_materialize_fn(world *w, world_materialize_fn fn, void *ctx);
+/* Introspection (bench/tests): rows currently present; bytes held by the view
+ * store (rows + maps) — the space the matched layer occupies instead of rules. */
+int    world_view_row_count(const world *w);
+size_t world_view_bytes(const world *w);
 
 /* Attach a provenance suffix (source span + generation reason, §6.3) to a rule
  * by its world_add_rule / world_add_step_rule handle; rendered by world_why /

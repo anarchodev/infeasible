@@ -17,12 +17,17 @@
     do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); \
                      return 1; } } while (0)
 
+/* The `watch` rule READS linked(a,b), so `linked` is deliberately NOT an
+ * island (#80): its matches must keep flowing through the jfam as ground
+ * matched rules — which is exactly the machinery whose append-only locations
+ * this test pins. (An island pred's matches never touch the location maps.) */
 static const char *STORY =
     "scene loc\n"
     "sort actor\n"
     "entity ( a, b, c : actor )\n"
     "state ( rel(actor, actor) )\n"
-    "rule link(X: actor, Y: actor): rel(X, Y) => linked(X, Y)\n";
+    "rule link(X: actor, Y: actor): rel(X, Y) => linked(X, Y)\n"
+    "rule watch: linked(a, b) => watched\n";
 
 int main(void)
 {

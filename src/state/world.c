@@ -144,6 +144,24 @@ struct world {
      * matched_stale, to refresh the matched layer against current facts before a
      * solve. `regrounding` guards the callback against re-entering a rebuild. */
     world_reground_fn reground_fn; void *reground_ctx; bool matched_stale, regrounding;
+
+    /* Matched views (#80): island judgments as sets instead of matched rules.
+     * Rows are the per-tick match set (cleared by world_views_reset, caps
+     * kept); vseen_of is the append-only ever-seen registry (atom -> view, -1
+     * never) and vmark_of stamps the reset sequence an atom was last added
+     * under, so "present" is vmark == vseq without any per-tick clearing. */
+    struct { uint32_t head_pred; bool head_neg; dl_rule_kind kind; } *views;
+    int nviews, capviews;
+    struct vrow { uint32_t atom; int view; int nvars;
+                  uint32_t bind[WORLD_VIEW_MAXBIND]; } *vrows;
+    int nvrow, capvrow;
+    uint32_t vseq;                 /* bumped by world_views_reset; 0 = pre-first */
+    int *vseen_of; uint32_t vseen_cap;
+    int *vmark_of; uint32_t vmark_cap;
+    int *vmat_of;  uint32_t vmat_cap;   /* atom -> vseq it was last why-materialized
+                                         * under (rules live until that re-ground) */
+    world_materialize_fn materialize_fn; void *materialize_ctx;
+
     srule *srules; int nsr, capsr;
 
     /* numeric value store + comparison guards (§5.8, read side). A clamp bound
@@ -314,6 +332,11 @@ void world_free(world *w)
     free(w->guard_of);
     free(w->prov_of);
     free(w->eguard_of);
+    free(w->views);
+    free(w->vrows);
+    free(w->vseen_of);
+    free(w->vmark_of);
+    free(w->vmat_of);
     free(w->jrules);
     free(w->jsups);
     free(w->srules);
@@ -577,6 +600,13 @@ static bool provider_holds(const world *w, int i)
                           w->provs[i].args, w->provs[i].nargs);
 }
 
+bool world_provider_holds_at(const world *w, uint32_t pred,
+                             const uint32_t *args, int nargs)
+{
+    if (!w->provider_fn) return false;
+    return w->provider_fn(w->provider_ctx, pred, args, nargs);
+}
+
 /* Load every ground provider atom as a closed-world fact from the callback —
  * mirrors the numeric-guard load; consulted fresh each solve (positions/state may
  * have changed), constant within the solve so the fixpoint's re-reads agree.
@@ -632,6 +662,12 @@ static bool guard_holds(const world *w, int g)
 {
     return cmp_ok(world_get_num(w, w->guards[g].num), w->guards[g].threshold,
                   w->guards[g].op);
+}
+
+bool world_num_cmp_holds(const world *w, uint32_t num_atom,
+                         world_cmp op, long threshold)
+{
+    return cmp_ok(world_get_num(w, num_atom), threshold, op);
 }
 
 static long eval_expr(const world *w, const expr_ins *code, int n);
@@ -736,6 +772,10 @@ void world_matched_checkpoint(world *w)
 
 void world_matched_reset(world *w)
 {
+    if (w->njr == w->jr_matched_base)
+        return;                  /* empty suffix: dropping nothing is not an edit —
+                                  * an all-view re-ground (#80) must not force a
+                                  * jfam re-emit every tick via struct_ver */
     w->njr = w->jr_matched_base;
     arena_release(&w->matched_a);   /* free the previous matched layer's strings/bodies */
     w->struct_ver++;             /* structural edit (#63) */
@@ -747,6 +787,67 @@ void world_set_reground_fn(world *w, world_reground_fn fn, void *ctx)
     w->reground_fn = fn;
     w->reground_ctx = ctx;
     w->matched_stale = true;        /* the first solve re-grounds the initial layer */
+}
+
+/* ---- matched views (#80): island judgments as sets, not rules ---- */
+
+int world_view_new(world *w, uint32_t head_pred, bool head_neg, dl_rule_kind kind)
+{
+    GROW(w->views, w->nviews, w->capviews);
+    w->views[w->nviews].head_pred = head_pred;
+    w->views[w->nviews].head_neg = head_neg;
+    w->views[w->nviews].kind = kind;
+    return w->nviews++;
+}
+
+void world_views_reset(world *w)
+{
+    w->nvrow = 0;                   /* drop rows, keep allocations (#48) */
+    w->vseq++;                      /* everything previously present is now absent */
+}
+
+void world_view_add(world *w, int view, uint32_t atom,
+                    const uint32_t *bind, int nvars)
+{
+    if (nvars > WORLD_VIEW_MAXBIND) {          /* loud, never silently truncated */
+        fprintf(stderr, "world_view_add: %d binds exceeds WORLD_VIEW_MAXBIND\n",
+                nvars);
+        abort();
+    }
+    GROW(w->vrows, w->nvrow, w->capvrow);
+    struct vrow *r = &w->vrows[w->nvrow++];
+    r->atom = atom;
+    r->view = view;
+    r->nvars = nvars;
+    for (int i = 0; i < nvars; i++) r->bind[i] = bind[i];
+    atom_map_set(&w->vseen_of, &w->vseen_cap, atom, view);   /* append-only */
+    atom_map_set(&w->vmark_of, &w->vmark_cap, atom, (int)w->vseq);
+}
+
+void world_set_materialize_fn(world *w, world_materialize_fn fn, void *ctx)
+{
+    w->materialize_fn = fn;
+    w->materialize_ctx = ctx;
+}
+
+int world_view_row_count(const world *w) { return w->nvrow; }
+
+size_t world_view_bytes(const world *w)
+{
+    return (size_t)w->capviews * sizeof *w->views
+         + (size_t)w->capvrow * sizeof *w->vrows
+         + (size_t)w->vseen_cap * sizeof *w->vseen_of
+         + (size_t)w->vmark_cap * sizeof *w->vmark_of
+         + (size_t)w->vmat_cap * sizeof *w->vmat_of;
+}
+
+/* Is `atom` view-owned, and is it present this tick? -1 = not view-owned. */
+static int view_of_atom(const world *w, uint32_t atom, bool *present)
+{
+    if (atom >= w->vseen_cap || w->vseen_of[atom] < 0)
+        return -1;
+    *present = atom < w->vmark_cap && w->vmark_of[atom] == (int)w->vseq;
+    return w->vseen_of[atom];
 }
 
 int world_add_step_rule(world *w, const char *name, uint32_t action,
@@ -866,7 +967,18 @@ static dl_verdict lazy_judgment_verdict(const world *w, dl_lit q)
  * measures the lane families against. */
 static dl_verdict query_jfam(world *w, dl_lit q)
 {
-    ensure_jfam(w);
+    ensure_jfam(w);                /* re-ground fills the views before we look */
+    /* Matched views (#80), checked BEFORE the solve and the jloc branch: a
+     * view atom's verdict is pure membership — an all-island query touches no
+     * dlcol at all — and a why-materialized view atom (which then has a jloc
+     * and transient rules) must keep answering from the view, not the family. */
+    bool present;
+    int vi = view_of_atom(w, q.atom, &present);
+    if (vi >= 0) {
+        if (present)
+            return q.neg == w->views[vi].head_neg ? DL_PROVED : DL_REFUTED;
+        return DL_REFUTED;         /* dropped match: located-rule-less analog */
+    }
     if (!w->jfam_solved)
         solve_judgment_family(w);
     if (q.atom < w->jloc_cap && w->jloc_of[q.atom] != LOC_NONE) {
@@ -901,11 +1013,41 @@ dl_verdict world_query(world *w, dl_lit q)
 void world_why(world *w, dl_lit q, FILE *out)
 {
     ensure_jfam(w);
+    /* Matched view atoms (#80) have no rules in the family; re-emit just this
+     * atom's instances as ordinary matched rules through the registered hook,
+     * so the one shared renderer produces the same trace full emission would
+     * (world_add_rule bumps struct_ver, so the ensure below re-emits the
+     * suffix; the next re-ground truncates these transients). NOT gated on the
+     * jloc — a view atom keeps its (append-only) jloc from an earlier
+     * materialization long after those rules were truncated; the vmat stamp is
+     * what says "this generation's rules are in the family", making repeated
+     * whys idempotent. A dropped view atom emits nothing and falls through to
+     * the lazy jloc materialization — the located-rule-less two-line REFUTED
+     * trace, exactly as a dropped matched rule rendered before views. */
+    {
+        bool present;
+        if (view_of_atom(w, q.atom, &present) >= 0
+            && present && w->materialize_fn
+            && !(q.atom < w->vmat_cap && w->vmat_of[q.atom] == (int)w->vseq)) {
+            for (int i = 0; i < w->nvrow; i++)
+                if (w->vrows[i].atom == q.atom)
+                    w->materialize_fn(w->materialize_ctx, w, q.atom,
+                                      w->vrows[i].view, w->vrows[i].bind,
+                                      w->vrows[i].nvars);
+            atom_map_set(&w->vmat_of, &w->vmat_cap, q.atom, (int)w->vseq);
+            ensure_jfam(w);
+        }
+    }
     if (q.atom >= w->jloc_cap || w->jloc_of[q.atom] == LOC_NONE) {
         /* outside the sparse family. If the dense map never saw it either (and
-         * it is no fluent), it is not in the theory — same message as always. */
+         * it is no fluent and no ever-seen view atom), it is not in the
+         * theory — same message as always. An ever-seen view atom instead
+         * takes the materialization below: a location with no rules renders
+         * the two-line REFUTED trace a dropped matched rule always had. */
+        bool vpresent;
         if ((q.atom >= w->loc_cap || w->loc_of[q.atom] == LOC_NONE)
-            && fluent_index(w, q.atom) < 0) {
+            && fluent_index(w, q.atom) < 0
+            && view_of_atom(w, q.atom, &vpresent) < 0) {
             fprintf(out, "why %s%s?\n  (not in the theory — no rule or fact)\n",
                     q.neg ? "~" : "", intern_name(w->syms, q.atom));
             return;

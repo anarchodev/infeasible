@@ -3246,6 +3246,45 @@ static bool rule_matchable(parser *p, ast_rule *r)
     return true;
 }
 
+static bool pred_in_refs(parser *p, uint32_t pred)
+{
+    for (int i = 0; i < p->nrefs; i++)
+        if (p->refs[i].pred == pred) return true;
+    return false;
+}
+
+/* Island judgment (#80): a matchable rule whose head predicate's ENTIRE proof
+ * cone is its own match set — so the matched layer can be a set-materialized
+ * view (world_view_*) instead of per-tick ground rules. Requires, on top of
+ * rule_matchable: a proving kind (a defeater never concludes); a head pred
+ * that is a pure judgment (not a fluent — closed-world facts would join its
+ * cone — nor mv/numeric/cell/provider); no OTHER rule concluding or attacking
+ * it (either polarity — this also subsumes the superiority clause: this rule
+ * itself is already gated by rule_in_sup, and any sup-carrying sibling is an
+ * "other head"); and read NOWHERE — p->refs already collects every read site:
+ * rule bodies, `unless` guards, action/ramification `requires`, and binder
+ * `where`/`when` (heads, effects and inits deliberately don't note). Called
+ * after desugar_bands, so band-synthesized `>` edges are visible via nsups.
+ * Guard/provider FILTERS are fine: the matcher evaluates them at the match
+ * leaf (world_num_cmp_holds / world_provider_holds_at) — the same values the
+ * solver's fact-load would read, at the same freshness (both run under one
+ * matched_stale trigger). A guard-filtered head answers UNDECIDED instead of
+ * eager's vacuous REFUTED — the documented provability-contract asymmetry the
+ * matcher already has for unsatisfiable instances. */
+static bool rule_island(parser *p, ast_rule *r)
+{
+    if (r->kind == DL_DEFEATER) return false;
+    pred_info *hp = find_pred(p, r->head.pred);
+    if (hp && (hp->is_fluent || hp->is_mv || hp->is_num || hp->is_cell ||
+               hp->is_provider))
+        return false;
+    if (pred_in_refs(p, r->head.pred)) return false;
+    for (int j = 0; j < p->nrules; j++)
+        if (&p->rules[j] != r && p->rules[j].head.pred == r->head.pred)
+            return false;
+    return true;
+}
+
 typedef struct { int *h; int n, cap; } inst_list;
 static void inst_push(inst_list *L, int handle)
 {
@@ -3419,6 +3458,8 @@ typedef struct {
     m_atom       head;
     m_atom       body[MAX_BODY];
     int          nbody;
+    bool         island;       /* #80: matches go to a world view, not rules */
+    int          view;         /* world_view_new handle, -1 when !island      */
 } m_rule;
 
 struct story_matcher {
@@ -3474,7 +3515,12 @@ static dl_lit m_ground_lit(story_matcher *m, const m_rule *r, const m_atom *a,
     return a->neg ? dl_neg(g) : dl_pos(g);
 }
 
-static void m_emit(story_matcher *m, m_rule *r, const uint32_t *bind)
+/* Emit one matched instance as an ordinary matched rule (world_add_rule) —
+ * the non-island path, and the materialize-on-why path for island instances
+ * (#80): the world hands the stored bindings back and this re-creates exactly
+ * the rule full emission would have, so the shared trace renderer output is
+ * byte-identical. */
+static void m_emit_rule(story_matcher *m, m_rule *r, const uint32_t *bind)
 {
     dl_lit head = m_ground_lit(m, r, &r->head, bind);
     dl_lit body[MAX_BODY];
@@ -3484,6 +3530,40 @@ static void m_emit(story_matcher *m, m_rule *r, const uint32_t *bind)
     inst_name_s(m->syms, name, sizeof name, r->label, r->varname, r->nvars, bind);
     int h = world_add_rule(m->w, name, r->kind, head, body, r->nbody);
     world_set_rule_prov(m->w, h, r->prov);
+}
+
+static void m_emit(story_matcher *m, m_rule *r, const uint32_t *bind)
+{
+    if (r->island) {                               /* #80: membership, not rules */
+        /* Guard/provider FILTERS evaluate here, at the leaf, instead of being
+         * carried into a rule body for the solver: same values, same
+         * matched_stale freshness. A failing filter emits nothing — the head
+         * stays unmatched (UNDECIDED), where eager's inapplicable ground rule
+         * would refute it: the documented provability-contract asymmetry.
+         * Nothing is registered — landmark atoms appear only if a why
+         * materializes the instance (m_emit_rule runs m_ground_lit then). */
+        for (int b = 0; b < r->nbody; b++) {
+            const m_atom *a = &r->body[b];
+            if (!a->is_guard && !a->is_provider)
+                continue;
+            uint32_t args[MAX_ARGS];
+            for (int k = 0; k < a->nargs; k++) {
+                int vi = m_var_index(r, a->arg[k]);
+                args[k] = vi >= 0 ? bind[vi] : a->arg[k];
+            }
+            if (a->is_guard) {
+                uint32_t term = ground_pred_s(m->syms, a->pred, args, a->nargs);
+                if (!world_num_cmp_holds(m->w, term, a->cmp, a->threshold))
+                    return;
+            } else if (!world_provider_holds_at(m->w, a->pred, args, a->nargs)) {
+                return;
+            }
+        }
+        dl_lit head = m_ground_lit(m, r, &r->head, bind);
+        world_view_add(m->w, r->view, head.atom, bind, r->nvars);
+        return;
+    }
+    m_emit_rule(m, r, bind);
 }
 
 /* atom_present over the compact plan + a live index (mirrors atom_present). */
@@ -3609,7 +3689,7 @@ static void m_capture_atom(parser *p, m_atom *d, const ast_atom *s)
 }
 
 /* Deep-copy one matchable rule into the retained plan (survives the parser). */
-static void matcher_capture(story_matcher *m, parser *p, ast_rule *r)
+static void matcher_capture(story_matcher *m, parser *p, ast_rule *r, bool island)
 {
     if (m->nrules == m->caprules) {
         m->caprules = m->caprules ? m->caprules * 2 : 16;
@@ -3626,11 +3706,30 @@ static void matcher_capture(story_matcher *m, parser *p, ast_rule *r)
     d->nbody = r->nbody;
     for (int b = 0; b < r->nbody && b < MAX_BODY; b++)
         m_capture_atom(p, &d->body[b], &r->body[b]);
+    d->island = island;
+    d->view = island ? world_view_new(p->w, r->head.pred, r->head.neg, r->kind)
+                     : -1;
+}
+
+/* Materialize-on-why (#80): the world hands back one stored view row; re-emit
+ * it through the normal matched-rule path so world_why renders the exact trace
+ * full emission would have. */
+static void matcher_materialize_thunk(void *ctx, world *w, uint32_t atom,
+                                      int view, const uint32_t *bind, int nvars)
+{
+    (void)w; (void)atom; (void)nvars;
+    story_matcher *m = ctx;
+    for (int i = 0; i < m->nrules; i++)
+        if (m->rules[i].island && m->rules[i].view == view) {
+            m_emit_rule(m, &m->rules[i], bind);
+            return;
+        }
 }
 
 void story_matcher_reground(story_matcher *m)
 {
     world_matched_reset(m->w);                       /* drop the previous layer */
+    world_views_reset(m->w);                         /* islands: previous match set (#80) */
     const factindex *ix = world_fact_index(m->w);    /* refresh from live vals  */
     m->probes = 0;
     uint32_t bind[MAX_ARGS];
@@ -5210,7 +5309,8 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
                 m->w = p->w;
                 for (int i = 0; i < p->nrules; i++)
                     if (rule_matchable(p, &p->rules[i]))
-                        matcher_capture(m, p, &p->rules[i]);
+                        matcher_capture(m, p, &p->rules[i],
+                                        rule_island(p, &p->rules[i]));
                     else
                         ground_rule(p, &p->rules[i]);
                 world_matched_checkpoint(p->w);       /* boundary: static | matched */
@@ -5298,5 +5398,6 @@ story_matcher *story_compile_matcher(const char *src, const char *srcname,
      * solve (#45). The host no longer calls story_matcher_reground; the first
      * world_query / world_step builds the initial layer. */
     world_set_reground_fn(w, matcher_reground_thunk, m);
+    world_set_materialize_fn(w, matcher_materialize_thunk, m);   /* islands (#80) */
     return m;
 }
