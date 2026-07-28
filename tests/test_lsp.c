@@ -26,6 +26,17 @@
 #define SRC_ERROR "rule bad1: a =>\n"                    /* missing head -> error */
 #define SRC_WARN  "state holding\nrule r: hodling => weak" /* typo -> warning     */
 
+/* Navigation fixture — exact columns matter, so lay it out explicitly:
+ *   L0: "state ( alive )"          alive: fluent decl at char 8
+ *   L1: "rule mk: alive => happy"  alive body char 9; happy HEAD char 18
+ *   L2: "rule br: happy => calm"   happy body char 9; calm HEAD char 18
+ * `alive` is a pure fluent (decl target); `happy` is a pure conclusion (head
+ * target) — so definition exercises both without fluent-as-head ambiguity. */
+#define SRC_NAV \
+    "state ( alive )\n" \
+    "rule mk: alive => happy\n" \
+    "rule br: happy => calm"
+
 /* Capture sink: accumulate every emitted body, newline-separated, for strstr. */
 static void cap_emit(void *ud, const char *body, size_t len)
 {
@@ -60,6 +71,34 @@ static void build_close(strbuf *m, const char *uri)
 {
     sb_reset(m);
     sb_raw(m, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\","
+              "\"params\":{\"textDocument\":{\"uri\":");
+    sb_jstr(m, uri);
+    sb_raw(m, "}}}");
+}
+
+static void build_pos_req(strbuf *m, const char *method, const char *uri,
+                          int line, int ch, int id)
+{
+    sb_reset(m);
+    sb_raw(m, "{\"jsonrpc\":\"2.0\",\"id\":");
+    sb_int(m, id);
+    sb_raw(m, ",\"method\":");
+    sb_jstr(m, method);
+    sb_raw(m, ",\"params\":{\"textDocument\":{\"uri\":");
+    sb_jstr(m, uri);
+    sb_raw(m, "},\"position\":{\"line\":");
+    sb_int(m, line);
+    sb_raw(m, ",\"character\":");
+    sb_int(m, ch);
+    sb_raw(m, "}}}");
+}
+
+static void build_docsym(strbuf *m, const char *uri, int id)
+{
+    sb_reset(m);
+    sb_raw(m, "{\"jsonrpc\":\"2.0\",\"id\":");
+    sb_int(m, id);
+    sb_raw(m, ",\"method\":\"textDocument/documentSymbol\","
               "\"params\":{\"textDocument\":{\"uri\":");
     sb_jstr(m, uri);
     sb_raw(m, "}}}");
@@ -192,6 +231,60 @@ static int test_lifecycle(void)
     return 0;
 }
 
+/* Navigation over the compiler's span model (no re-parse): go-to-definition,
+ * find-references, and the document outline. */
+static int test_navigation(void)
+{
+    lsp_server *s = lsp_new();
+    strbuf cap; sb_init(&cap);
+    strbuf msg; sb_init(&msg);
+    const char *uri = "file:///nav.story";
+
+    build_open(&msg, uri, SRC_NAV);
+    dispatch(s, &cap, msg.buf);
+    sb_reset(&cap);
+
+    /* definition on the body use of `alive` (L1) -> its fluent decl (L0 char 8),
+     * NOT the body use itself. */
+    build_pos_req(&msg, "textDocument/definition", uri, 1, 9, 10);
+    dispatch(s, &cap, msg.buf);
+    CHECK(strstr(cap.buf, "\"line\":0,\"character\":8") != NULL);
+    CHECK(strstr(cap.buf, "\"character\":9") == NULL);
+    sb_reset(&cap);
+
+    /* definition on the body use of `happy` (L2) -> the rule that concludes it
+     * (mk's head, L1 char 18) — "find all rules that conclude p". */
+    build_pos_req(&msg, "textDocument/definition", uri, 2, 9, 11);
+    dispatch(s, &cap, msg.buf);
+    CHECK(strstr(cap.buf, "\"line\":1,\"character\":18") != NULL);
+    sb_reset(&cap);
+
+    /* references on `happy` (click its head, L1 char 18) -> head + body use. */
+    build_pos_req(&msg, "textDocument/references", uri, 1, 18, 12);
+    dispatch(s, &cap, msg.buf);
+    CHECK(strstr(cap.buf, "\"line\":1,\"character\":18") != NULL);  /* head */
+    CHECK(strstr(cap.buf, "\"line\":2,\"character\":9") != NULL);   /* body */
+    sb_reset(&cap);
+
+    /* documentSymbol -> the outline: the fluent (Field=8) and both rules. */
+    build_docsym(&msg, uri, 13);
+    dispatch(s, &cap, msg.buf);
+    CHECK(strstr(cap.buf, "\"name\":\"alive\"") != NULL);
+    CHECK(strstr(cap.buf, "\"kind\":8") != NULL);
+    CHECK(strstr(cap.buf, "\"name\":\"mk\"") != NULL);
+    CHECK(strstr(cap.buf, "\"name\":\"br\"") != NULL);
+    sb_reset(&cap);
+
+    /* definition on a keyword / non-atom position -> empty result. */
+    build_pos_req(&msg, "textDocument/definition", uri, 0, 0, 14);
+    dispatch(s, &cap, msg.buf);
+    CHECK(strstr(cap.buf, "\"result\":[]") != NULL);
+
+    sb_free(&msg); sb_free(&cap);
+    lsp_free(s);
+    return 0;
+}
+
 /* The minimal JSON layer: parse a nested object, typed accessors, escapes,
  * and rejection of malformed input. */
 static int test_json(void)
@@ -233,6 +326,7 @@ int main(void)
     if (test_change_warns()) return 1;
     if (test_close_clears()) return 1;
     if (test_lifecycle())   return 1;
+    if (test_navigation())  return 1;
     printf("test_lsp: all passed\n");
     return 0;
 }

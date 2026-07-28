@@ -215,8 +215,189 @@ static void reply_error(lsp_emit_fn emit, void *ud, const json *id,
 /* Capabilities advertised on `initialize`: open/close notifications and full
  * document sync (change kind 1). Push diagnostics need no capability. */
 static const char *INITIALIZE_RESULT =
-    "{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":1}}"
+    "{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":1}"
+    ",\"definitionProvider\":true,\"referencesProvider\":true"
+    ",\"documentSymbolProvider\":true}"
     ",\"serverInfo\":{\"name\":\"infeasible-story-lsp\",\"version\":\"0.1.0\"}}";
+
+/* ---------------------------------------------------------------- navigation */
+
+/* Compile `text` for its span model only (diagnostics dropped); the model
+ * copies names, so `syms` is freed immediately. NULL on allocation failure.
+ * TODO: cache per document — recompiling on every navigation request is fine
+ * for editor-sized files but wasteful; invalidate on didChange. */
+static story_model *model_for(const char *text)
+{
+    story_model *m = NULL;
+    intern *syms = intern_new();
+    world *w = story_compile_model(text, "<lsp>", syms, NULL, &m);
+    if (w) world_free(w);
+    intern_free(syms);
+    return m;
+}
+
+/* The occurrence whose token covers 1-based (line, col), or NULL. */
+static const story_occ *occ_at(const story_model *m, int line, int col)
+{
+    int n;
+    const story_occ *occs = story_model_occs(m, &n);
+    for (int i = 0; i < n; i++)
+        if (occs[i].line == line &&
+            col >= occs[i].col && col < occs[i].col + occs[i].len)
+            return &occs[i];
+    return NULL;
+}
+
+/* 1-based (line,col,len) -> an LSP Range (0-based, half-open on the end). */
+static void write_range(strbuf *sb, int line, int col, int len)
+{
+    int l0 = line > 0 ? line - 1 : 0;
+    int c0 = col  > 0 ? col  - 1 : 0;
+    sb_raw(sb, "{\"start\":{\"line\":");
+    sb_int(sb, l0);
+    sb_raw(sb, ",\"character\":");
+    sb_int(sb, c0);
+    sb_raw(sb, "},\"end\":{\"line\":");
+    sb_int(sb, l0);
+    sb_raw(sb, ",\"character\":");
+    sb_int(sb, c0 + len);
+    sb_raw(sb, "}}");
+}
+
+static void write_location(strbuf *sb, const char *uri, const story_occ *o)
+{
+    sb_raw(sb, "{\"uri\":");
+    sb_jstr(sb, uri);
+    sb_raw(sb, ",\"range\":");
+    write_range(sb, o->line, o->col, o->len);
+    sb_char(sb, '}');
+}
+
+/* story_sym_kind -> LSP SymbolKind. */
+static int symbol_kind(story_sym_kind k)
+{
+    switch (k) {
+        case STORY_SYM_SORT:     return 5;   /* Class     */
+        case STORY_SYM_DOMAIN:   return 5;   /* Class     */
+        case STORY_SYM_ENTITY:   return 14;  /* Constant  */
+        case STORY_SYM_FLUENT:   return 8;   /* Field     */
+        case STORY_SYM_PROVIDER: return 11;  /* Interface */
+        case STORY_SYM_FUNCTION: return 12;  /* Function  */
+        case STORY_SYM_ENUM:     return 10;  /* Enum      */
+        case STORY_SYM_ACTION:   return 6;   /* Method    */
+        case STORY_SYM_RULE:     return 24;  /* Event     */
+    }
+    return 13;   /* Variable — unreachable fallback */
+}
+
+/* params.position -> 1-based line/col; document text via the store. */
+static lsp_doc *nav_target(lsp_server *s, const json *msg, int *line, int *col)
+{
+    const json *params = json_get(msg, "params");
+    const char *uri = json_str(json_get(json_get(params, "textDocument"), "uri"));
+    const json *pos = json_get(params, "position");
+    *line = (int)json_int(json_get(pos, "line"), 0) + 1;
+    *col  = (int)json_int(json_get(pos, "character"), 0) + 1;
+    return uri ? doc_find(s, uri) : NULL;
+}
+
+static const char *nav_uri(const json *msg)
+{
+    return json_str(json_get(json_get(json_get(msg, "params"), "textDocument"),
+                             "uri"));
+}
+
+/* Go-to-definition: an atom resolves to its declaration site(s) and every rule
+ * that concludes it (head occurrences) — "find all rules that conclude p". */
+static void on_definition(lsp_server *s, const json *msg, const json *id,
+                          lsp_emit_fn emit, void *ud)
+{
+    int line, col;
+    lsp_doc *d = nav_target(s, msg, &line, &col);
+    const char *uri = nav_uri(msg);
+    strbuf rb; sb_init(&rb); sb_char(&rb, '[');
+    if (d) {
+        story_model *m = model_for(d->text);
+        const story_occ *hit = occ_at(m, line, col);
+        if (hit) {
+            int n; const story_occ *occs = story_model_occs(m, &n);
+            int emitted = 0;
+            for (int i = 0; i < n; i++) {
+                if ((occs[i].role == STORY_OCC_DECL ||
+                     occs[i].role == STORY_OCC_HEAD) &&
+                    strcmp(occs[i].name, hit->name) == 0) {
+                    if (emitted++) sb_char(&rb, ',');
+                    write_location(&rb, uri, &occs[i]);
+                }
+            }
+        }
+        story_model_free(m);
+    }
+    sb_char(&rb, ']');
+    reply_result(emit, ud, id, rb.buf);
+    sb_free(&rb);
+}
+
+/* Find-references: every occurrence of the atom under the cursor (declaration
+ * included unless context.includeDeclaration is false). */
+static void on_references(lsp_server *s, const json *msg, const json *id,
+                          lsp_emit_fn emit, void *ud)
+{
+    int line, col;
+    lsp_doc *d = nav_target(s, msg, &line, &col);
+    const char *uri = nav_uri(msg);
+    bool incl = json_bool(
+        json_get(json_get(json_get(msg, "params"), "context"),
+                 "includeDeclaration"), true);
+    strbuf rb; sb_init(&rb); sb_char(&rb, '[');
+    if (d) {
+        story_model *m = model_for(d->text);
+        const story_occ *hit = occ_at(m, line, col);
+        if (hit) {
+            int n; const story_occ *occs = story_model_occs(m, &n);
+            int emitted = 0;
+            for (int i = 0; i < n; i++) {
+                if (strcmp(occs[i].name, hit->name) != 0) continue;
+                if (!incl && occs[i].role == STORY_OCC_DECL) continue;
+                if (emitted++) sb_char(&rb, ',');
+                write_location(&rb, uri, &occs[i]);
+            }
+        }
+        story_model_free(m);
+    }
+    sb_char(&rb, ']');
+    reply_result(emit, ud, id, rb.buf);
+    sb_free(&rb);
+}
+
+/* Document outline: every declaration, as a flat DocumentSymbol[]. */
+static void on_document_symbol(lsp_server *s, const json *msg, const json *id,
+                               lsp_emit_fn emit, void *ud)
+{
+    const char *uri = nav_uri(msg);
+    lsp_doc *d = uri ? doc_find(s, uri) : NULL;
+    strbuf rb; sb_init(&rb); sb_char(&rb, '[');
+    if (d) {
+        story_model *m = model_for(d->text);
+        int n; const story_symbol *syms = story_model_symbols(m, &n);
+        for (int i = 0; i < n; i++) {
+            if (i) sb_char(&rb, ',');
+            sb_raw(&rb, "{\"name\":");
+            sb_jstr(&rb, syms[i].name);
+            sb_raw(&rb, ",\"kind\":");
+            sb_int(&rb, symbol_kind(syms[i].kind));
+            sb_raw(&rb, ",\"range\":");
+            write_range(&rb, syms[i].line, syms[i].col, syms[i].len);
+            sb_raw(&rb, ",\"selectionRange\":");
+            write_range(&rb, syms[i].line, syms[i].col, syms[i].len);
+            sb_char(&rb, '}');
+        }
+        story_model_free(m);
+    }
+    sb_char(&rb, ']');
+    reply_result(emit, ud, id, rb.buf);
+    sb_free(&rb);
+}
 
 /* ----------------------------------------------------------------- dispatch */
 
@@ -288,6 +469,12 @@ bool lsp_dispatch(lsp_server *s, const char *body, size_t len,
         on_did_change(s, msg, emit, ud);
     } else if (strcmp(method, "textDocument/didClose") == 0) {
         on_did_close(s, msg, emit, ud);
+    } else if (strcmp(method, "textDocument/definition") == 0) {
+        on_definition(s, msg, id, emit, ud);
+    } else if (strcmp(method, "textDocument/references") == 0) {
+        on_references(s, msg, id, emit, ud);
+    } else if (strcmp(method, "textDocument/documentSymbol") == 0) {
+        on_document_symbol(s, msg, id, emit, ud);
     } else if (id) {
         /* An unknown *request* must be answered; notifications are dropped. */
         reply_error(emit, ud, id, RPC_METHOD_NOT_FOUND, "method not found");

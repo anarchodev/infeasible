@@ -5,6 +5,7 @@
 
 #include "core/intern.h"
 #include "state/world.h"
+#include "lang/story_model.h"
 
 /* Front half of the .story compiler (DESIGN.md §11 M1). Two passes over an
  * arena AST (§10): recursive-descent parse, then a semantic + build-time
@@ -128,5 +129,16 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
  * instances rather than every sort^k possibility. */
 world *story_compile_matched(const char *src, const char *srcname, intern *syms,
                              story_diags *diags);
+
+/* Same compile, but also harvest the symbol/occurrence model (story_model.h)
+ * from the parser tables into `*out` — the source-span index navigation, hover,
+ * and the interface artifact read (§6.1 item 7, §6.3). The world is returned as
+ * usual (NULL on error); the model is populated best-effort even when the
+ * compile fails, so an editor navigates a broken file. Pass NULL for `out` to
+ * skip it (then this is exactly story_compile). The caller owns `*out` and
+ * frees it with story_model_free; unlike the world it does not borrow `syms`
+ * (names are copied), so it may outlive both `syms` and `src`. */
+world *story_compile_model(const char *src, const char *srcname, intern *syms,
+                           story_diags *diags, story_model **out);
 
 #endif
