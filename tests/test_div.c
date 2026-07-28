@@ -128,6 +128,52 @@ static int test_story_div(void)
     return 0;
 }
 
+/* --- divup: ceiling division, desugared to -((-a)/b) --- */
+static int test_divup(void)
+{
+    const char *src =
+        "state (\n"
+        "    hp : int\n"
+        "    d  : int\n"
+        "    z  : int\n"
+        ")\n"
+        "init ( hp = 7  z = 0 )\n"
+        "// the 5e exception: \"half X, rounded up\"\n"
+        "action halfup:   causes d := divup(hp, 2)\n"
+        "// toward +inf on negatives, the dual of '/'\n"
+        "action neghalf:  causes d := divup(0 - hp, 2)\n"
+        "// fully constant: the fold takes the same desugared path\n"
+        "action cfold:    causes d := divup(7, 2)\n"
+        "// exact division needs no adjustment\n"
+        "action exact:    causes d := divup(8, 2)\n"
+        "// runtime zero divisor: still the defined 0\n"
+        "action divz:     causes d := divup(hp, z)\n"
+        "// usable as a guard lead, like min/max\n"
+        "rule sturdy_check: divup(hp, 2) >= 4 -> sturdy\n";
+
+    intern *sy = intern_new();
+    world *w = compile_ok(src, sy);
+    CHECK(w != NULL);
+    uint32_t d = intern_id(sy, "d");
+    dl_lit sturdy = { intern_id(sy, "sturdy"), false };
+
+    CHECK(world_query(w, sturdy) == DL_PROVED);   /* divup(7,2) = 4 >= 4 */
+    CHECK(step(w, sy, "halfup") == 0);
+    CHECK(world_get_num(w, d) == 4);              /* 7/2 rounds UP */
+    CHECK(step(w, sy, "neghalf") == 0);
+    CHECK(world_get_num(w, d) == -3);             /* -7/2 toward +inf */
+    CHECK(step(w, sy, "cfold") == 0);
+    CHECK(world_get_num(w, d) == 4);
+    CHECK(step(w, sy, "exact") == 0);
+    CHECK(world_get_num(w, d) == 4);
+    CHECK(step(w, sy, "divz") == 0);
+    CHECK(world_get_num(w, d) == 0);
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
 /* --- `/` in an expression guard feeding a judgment --- */
 static int test_guard_div(void)
 {
@@ -157,6 +203,7 @@ static int test_const_zero_rejected(void)
     static const char *const BAD[] = {
         "state d : int\naction a: causes d := d / 0\n",
         "state d : int\naction a: causes d := d / (2 - 2)\n",
+        "state d : int\naction a: causes d := divup(d, 0)\n",
     };
     for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {
         intern *sy = intern_new();
@@ -178,6 +225,7 @@ int main(void)
 {
     if (test_vm_floor()) return 1;
     if (test_story_div()) return 1;
+    if (test_divup()) return 1;
     if (test_guard_div()) return 1;
     if (test_const_zero_rejected()) return 1;
     printf("test_div: all passed\n");

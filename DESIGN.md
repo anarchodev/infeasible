@@ -785,6 +785,11 @@ lookup where the solver would be:
   matching 5e's "round down", *not* C's truncation toward zero; the semantics are
   pinned by golden test, not inherited from the host. Division by zero is defined
   as 0 at runtime; a divisor that constant-folds to 0 is a compile error.
+  Round-up sites — 5e's explicit per-feature exceptions ("half your level,
+  rounded up") — are `divup(a, b)`, a named builtin beside `min`/`max` that
+  desugars to `-((-a)/b)`, so ceiling can never drift from floor. Rounding is
+  never a mode or a property of `/` itself: which rounding applies is always
+  visible at the expression.
 - **The compiler may solve; the engine only evaluates.** Build-time
   diagnostics (conflictable-pair witnesses §6.1 item 4, vacuous guards) are
   satisfiability queries — cheap and decidable over finite interval

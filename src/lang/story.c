@@ -605,7 +605,8 @@ static void parse_entity(parser *p)
  *
  *   expr   := term (('+'|'-') term)*
  *   term   := factor (('*'|'/') factor)*      -- '/' floors (rounds toward -inf)
- *   factor := '-' factor | INT | ('min'|'max') '(' expr ',' expr ')'
+ *   factor := '-' factor | INT
+ *           | ('min'|'max'|'divup') '(' expr ',' expr ')'  -- divup = ceiling div
  *           | IDENT [ '(' arg (',' arg)* ')' ]        -- a numeric fluent read
  *           | '(' expr ')'
  * Returns a node index into p->exprs, or -1 on error. */
@@ -658,6 +659,7 @@ static int parse_factor(parser *p)
     if (p->cur.kind == TK_IDENT) {
         token id = p->cur;
         bool ismin = ident_is(id, "min"), ismax = ident_is(id, "max");
+        bool isdivup = ident_is(id, "divup");
         advance(p);
         if (ident_is(id, "roll") && p->cur.kind == TK_LPAREN) {   /* roll(sides[, tag]) */
             advance(p);
@@ -672,7 +674,8 @@ static int parse_factor(parser *p)
             p->exprs[n].lhs = (int)tag;
             return n;
         }
-        if ((ismin || ismax) && p->cur.kind == TK_LPAREN) {   /* min/max(a, b) */
+        if ((ismin || ismax || isdivup) && p->cur.kind == TK_LPAREN) {
+            /* min/max(a, b), divup(a, b) */
             advance(p);
             int a = parse_expr(p);
             if (a < 0) return -1;
@@ -680,6 +683,28 @@ static int parse_factor(parser *p)
             int b = parse_expr(p);
             if (b < 0) return -1;
             if (!expect(p, TK_RPAREN)) return -1;
+            if (isdivup) {
+                /* ceiling division ("rounded up", the 5e per-feature exception
+                 * to the global round-down rule): desugar to -((-a) / b) — the
+                 * floor/ceil identity, so the dual semantics can never drift
+                 * from EXPR_DIV and fold/VM agree by construction. */
+                long dv;
+                if (expr_fold(p, b, &dv) && dv == 0) {
+                    fail(p, id.line, id.col, "division by a constant zero");
+                    return -1;
+                }
+                int na = alloc_expr(p, EX_NEG, id.line, id.col);
+                if (na < 0) return -1;
+                p->exprs[na].lhs = a;
+                int nd = alloc_expr(p, EX_DIV, id.line, id.col);
+                if (nd < 0) return -1;
+                p->exprs[nd].lhs = na;
+                p->exprs[nd].rhs = b;
+                int nn = alloc_expr(p, EX_NEG, id.line, id.col);
+                if (nn < 0) return -1;
+                p->exprs[nn].lhs = nd;
+                return nn;
+            }
             int n = alloc_expr(p, ismin ? EX_MIN : EX_MAX, id.line, id.col);
             if (n < 0) return -1;
             p->exprs[n].lhs = a;
@@ -786,10 +811,11 @@ static bool parse_atom(parser *p, ast_atom *out)
     memset(out, 0, sizeof *out);
     if (p->cur.kind == TK_TILDE) { out->neg = true; advance(p); }
     /* An expression guard `expr <cmp> expr` (§5.8/§5.10) — recognised when the
-     * conjunct starts with something a boolean atom can't: a `roll`/`min`/`max`
-     * function call, an int, `(`, or `-`. Covers the d20:
+     * conjunct starts with something a boolean atom can't: a `roll`/`min`/`max`/
+     * `divup` function call, an int, `(`, or `-`. Covers the d20:
      * `roll(20) + atk(A) >= ac(T)` and `max(roll(20,1), roll(20,2)) + atk >= ac`. */
     if (ident_is(p->cur, "roll") || ident_is(p->cur, "min") || ident_is(p->cur, "max") ||
+        ident_is(p->cur, "divup") ||
         p->cur.kind == TK_INT || p->cur.kind == TK_LPAREN || p->cur.kind == TK_MINUS) {
         token lead = p->cur;
         int lhs = parse_expr(p);

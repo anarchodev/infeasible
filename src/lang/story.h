@@ -76,7 +76,8 @@
  *   numop   := ':=' | '+=' | '-='                        -- numeric effect (§5.8)
  *   expr    := term (('+'|'-') term)*                    -- effect RHS, int-only
  *   term    := factor (('*'|'/') factor)*   -- '/' floors (rounds toward -inf, §5.8)
- *   factor  := '-' factor | INT | ('min'|'max') '(' expr ',' expr ')'
+ *   factor  := '-' factor | INT
+ *            | ('min'|'max'|'divup') '(' expr ',' expr ')'  -- divup = ceiling div
  *            | IDENT '(' expr (',' expr)* ')'           -- fn-provider call (§5.6)
  *            | IDENT [ '(' arg (',' arg)* ')' ] | '(' expr ')'
  *   atom    := [ '~' ] IDENT [ '(' arg (',' arg)* ')' ] [ "'" ]
