@@ -129,4 +129,25 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
 world *story_compile_matched(const char *src, const char *srcname, intern *syms,
                              story_diags *diags);
 
+/* Tick-time matcher (#28, the runtime half). Compiles like story_compile_matched
+ * but RETAINS a compact plan of the matchable rules, so the matched judgment
+ * layer can be re-grounded against the world's *current* facts each tick — the
+ * matcher scans the live fact-store extension (world_fact_index), so cost tracks
+ * actual matches, not the sort cross product, even after world_step changes the
+ * state. The static (non-matchable) rules are ground once, as usual.
+ *
+ * `*out` receives the compiled world (NULL on compile error). The returned handle
+ * owns only the plan; the world is owned by the caller (world_free it). Verdicts
+ * and why-traces stay identical to the eager path (test_ticktime pins it across a
+ * state change). Prototype: NOT yet routed through world_step — the host drives
+ * re-grounding, mirroring how the lanes were validated before adoption. */
+typedef struct story_matcher story_matcher;
+story_matcher *story_compile_matcher(const char *src, const char *srcname,
+                                     intern *syms, story_diags *diags, world **out);
+/* Re-materialize the matched judgment layer against the world's current facts:
+ * drop the previous matched rules, refresh the extension index, re-run the join. */
+void   story_matcher_reground(story_matcher *m);
+world *story_matcher_world(const story_matcher *m);
+void   story_matcher_free(story_matcher *m);
+
 #endif

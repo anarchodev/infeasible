@@ -2767,39 +2767,54 @@ static void semantic_pass(parser *p)
 /* ---- grounding: emit ground rules into world_* ---------------------- */
 
 /* Write the ground term "pred(e1,e2)" (bare "pred" at arity 0) into buf. */
-static int build_term(parser *p, uint32_t pred, const uint32_t *args, int n,
+/* Takes the intern table directly (not the parser) so the tick-time matcher
+ * (#28) can reuse the EXACT ground-atom spelling post-compile — byte-identical
+ * atoms and why-traces by construction. */
+static int build_term(intern *syms, uint32_t pred, const uint32_t *args, int n,
                       char *buf, size_t cap)
 {
-    int off = snprintf(buf, cap, "%s", intern_name(p->syms, pred));
+    int off = snprintf(buf, cap, "%s", intern_name(syms, pred));
     if (n == 0) return off;
     off += snprintf(buf + off, cap - (size_t)off, "(");
     for (int i = 0; i < n && off < (int)cap; i++)
         off += snprintf(buf + off, cap - (size_t)off, "%s%s",
-                        i ? "," : "", intern_name(p->syms, args[i]));
+                        i ? "," : "", intern_name(syms, args[i]));
     if (off < (int)cap) off += snprintf(buf + off, cap - (size_t)off, ")");
     return off;
 }
 
 /* Build the interned ground atom "pred(e1,e2)" (bare "pred" at arity 0). */
-static uint32_t ground_pred(parser *p, uint32_t pred, const uint32_t *args, int n)
+/* syms-only core so the tick-time matcher (#28) spells ground atoms identically. */
+static uint32_t ground_pred_s(intern *syms, uint32_t pred, const uint32_t *args, int n)
 {
     if (n == 0) return pred;
     char buf[MAX_GROUND];
-    build_term(p, pred, args, n, buf, sizeof buf);
-    return intern_id(p->syms, buf);
+    build_term(syms, pred, args, n, buf, sizeof buf);
+    return intern_id(syms, buf);
+}
+
+static uint32_t ground_pred(parser *p, uint32_t pred, const uint32_t *args, int n)
+{
+    return ground_pred_s(p->syms, pred, args, n);
 }
 
 /* Build the interned value-atom "pred(e1,e2)=v" — a multi-valued fluent's
  * value erases to this boolean atom (§5.7). */
+static uint32_t ground_mv_atom_s(intern *syms, uint32_t pred, const uint32_t *args,
+                                 int n, uint32_t value)
+{
+    char buf[MAX_GROUND];
+    int off = build_term(syms, pred, args, n, buf, sizeof buf);
+    if (off < (int)sizeof buf)
+        snprintf(buf + off, sizeof buf - (size_t)off, "=%s",
+                 intern_name(syms, value));
+    return intern_id(syms, buf);
+}
+
 static uint32_t ground_mv_atom(parser *p, uint32_t pred, const uint32_t *args,
                                int n, uint32_t value)
 {
-    char buf[MAX_GROUND];
-    int off = build_term(p, pred, args, n, buf, sizeof buf);
-    if (off < (int)sizeof buf)
-        snprintf(buf + off, sizeof buf - (size_t)off, "=%s",
-                 intern_name(p->syms, value));
-    return intern_id(p->syms, buf);
+    return ground_mv_atom_s(p->syms, pred, args, n, value);
 }
 
 static const char *cmp_spelling(world_cmp op)
@@ -2821,7 +2836,7 @@ static uint32_t ground_guard_atom(parser *p, uint32_t pred, const uint32_t *args
                                   int n, world_cmp op, long threshold)
 {
     char buf[MAX_GROUND];
-    int off = build_term(p, pred, args, n, buf, sizeof buf);
+    int off = build_term(p->syms, pred, args, n, buf, sizeof buf);
     if (off < (int)sizeof buf)
         snprintf(buf + off, sizeof buf - (size_t)off, "%s%ld",
                  cmp_spelling(op), threshold);
@@ -2963,17 +2978,27 @@ static dl_lit ground_lit(parser *p, ast_atom *at, var_bind *vars, int nvars,
     return at->neg ? dl_neg(g) : dl_pos(g);
 }
 
-/* Readable instance name for why-traces: "label[X=hero,Y=key]". */
-static void inst_name(parser *p, char *buf, size_t n, const char *label,
-                      var_bind *vars, int nvars, const uint32_t *binding)
+/* Readable instance name for why-traces: "label[X=hero,Y=key]". The `_s` core
+ * takes the intern table + bare var-name array so the tick-time matcher (#28)
+ * spells instance names identically post-compile. */
+static void inst_name_s(intern *syms, char *buf, size_t n, const char *label,
+                        const uint32_t *varnames, int nvars, const uint32_t *binding)
 {
     if (nvars == 0) { snprintf(buf, n, "%s", label); return; }
     int off = snprintf(buf, n, "%s[", label);
     for (int i = 0; i < nvars && off < (int)n; i++)
         off += snprintf(buf + off, n - (size_t)off, "%s%s=%s", i ? "," : "",
-                        intern_name(p->syms, vars[i].name),
-                        intern_name(p->syms, binding[i]));
+                        intern_name(syms, varnames[i]),
+                        intern_name(syms, binding[i]));
     if (off < (int)n) snprintf(buf + off, n - (size_t)off, "]");
+}
+
+static void inst_name(parser *p, char *buf, size_t n, const char *label,
+                      var_bind *vars, int nvars, const uint32_t *binding)
+{
+    uint32_t names[MAX_ARGS];
+    for (int i = 0; i < nvars && i < MAX_ARGS; i++) names[i] = vars[i].name;
+    inst_name_s(p->syms, buf, n, label, names, nvars, binding);
 }
 
 /* Total instances for a var list; 0 if any sort is empty or an error left a
@@ -3059,6 +3084,10 @@ static void declare_ground_fluents(parser *p)
                 uint32_t a = ground_pred(p, f->pred, binding, f->nargs);
                 world_declare_fluent(p->w, a);
                 world_set_fluent_prov(p->w, a, decl);
+                /* structured (pred, args) handoff so the world can rebuild the
+                 * tick-time extension index from its live vals (#28). Base
+                 * boolean fluents only — the matcher kernel matches nothing else. */
+                world_set_fluent_struct(p->w, a, f->pred, binding, f->nargs);
             }
         }
     }
@@ -3264,6 +3293,181 @@ static void build_fact_index(parser *p)
         for (int k = 0; k < a->nargs; k++) args[k] = a->args[k].name;
         factindex_add(p->fidx, a->pred, args, a->nargs);
     }
+}
+
+/* ---- tick-time matcher (#28, the runtime half) ---------------------------
+ * A compact retained plan of the matchable rules, re-grounded against the
+ * world's LIVE fact index each tick. Owns deep copies (no parser-lifetime
+ * dependency) and reuses the syms-only cores (ground_pred_s / ground_mv_atom_s /
+ * inst_name_s), so re-materialized atoms and why-traces are byte-identical to the
+ * eager path. Kernel-only (rule_matchable): body atoms are positive base boolean
+ * fluents, so the emit path never needs the guard/provider/expr branches.
+ *
+ * m_match_rec / m_ground_lit / m_var_index deliberately mirror the compile-time
+ * match_rec / ground_lit / var_index over the retained plan instead of the parser
+ * AST. LOCKSTEP INVARIANT: a change to the eager matchable-kernel semantics must
+ * be mirrored here, or the equivalence pin (test_matcher / test_ticktime) rots.
+ * The full unification behind a shared plan+callback is the adoption target — as
+ * is sinking this executor below the lang tier (or lowering the plan into a
+ * state-owned structure), which routing through world_step will require since
+ * state must not depend on lang. For the prototype the host drives re-grounding,
+ * so no state->lang edge exists yet. */
+typedef struct {
+    uint32_t pred, value;      /* value != INTERN_NONE: an mv head "pred(a)=v" */
+    bool     neg;
+    int      nargs;
+    uint32_t arg[MAX_ARGS];    /* a var NAME or a constant entity (disambiguated below) */
+} m_atom;
+
+typedef struct {
+    char        *label, *prov; /* owned copies (outlive the parser) */
+    dl_rule_kind kind;
+    int          nvars;
+    uint32_t     varname[MAX_ARGS];
+    m_atom       head;
+    m_atom       body[MAX_BODY];
+    int          nbody;
+} m_rule;
+
+struct story_matcher {
+    intern *syms;
+    world  *w;
+    m_rule *rules;
+    int     nrules, caprules;
+};
+
+static char *m_dup(const char *s)
+{
+    if (!s) return NULL;
+    size_t n = strlen(s) + 1;
+    char *d = malloc(n);
+    memcpy(d, s, n);
+    return d;
+}
+
+static int m_var_index(const m_rule *r, uint32_t name)
+{
+    for (int i = 0; i < r->nvars; i++) if (r->varname[i] == name) return i;
+    return -1;
+}
+
+/* ground_lit restricted to the matchable kernel: the plain and mv-head branches.
+ * An arg is a var (resolve through `bind`) or a constant entity (pass through) —
+ * exactly resolve_arg's rule, over the retained var-name array. */
+static dl_lit m_ground_lit(story_matcher *m, const m_rule *r, const m_atom *a,
+                           const uint32_t *bind)
+{
+    uint32_t args[MAX_ARGS];
+    for (int k = 0; k < a->nargs; k++) {
+        int vi = m_var_index(r, a->arg[k]);
+        args[k] = vi >= 0 ? bind[vi] : a->arg[k];
+    }
+    uint32_t g;
+    if (a->value != INTERN_NONE) {                 /* mv head "pred(a)=v" (§5.7) */
+        uint32_t val = a->value;
+        int vvi = m_var_index(r, val);
+        if (vvi >= 0) val = bind[vvi];
+        g = ground_mv_atom_s(m->syms, a->pred, args, a->nargs, val);
+    } else {
+        g = ground_pred_s(m->syms, a->pred, args, a->nargs);
+    }
+    return a->neg ? dl_neg(g) : dl_pos(g);
+}
+
+static void m_emit(story_matcher *m, m_rule *r, const uint32_t *bind)
+{
+    dl_lit head = m_ground_lit(m, r, &r->head, bind);
+    dl_lit body[MAX_BODY];
+    for (int b = 0; b < r->nbody; b++)
+        body[b] = m_ground_lit(m, r, &r->body[b], bind);
+    char name[MAX_GROUND];
+    inst_name_s(m->syms, name, sizeof name, r->label, r->varname, r->nvars, bind);
+    int h = world_add_rule(m->w, name, r->kind, head, body, r->nbody);
+    world_set_rule_prov(m->w, h, r->prov);
+}
+
+/* The same semi-naïve nested-loop join as match_rec, over the compact plan and a
+ * caller-supplied (live) fact index. */
+static void m_match_rec(story_matcher *m, m_rule *r, int b, uint32_t *bind,
+                        const factindex *ix)
+{
+    if (b == r->nbody) { m_emit(m, r, bind); return; }
+    m_atom *at = &r->body[b];
+    int n = at->nargs;
+    bool     filt[FACTINDEX_MAXARGS];
+    uint32_t want[FACTINDEX_MAXARGS];
+    int      freevar[FACTINDEX_MAXARGS];
+    for (int k = 0; k < n; k++) {
+        int vi = m_var_index(r, at->arg[k]);
+        if (vi < 0)                       { filt[k] = true;  want[k] = at->arg[k]; freevar[k] = -1; }
+        else if (bind[vi] != INTERN_NONE) { filt[k] = true;  want[k] = bind[vi];   freevar[k] = -1; }
+        else                              { filt[k] = false; want[k] = 0;          freevar[k] = vi; }
+    }
+    factindex_cursor c;
+    factindex_scan(ix, at->pred, filt, want, &c);
+    uint32_t tup[FACTINDEX_MAXARGS];
+    while (factindex_next(&c, tup)) {
+        int set[FACTINDEX_MAXARGS], nset = 0;
+        bool ok = true;
+        for (int k = 0; k < n; k++) {
+            int vi = freevar[k];
+            if (vi < 0) continue;
+            if (bind[vi] == INTERN_NONE) { bind[vi] = tup[k]; set[nset++] = vi; }
+            else if (bind[vi] != tup[k]) { ok = false; break; }   /* repeated var agrees */
+        }
+        if (ok) m_match_rec(m, r, b + 1, bind, ix);
+        for (int s = 0; s < nset; s++) bind[set[s]] = INTERN_NONE; /* backtrack */
+    }
+}
+
+static void m_capture_atom(m_atom *d, const ast_atom *s)
+{
+    d->pred = s->pred;
+    d->value = s->value;
+    d->neg = s->neg;
+    d->nargs = s->nargs;
+    for (int k = 0; k < s->nargs && k < MAX_ARGS; k++) d->arg[k] = s->args[k].name;
+}
+
+/* Deep-copy one matchable rule into the retained plan (survives the parser). */
+static void matcher_capture(story_matcher *m, parser *p, ast_rule *r)
+{
+    if (m->nrules == m->caprules) {
+        m->caprules = m->caprules ? m->caprules * 2 : 16;
+        m->rules = realloc(m->rules, (size_t)m->caprules * sizeof *m->rules);
+    }
+    m_rule *d = &m->rules[m->nrules++];
+    d->label = m_dup(r->label);
+    char pbuf[MAX_NAME + 24];
+    d->prov = m_dup(prov_str(p, r->line, pbuf, sizeof pbuf));
+    d->kind = r->kind;
+    d->nvars = r->nvars;
+    for (int i = 0; i < r->nvars && i < MAX_ARGS; i++) d->varname[i] = r->vars[i].name;
+    m_capture_atom(&d->head, &r->head);
+    d->nbody = r->nbody;
+    for (int b = 0; b < r->nbody && b < MAX_BODY; b++)
+        m_capture_atom(&d->body[b], &r->body[b]);
+}
+
+void story_matcher_reground(story_matcher *m)
+{
+    world_matched_reset(m->w);                       /* drop the previous layer */
+    const factindex *ix = world_fact_index(m->w);    /* refresh from live vals  */
+    uint32_t bind[MAX_ARGS];
+    for (int i = 0; i < m->nrules; i++) {
+        for (int v = 0; v < m->rules[i].nvars; v++) bind[v] = INTERN_NONE;
+        m_match_rec(m, &m->rules[i], 0, bind, ix);
+    }
+}
+
+world *story_matcher_world(const story_matcher *m) { return m->w; }
+
+void story_matcher_free(story_matcher *m)
+{
+    if (!m) return;
+    for (int i = 0; i < m->nrules; i++) { free(m->rules[i].label); free(m->rules[i].prov); }
+    free(m->rules);
+    free(m);
 }
 
 static void ground_action(parser *p, ast_action *a)
@@ -4452,11 +4656,14 @@ static void build_lane_families(parser *p)
             emit_join_family(p, &p->rules[i]);
 }
 
+/* When `mret` is non-NULL, retain a tick-time matcher plan (#28): matched rules
+ * are captured (not eagerly ground) into `*mret`, and the judgment layer is left
+ * for the caller's first story_matcher_reground. Implies matched grounding. */
 static world *compile_impl(const char *src, const char *srcname, intern *syms,
-                           story_diags *diags, bool matched)
+                           story_diags *diags, bool matched, story_matcher **mret)
 {
     parser *p = calloc(1, sizeof *p);
-    p->ground_matched = matched;
+    p->ground_matched = matched || mret != NULL;
     p->rules = calloc(MAX_RULES, sizeof *p->rules);
     p->actions = calloc(MAX_ACTIONS, sizeof *p->actions);
     p->binders = calloc(MAX_BINDERS, sizeof *p->binders);
@@ -4502,6 +4709,7 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
     }
 
     world *result = NULL;
+    story_matcher *m = NULL;
     if (p->nerrors == 0) {
         /* pass 2: semantic analysis, then build-time grounding */
         semantic_pass(p);
@@ -4509,22 +4717,43 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
             desugar_bands(p);                     /* band ladders → pairwise `>` (§6.2) */
             declare_ground_fluents(p);
             ground_inits(p);
-            if (p->ground_matched) build_fact_index(p);
-            for (int i = 0; i < p->nrules; i++) {
-                if (p->ground_matched && rule_matchable(p, &p->rules[i]))
-                    ground_rule_matched(p, &p->rules[i]);
-                else
-                    ground_rule(p, &p->rules[i]);
+            if (p->ground_matched && !mret) build_fact_index(p);
+            if (mret) {
+                /* tick-time: ground the static (non-matchable) layer, capture the
+                 * matchable rules into the retained plan (capture emits no jrules,
+                 * so one interleaved pass suffices). The matched layer is
+                 * materialized by the caller's first story_matcher_reground — one
+                 * code path grounds it, always. */
+                m = calloc(1, sizeof *m);
+                m->syms = syms;
+                m->w = p->w;
+                for (int i = 0; i < p->nrules; i++)
+                    if (rule_matchable(p, &p->rules[i]))
+                        matcher_capture(m, p, &p->rules[i]);
+                    else
+                        ground_rule(p, &p->rules[i]);
+                world_matched_checkpoint(p->w);       /* boundary: static | matched */
+            } else {
+                for (int i = 0; i < p->nrules; i++) {
+                    if (p->ground_matched && rule_matchable(p, &p->rules[i]))
+                        ground_rule_matched(p, &p->rules[i]);
+                    else
+                        ground_rule(p, &p->rules[i]);
+                }
             }
             for (int i = 0; i < p->nactions; i++) ground_action(p, &p->actions[i]);
             for (int i = 0; i < p->nsups; i++)    ground_sup(p, &p->sups[i]);
             check_orphans(p);
-            if (p->nerrors == 0) build_lane_families(p);   /* the DoD thesis, 2a */
+            /* Skip lanes in tick-time matcher mode: matchable rules aren't ground
+             * into the world (only captured), so a judgment lane family would
+             * shadow the re-materialized layer with stale, un-re-ground results.
+             * lane↔matcher routing is a later slice (#28 router). */
+            if (p->nerrors == 0 && !mret) build_lane_families(p);   /* the DoD thesis, 2a */
         }
     }
 
-    if (p->nerrors == 0) result = p->w;
-    else world_free(p->w);
+    if (p->nerrors == 0) { result = p->w; if (mret) *mret = m; }
+    else { world_free(p->w); story_matcher_free(m); if (mret) *mret = NULL; }
 
     for (int i = 0; i < p->nrules; i++) free(p->rules[i].insts);
     free(p->rules);
@@ -4543,7 +4772,7 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
 world *story_compile(const char *src, const char *srcname, intern *syms,
                      story_diags *diags)
 {
-    return compile_impl(src, srcname, syms, diags, false);
+    return compile_impl(src, srcname, syms, diags, false, NULL);
 }
 
 /* Same grammar and world, but ground rules in the join-matcher kernel via the
@@ -4552,5 +4781,19 @@ world *story_compile(const char *src, const char *srcname, intern *syms,
 world *story_compile_matched(const char *src, const char *srcname, intern *syms,
                              story_diags *diags)
 {
-    return compile_impl(src, srcname, syms, diags, true);
+    return compile_impl(src, srcname, syms, diags, true, NULL);
+}
+
+/* Tick-time matcher: compile, retain the matchable-rule plan, and materialize the
+ * initial matched layer against the init facts (the same reground path used every
+ * tick — so the initial layer and every re-grounding go through one code path). */
+story_matcher *story_compile_matcher(const char *src, const char *srcname,
+                                     intern *syms, story_diags *diags, world **out)
+{
+    story_matcher *m = NULL;
+    world *w = compile_impl(src, srcname, syms, diags, true, &m);
+    if (out) *out = w;
+    if (!w) return NULL;                 /* compile failed; m already NULL/freed */
+    story_matcher_reground(m);           /* build the initial matched layer */
+    return m;
 }
