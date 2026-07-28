@@ -3174,10 +3174,12 @@ static void ground_rule(parser *p, ast_rule *r)
  * extension index rather than the sort cross product. Kernel body atoms:
  * positive base boolean fluents GENERATE (scanned from the extension); negated
  * ones FILTER (closed-world membership at the leaf); numeric comparison guards
- * (`hp(X) <= 0`) are carried into the emitted rule and the solver evaluates them
- * — so every var must be bound by a positive generator, never merely by a guard.
- * Expr/roll guards, providers, mv value-joins, `unless`, and superiority still
- * fall back to eager (#44 later slices). Anything
+ * (`hp(X) <= 0`) and host-answered providers (`sees(X,Y)`) are carried into the
+ * emitted rule and the solver evaluates/consults them. So every var must be bound
+ * by a positive generator, never merely by a guard or a (non-enumerable) provider
+ * — a var bound only by `near(X,Y,2)` is the generator-provider case, deferred.
+ * Expr/roll guards, mv value-joins, `unless`, and superiority still fall back to
+ * eager (#44 later slices). Anything
  * outside the kernel falls back to eager ground_rule, so every story still
  * compiles both ways and the two theories differ only where the matcher runs.
  * The equivalence (identical query verdicts + why-traces) is pinned by
@@ -3204,14 +3206,22 @@ static bool rule_matchable(parser *p, ast_rule *r)
     for (int b = 0; b < r->nbody; b++) {
         ast_atom *at = &r->body[b];
         if (at->is_expr_guard || at->primed) return false;  /* roll/expr, primed — later */
+        pred_info *pi = find_pred(p, at->pred);
         if (at->is_guard) {                        /* numeric comparison FILTER */
-            pred_info *pi = find_pred(p, at->pred);
             if (!pi || !pi->is_num) return false;  /* guards read a numeric fluent */
             continue;                              /* binds nothing; solver evaluates it */
         }
+        if (pi && pi->is_provider) {               /* host-answered relation FILTER */
+            /* Not enumerable (the callback answers yes/no for BOUND args), so a
+             * provider never generates a var — its args must be fluent-bound (the
+             * genbound check enforces it). The emitted provider atom is consulted
+             * from the callback by the solver, like a guard. A var bound ONLY by a
+             * provider is the generator-provider case (deferred): it fails
+             * genbound and the rule stays eager. */
+            continue;
+        }
         if (at->value != INTERN_NONE) return false;        /* mv value-join — later */
-        pred_info *pi = find_pred(p, at->pred);
-        if (!pi || !pi->is_fluent || pi->is_provider || pi->is_num || pi->is_mv)
+        if (!pi || !pi->is_fluent || pi->is_num || pi->is_mv)
             return false;                                  /* base boolean fluent only */
         /* Only a POSITIVE fluent atom is a generator (scanned from the extension).
          * A negated atom is a closed-world FILTER — it binds nothing (§5.2 range
@@ -3223,9 +3233,9 @@ static bool rule_matchable(parser *p, ast_rule *r)
             }
     }
     /* Every var must be generator-bound — stricter than compute_bound_vars, which
-     * counts a numeric guard as binding for range-restriction safety. The matcher
-     * cannot ENUMERATE a var from a guard (it has no extension), only from a
-     * positive fluent's tuples. */
+     * counts a numeric guard or an anchored provider as binding for
+     * range-restriction safety. The matcher can only ENUMERATE a var from a
+     * positive fluent's tuples, never from a guard or a (non-enumerable) provider. */
     for (int i = 0; i < r->nvars; i++) if (!genbound[i]) return false;
     return true;
 }
@@ -3276,6 +3286,16 @@ static bool atom_present(factindex *ix, ast_atom *at, var_bind *vars, int nvars,
     return factindex_next(&c, tup);
 }
 
+/* A body atom that is a host-answered provider relation — a filter, not a
+ * generator, and not in the boolean fact index (so the leaf negation-membership
+ * test must skip it; the solver consults its callback instead). */
+static bool atom_is_provider(parser *p, const ast_atom *at)
+{
+    if (at->is_guard) return false;
+    pred_info *pi = find_pred(p, at->pred);
+    return pi && pi->is_provider;
+}
+
 /* Semi-naïve nested-loop join: probe positive body atom `b`'s extension with the
  * positions already bound (constants and vars bound by earlier atoms), bind its
  * free vars from each matching tuple, recurse. Negated atoms bind nothing, so
@@ -3287,14 +3307,15 @@ static void match_rec(parser *p, ast_rule *r, int b, uint32_t *bind, inst_list *
     if (b == r->nbody) {
         for (int f = 0; f < r->nbody; f++)
             if (r->body[f].neg && !r->body[f].is_guard &&
+                !atom_is_provider(p, &r->body[f]) &&
                 atom_present(p->fidx, &r->body[f], r->vars, r->nvars, bind))
                 return;                                /* ~fluent fails: it is true */
         emit_matched(p, r, bind, L);
         return;
     }
     ast_atom *at = &r->body[b];
-    if (at->neg || at->is_guard) {                 /* filter, not a generator: defer */
-        match_rec(p, r, b + 1, bind, L); return;   /* negation → leaf; guard → solver */
+    if (at->neg || at->is_guard || atom_is_provider(p, at)) {  /* filter: defer */
+        match_rec(p, r, b + 1, bind, L); return;   /* negation → leaf; guard/provider → solver */
     }
     int n = at->nargs;
 
@@ -3360,8 +3381,9 @@ static void build_fact_index(parser *p)
  * dependency) and reuses the syms-only cores (ground_pred_s / ground_mv_atom_s /
  * inst_name_s), so re-materialized atoms and why-traces are byte-identical to the
  * eager path. Kernel (rule_matchable): base boolean fluents (positive generate,
- * negated filter) plus numeric comparison guards (carried into the rule, solver-
- * evaluated); the emit path never needs the provider/expr branches.
+ * negated filter) plus numeric comparison guards and provider relations (carried
+ * into the rule, solver-evaluated/consulted); the emit path never needs the expr
+ * branch.
  *
  * m_match_rec / m_ground_lit / m_var_index deliberately mirror the compile-time
  * match_rec / ground_lit / var_index over the retained plan instead of the parser
@@ -3376,6 +3398,7 @@ typedef struct {
     uint32_t  pred, value;     /* value != INTERN_NONE: an mv head "pred(a)=v" */
     bool      neg;
     bool      is_guard;        /* numeric comparison `pred(args) <cmp> threshold` */
+    bool      is_provider;     /* host-answered relation (consulted by the solver) */
     world_cmp cmp;
     long      threshold;
     int       nargs;
@@ -3430,6 +3453,9 @@ static dl_lit m_ground_lit(story_matcher *m, const m_rule *r, const m_atom *a,
         uint32_t term = ground_pred_s(m->syms, a->pred, args, a->nargs);
         g = ground_guard_atom_s(m->syms, a->pred, args, a->nargs, a->cmp, a->threshold);
         world_add_guard(m->w, g, term, a->cmp, a->threshold);
+    } else if (a->is_provider) {                   /* host-answered relation (§5.6) */
+        g = ground_pred_s(m->syms, a->pred, args, a->nargs);
+        world_declare_provider_atom(m->w, g, a->pred, args, a->nargs);
     } else if (a->value != INTERN_NONE) {          /* mv head "pred(a)=v" (§5.7) */
         uint32_t val = a->value;
         int vvi = m_var_index(r, val);
@@ -3478,14 +3504,14 @@ static void m_match_rec(story_matcher *m, m_rule *r, int b, uint32_t *bind,
 {
     if (b == r->nbody) {
         for (int f = 0; f < r->nbody; f++)
-            if (r->body[f].neg && !r->body[f].is_guard &&
+            if (r->body[f].neg && !r->body[f].is_guard && !r->body[f].is_provider &&
                 m_atom_present(ix, r, &r->body[f], bind))
                 return;                                /* ~fluent fails: it is true */
         m_emit(m, r, bind);
         return;
     }
     m_atom *at = &r->body[b];
-    if (at->neg || at->is_guard) {                 /* filter, not a generator: defer */
+    if (at->neg || at->is_guard || at->is_provider) {  /* filter, not a generator: defer */
         m_match_rec(m, r, b + 1, bind, ix); return;
     }
     int n = at->nargs;
@@ -3515,12 +3541,13 @@ static void m_match_rec(story_matcher *m, m_rule *r, int b, uint32_t *bind,
     }
 }
 
-static void m_capture_atom(m_atom *d, const ast_atom *s)
+static void m_capture_atom(parser *p, m_atom *d, const ast_atom *s)
 {
     d->pred = s->pred;
     d->value = s->value;
     d->neg = s->neg;
     d->is_guard = s->is_guard;
+    d->is_provider = atom_is_provider(p, s);
     d->cmp = s->cmp;
     d->threshold = s->threshold;
     d->nargs = s->nargs;
@@ -3541,10 +3568,10 @@ static void matcher_capture(story_matcher *m, parser *p, ast_rule *r)
     d->kind = r->kind;
     d->nvars = r->nvars;
     for (int i = 0; i < r->nvars && i < MAX_ARGS; i++) d->varname[i] = r->vars[i].name;
-    m_capture_atom(&d->head, &r->head);
+    m_capture_atom(p, &d->head, &r->head);
     d->nbody = r->nbody;
     for (int b = 0; b < r->nbody && b < MAX_BODY; b++)
-        m_capture_atom(&d->body[b], &r->body[b]);
+        m_capture_atom(p, &d->body[b], &r->body[b]);
 }
 
 void story_matcher_reground(story_matcher *m)
