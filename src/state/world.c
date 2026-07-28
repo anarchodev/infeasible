@@ -215,6 +215,17 @@ struct world {
     uint32_t *loc_atom;           /* reverse: schema loc -> intern atom (#68 names)*/
     uint32_t loc_atom_cap;
     uint32_t *fl_loc, *pr_loc;    /* per fluent: schema ids of f and f'          */
+    /* The jfam-only SPARSE location map (#77): only atoms the judgment rules
+     * actually reference (heads/bodies, static + matched) plus lazily-
+     * materialized query atoms — never the fluent sweep, primed twins, or step
+     * atoms the dense map carries for the step family. Append-only like the
+     * dense map (#67), so the cached jfam's columns keep their meaning across
+     * re-grounds. Everything outside it answers through the exact lazy path in
+     * query_jfam. */
+    uint32_t *jloc_of;            /* intern atom -> jfam schema atom, ~0u absent */
+    uint32_t jloc_cap, njloc;
+    uint32_t *jloc_atom;          /* reverse: jfam schema atom -> intern atom    */
+    uint32_t jloc_atom_cap;
     /* jfam incremental reuse (#68): the static-rule watermark in the cached jfam
      * dlcol, and how far its atom names have been emitted. */
     int jfam_wm_rules, jfam_wm_body, jfam_wm_sups; uint32_t jfam_named;
@@ -283,6 +294,8 @@ void world_free(world *w)
     free(w->lane_map);
     free(w->loc_of);
     free(w->loc_atom);
+    free(w->jloc_of);
+    free(w->jloc_atom);
     free(w->fl_loc);
     free(w->pr_loc);
     arena_release(&w->a);
@@ -811,6 +824,43 @@ static void solve_lane_iter(world *w, lane_family *lf, int it);
 static void solve_step_family(world *w, const uint32_t *actions, int nactions);
 static void solve_step_family_vals(world *w, const bool *vals,
                                    const uint32_t *actions, int nactions);
+static uint32_t jassign_loc(world *w, uint32_t atom);
+static void emit_atom_names_range(dlcol *f, const world *w, const uint32_t *atomv,
+                                  uint32_t from, uint32_t to);
+
+/* Exact verdict for an atom OUTSIDE the sparse judgment family (#77): no
+ * judgment rule concludes or attacks it, so its verdict is a pure function of
+ * its own fact — precisely what the dense family's fact load concluded for it.
+ * Row order matters and mirrors the dense behavior class by class:
+ *   - a declared fluent answers closed-world from the value store (the world.h
+ *     contract; the dense family loaded f or ~f for every declared fluent);
+ *   - otherwise, an atom the dense map never located is not in the theory at
+ *     all (never-declared, or a registered-but-unreferenced guard/provider —
+ *     the landmark carve-out) -> UNDECIDED, exactly as before;
+ *   - a guard/provider/expr-guard atom the dense map located (e.g. referenced
+ *     only by a step-rule body) was loaded as a closed-world fact -> its
+ *     holds() verdict;
+ *   - anything else the dense map located (primed, action, step-only atoms)
+ *     had a location but no rules and no fact: refuted, both polarities.
+ * Pure: mutates nothing (world_why materializes instead, so traces render). */
+static dl_verdict lazy_judgment_verdict(const world *w, dl_lit q)
+{
+    int i = fluent_index(w, q.atom);
+    if (i >= 0)
+        return q.neg != w->vals[i] ? DL_PROVED : DL_REFUTED;
+    if (q.atom >= w->loc_cap || w->loc_of[q.atom] == LOC_NONE)
+        return DL_UNDECIDED;                       /* absent: unmentioned atom */
+    int g = guard_index(w, q.atom);
+    if (g >= 0)
+        return q.neg != guard_holds(w, g) ? DL_PROVED : DL_REFUTED;
+    int p = prov_index(w, q.atom);
+    if (p >= 0)
+        return q.neg != provider_holds(w, p) ? DL_PROVED : DL_REFUTED;
+    int e = eguard_index(w, q.atom);
+    if (e >= 0)
+        return q.neg != guard_holds_expr(w, e) ? DL_PROVED : DL_REFUTED;
+    return DL_REFUTED;         /* located, rule-less, fact-less: -d both ways */
+}
 
 /* The N=1 judgment path: the proven route, and the oracle world_lanes_check
  * measures the lane families against. */
@@ -819,10 +869,11 @@ static dl_verdict query_jfam(world *w, dl_lit q)
     ensure_jfam(w);
     if (!w->jfam_solved)
         solve_judgment_family(w);
-    if (q.atom >= w->loc_cap || w->loc_of[q.atom] == LOC_NONE)
-        return DL_UNDECIDED;                       /* absent: unmentioned atom */
-    dl_lit loc = { w->loc_of[q.atom], q.neg };
-    return dlcol_defeasible(w->jfam, loc, 0);
+    if (q.atom < w->jloc_cap && w->jloc_of[q.atom] != LOC_NONE) {
+        dl_lit loc = { w->jloc_of[q.atom], q.neg };
+        return dlcol_defeasible(w->jfam, loc, 0);
+    }
+    return lazy_judgment_verdict(w, q);
 }
 
 dl_verdict world_query(world *w, dl_lit q)
@@ -850,14 +901,30 @@ dl_verdict world_query(world *w, dl_lit q)
 void world_why(world *w, dl_lit q, FILE *out)
 {
     ensure_jfam(w);
+    if (q.atom >= w->jloc_cap || w->jloc_of[q.atom] == LOC_NONE) {
+        /* outside the sparse family. If the dense map never saw it either (and
+         * it is no fluent), it is not in the theory — same message as always. */
+        if ((q.atom >= w->loc_cap || w->loc_of[q.atom] == LOC_NONE)
+            && fluent_index(w, q.atom) < 0) {
+            fprintf(out, "why %s%s?\n  (not in the theory — no rule or fact)\n",
+                    q.neg ? "~" : "", intern_name(w->syms, q.atom));
+            return;
+        }
+        /* Lazily materialize it into the jfam so the trace renders: append a
+         * location (append-only, so the cached family stays valid), grow the
+         * columns, name the tail, re-solve. The next solve's fact load picks
+         * the atom up (fluent / guard / provider) via the jloc gate, so the
+         * trace is byte-identical to the dense family's. NOT a structural
+         * edit: struct_ver stays put (bumping it would force a re-ground). */
+        jassign_loc(w, q.atom);
+        dlcol_ensure_atoms(w->jfam, (int)w->njloc);
+        emit_atom_names_range(w->jfam, w, w->jloc_atom, w->jfam_named, w->njloc);
+        w->jfam_named = w->njloc;
+        w->jfam_solved = false;
+    }
     if (!w->jfam_solved)
         solve_judgment_family(w);
-    if (q.atom >= w->loc_cap || w->loc_of[q.atom] == LOC_NONE) {
-        fprintf(out, "why %s%s?\n  (not in the theory — no rule or fact)\n",
-                q.neg ? "~" : "", intern_name(w->syms, q.atom));
-        return;
-    }
-    dl_lit loc = { w->loc_of[q.atom], q.neg };
+    dl_lit loc = { w->jloc_of[q.atom], q.neg };
     dlcol_why(w->jfam, loc, 0, out);
 }
 
@@ -1305,6 +1372,46 @@ static void grow_loc_of(world *w)
     }
 }
 
+/* ---- the jfam-only sparse map (#77): same append-only discipline (#67),
+ * separate space. The dense map interleaves f, f' from location 0 for the step
+ * family's sake; the judgment family never reads a primed atom, so sizing it to
+ * the dense space made every solve sweep ~2x all declared fluents. The sparse
+ * map holds only judgment-rule atoms + lazily-materialized query atoms. */
+
+static uint32_t jassign_loc(world *w, uint32_t atom)
+{
+    if (atom >= w->jloc_cap) {                     /* grow atom -> loc to intern size */
+        uint32_t na = intern_count(w->syms);
+        w->jloc_of = realloc(w->jloc_of, (size_t)na * sizeof *w->jloc_of);
+        for (uint32_t k = w->jloc_cap; k < na; k++) w->jloc_of[k] = LOC_NONE;
+        w->jloc_cap = na;
+    }
+    if (w->jloc_of[atom] == LOC_NONE) {
+        uint32_t loc = w->njloc++;
+        w->jloc_of[atom] = loc;
+        if (loc >= w->jloc_atom_cap) {             /* grow the reverse loc -> atom map */
+            uint32_t nc = w->jloc_atom_cap ? w->jloc_atom_cap : 64;
+            while (nc <= loc) nc *= 2;
+            w->jloc_atom = realloc(w->jloc_atom, (size_t)nc * sizeof *w->jloc_atom);
+            w->jloc_atom_cap = nc;
+        }
+        w->jloc_atom[loc] = atom;
+    }
+    return w->jloc_of[atom];
+}
+
+/* jfam locations for jrules[from, to) heads/bodies, in rule order (I4:
+ * deterministic given the same add/re-ground sequence). No fluent sweep, no
+ * primed twins, no step rules — that is the whole point. */
+static void assign_jlocs_range(world *w, int from, int to)
+{
+    for (int j = from; j < to; j++) {
+        jassign_loc(w, w->jrules[j].head.atom);
+        for (int i = 0; i < w->jrules[j].nbody; i++)
+            jassign_loc(w, w->jrules[j].body[i].atom);
+    }
+}
+
 /* Assign the locations of only the matched jrules[jr_matched_base, njr) (#68).
  * Fluent + static-rule + step-rule locations are already assigned (append-only,
  * #67) and never re-scanned per re-ground — that O(fluents) rescan was the fixed
@@ -1414,26 +1521,30 @@ static void emit_judgment_rules(dlcol *f, const world *w)
 static void emit_judgment_family(world *w)
 {
     if (w->jfam && w->jfam_static_ver == w->static_ver) {
-        assign_locs_matched(w);        /* only the matched jrules — no O(fluents) rescan */
+        assign_locs_matched(w);        /* dense map: world_atom_loc's schedule (#67) */
+        assign_jlocs_range(w, w->jr_matched_base, w->njr);
         dlcol_truncate_rules(w->jfam, w->jfam_wm_rules, w->jfam_wm_body, w->jfam_wm_sups);
-        dlcol_ensure_atoms(w->jfam, (int)w->nloc);
-        emit_atom_names_range(w->jfam, w, w->loc_atom, w->jfam_named, w->nloc);
-        w->jfam_named = w->nloc;
+        dlcol_ensure_atoms(w->jfam, (int)w->njloc);
+        emit_atom_names_range(w->jfam, w, w->jloc_atom, w->jfam_named, w->njloc);
+        w->jfam_named = w->njloc;
     } else {
-        assign_locs(w);                /* full: fluents + static rules + step rules */
+        assign_locs(w);                /* dense map keeps its schedule: fluents +
+                                        * rules + step rules (the step family and
+                                        * the lazy path's located/absent line) */
+        assign_jlocs_range(w, 0, w->njr);          /* sparse: judgment atoms only */
         if (w->jfam) dlcol_free(w->jfam);
-        w->jfam = dlcol_new((int)w->nloc, 1);
-        emit_atom_names_range(w->jfam, w, w->loc_atom, 0, w->nloc);
-        emit_judgment_rule_range(w->jfam, w, w->loc_of, 0, w->jr_matched_base); /* static */
+        w->jfam = dlcol_new((int)w->njloc, 1);
+        emit_atom_names_range(w->jfam, w, w->jloc_atom, 0, w->njloc);
+        emit_judgment_rule_range(w->jfam, w, w->jloc_of, 0, w->jr_matched_base); /* static */
         for (int j = 0; j < w->njs; j++)                              /* static sups */
             dlcol_add_sup(w->jfam, w->jsups[j].winner, w->jsups[j].loser);
         w->jfam_wm_rules = dlcol_rule_count(w->jfam);
         w->jfam_wm_body  = dlcol_body_count(w->jfam);
         w->jfam_wm_sups  = dlcol_sup_count(w->jfam);
-        w->jfam_named    = w->nloc;
+        w->jfam_named    = w->njloc;
         w->jfam_static_ver = w->static_ver;
     }
-    emit_judgment_rule_range(w->jfam, w, w->loc_of, w->jr_matched_base, w->njr); /* matched suffix */
+    emit_judgment_rule_range(w->jfam, w, w->jloc_of, w->jr_matched_base, w->njr); /* matched suffix */
     w->jfam_solved = false;
 }
 
@@ -1562,13 +1673,18 @@ static void solve_judgment_family(world *w)
 {
     dlcol *f = w->jfam;
     dlcol_clear_facts(f);
-    for (int i = 0; i < w->nfl; i++) {
-        dl_lit l = { w->fl_loc[i], !w->vals[i] };   /* f if true, ~f if false */
-        dlcol_add_fact(f, l, 0);
+    /* Closed-world facts for the family's OWN atoms only (#77): iterate the
+     * sparse locations, not the declared-fluent sweep — O(jfam atoms) where the
+     * dense map is O(all fluents ever declared). A declared fluent outside the
+     * family answers through lazy_judgment_verdict instead. */
+    for (uint32_t loc = 0; loc < w->njloc; loc++) {
+        int i = fluent_index(w, w->jloc_atom[loc]);
+        if (i >= 0)
+            dlcol_add_fact(f, (dl_lit){ loc, !w->vals[i] }, 0);  /* f or ~f */
     }
-    load_guards(w, f, w->loc_of, w->loc_cap);
-    load_providers(w, f, w->loc_of, w->loc_cap);
-    load_eguards(w, f, w->loc_of, w->loc_cap);
+    load_guards(w, f, w->jloc_of, w->jloc_cap);
+    load_providers(w, f, w->jloc_of, w->jloc_cap);
+    load_eguards(w, f, w->jloc_of, w->jloc_cap);
     dlcol_solve(f);
     w->jfam_solved = true;
 }
