@@ -31,6 +31,23 @@ void world_set_fluent_prov(world *w, uint32_t atom, const char *at);
 void world_set(world *w, uint32_t atom, bool value);   /* initial state / loading */
 bool world_get(const world *w, uint32_t atom);
 
+/* Structured view of a boolean fluent, for the tick-time matcher's extension
+ * index (§5.2 item 4, #28): records the ground atom's (pred, arg-entity) shape
+ * so world_fact_index can rebuild predicate -> its true tuples from w->vals.
+ * Only base boolean fluents carry this; the grounder attaches it right after
+ * world_declare_fluent. A fluent with no structure is absent from the index. */
+void world_set_fluent_struct(world *w, uint32_t atom, uint32_t pred,
+                             const uint32_t *args, int nargs);
+
+/* The fact-store extension index over the CURRENT boolean state (the inverse of
+ * "is this atom true?": a predicate -> its true argument tuples). Refreshed
+ * lazily from w->vals on any state edit, in fluent-declaration order (so
+ * enumeration is deterministic — replay-exact, I4). The tick-time matcher scans
+ * this instead of the sort cross product. Owned by the world; the returned
+ * pointer is valid until the next state edit. */
+struct factindex;
+const struct factindex *world_fact_index(world *w);
+
 /* Numeric fluents (DESIGN.md §5.8): an integer value store, kept separate from
  * the boolean closed-world fluents — scalars never become atoms. Values are
  * read only through comparison *guard atoms* (`hp<=0`), which the world asserts
@@ -129,6 +146,15 @@ void world_set_num_clamp(world *w, uint32_t atom,
 int  world_add_rule(world *w, const char *name, dl_rule_kind kind,
                     dl_lit head, const dl_lit *body, int nbody);
 void world_add_sup(world *w, int winner, int loser);
+
+/* Tick-time matcher (#28): checkpoint the current judgment-rule count as the
+ * boundary between statically-ground rules and re-materialized *matched* rules,
+ * then drop everything above the checkpoint before each re-ground; world_query
+ * rebuilds the judgment family from what remains. Matched-kernel rules carry no
+ * superiority, so only the rule array is watermarked — the static `>` relation is
+ * left intact. */
+void world_matched_checkpoint(world *w);
+void world_matched_reset(world *w);
 
 /* Attach a provenance suffix (source span + generation reason, §6.3) to a rule
  * by its world_add_rule / world_add_step_rule handle; rendered by world_why /
