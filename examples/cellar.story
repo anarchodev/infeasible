@@ -6,13 +6,14 @@ scene cellar
 sort actor, item
 
 entity (
-    guard : actor
+    guard, player : actor
     rusty_key, torch, antidote : item
 )
 
 state (
     holding(actor, item)
     hp(actor) : int
+    strength(actor) : int
     door : { locked, closed, open }
     poisoned(actor)
 )
