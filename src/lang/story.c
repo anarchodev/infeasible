@@ -71,17 +71,20 @@ typedef struct {
  * nodes are the closed arithmetic set. Grounding walks the tree per instance,
  * folding constant subtrees and emitting VM bytecode for the rest. */
 typedef enum {
-    EX_CONST, EX_LOAD, EX_ROLL, EX_ADD, EX_SUB, EX_MUL, EX_NEG, EX_MIN, EX_MAX
+    EX_CONST, EX_LOAD, EX_ROLL, EX_CALL, EX_ADD, EX_SUB, EX_MUL, EX_NEG, EX_MIN, EX_MAX
 } ex_kind;
+/* EX_CALL (§5.6): a value-returning function-provider call `f(e1, …, ek)`.
+ * `pred` = the function name; `nargs` = k; `cargs[0..k)` = child expr indices. */
 /* EX_ROLL (§5.10): a seeded die. `konst` = sides, `lhs` = an author disambiguator
  * tag (0 default). The roll site is keyed by (this node, the binding, tag). */
 
 typedef struct {
     ex_kind  kind;
     long     konst;           /* EX_CONST */
-    uint32_t pred;            /* EX_LOAD: numeric fluent */
-    int      nargs;
+    uint32_t pred;            /* EX_LOAD: numeric fluent; EX_CALL: function name */
+    int      nargs;           /* EX_LOAD: arg names; EX_CALL: call args */
     ast_arg  args[MAX_ARGS];  /* EX_LOAD */
+    int      cargs[MAX_ARGS]; /* EX_CALL: child expr node indices */
     int      lhs, rhs;        /* child node indices (rhs unused for CONST/LOAD/NEG) */
     int      line, col;
 } ex_node;
@@ -219,6 +222,19 @@ typedef struct {
     bool     is_provider;         /* a computed relation, host-answered (§5.6) */
 } pred_info;
 
+/* A value-returning function provider (§5.6): `function f(t1,…) : ret`. Unlike a
+ * boolean provider (a relation), a function returns a value used in effect
+ * expressions (EX_CALL) — e.g. `neighbor(cell, dir) : cell` for movement. Arg and
+ * return types are declared sorts/domains, or `int`; they are recorded for
+ * arity/return-type checks but the value is opaque to the engine (host-computed). */
+typedef struct {
+    uint32_t name;
+    int      nargs;
+    uint32_t argsort[MAX_ARGS];   /* arg type name atom; INTERN_NONE means `int` */
+    uint32_t ret;                 /* return type name atom; INTERN_NONE means `int` */
+    int      line, col;
+} ast_function;
+
 typedef struct {
     lexer        lx;
     token        cur;
@@ -262,6 +278,8 @@ typedef struct {
     int nfluents;
     ast_fluent  providers[MAX_FLUENTS];   /* computed relations (§5.6), host-answered */
     int nproviders;
+    ast_function functions[MAX_FLUENTS];  /* value-returning fn providers (§5.6) */
+    int nfunctions;
     ast_rule   *rules;            /* heap; MAX_RULES */
     int nrules;
     ast_action *actions;          /* heap; MAX_ACTIONS */
@@ -607,6 +625,7 @@ static int alloc_expr(parser *p, ex_kind k, int line, int col)
 static int parse_expr(parser *p);
 static bool expr_fold(parser *p, int e, long *out);
 static bool expr_reads_roll(parser *p, int e);
+static int find_function(parser *p, uint32_t name);
 
 static int parse_factor(parser *p)
 {
@@ -662,6 +681,29 @@ static int parse_factor(parser *p)
             if (n < 0) return -1;
             p->exprs[n].lhs = a;
             p->exprs[n].rhs = b;
+            return n;
+        }
+        if (find_function(p, intern_tok(p, id)) >= 0 && p->cur.kind == TK_LPAREN) {
+            /* a value-returning function-provider call `f(e1, …, ek)` (§5.6):
+             * arguments are expressions (a cell read `at(X)`, a direction int),
+             * not bare arg names — distinguished from a fluent read by the callee
+             * being a declared `function`. */
+            advance(p);                                        /* '(' */
+            int n = alloc_expr(p, EX_CALL, id.line, id.col);
+            if (n < 0) return -1;
+            p->exprs[n].pred = intern_tok(p, id);
+            for (;;) {
+                int a = parse_expr(p);
+                if (a < 0) return -1;
+                if (p->exprs[n].nargs >= MAX_ARGS) {
+                    fail(p, id.line, id.col, "too many arguments (max %d)", MAX_ARGS);
+                    return -1;
+                }
+                p->exprs[n].cargs[p->exprs[n].nargs++] = a;
+                if (p->cur.kind == TK_COMMA) { advance(p); continue; }
+                break;
+            }
+            if (!expect(p, TK_RPAREN)) return -1;
             return n;
         }
         int n = alloc_expr(p, EX_LOAD, id.line, id.col);        /* fluent read */
@@ -1145,6 +1187,74 @@ static void parse_provider(parser *p)
         p->nproviders++;
     } while (grouped && p->cur.kind == TK_IDENT);
     if (grouped && !expect(p, TK_RPAREN)) return;
+}
+
+static int find_function(parser *p, uint32_t name)
+{
+    for (int i = 0; i < p->nfunctions; i++)
+        if (p->functions[i].name == name) return i;
+    return -1;
+}
+
+/* One type token in a function signature: a declared sort/domain name, or `int`.
+ * Returns the type name atom, INTERN_NONE for `int`; sets *ok=false on error. */
+static uint32_t parse_type_token(parser *p, bool *ok)
+{
+    *ok = true;
+    if (p->cur.kind != TK_IDENT) {
+        char d[64]; tok_desc(p->cur, d, sizeof d);
+        fail(p, p->cur.line, p->cur.col,
+             "expected a type name (a sort, domain, or `int`), found %s", d);
+        *ok = false;
+        return INTERN_NONE;
+    }
+    if (ident_is(p->cur, "int")) { advance(p); return INTERN_NONE; }
+    uint32_t t = intern_tok(p, p->cur);
+    advance(p);
+    return t;
+}
+
+/* function := 'function' IDENT '(' type (',' type)* ')' ':' type
+ * A value-returning host function (§5.6): args/return are declared sorts/domains
+ * (or `int`). Registered so a call `f(…)` in an effect expression grounds to an
+ * EX_CALL; the returned value is opaque to the engine (host-computed, I4). */
+static void parse_function(parser *p)
+{
+    advance(p);                                    /* 'function' */
+    if (p->cur.kind != TK_IDENT) {
+        char d[64]; tok_desc(p->cur, d, sizeof d);
+        fail(p, p->cur.line, p->cur.col, "expected a function name, found %s", d);
+        return;
+    }
+    if (p->nfunctions >= MAX_FLUENTS) {
+        fail(p, p->cur.line, p->cur.col, "too many functions (max %d)", MAX_FLUENTS);
+        return;
+    }
+    ast_function *fn = &p->functions[p->nfunctions];
+    memset(fn, 0, sizeof *fn);
+    fn->name = intern_tok(p, p->cur);
+    fn->line = p->cur.line;
+    fn->col = p->cur.col;
+    advance(p);
+    if (!expect(p, TK_LPAREN)) return;
+    for (;;) {
+        if (fn->nargs >= MAX_ARGS) {
+            fail(p, fn->line, fn->col, "too many function arguments (max %d)", MAX_ARGS);
+            return;
+        }
+        bool ok;
+        uint32_t t = parse_type_token(p, &ok);
+        if (!ok) return;
+        fn->argsort[fn->nargs++] = t;
+        if (p->cur.kind == TK_COMMA) { advance(p); continue; }
+        break;
+    }
+    if (!expect(p, TK_RPAREN)) return;
+    if (!expect(p, TK_COLON)) return;
+    bool ok;
+    fn->ret = parse_type_token(p, &ok);
+    if (!ok) return;
+    p->nfunctions++;
 }
 
 /* init := 'init' ( atom | '(' atom* ')' ); atoms are ground (entity args). */
@@ -1915,6 +2025,24 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
                         "an effect expression");
         return;
     }
+    case EX_CALL: {
+        int fi = find_function(p, n->pred);
+        if (fi < 0) {                          /* unreachable: parse gated on this */
+            serr(p, n->line, n->col, "'%s' is not a declared function",
+                 intern_name(p->syms, n->pred));
+            return;
+        }
+        ast_function *fn = &p->functions[fi];
+        if (fn->nargs != n->nargs) {
+            serr(p, n->line, n->col, "function '%s' takes %d argument%s but %d given",
+                 intern_name(p->syms, n->pred), fn->nargs,
+                 fn->nargs == 1 ? "" : "s", n->nargs);
+            return;
+        }
+        for (int k = 0; k < n->nargs; k++)     /* args are ordinary RHS expressions */
+            check_expr(p, n->cargs[k], vars, nvars);
+        return;
+    }
     case EX_NEG:
         check_expr(p, n->lhs, vars, nvars);
         return;
@@ -1954,15 +2082,24 @@ static void check_fluent_bounds(parser *p)
     }
 }
 
-/* Is expr `e` a bare read of a store-backed cell fluent? (a valid `:=` RHS for
- * a cell move — `at(X) := at(Y)`.) */
-static bool expr_is_cell_load(parser *p, int e)
+/* Is expr `e` a valid RHS for a store-backed cell `:=` (§5.6)? Either a bare read
+ * of another cell fluent (a move/copy — `at(X) := at(Y)`), or a call to a value-
+ * returning function whose declared return type is the target cell's value domain
+ * (`val_sort`) — `at(X) := neighbor(at(X), dir)`. Both hand the store an opaque
+ * handle; no arithmetic on it. */
+static bool expr_is_cell_rhs(parser *p, int e, int val_sort)
 {
     if (e < 0) return false;
     ex_node *n = &p->exprs[e];
-    if (n->kind != EX_LOAD) return false;
-    pred_info *pi = find_pred(p, n->pred);
-    return pi && pi->is_cell;
+    if (n->kind == EX_LOAD) {
+        pred_info *pi = find_pred(p, n->pred);
+        return pi && pi->is_cell;
+    }
+    if (n->kind == EX_CALL) {
+        int fi = find_function(p, n->pred);
+        return fi >= 0 && find_sort(p, p->functions[fi].ret) == val_sort;
+    }
+    return false;
 }
 
 /* Validate one atom against the schema: predicate known, arity matches, and
@@ -2045,10 +2182,12 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
                      "'%s' is a store-backed cell fluent — it takes `:=` (a copy), "
                      "not `+=`/`-=`; there is no arithmetic on an opaque cell handle",
                      intern_name(p->syms, at->pred));
-            else if (!expr_is_cell_load(p, at->expr_root))
+            else if (!expr_is_cell_rhs(p, at->expr_root, pi->val_sort))
                 serr(p, at->line, at->col,
-                     "'%s :=' must copy another cell fluent (e.g. `at(Y)`), not an "
-                     "arithmetic or literal expression", intern_name(p->syms, at->pred));
+                     "'%s :=' must copy another cell fluent (e.g. `at(Y)`) or call a "
+                     "function returning that cell type (e.g. `neighbor(at(X), dir)`), "
+                     "not an arithmetic or literal expression",
+                     intern_name(p->syms, at->pred));
         }
         check_pred_args(p, at->pred, pi, at->args, at->nargs, vars, nvars, ctx);
         check_expr(p, at->expr_root, vars, nvars);
@@ -2129,6 +2268,10 @@ static bool expr_reads_roll(parser *p, int e)
     case EX_CONST: case EX_LOAD: return false;
     case EX_ROLL: return true;
     case EX_NEG:  return expr_reads_roll(p, n->lhs);
+    case EX_CALL:
+        for (int k = 0; k < n->nargs; k++)
+            if (expr_reads_roll(p, n->cargs[k])) return true;
+        return false;
     default:      return expr_reads_roll(p, n->lhs) || expr_reads_roll(p, n->rhs);
     }
 }
@@ -2142,6 +2285,10 @@ static bool expr_uses_var(parser *p, int e, uint32_t name)
     case EX_CONST: case EX_ROLL: return false;
     case EX_LOAD:
         for (int k = 0; k < n->nargs; k++) if (n->args[k].name == name) return true;
+        return false;
+    case EX_CALL:
+        for (int k = 0; k < n->nargs; k++)
+            if (expr_uses_var(p, n->cargs[k], name)) return true;
         return false;
     case EX_NEG: return expr_uses_var(p, n->lhs, name);
     default:     return expr_uses_var(p, n->lhs, name) || expr_uses_var(p, n->rhs, name);
@@ -2366,6 +2513,36 @@ static void populate_sort_valued_fluents(parser *p)
     }
 }
 
+/* Validate value-returning function declarations (§5.6): every arg/return type is
+ * a declared sort/domain (or `int`); the name doesn't clash with a fluent,
+ * provider, or another function. Types are checked once here, not per call. */
+static void check_functions(parser *p)
+{
+    for (int i = 0; i < p->nfunctions; i++) {
+        ast_function *fn = &p->functions[i];
+        for (int j = 0; j < i; j++)
+            if (p->functions[j].name == fn->name)
+                serr(p, fn->line, fn->col, "function '%s' is declared more than once",
+                     intern_name(p->syms, fn->name));
+        pred_info *pi = find_pred(p, fn->name);
+        if (pi && (pi->is_fluent || pi->is_provider))
+            serr(p, fn->line, fn->col,
+                 "function '%s' clashes with a fluent or provider of the same name",
+                 intern_name(p->syms, fn->name));
+        for (int k = 0; k < fn->nargs; k++)
+            if (fn->argsort[k] != INTERN_NONE && find_sort(p, fn->argsort[k]) < 0)
+                serr(p, fn->line, fn->col,
+                     "function '%s' argument %d has unknown type '%s' (expected a "
+                     "sort, domain, or `int`)", intern_name(p->syms, fn->name), k + 1,
+                     intern_name(p->syms, fn->argsort[k]));
+        if (fn->ret != INTERN_NONE && find_sort(p, fn->ret) < 0)
+            serr(p, fn->line, fn->col,
+                 "function '%s' has unknown return type '%s' (expected a sort, "
+                 "domain, or `int`)", intern_name(p->syms, fn->name),
+                 intern_name(p->syms, fn->ret));
+    }
+}
+
 static void semantic_pass(parser *p)
 {
     resolve_entities(p);
@@ -2373,6 +2550,7 @@ static void semantic_pass(parser *p)
     register_set_providers(p);
     build_pred_registry(p);
     check_fluent_bounds(p);
+    check_functions(p);
 
     for (int i = 0; i < p->nrules; i++) {
         ast_rule *r = &p->rules[i];
@@ -2573,6 +2751,7 @@ static bool expr_fold(parser *p, int e, long *out)
     case EX_CONST: *out = n->konst; return true;
     case EX_LOAD:  return false;
     case EX_ROLL:  return false;              /* a fresh draw — never a constant */
+    case EX_CALL:  return false;              /* a host call — never a constant */
     case EX_NEG:
         if (!expr_fold(p, n->lhs, &a)) return false;
         *out = -a; return true;
@@ -2618,6 +2797,17 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
             site = site * 0x100000001B3ull ^ binding[k];
         int idx = world_add_roll_site(p->w, (int)n->konst, site);
         if (*pos < MAX_CODE) { code[*pos].op = EXPR_ROLL; code[(*pos)++].arg = (long)idx; }
+        return;
+    }
+    if (n->kind == EX_CALL) {
+        /* push each argument, then EXPR_CALL — arg packs (pred<<8 | nargs); the
+         * function pred is a plain interned name the host dispatches on (§5.6). */
+        for (int k = 0; k < n->nargs; k++)
+            emit_expr(p, n->cargs[k], vars, nvars, binding, code, pos);
+        if (*pos < MAX_CODE) {
+            code[*pos].op = EXPR_CALL;
+            code[(*pos)++].arg = ((long)n->pred << 8) | (long)(n->nargs & 0xff);
+        }
         return;
     }
     if (n->kind == EX_NEG) {
@@ -4179,6 +4369,7 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
         case TK_ENTITY: parse_entity(p); break;
         case TK_STATE:  parse_state(p);  break;
         case TK_PROVIDER: parse_provider(p); break;
+        case TK_FUNCTION: parse_function(p); break;
         case TK_INIT:   parse_init(p);   break;
         case TK_RULE:   parse_rule(p);   break;
         case TK_ACTION: parse_action(p); break;

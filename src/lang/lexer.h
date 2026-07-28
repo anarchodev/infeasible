@@ -16,6 +16,7 @@ typedef enum {
      * so the lexer is stable even though this slice's parser handles only a
      * subset (state/init/rule/action/requires/causes/unless). */
     TK_SORT, TK_ENTITY, TK_STATE, TK_INIT, TK_PROVIDER,
+    TK_FUNCTION,   /* value-returning host function (§5.6): `function f(…) : type` */
     TK_RULE, TK_ACTION, TK_REQUIRES, TK_CAUSES, TK_UNLESS,
     TK_MODULE, TK_EXTEND, TK_SCENE, TK_IN,
     TK_BANDS,      /* priority-ladder declaration (§6.2) */

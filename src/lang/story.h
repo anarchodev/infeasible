@@ -42,7 +42,7 @@
  * Grammar handled by this slice:
  *
  *   file    := decl*
- *   decl    := sort | enum | entity | state | init | rule | action | sup
+ *   decl    := sort | enum | entity | state | function | init | rule | action | sup
  *   sort    := 'sort'   ( IDENT | '(' IDENT (','? IDENT)* ')' )
  *   enum    := 'enum' IDENT '{' IDENT (',' IDENT)* '}'  -- named value domain (§13)
  *   entity  := 'entity' ( ebind | '(' ebind* ')' )
@@ -52,6 +52,8 @@
  *   ftype   := ':' 'int' [ 'in' INT '..' INT ]         -- numeric + clamp range
  *            | ':' '{' IDENT (',' IDENT)* '}'           -- inline multi-valued domain
  *            | ':' IDENT                                -- a declared `enum` domain
+ *   function:= 'function' IDENT '(' vtype (',' vtype)* ')' ':' vtype -- host fn (§5.6)
+ *   vtype   := IDENT | 'int'                            -- a sort/domain, or int
  *   init    := 'init'   ( iatom | '(' iatom* ')' )      -- ground
  *   iatom   := atom | IDENT '=' (IDENT | INT)           -- MV / numeric init
  *   rule    := 'rule' IDENT [ params ] ':' conj                 -- judgment
@@ -74,6 +76,7 @@
  *   expr    := term (('+'|'-') term)*                    -- effect RHS, int-only
  *   term    := factor ('*' factor)*
  *   factor  := '-' factor | INT | ('min'|'max') '(' expr ',' expr ')'
+ *            | IDENT '(' expr (',' expr)* ')'           -- fn-provider call (§5.6)
  *            | IDENT [ '(' arg (',' arg)* ')' ] | '(' expr ')'
  *   atom    := [ '~' ] IDENT [ '(' arg (',' arg)* ')' ] [ "'" ]
  *   arg     := IDENT                                    -- a var or an entity
