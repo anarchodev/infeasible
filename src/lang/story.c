@@ -3058,6 +3058,17 @@ static void declare_ground_fluents(parser *p)
         }
         bool of = false;
         long total = instance_count(p, vb, f->nargs, &of);
+        if (of) {
+            /* Hard error, not silence: instance_count returns 0 on overflow, so
+             * this previously declared NOTHING for an over-large state pred —
+             * every fact/query on it silently no-oped ("loud failures, no
+             * silent caps"). */
+            serr(p, f->line, f->col,
+                 "state '%s' grounds to more than %d instances — split the "
+                 "sorts (§5.2 cardinality cap)",
+                 intern_name(p->syms, f->pred), MAX_INSTANCES);
+            return;
+        }
         uint32_t binding[MAX_ARGS];
         char pbuf[MAX_NAME + 24];
         const char *decl = prov_str(p, f->line, pbuf, sizeof pbuf);

@@ -1452,6 +1452,14 @@ void world_step_why(world *w, dl_lit q, bool next, FILE *out)
 static dl_lit primed_lit(const world *w, dl_lit l)
 {
     int i = fluent_index(w, l.atom);
+    if (i < 0) {                   /* tripwire, not a path: every primed read /
+                                    * effect head must be a DECLARED fluent —
+                                    * the grounder guarantees it (#92); reading
+                                    * primed[-1] would be silent OOB */
+        fprintf(stderr, "world: primed reference to undeclared fluent '%s'\n",
+                intern_name(w->syms, l.atom));
+        abort();
+    }
     dl_lit p = { w->primed[i], l.neg };
     return p;
 }
@@ -1748,6 +1756,12 @@ static void emit_step_family(world *w)
         for (int e = 0; e < r->neffects; e++) {
             dl_lit eff = r->effects[e];
             int fi = fluent_index(w, eff.atom);
+            if (fi < 0) {          /* tripwire (#92): effect heads must be
+                                    * declared fluents; pr_loc[-1] is silent OOB */
+                fprintf(stderr, "world: step effect on undeclared fluent '%s'\n",
+                        intern_name(w->syms, eff.atom));
+                abort();
+            }
             dl_lit head = { w->pr_loc[fi], eff.neg };
             snprintf(buf, sizeof buf, "%s/%s%s", r->name,
                      eff.neg ? "~" : "", intern_name(w->syms, eff.atom));
