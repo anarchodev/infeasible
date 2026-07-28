@@ -62,6 +62,17 @@ void world_set_provider_fn(world *w, world_provider_fn fn, void *ctx);
 void world_declare_provider_atom(world *w, uint32_t atom, uint32_t pred,
                                  const uint32_t *args, int nargs);
 
+/* Value-returning function providers (§5.6): a host function that returns a
+ * value (a cell handle / int), not a relation — e.g. `neighbor(at(X), dir)` for
+ * directional movement. Consulted from the effect-VM (EXPR_CALL) at commit time;
+ * `pred` names the function, `args` are the already-evaluated argument values (a
+ * cell handle read via EXPR_LOAD, an int, …). Must be deterministic and seedless
+ * (I4) — geometry, not judgment; randomness goes through roll() (§5.10). With no
+ * callback set a call reads 0, the closed-world analog of a false provider. */
+typedef long (*world_fn_provider_fn)(void *ctx, uint32_t pred,
+                                     const long *args, int nargs);
+void world_set_fn_provider_fn(world *w, world_fn_provider_fn fn, void *ctx);
+
 /* Seeded randomness (§5.10): a roll is a keyed lookup, not a stream. `seed` is
  * save state; `tick` is a monotone step counter the engine bumps each successful
  * world_step. A roll site (die `sides`, a precomputed `site` key folding the
@@ -91,6 +102,10 @@ typedef enum {
     EXPR_CONST,   /* push arg */
     EXPR_LOAD,    /* push current value of the numeric fluent whose atom = arg */
     EXPR_ROLL,    /* push a seeded die face 1..sides for roll-site index = arg (§5.10) */
+    EXPR_CALL,    /* call a value-returning fn provider (§5.6): arg packs the
+                   * function pred (<<8) and its argument count (low 8 bits); the
+                   * top `nargs` stack cells are the (already-evaluated) call args,
+                   * replaced by the returned value */
     EXPR_ADD, EXPR_SUB, EXPR_MUL, EXPR_NEG, EXPR_MIN, EXPR_MAX
 } expr_op;
 typedef struct { expr_op op; long arg; } expr_ins;

@@ -150,6 +150,10 @@ struct world {
     struct { uint32_t atom, pred; int nargs; uint32_t args[4]; } *provs;
     int nprov, capprov;
     world_provider_fn provider_fn; void *provider_ctx;
+    /* value-returning function providers (§5.6): host functions consulted from
+     * the effect-VM (EXPR_CALL), returning a cell handle / int. No ground-atom
+     * table — a call carries its function pred + args in the bytecode. */
+    world_fn_provider_fn fn_provider_fn; void *fn_provider_ctx;
 
     /* Seeded randomness (§5.10): a roll is a keyed lookup hash(seed, tick, site),
      * idempotent under re-read and independent across sites — so it can sit inside
@@ -413,6 +417,12 @@ void world_set_provider_fn(world *w, world_provider_fn fn, void *ctx)
 {
     w->provider_fn = fn;
     w->provider_ctx = ctx;
+}
+
+void world_set_fn_provider_fn(world *w, world_fn_provider_fn fn, void *ctx)
+{
+    w->fn_provider_fn = fn;
+    w->fn_provider_ctx = ctx;
 }
 
 void world_declare_provider_atom(world *w, uint32_t atom, uint32_t pred,
@@ -1295,6 +1305,20 @@ static long eval_expr(const world *w, const expr_ins *code, int n)
         case EXPR_CONST: st[sp++] = code[i].arg; break;
         case EXPR_LOAD:  st[sp++] = world_get_num(w, (uint32_t)code[i].arg); break;
         case EXPR_ROLL:  st[sp++] = roll_value(w, (int)code[i].arg); break;
+        case EXPR_CALL: {
+            /* value-returning fn provider (§5.6): arg packs (pred<<8 | nargs);
+             * the call args are the top `nargs` stack cells (contiguous longs),
+             * replaced in place by the returned value. No callback -> 0. */
+            unsigned long packed = (unsigned long)code[i].arg;
+            uint32_t pred = (uint32_t)(packed >> 8);
+            int nargs = (int)(packed & 0xff);
+            sp -= nargs;
+            long r = w->fn_provider_fn
+                ? w->fn_provider_fn(w->fn_provider_ctx, pred, &st[sp], nargs)
+                : 0;
+            st[sp++] = r;
+            break;
+        }
         case EXPR_NEG:   st[sp-1] = -st[sp-1]; break;
         case EXPR_ADD:   sp--; st[sp-1] += st[sp]; break;
         case EXPR_SUB:   sp--; st[sp-1] -= st[sp]; break;
