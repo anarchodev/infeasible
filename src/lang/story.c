@@ -2448,6 +2448,58 @@ static void check_safety(parser *p, ast_rule *r)
     }
 }
 
+static long instance_count(parser *p, var_bind *vars, int nvars, bool *overflow);
+
+/* Tiny union-find over a rule's variable indices (nvars <= MAX_ARGS). */
+static int uf_find(int *uf, int x) { while (uf[x] != x) x = uf[x] = uf[uf[x]]; return x; }
+static void uf_union(int *uf, int a, int b) { uf[uf_find(uf, a)] = uf_find(uf, b); }
+
+/* Cardinality guard (§5.2 item 5 / §5.6): a rule whose variables split into two
+ * or more groups that no positive body atom joins ranges over their *cross
+ * product* — a multiplicative blow-up with no sparse relation linking the groups.
+ * When that product is large it is a compile-time WARNING carrying the estimated
+ * count, so an author anchors it (a provider like `near(X,Y)`, or a joining
+ * fluent) rather than paying nᵏ silently. This is the gap check_safety leaves:
+ * there every var is *unbound*; here every var IS bound (the rule is safe) but
+ * the groups are independent. A single joined group (one component) is a genuine
+ * relation the tick-time matcher / provider prunes, so it never warns. */
+static void check_cardinality(parser *p, ast_rule *r)
+{
+    if (r->nvars < 2) return;                      /* no cross product to blow up */
+
+    bool of = false;
+    long total = instance_count(p, r->vars, r->nvars, &of);
+    if (of || total <= CARD_WARN) return;          /* overflow is reported at grounding */
+
+    /* only flag a *safe* rule — an unbound var is check_safety's to report. */
+    bool vbound[MAX_ARGS];
+    compute_bound_vars(p, r, vbound);
+    for (int i = 0; i < r->nvars; i++) if (!vbound[i]) return;
+
+    /* union the variables any positive (non-negated) body atom relates: vars
+     * sharing such an atom are one group; independent groups multiply. */
+    int uf[MAX_ARGS];
+    for (int i = 0; i < r->nvars; i++) uf[i] = i;
+    for (int b = 0; b < r->nbody; b++) {
+        ast_atom *at = &r->body[b];
+        if (at->neg) continue;                     /* a filter, not a join */
+        int first = -1;
+        for (int i = 0; i < r->nvars; i++) {
+            if (!atom_uses_var(p, at, r->vars[i].name)) continue;
+            if (first < 0) first = i; else uf_union(uf, first, i);
+        }
+    }
+    int comps = 0;
+    for (int i = 0; i < r->nvars; i++) if (uf_find(uf, i) == i) comps++;
+    if (comps < 2) return;                          /* one joined group: anchored */
+
+    warn(p, r->line, r->col,
+         "rule '%s' grounds to %ld instances over an un-anchored cross product "
+         "(%d independent variable groups) — join the variables with a sparse "
+         "anchor (a provider like `near(X, Y)`) or split the sorts "
+         "(§5.2 cardinality warning)", r->label, total, comps);
+}
+
 /* Priority-ladder well-formedness (§6.2): ladder names unique, band names
  * unique within a ladder, and no band shared across ladders (comparability
  * must be unambiguous). Every `@band` annotation must name a declared band —
@@ -2617,6 +2669,7 @@ static void semantic_pass(parser *p)
         for (int b = 0; b < r->nguard; b++)
             check_atom(p, &r->guard[b], r->vars, r->nvars, true, false, false, "an `unless` guard");
         check_safety(p, r);
+        check_cardinality(p, r);
         for (int j = i + 1; j < p->nrules; j++)
             if (strcmp(r->label, p->rules[j].label) == 0)
                 serr(p, p->rules[j].line, p->rules[j].col,
@@ -3040,10 +3093,9 @@ static void ground_rule(parser *p, ast_rule *r)
         return;
     }
     if (total == 0) return;                        /* an empty sort: no ground rules */
-    if (total > CARD_WARN)
-        warn(p, r->line, r->col,
-             "rule '%s' grounds to %ld instances with no sparse anchor "
-             "(§5.2 cardinality warning)", r->label, total);
+    /* the large-cross-product warning is anchor-aware and lives in the semantic
+     * pass now (check_cardinality) — grounding-path independent, and it only
+     * fires for a genuinely un-anchored product rather than on raw size. */
 
     r->insts = malloc((size_t)total * sizeof *r->insts);
     r->ninst = (int)total;
