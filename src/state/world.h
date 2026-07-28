@@ -156,6 +156,17 @@ void world_add_sup(world *w, int winner, int loser);
 void world_matched_checkpoint(world *w);
 void world_matched_reset(world *w);
 
+/* Auto re-ground hook (#45): register a callback the world fires — lazily, once
+ * per state change, right before it (re)builds its solve families — to refresh
+ * the matched judgment layer against the current facts. This is dependency
+ * inversion (like world_set_provider_fn): the state tier declares the interface;
+ * the .story compiler supplies the matcher as `ctx`. With it set, a host just
+ * calls world_step / world_query as usual and the matched layer stays fresh — no
+ * host-driven re-grounding. `ctx` must outlive the world (free the world first).
+ * Registering marks the layer stale so the first solve re-grounds. */
+typedef void (*world_reground_fn)(void *ctx, world *w);
+void world_set_reground_fn(world *w, world_reground_fn fn, void *ctx);
+
 /* Attach a provenance suffix (source span + generation reason, §6.3) to a rule
  * by its world_add_rule / world_add_step_rule handle; rendered by world_why /
  * the step trace after the rule kind. Copied; NULL clears it. */

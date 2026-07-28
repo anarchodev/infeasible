@@ -137,6 +137,10 @@ struct world {
      * (#48). `in_matched` (set at the checkpoint) routes world_add_rule /
      * world_set_rule_prov allocations there for every add past the boundary. */
     arena matched_a; bool in_matched;
+    /* auto re-ground hook (#45): fired from ensure_families when matched_stale,
+     * to refresh the matched layer against current facts before a solve.
+     * `regrounding` guards the callback against re-entering ensure_families. */
+    world_reground_fn reground_fn; void *reground_ctx; bool matched_stale, regrounding;
     srule *srules; int nsr, capsr;
 
     /* numeric value store + comparison guards (§5.8, read side). A clamp bound
@@ -229,6 +233,7 @@ static void invalidate_state_solved(world *w)
 {
     w->jfam_solved = false;
     w->fidx_dirty = true;              /* the extension index tracks the vals */
+    w->matched_stale = true;           /* the matched layer must be re-ground (#45) */
     for (int i = 0; i < w->nlanes; i++)
         w->lanes[i].solved = false;
 }
@@ -652,6 +657,13 @@ void world_matched_reset(world *w)
     arena_release(&w->matched_a);   /* free the previous matched layer's strings/bodies */
     w->fam_dirty = true;
     w->lanes_ok = false;
+}
+
+void world_set_reground_fn(world *w, world_reground_fn fn, void *ctx)
+{
+    w->reground_fn = fn;
+    w->reground_ctx = ctx;
+    w->matched_stale = true;        /* the first solve re-grounds the initial layer */
 }
 
 int world_add_step_rule(world *w, const char *name, uint32_t action,
@@ -1348,6 +1360,17 @@ static void emit_step_family(world *w)
  * was added). Facts are set later — per step for `fam`, per query for `jfam`. */
 static void ensure_families(world *w)
 {
+    /* Refresh the matched judgment layer against current facts before (re)building
+     * the solve families (#45). The callback (world_matched_reset + re-match) sets
+     * fam_dirty, so the rebuild below picks up the fresh layer. `regrounding`
+     * blocks re-entry — the callback touches only the index and jrules, never a
+     * solve, but the guard makes that contract explicit. */
+    if (w->reground_fn && w->matched_stale && !w->regrounding) {
+        w->regrounding = true;
+        w->reground_fn(w->reground_ctx, w);
+        w->matched_stale = false;
+        w->regrounding = false;
+    }
     if (w->fam && w->jfam && !w->fam_dirty)
         return;
     assign_locs(w);
