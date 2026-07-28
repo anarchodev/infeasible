@@ -99,6 +99,57 @@ static int test_unresolved_conflict(void)
     return 0;
 }
 
+/* Team defeat (§13: DECIDED — keep). The criss-cross is the case that
+ * separates team defeat from single-champion defeat: two supporters, two
+ * attackers, r1>s1 and r2>s2 but NO single rule beats both attackers. Under
+ * team defeat q is PROVED — each attacker is beaten by SOME applicable
+ * supporter; under single-champion it would be REFUTED. This is the verdict-
+ * level pin (test_col's criss-cross only pins dl==dl_col, which a coordinated
+ * semantics change would slip past). The control drops one edge: an unbeaten
+ * applicable attacker sinks the team, both sides REFUTED. */
+static int test_team_defeat(void)
+{
+    intern *sy = intern_new();
+    uint32_t a = intern_id(sy, "a"), b = intern_id(sy, "b"),
+             c = intern_id(sy, "c"), d = intern_id(sy, "d"),
+             q = intern_id(sy, "q");
+    dl_lit la = dl_pos(a), lb = dl_pos(b), lc = dl_pos(c), ld = dl_pos(d);
+
+    /* full criss-cross: the team covers every attacker -> q wins */
+    dl_theory *t = dl_theory_new(sy);
+    int r1 = dl_add_rule(t, "r1", DL_DEFEASIBLE, dl_pos(q), &la, 1);
+    int r2 = dl_add_rule(t, "r2", DL_DEFEASIBLE, dl_pos(q), &lb, 1);
+    int s1 = dl_add_rule(t, "s1", DL_DEFEASIBLE, dl_neg(q), &lc, 1);
+    int s2 = dl_add_rule(t, "s2", DL_DEFEASIBLE, dl_neg(q), &ld, 1);
+    dl_add_sup(t, r1, s1);
+    dl_add_sup(t, r2, s2);
+    dl_add_fact(t, la); dl_add_fact(t, lb);
+    dl_add_fact(t, lc); dl_add_fact(t, ld);
+    dl_result *res = dl_solve(t);
+    CHECK(dl_defeasible(res, dl_pos(q)) == DL_PROVED);
+    CHECK(dl_defeasible(res, dl_neg(q)) == DL_REFUTED);
+    dl_result_free(res);
+    dl_theory_free(t);
+
+    /* control: one attacker unbeaten -> the team loses, nobody wins */
+    t = dl_theory_new(sy);
+    r1 = dl_add_rule(t, "r1", DL_DEFEASIBLE, dl_pos(q), &la, 1);
+    r2 = dl_add_rule(t, "r2", DL_DEFEASIBLE, dl_pos(q), &lb, 1);
+    s1 = dl_add_rule(t, "s1", DL_DEFEASIBLE, dl_neg(q), &lc, 1);
+    s2 = dl_add_rule(t, "s2", DL_DEFEASIBLE, dl_neg(q), &ld, 1);
+    dl_add_sup(t, r1, s1);                         /* s2 has no conqueror */
+    dl_add_fact(t, la); dl_add_fact(t, lb);
+    dl_add_fact(t, lc); dl_add_fact(t, ld);
+    res = dl_solve(t);
+    CHECK(dl_defeasible(res, dl_pos(q)) == DL_REFUTED);
+    CHECK(dl_defeasible(res, dl_neg(q)) == DL_REFUTED);
+    dl_result_free(res);
+    dl_theory_free(t);
+
+    intern_free(sy);
+    return 0;
+}
+
 /* Strict conclusions are immune to defeasible attack. */
 static int test_strict_wins(void)
 {
@@ -176,6 +227,7 @@ int main(void)
     if (test_tweety()) return 1;
     if (test_defeater()) return 1;
     if (test_unresolved_conflict()) return 1;
+    if (test_team_defeat()) return 1;
     if (test_strict_wins()) return 1;
     if (test_drivers_agree()) return 1;
     printf("test_dl: all passed\n");
