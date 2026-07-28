@@ -206,11 +206,11 @@ int main(void)
     uint32_t wake_b = intern_id(sy, "wake(b)");
 
     /* step 1 — wake(b): the matched set GROWS. adj(b,c) & awake(b) now holds, so
-     * threatens(b,c) becomes provable. Eager recomputes for free; the matcher
-     * must re-ground to see it. */
+     * threatens(b,c) becomes provable. NO manual re-ground: the world auto-
+     * re-grounds the matched layer on the next query/step (#45), so the matcher
+     * tracks the step exactly like the eager world recomputes for free. */
     CHECK(world_step(A, &wake_b, 1, err, sizeof err) == 0);
     CHECK(world_step(B, &wake_b, 1, err, sizeof err) == 0);
-    story_matcher_reground(M);
 
     CHECK(world_query(A, t_bc) == DL_PROVED);
     CHECK(world_query(B, t_bc) == DL_PROVED);        /* the tick-time payoff */
@@ -227,12 +227,12 @@ int main(void)
     CHECK(why_same(A, B, spot_ab));                  /* provider landmark atom in the trace */
 
     /* step 2 — sleep(a): the matched set SHRINKS. awake(a) is now false, so the
-     * only support for threatens(a,b) is gone; re-grounding must DROP that
-     * instance (a broken world_matched_reset would leave it, diverging from eager). */
+     * only support for threatens(a,b) is gone; the auto re-ground must DROP that
+     * instance (a broken world_matched_reset would leave it, diverging from eager).
+     * Again NO manual re-ground — the world does it. */
     uint32_t sleep_a = intern_id(sy, "sleep(a)");
     CHECK(world_step(A, &sleep_a, 1, err, sizeof err) == 0);
     CHECK(world_step(B, &sleep_a, 1, err, sizeof err) == 0);
-    story_matcher_reground(M);
 
     CHECK(world_query(A, t_ab) != DL_PROVED);
     CHECK(world_query(B, t_ab) != DL_PROVED);        /* dropped, not stale */

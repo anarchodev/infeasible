@@ -5162,6 +5162,14 @@ world *story_compile_matched(const char *src, const char *srcname, intern *syms,
 /* Tick-time matcher: compile, retain the matchable-rule plan, and materialize the
  * initial matched layer against the init facts (the same reground path used every
  * tick — so the initial layer and every re-grounding go through one code path). */
+/* The world's auto re-ground hook (#45): state calls this before a solve when the
+ * matched layer is stale. ctx is the matcher; w == m->w. */
+static void matcher_reground_thunk(void *ctx, world *w)
+{
+    (void)w;
+    story_matcher_reground((story_matcher *)ctx);
+}
+
 story_matcher *story_compile_matcher(const char *src, const char *srcname,
                                      intern *syms, story_diags *diags, world **out)
 {
@@ -5169,6 +5177,9 @@ story_matcher *story_compile_matcher(const char *src, const char *srcname,
     world *w = compile_impl(src, srcname, syms, diags, true, NULL, &m);
     if (out) *out = w;
     if (!w) return NULL;                 /* compile failed; m already NULL/freed */
-    story_matcher_reground(m);           /* build the initial matched layer */
+    /* Auto re-ground: the world refreshes the matched layer itself before each
+     * solve (#45). The host no longer calls story_matcher_reground; the first
+     * world_query / world_step builds the initial layer. */
+    world_set_reground_fn(w, matcher_reground_thunk, m);
     return m;
 }
