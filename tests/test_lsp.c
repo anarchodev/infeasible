@@ -37,6 +37,14 @@
     "rule mk: alive => happy\n" \
     "rule br: happy => calm"
 
+/* Cone fixture: `open` is concluded by `can` and attacked (`~open`) by `blk`.
+ *   L1: "rule can: strong => open"   open HEAD (positive) at char 20
+ *   L2: "rule blk: weak => ~open"    open HEAD (negated / attacker)          */
+#define SRC_CONE \
+    "state ( strong weak )\n" \
+    "rule can: strong => open\n" \
+    "rule blk: weak => ~open"
+
 /* Capture sink: accumulate every emitted body, newline-separated, for strstr. */
 static void cap_emit(void *ud, const char *body, size_t len)
 {
@@ -285,6 +293,39 @@ static int test_navigation(void)
     return 0;
 }
 
+/* Hover cone summary: the atom under the cursor, the rules that conclude it,
+ * and the rules that attack it (`~p` heads) — the dependency/attacker cone. */
+static int test_hover(void)
+{
+    lsp_server *s = lsp_new();
+    strbuf cap; sb_init(&cap);
+    strbuf msg; sb_init(&msg);
+    const char *uri = "file:///cone.story";
+
+    build_open(&msg, uri, SRC_CONE);
+    dispatch(s, &cap, msg.buf);
+    sb_reset(&cap);
+
+    /* hover on the positive head `open` (L1 char 20) -> concluder + attacker */
+    build_pos_req(&msg, "textDocument/hover", uri, 1, 20, 20);
+    dispatch(s, &cap, msg.buf);
+    CHECK(strstr(cap.buf, "conclusion") != NULL);
+    CHECK(strstr(cap.buf, "Concluded by") != NULL);
+    CHECK(strstr(cap.buf, "can") != NULL);
+    CHECK(strstr(cap.buf, "Attacked by") != NULL);   /* polarity split */
+    CHECK(strstr(cap.buf, "blk") != NULL);
+    sb_reset(&cap);
+
+    /* hover off any atom (the `rule` keyword, L1 char 0) -> null. */
+    build_pos_req(&msg, "textDocument/hover", uri, 1, 0, 21);
+    dispatch(s, &cap, msg.buf);
+    CHECK(strstr(cap.buf, "\"result\":null") != NULL);
+
+    sb_free(&msg); sb_free(&cap);
+    lsp_free(s);
+    return 0;
+}
+
 /* The minimal JSON layer: parse a nested object, typed accessors, escapes,
  * and rejection of malformed input. */
 static int test_json(void)
@@ -327,6 +368,7 @@ int main(void)
     if (test_close_clears()) return 1;
     if (test_lifecycle())   return 1;
     if (test_navigation())  return 1;
+    if (test_hover())       return 1;
     printf("test_lsp: all passed\n");
     return 0;
 }

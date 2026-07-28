@@ -217,7 +217,7 @@ static void reply_error(lsp_emit_fn emit, void *ud, const json *id,
 static const char *INITIALIZE_RESULT =
     "{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":1}"
     ",\"definitionProvider\":true,\"referencesProvider\":true"
-    ",\"documentSymbolProvider\":true}"
+    ",\"documentSymbolProvider\":true,\"hoverProvider\":true}"
     ",\"serverInfo\":{\"name\":\"infeasible-story-lsp\",\"version\":\"0.1.0\"}}";
 
 /* ---------------------------------------------------------------- navigation */
@@ -370,6 +370,106 @@ static void on_references(lsp_server *s, const json *msg, const json *id,
     sb_free(&rb);
 }
 
+/* story_sym_kind -> the .story concept word, for hover prose. */
+static const char *sym_kind_word(story_sym_kind k)
+{
+    switch (k) {
+        case STORY_SYM_SORT:     return "sort";
+        case STORY_SYM_DOMAIN:   return "domain";
+        case STORY_SYM_ENTITY:   return "entity";
+        case STORY_SYM_FLUENT:   return "fluent";
+        case STORY_SYM_PROVIDER: return "provider";
+        case STORY_SYM_FUNCTION: return "function";
+        case STORY_SYM_ENUM:     return "enum";
+        case STORY_SYM_ACTION:   return "action";
+        case STORY_SYM_RULE:     return "rule";
+    }
+    return "atom";
+}
+
+/* Append a rule's display name: its label, or `rule@L<line>` when anonymous. */
+static void append_rule_name(strbuf *md, const story_model *m, int rule)
+{
+    int n; const story_rule *rs = story_model_rules(m, &n);
+    if (rule < 0 || rule >= n) { sb_raw(md, "`?`"); return; }
+    sb_char(md, '`');
+    if (rs[rule].label[0]) {
+        sb_raw(md, rs[rule].label);
+    } else {
+        sb_raw(md, "rule@L");
+        sb_int(md, rs[rule].line);
+    }
+    sb_char(md, '`');
+}
+
+/* Hover: a cone summary for the atom under the cursor — its kind, the rules
+ * that conclude it, the rules that attack it (`~p` heads / defeaters), and how
+ * many rule bodies read it (§6.1 item 7). All from the compiler's span model. */
+static void on_hover(lsp_server *s, const json *msg, const json *id,
+                     lsp_emit_fn emit, void *ud)
+{
+    int line, col;
+    lsp_doc *d = nav_target(s, msg, &line, &col);
+    strbuf rb; sb_init(&rb);
+    bool have = false;
+
+    if (d) {
+        story_model *m = model_for(d->text);
+        const story_occ *hit = occ_at(m, line, col);
+        if (hit) {
+            have = true;
+            const char *kind = "conclusion";   /* undeclared head => a conclusion */
+            int ns; const story_symbol *syms = story_model_symbols(m, &ns);
+            for (int i = 0; i < ns; i++)
+                if (strcmp(syms[i].name, hit->name) == 0) {
+                    kind = sym_kind_word(syms[i].kind);
+                    break;
+                }
+
+            strbuf md; sb_init(&md);
+            sb_raw(&md, "**");
+            sb_raw(&md, hit->name);
+            sb_raw(&md, "** — ");
+            sb_raw(&md, kind);
+
+            int no; const story_occ *occs = story_model_occs(m, &no);
+            int nc = 0, na = 0, nu = 0;
+            for (int i = 0; i < no; i++)
+                if (occs[i].role == STORY_OCC_HEAD && !occs[i].neg &&
+                    strcmp(occs[i].name, hit->name) == 0) {
+                    sb_raw(&md, nc++ ? ", " : "\n\nConcluded by: ");
+                    append_rule_name(&md, m, occs[i].rule);
+                }
+            for (int i = 0; i < no; i++)
+                if (occs[i].role == STORY_OCC_HEAD && occs[i].neg &&
+                    strcmp(occs[i].name, hit->name) == 0) {
+                    sb_raw(&md, na++ ? ", " : "\n\nAttacked by: ");
+                    append_rule_name(&md, m, occs[i].rule);
+                }
+            for (int i = 0; i < no; i++)
+                if (occs[i].role == STORY_OCC_BODY && occs[i].rule >= 0 &&
+                    strcmp(occs[i].name, hit->name) == 0)
+                    nu++;
+            if (nu) {
+                sb_raw(&md, "\n\nUsed in ");
+                sb_int(&md, nu);
+                sb_raw(&md, nu == 1 ? " rule body" : " rule bodies");
+            }
+
+            sb_raw(&rb, "{\"contents\":{\"kind\":\"markdown\",\"value\":");
+            sb_jstr(&rb, md.buf);
+            sb_raw(&rb, "},\"range\":");
+            write_range(&rb, hit->line, hit->col, hit->len);
+            sb_char(&rb, '}');
+            sb_free(&md);
+        }
+        story_model_free(m);
+    }
+
+    reply_result(emit, ud, id, have ? rb.buf : "null");
+    sb_free(&rb);
+}
+
 /* Document outline: every declaration, as a flat DocumentSymbol[]. */
 static void on_document_symbol(lsp_server *s, const json *msg, const json *id,
                                lsp_emit_fn emit, void *ud)
@@ -475,6 +575,8 @@ bool lsp_dispatch(lsp_server *s, const char *body, size_t len,
         on_references(s, msg, id, emit, ud);
     } else if (strcmp(method, "textDocument/documentSymbol") == 0) {
         on_document_symbol(s, msg, id, emit, ud);
+    } else if (strcmp(method, "textDocument/hover") == 0) {
+        on_hover(s, msg, id, emit, ud);
     } else if (id) {
         /* An unknown *request* must be answered; notifications are dropped. */
         reply_error(emit, ud, id, RPC_METHOD_NOT_FOUND, "method not found");

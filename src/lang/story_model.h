@@ -52,12 +52,26 @@ typedef struct {
     const char    *name;   /* NUL-terminated, model-owned */
     story_occ_role role;
     int            line, col, len;
+    bool           neg;    /* the `~` on this atom — a HEAD with neg=true is an
+                            * attacker of its pred, not a concluder of it */
+    int            rule;   /* index into story_model_rules of the owning rule,
+                            * or -1 (decls, args, actions, inits, sup operands) */
 } story_occ;
+
+/* One judgment rule, indexed by story_occ.rule. `label` is the author's rule
+ * label, or "" for an anonymous rule (identify it by its span instead). This
+ * is what the dependency/attacker cone (§6.1 item 7, §9) is built over: the
+ * head/body occurrences of a rule share its index. */
+typedef struct {
+    const char *label;     /* NUL-terminated, model-owned; "" if anonymous */
+    int         line, col;
+} story_rule;
 
 typedef struct story_model story_model;
 
 const story_symbol *story_model_symbols(const story_model *m, int *n);
 const story_occ    *story_model_occs(const story_model *m, int *n);
+const story_rule   *story_model_rules(const story_model *m, int *n);
 void                story_model_free(story_model *m);
 
 #endif

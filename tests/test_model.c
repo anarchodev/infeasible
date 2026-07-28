@@ -45,6 +45,24 @@ static bool has_occ(const story_model *m, const char *name, story_occ_role r)
     return false;
 }
 
+/* A HEAD occurrence of `name` with the given polarity (attacker iff neg). */
+static bool has_head(const story_model *m, const char *name, bool neg)
+{
+    int n; const story_occ *o = story_model_occs(m, &n);
+    for (int i = 0; i < n; i++)
+        if (o[i].role == STORY_OCC_HEAD && o[i].neg == neg &&
+            strcmp(o[i].name, name) == 0) return true;
+    return false;
+}
+
+static bool has_rule_label(const story_model *m, const char *label)
+{
+    int n; const story_rule *r = story_model_rules(m, &n);
+    for (int i = 0; i < n; i++)
+        if (strcmp(r[i].label, label) == 0) return true;
+    return false;
+}
+
 /* A clean source: declarations become spanned symbols; atom mentions become
  * role-tagged occurrences; the conclusion `happy` is not a declaration. */
 static int test_harvest(void)
@@ -52,9 +70,10 @@ static int test_harvest(void)
     const char *src =
         "sort actor\n"                       /* L1 */
         "entity hero : actor\n"              /* L2 */
-        "state ( alive(actor) )\n"           /* L3 */
-        "rule r: alive(hero) => happy(hero)\n" /* L4 */
-        "action wake(X: actor): causes alive(X)"; /* L5 */
+        "state ( alive(actor) )\n"             /* L3 */
+        "rule r: alive(hero) => happy(hero)\n" /* L4: concludes happy      */
+        "rule no: alive(hero) => ~happy(hero)\n" /* L5: attacks happy       */
+        "action wake(X: actor): causes alive(X)"; /* L6 */
 
     intern *sy = intern_new();
     story_model *m = NULL;
@@ -82,6 +101,23 @@ static int test_harvest(void)
     CHECK(has_occ(m, "alive", STORY_OCC_BODY));    /* r body            */
     CHECK(has_occ(m, "alive", STORY_OCC_EFFECT));  /* wake writes it     */
     CHECK(has_occ(m, "hero",  STORY_OCC_ARG));     /* an argument        */
+
+    /* head polarity: `happy` is both concluded (r) and attacked (no) */
+    CHECK(has_head(m, "happy", false));            /* concluder  */
+    CHECK(has_head(m, "happy", true));             /* attacker   */
+
+    /* the rules list carries labels, indexed by story_occ.rule */
+    CHECK(has_rule_label(m, "r"));
+    CHECK(has_rule_label(m, "no"));
+    /* a body occurrence points back at a rule; a decl does not */
+    {
+        int n; const story_occ *o = story_model_occs(m, &n);
+        for (int i = 0; i < n; i++) {
+            if (o[i].role == STORY_OCC_BODY && o[i].rule >= 0) { CHECK(1); break; }
+        }
+        for (int i = 0; i < n; i++)
+            if (o[i].role == STORY_OCC_DECL) CHECK(o[i].rule == -1);
+    }
 
     story_model_free(m);
     world_free(w);

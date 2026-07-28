@@ -4458,8 +4458,9 @@ static void build_lane_families(parser *p)
  * spanned tables — never a second parse. Names are copied so the model can
  * outlive `syms` and `src`. */
 struct story_model {
-    story_symbol *syms; int nsyms, capsyms;
-    story_occ    *occs; int noccs, capoccs;
+    story_symbol *syms;  int nsyms,  capsyms;
+    story_occ    *occs;  int noccs,  capoccs;
+    story_rule   *rules; int nrules, caprules;
 };
 
 static char *sm_dup(const char *s)
@@ -4486,7 +4487,7 @@ static void sm_add_sym(story_model *m, const char *name, story_sym_kind k,
 }
 
 static void sm_add_occ(story_model *m, const char *name, story_occ_role r,
-                       int line, int col)
+                       int line, int col, bool neg, int rule)
 {
     if (!name || !name[0]) return;
     if (line <= 0) return;                     /* synthetic node, no source span */
@@ -4498,19 +4499,30 @@ static void sm_add_occ(story_model *m, const char *name, story_occ_role r,
     o->name = sm_dup(name);
     o->role = r;
     o->line = line; o->col = col; o->len = (int)strlen(name);
+    o->neg = neg; o->rule = rule;
 }
 
-/* Harvest one atom: the predicate occurrence plus its entity/var arguments.
- * Skips synthetic predicate-less atoms (expr guards like `roll(20)+atk >= ac`,
- * whose fluent reads live in expr trees — a later slice). */
-static void sm_atom(story_model *m, parser *p, const ast_atom *a, story_occ_role role)
+/* A DECL/arg/init/sup occurrence: no rule owner, no meaningful polarity. */
+static void sm_add_ref(story_model *m, const char *name, story_occ_role r,
+                       int line, int col)
+{
+    sm_add_occ(m, name, r, line, col, false, -1);
+}
+
+/* Harvest one atom of rule `rule` (-1 for non-rule contexts): the predicate
+ * occurrence (carrying its `~` polarity) plus its entity/var arguments. Skips
+ * synthetic predicate-less atoms (expr guards like `roll(20)+atk >= ac`, whose
+ * fluent reads live in expr trees — a later slice). */
+static void sm_atom(story_model *m, parser *p, const ast_atom *a,
+                    story_occ_role role, int rule)
 {
     if (a->pred != INTERN_NONE)
-        sm_add_occ(m, intern_name(p->syms, a->pred), role, a->line, a->col);
+        sm_add_occ(m, intern_name(p->syms, a->pred), role, a->line, a->col,
+                   a->neg, rule);
     for (int i = 0; i < a->nargs; i++) {
         if (a->args[i].is_int) continue;
         sm_add_occ(m, intern_name(p->syms, a->args[i].name), STORY_OCC_ARG,
-                   a->args[i].line, a->args[i].col);
+                   a->args[i].line, a->args[i].col, false, rule);
     }
 }
 
@@ -4518,36 +4530,49 @@ static story_model *harvest_model(parser *p)
 {
     story_model *m = calloc(1, sizeof *m);
 
+    /* rules first — story_occ.rule indexes this list, and it must line up with
+     * p->rules[i] so a rule's head/body occurrences share one owner id. */
+    if (p->nrules > 0) {
+        m->rules = calloc((size_t)p->nrules, sizeof *m->rules);
+        m->caprules = p->nrules;
+        for (int i = 0; i < p->nrules; i++) {
+            m->rules[i].label = sm_dup(p->rules[i].label);   /* "" if anonymous */
+            m->rules[i].line  = p->rules[i].line;
+            m->rules[i].col   = p->rules[i].col;
+        }
+        m->nrules = p->nrules;
+    }
+
     /* declaration symbols (the document outline) + a DECL occurrence each, so
      * a references query can surface the declaring site alongside the uses. */
     for (int i = 0; i < p->nsorts; i++) {
         story_sym_kind k = p->sorts[i].is_domain ? STORY_SYM_DOMAIN : STORY_SYM_SORT;
         sm_add_sym(m, p->sorts[i].name, k, p->sorts[i].line, p->sorts[i].col);
-        sm_add_occ(m, p->sorts[i].name, STORY_OCC_DECL, p->sorts[i].line, p->sorts[i].col);
+        sm_add_ref(m, p->sorts[i].name, STORY_OCC_DECL, p->sorts[i].line, p->sorts[i].col);
     }
     for (int i = 0; i < p->nents; i++) {
         const char *nm = intern_name(p->syms, p->ents[i].atom);
         sm_add_sym(m, nm, STORY_SYM_ENTITY, p->ents[i].line, p->ents[i].col);
-        sm_add_occ(m, nm, STORY_OCC_DECL, p->ents[i].line, p->ents[i].col);
+        sm_add_ref(m, nm, STORY_OCC_DECL, p->ents[i].line, p->ents[i].col);
     }
     for (int i = 0; i < p->nfluents; i++) {
         const char *nm = intern_name(p->syms, p->fluents[i].pred);
         sm_add_sym(m, nm, STORY_SYM_FLUENT, p->fluents[i].line, p->fluents[i].col);
-        sm_add_occ(m, nm, STORY_OCC_DECL, p->fluents[i].line, p->fluents[i].col);
+        sm_add_ref(m, nm, STORY_OCC_DECL, p->fluents[i].line, p->fluents[i].col);
     }
     for (int i = 0; i < p->nproviders; i++) {
         const char *nm = intern_name(p->syms, p->providers[i].pred);
         sm_add_sym(m, nm, STORY_SYM_PROVIDER, p->providers[i].line, p->providers[i].col);
-        sm_add_occ(m, nm, STORY_OCC_DECL, p->providers[i].line, p->providers[i].col);
+        sm_add_ref(m, nm, STORY_OCC_DECL, p->providers[i].line, p->providers[i].col);
     }
     for (int i = 0; i < p->nfunctions; i++) {
         const char *nm = intern_name(p->syms, p->functions[i].name);
         sm_add_sym(m, nm, STORY_SYM_FUNCTION, p->functions[i].line, p->functions[i].col);
-        sm_add_occ(m, nm, STORY_OCC_DECL, p->functions[i].line, p->functions[i].col);
+        sm_add_ref(m, nm, STORY_OCC_DECL, p->functions[i].line, p->functions[i].col);
     }
     for (int i = 0; i < p->nenums; i++) {
         sm_add_sym(m, p->enums[i].name, STORY_SYM_ENUM, p->enums[i].line, p->enums[i].col);
-        sm_add_occ(m, p->enums[i].name, STORY_OCC_DECL, p->enums[i].line, p->enums[i].col);
+        sm_add_ref(m, p->enums[i].name, STORY_OCC_DECL, p->enums[i].line, p->enums[i].col);
     }
     for (int i = 0; i < p->nactions; i++)
         sm_add_sym(m, p->actions[i].name, STORY_SYM_ACTION,
@@ -4556,24 +4581,24 @@ static story_model *harvest_model(parser *p)
         sm_add_sym(m, p->rules[i].label, STORY_SYM_RULE,
                    p->rules[i].line, p->rules[i].col);
 
-    /* rule heads (conclusions) / bodies / guards */
+    /* rule heads (conclusions) / bodies / guards — tagged with the rule id */
     for (int i = 0; i < p->nrules; i++) {
         ast_rule *r = &p->rules[i];
-        sm_atom(m, p, &r->head, STORY_OCC_HEAD);
-        for (int b = 0; b < r->nbody; b++)  sm_atom(m, p, &r->body[b],  STORY_OCC_BODY);
-        for (int g = 0; g < r->nguard; g++) sm_atom(m, p, &r->guard[g], STORY_OCC_BODY);
+        sm_atom(m, p, &r->head, STORY_OCC_HEAD, i);
+        for (int b = 0; b < r->nbody; b++)  sm_atom(m, p, &r->body[b],  STORY_OCC_BODY, i);
+        for (int g = 0; g < r->nguard; g++) sm_atom(m, p, &r->guard[g], STORY_OCC_BODY, i);
     }
-    /* actions: requires (conditions) + effects (writes) */
+    /* actions: requires (conditions) + effects (writes) — not logic rules */
     for (int i = 0; i < p->nactions; i++) {
         ast_action *a = &p->actions[i];
-        for (int q = 0; q < a->nreq; q++) sm_atom(m, p, &a->requires[q], STORY_OCC_BODY);
-        for (int e = 0; e < a->neff; e++) sm_atom(m, p, &a->effects[e],  STORY_OCC_EFFECT);
+        for (int q = 0; q < a->nreq; q++) sm_atom(m, p, &a->requires[q], STORY_OCC_BODY, -1);
+        for (int e = 0; e < a->neff; e++) sm_atom(m, p, &a->effects[e],  STORY_OCC_EFFECT, -1);
     }
     for (int i = 0; i < p->ninits; i++)
-        sm_atom(m, p, &p->inits[i], STORY_OCC_BODY);
+        sm_atom(m, p, &p->inits[i], STORY_OCC_BODY, -1);
     for (int i = 0; i < p->nsups; i++) {   /* `a > b` — references two rule labels */
-        sm_add_occ(m, p->sups[i].a, STORY_OCC_BODY, p->sups[i].aline, p->sups[i].acol);
-        sm_add_occ(m, p->sups[i].b, STORY_OCC_BODY, p->sups[i].bline, p->sups[i].bcol);
+        sm_add_ref(m, p->sups[i].a, STORY_OCC_BODY, p->sups[i].aline, p->sups[i].acol);
+        sm_add_ref(m, p->sups[i].b, STORY_OCC_BODY, p->sups[i].bline, p->sups[i].bcol);
     }
     return m;
 }
@@ -4590,13 +4615,21 @@ const story_occ *story_model_occs(const story_model *m, int *n)
     return m ? m->occs : NULL;
 }
 
+const story_rule *story_model_rules(const story_model *m, int *n)
+{
+    if (n) *n = m ? m->nrules : 0;
+    return m ? m->rules : NULL;
+}
+
 void story_model_free(story_model *m)
 {
     if (!m) return;
-    for (int i = 0; i < m->nsyms; i++) free((char *)m->syms[i].name);
-    for (int i = 0; i < m->noccs; i++) free((char *)m->occs[i].name);
+    for (int i = 0; i < m->nsyms; i++)  free((char *)m->syms[i].name);
+    for (int i = 0; i < m->noccs; i++)  free((char *)m->occs[i].name);
+    for (int i = 0; i < m->nrules; i++) free((char *)m->rules[i].label);
     free(m->syms);
     free(m->occs);
+    free(m->rules);
     free(m);
 }
 
