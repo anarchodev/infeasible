@@ -43,7 +43,7 @@
  * Grammar handled by this slice:
  *
  *   file    := decl*
- *   decl    := sort | enum | entity | state | function | init | rule | action | sup
+ *   decl    := sort | enum | entity | state | function | value | init | rule | action | sup
  *   sort    := 'sort'   ( IDENT | '(' IDENT (','? IDENT)* ')' )
  *   enum    := 'enum' IDENT '{' IDENT (',' IDENT)* '}'  -- named value domain (§13)
  *   entity  := 'entity' ( ebind | '(' ebind* ')' )
@@ -54,12 +54,21 @@
  *            | ':' '{' IDENT (',' IDENT)* '}'           -- inline multi-valued domain
  *            | ':' IDENT                                -- a declared `enum` domain
  *   function:= 'function' IDENT '(' vtype (',' vtype)* ')' ':' vtype -- host fn (§5.6)
+ *   value   := 'value' ( vdecl | '(' vdecl* ')' )       -- engine-derived value (#82)
+ *   vdecl   := IDENT [ '(' IDENT* ')' ] ':' 'int'        -- defined by a rule, inlined
+ *                                                        -- at reads; roll sites key on
+ *                                                        -- the definition, so every
+ *                                                        -- reader shares the draw
  *   vtype   := IDENT | 'int'                            -- a sort/domain, or int
  *   init    := 'init'   ( iatom | '(' iatom* ')' )      -- ground
  *   iatom   := atom | IDENT '=' (IDENT | INT)           -- MV / numeric init
  *   rule    := 'rule' IDENT [ params ] ':' conj                 -- judgment
  *                ( OP atom [ 'unless' conj ]
  *                | 'causes' effects )                           -- ramification
+ *            | 'rule' IDENT [ params ] ':' '=>' IDENT '(' args ')' '=' expr
+ *                                          -- value definition (#82): body must be
+ *                                          -- empty in this slice (one total
+ *                                          -- definition per value; layering later)
  *   action  := 'action' IDENT [ params ] ':' [ 'requires' conj ] 'causes' effects
  *   effects := effitem ( '&' effitem )*                         -- effect body
  *   effitem := eatom | binder                                   -- plain or set-quantified

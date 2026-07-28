@@ -29,7 +29,8 @@ typedef enum {
     STORY_SYM_FUNCTION,  /* `function g(...) : t` — host fn   */
     STORY_SYM_ENUM,      /* `enum e { ... }`                  */
     STORY_SYM_ACTION,    /* `action a`                        */
-    STORY_SYM_RULE       /* a labelled `rule L: ...`          */
+    STORY_SYM_RULE,      /* a labelled `rule L: ...`          */
+    STORY_SYM_VALUE      /* `value v(...) : int` — derived (#82) */
 } story_sym_kind;
 
 /* Where an identifier occurrence sits, so navigation can distinguish "declared

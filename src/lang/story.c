@@ -63,6 +63,8 @@ typedef struct {
     bool        is_expr_guard; /* `expr <cmp> expr` guard (roll-/int-/paren-led) — a
                                 * body-only computed atom, e.g. roll(20)+atk >= ac */
     int         lhs_root, rhs_root;   /* the two expr trees, when is_expr_guard */
+    bool        is_valuedef;   /* head only: `v(args) = expr` defines a declared
+                                * `value` (#82); lhs_root holds the definition expr */
     int       line, col;
 } ast_atom;
 
@@ -221,6 +223,8 @@ typedef struct {
     bool     is_num;              /* a numeric fluent (§5.8) */
     bool     is_cell;             /* a store-backed opaque-domain fluent (§5.6) */
     bool     is_provider;         /* a computed relation, host-answered (§5.6) */
+    bool     is_value;            /* an engine-derived value (#82): defined by a
+                                   * rule, inlined at read sites, never stored */
 } pred_info;
 
 /* A value-returning function provider (§5.6): `function f(t1,…) : ret`. Unlike a
@@ -283,6 +287,10 @@ typedef struct {
     int nproviders;
     ast_function functions[MAX_FLUENTS];  /* value-returning fn providers (§5.6) */
     int nfunctions;
+    ast_fluent  valuedecls[MAX_FLUENTS];  /* engine-derived values (#82): `value v(…) : int` */
+    int nvaluedecls;
+    int value_def[MAX_FLUENTS];           /* per value: defining rule index, -1 = none */
+    int vdepth;                           /* value-inline recursion depth (cycle backstop) */
     ast_rule   *rules;            /* heap; MAX_RULES */
     int nrules;
     ast_action *actions;          /* heap; MAX_ACTIONS */
@@ -601,6 +609,16 @@ static void parse_entity(parser *p)
     if (grouped && !expect(p, TK_RPAREN)) return;
 }
 
+/* A declared engine-derived value (#82), matched by name; -1 if none. Values
+ * must be declared before the rules that read or define them (the same
+ * decl-before-use contract `function` calls already rely on in parse_factor). */
+static int find_value(parser *p, uint32_t name)
+{
+    for (int i = 0; i < p->nvaluedecls; i++)
+        if (p->valuedecls[i].pred == name) return i;
+    return -1;
+}
+
 /* ---- effect-expression parser (§5.8) --------------------------------
  *
  *   expr   := term (('+'|'-') term)*
@@ -812,10 +830,12 @@ static bool parse_atom(parser *p, ast_atom *out)
     if (p->cur.kind == TK_TILDE) { out->neg = true; advance(p); }
     /* An expression guard `expr <cmp> expr` (§5.8/§5.10) — recognised when the
      * conjunct starts with something a boolean atom can't: a `roll`/`min`/`max`/
-     * `divup` function call, an int, `(`, or `-`. Covers the d20:
-     * `roll(20) + atk(A) >= ac(T)` and `max(roll(20,1), roll(20,2)) + atk >= ac`. */
+     * `divup` function call, an int, `(`, `-`, or a declared `value` (#82).
+     * Covers the d20: `roll(20) + atk(A) >= ac(T)`, `max(roll(20,1),
+     * roll(20,2)) + atk >= ac`, and `atk_roll(A,T) + atk(A) >= ac(T)`. */
     if (ident_is(p->cur, "roll") || ident_is(p->cur, "min") || ident_is(p->cur, "max") ||
         ident_is(p->cur, "divup") ||
+        (p->cur.kind == TK_IDENT && find_value(p, intern_tok(p, p->cur)) >= 0) ||
         p->cur.kind == TK_INT || p->cur.kind == TK_LPAREN || p->cur.kind == TK_MINUS) {
         token lead = p->cur;
         int lhs = parse_expr(p);
@@ -827,6 +847,17 @@ static bool parse_atom(parser *p, ast_atom *out)
         case TK_EQ: op = WORLD_CMP_EQ; break; default: have = false; break;
         }
         if (!have) {
+            ex_node *lv = &p->exprs[lhs];
+            if ((p->cur.kind == TK_ASSIGN || p->cur.kind == TK_PLUSEQ ||
+                 p->cur.kind == TK_MINUSEQ) && lv->kind == EX_LOAD &&
+                find_value(p, lv->pred) >= 0) {
+                fail(p, lead.line, lead.col,
+                     "'%s' is a derived value — it cannot be written or caused; "
+                     "change the state its definition reads, or redefine it "
+                     "(`rule <label>: => %s(…) = expr`)",
+                     intern_name(p->syms, lv->pred), intern_name(p->syms, lv->pred));
+                return false;
+            }
             char d[64]; tok_desc(p->cur, d, sizeof d);
             fail(p, p->cur.line, p->cur.col,
                  "expected a comparison (<=, <, >=, >, =) in a roll/expression guard, found %s", d);
@@ -835,6 +866,19 @@ static bool parse_atom(parser *p, ast_atom *out)
         advance(p);
         int rhs = parse_expr(p);
         if (rhs < 0) return false;
+        ex_node *ln = &p->exprs[lhs];
+        if (op == WORLD_CMP_EQ && !out->neg && ln->kind == EX_LOAD &&
+            find_value(p, ln->pred) >= 0) {
+            /* bare `v(args) = expr` (#82): a value definition in head position,
+             * an equality guard in a body — the semantic pass disambiguates */
+            out->pred = ln->pred;
+            out->nargs = ln->nargs;
+            for (int k = 0; k < ln->nargs; k++) out->args[k] = ln->args[k];
+            out->is_valuedef = true;
+            out->lhs_root = rhs;
+            out->line = lead.line; out->col = lead.col;
+            return true;
+        }
         out->is_expr_guard = true;
         out->lhs_root = lhs; out->rhs_root = rhs; out->cmp = op;
         out->line = lead.line; out->col = lead.col;
@@ -1224,6 +1268,46 @@ static void parse_provider(parser *p)
     if (grouped && !expect(p, TK_RPAREN)) return;
 }
 
+/* value := 'value' ( vdecl | '(' vdecl* ')' ) ; vdecl := fdecl with `: int`.
+ * An engine-derived value (#82): declared here (name + type, so definitions can
+ * spread across rules and a typo'd read is a located error, not a silent new
+ * predicate), defined by a `rule … => v(args) = expr` head, and inlined at
+ * every read site. Never stored, never a fluent — no inertia, no effects. */
+static void parse_value(parser *p)
+{
+    advance(p);                                    /* 'value' */
+    bool grouped = false;
+    if (p->cur.kind == TK_LPAREN) { grouped = true; advance(p); }
+    do {
+        if (p->cur.kind != TK_IDENT) {
+            char d[64]; tok_desc(p->cur, d, sizeof d);
+            fail(p, p->cur.line, p->cur.col, "expected a value name, found %s", d);
+            return;
+        }
+        if (p->nvaluedecls >= MAX_FLUENTS) {
+            fail(p, p->cur.line, p->cur.col, "too many values (max %d)", MAX_FLUENTS);
+            return;
+        }
+        ast_fluent *v = &p->valuedecls[p->nvaluedecls];
+        if (!parse_fdecl(p, v)) return;
+        if (!v->is_num || v->is_mv || v->is_cell) {
+            fail(p, v->line, v->col,
+                 "a value needs a return type, and only `: int` is supported "
+                 "in this slice (#82) — enum-valued values are a later slice");
+            return;
+        }
+        if (v->has_range) {
+            fail(p, v->line, v->col,
+                 "a value has no clamp range — a range clamps stored state "
+                 "(§5.8); a derived value is whatever its definition computes");
+            return;
+        }
+        p->value_def[p->nvaluedecls] = -1;
+        p->nvaluedecls++;
+    } while (grouped && p->cur.kind == TK_IDENT);
+    if (grouped && !expect(p, TK_RPAREN)) return;
+}
+
 static int find_function(parser *p, uint32_t name)
 {
     for (int i = 0; i < p->nfunctions; i++)
@@ -1572,8 +1656,15 @@ static void parse_rule(parser *p)
     if (!parse_params(p, r->vars, &r->nvars, NULL)) return;   /* rules: no set params */
     if (!expect(p, TK_COLON)) return;
 
-    int nb = parse_conj(p, r->body, MAX_BODY);
-    if (nb < 0) return;
+    /* An arrow directly after ':' is an empty body — legal only for a value
+     * definition (`rule L(…): => v(…) = expr`, #82); the semantic pass rejects
+     * an empty-bodied boolean rule. */
+    int nb = 0;
+    if (p->cur.kind != TK_ARROW && p->cur.kind != TK_FATARROW &&
+        p->cur.kind != TK_SQARROW) {
+        nb = parse_conj(p, r->body, MAX_BODY);
+        if (nb < 0) return;
+    }
     r->nbody = nb;
 
     /* `causes` instead of an arrow: this `rule` is a ramification. Re-home the
@@ -1957,9 +2048,30 @@ static void build_pred_registry(parser *p)
         }
     }
 
+    /* engine-derived values (#82) register the pred with its arg sorts. Not a
+     * fluent (never stored, no inertia, no effects) and not a head (its
+     * definitions are the attackable literals, never the value itself). */
+    for (int i = 0; i < p->nvaluedecls; i++) {
+        ast_fluent *v = &p->valuedecls[i];
+        pred_info *pi = find_pred(p, v->pred);
+        if (pi && (pi->is_fluent || pi->is_provider || pi->is_value)) {
+            serr(p, v->line, v->col, "'%s' is already declared",
+                 intern_name(p->syms, v->pred));
+            continue;
+        }
+        pi = intern_pred(p, v->pred, v->nargs);
+        if (!pi) { serr(p, v->line, v->col, "too many predicates"); return; }
+        pi->is_value = true;
+        pi->arity = v->nargs;
+        for (int k = 0; k < v->nargs; k++)
+            pi->argsort[k] = decode_sort(p, -(int)v->argsort[k] - 2,
+                                         v->line, v->col, "a value declaration");
+    }
+
     /* rule heads register the conclusion predicates (arity from the head). */
     for (int i = 0; i < p->nrules; i++) {
         ast_atom *h = &p->rules[i].head;
+        if (h->is_valuedef) continue;      /* a definition head is not a boolean conclusion */
         pred_info *pi = intern_pred(p, h->pred, h->nargs);
         if (!pi) { serr(p, h->line, h->col, "too many predicates"); return; }
         if (pi->arity != h->nargs)
@@ -2052,6 +2164,25 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
     case EX_LOAD: {
         note_ref(p, n->pred, n->line, n->col);
         pred_info *pi = find_pred(p, n->pred);
+        if (pi && pi->is_value) {              /* a derived-value read (#82) */
+            int vi = find_value(p, n->pred);
+            if (vi >= 0 && p->value_def[vi] < 0) {
+                serr(p, n->line, n->col,
+                     "value '%s' has no definition — write "
+                     "`rule <label>: => %s(…) = expr`",
+                     intern_name(p->syms, n->pred), intern_name(p->syms, n->pred));
+                return;
+            }
+            if (pi->arity != n->nargs) {
+                serr(p, n->line, n->col, "'%s' takes %d argument%s but %d given",
+                     intern_name(p->syms, n->pred), pi->arity,
+                     pi->arity == 1 ? "" : "s", n->nargs);
+                return;
+            }
+            check_pred_args(p, n->pred, pi, n->args, n->nargs, vars, nvars,
+                            "a value read");
+            return;
+        }
         if (!pi || !pi->is_fluent || !pi->is_num) {
             serr(p, n->line, n->col,
                  "'%s' is read in an effect expression but is not a declared "
@@ -2188,6 +2319,56 @@ static const char *value_sort_name(parser *p, int s)
     return s < 0 ? "int" : p->sorts[s].name;
 }
 
+/* A derived-value read in a rule position (#82). Rewrites the two comparison
+ * forms into an ordinary expr guard over an EX_LOAD of the value — ONE
+ * canonical shape downstream, so grounding, lanes, and the matcher never see a
+ * value-specific atom — and rejects everything else: a value is derived, so it
+ * is never written, never primed (that's #87 stratification), and never a
+ * boolean atom (its definitions are the attackable literals, not the value). */
+static void check_value_read(parser *p, ast_atom *at, bool in_effect)
+{
+    const char *nm = intern_name(p->syms, at->pred);
+    if (at->primed) {
+        serr(p, at->line, at->col,
+             "a primed value read (`%s'`) needs the §5.8 stratification (#87) — "
+             "not supported yet; test the current value instead", nm);
+        return;
+    }
+    if (in_effect || at->is_num_effect) {
+        serr(p, at->line, at->col,
+             "'%s' is a derived value — it cannot be written or caused; change "
+             "the state its definition reads, or write a definition rule "
+             "(`rule <label>: => %s(…) = expr`)", nm, nm);
+        return;
+    }
+    if (at->is_guard || at->is_valuedef) {          /* `v cmp n` / body `v = expr` */
+        int l = alloc_expr(p, EX_LOAD, at->line, at->col);
+        if (l < 0) return;
+        p->exprs[l].pred = at->pred;
+        p->exprs[l].nargs = at->nargs;
+        for (int k = 0; k < at->nargs; k++) p->exprs[l].args[k] = at->args[k];
+        int r;
+        if (at->is_valuedef) {                      /* body position: equality guard */
+            r = at->lhs_root;
+            at->cmp = WORLD_CMP_EQ;
+            at->is_valuedef = false;
+        } else {
+            r = alloc_expr(p, EX_CONST, at->line, at->col);
+            if (r < 0) return;
+            p->exprs[r].konst = at->threshold;
+            at->is_guard = false;
+        }
+        at->is_expr_guard = true;
+        at->lhs_root = l;
+        at->rhs_root = r;
+        return;
+    }
+    serr(p, at->line, at->col,
+         "'%s' is a value — read it in a comparison (`%s(…) >= n`) or inside an "
+         "expression, never as a boolean atom; to dispute it, defeat its "
+         "definitions (#82)", nm, nm);
+}
+
 /* Validate one atom against the schema: predicate known, arity matches, and
  * every argument is a bound variable or a declared entity (with a sort check
  * for fluent atoms). `note` records condition refs for orphan analysis;
@@ -2242,6 +2423,13 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
              "'%s' takes %d argument%s but %d given",
              intern_name(p->syms, at->pred), pi->arity,
              pi->arity == 1 ? "" : "s", at->nargs);
+        return;
+    }
+    if (pi && pi->is_value) {                       /* a derived value (#82) */
+        check_value_read(p, at, in_effect);
+        if (!at->is_expr_guard) return;             /* misuse already reported */
+        check_expr(p, at->lhs_root, vars, nvars);
+        check_expr(p, at->rhs_root, vars, nvars);
         return;
     }
     /* numeric write discipline (§5.8): an effect operator assigns a numeric
@@ -2681,6 +2869,125 @@ static void check_functions(parser *p)
     }
 }
 
+/* Register a value definition's rule index (#82) — a pre-pass, so a read
+ * checked anywhere in the rules loop can already see whether a definition
+ * exists regardless of declaration order. */
+static void register_valuedef(parser *p, int ri)
+{
+    ast_rule *r = &p->rules[ri];
+    int vi = find_value(p, r->head.pred);          /* parse gated on this */
+    if (vi < 0) return;
+    if (p->value_def[vi] >= 0) {
+        serr(p, r->line, r->col,
+             "'%s' already has a definition ('%s') — multiple definitions "
+             "ordered by superiority are a later slice of #82",
+             intern_name(p->syms, r->head.pred),
+             p->rules[p->value_def[vi]].label);
+        return;
+    }
+    p->value_def[vi] = ri;
+}
+
+/* Validate a value definition `rule L(vars): => v(args) = expr` (#82, slice 1:
+ * exactly one unconditional definition per value; guards, layering via
+ * superiority, and `prior` are the next slice). A definition is never a dl
+ * rule — it is inlined at every read site, grounds nothing, and joins no
+ * fixpoint; that is why the whole rules pipeline skips it. */
+static void check_valuedef(parser *p, int ri)
+{
+    ast_rule *r = &p->rules[ri];
+    ast_atom *h = &r->head;
+    const char *nm = intern_name(p->syms, h->pred);
+    resolve_vars(p, r->vars, r->nvars, "a value definition");
+    if (h->neg) {
+        serr(p, h->line, h->col,
+             "a value definition cannot be negated — to dispute '%s', defeat "
+             "its definitions (#82)", nm);
+        return;
+    }
+    if (r->kind != DL_DEFEASIBLE) {
+        serr(p, h->line, h->col,
+             "a value definition is defeasible — write '=>' (defeat between "
+             "definitions is what will make '%s' layerable, #82)", nm);
+        return;
+    }
+    if (r->nbody > 0 || r->has_guard) {
+        serr(p, r->line, r->col,
+             "a guarded value definition is a later slice of #82 — '%s' takes "
+             "exactly one unconditional definition for now (layered definitions "
+             "need superiority + `prior`)", nm);
+        return;
+    }
+    int vi = find_value(p, h->pred);
+    ast_fluent *v = &p->valuedecls[vi];
+    pred_info *pi = find_pred(p, h->pred);
+    if (h->nargs != v->nargs || r->nvars != v->nargs) {
+        serr(p, h->line, h->col,
+             "the definition of '%s' must bind exactly its %d declared "
+             "argument%s (each head argument a distinct rule parameter)",
+             nm, v->nargs, v->nargs == 1 ? "" : "s");
+        return;
+    }
+    bool used[MAX_ARGS] = { false };
+    for (int k = 0; k < h->nargs; k++) {
+        int f = var_index(r->vars, r->nvars, h->args[k].name);
+        if (f < 0 || used[f]) {
+            serr(p, h->args[k].line, h->args[k].col,
+                 "value-definition argument %d of '%s' must be a distinct rule "
+                 "parameter, got '%s'", k + 1, nm,
+                 intern_name(p->syms, h->args[k].name));
+            return;
+        }
+        used[f] = true;
+        if (pi && pi->argsort[k] >= 0 && r->vars[f].sort >= 0 &&
+            pi->argsort[k] != r->vars[f].sort)
+            serr(p, h->args[k].line, h->args[k].col,
+                 "'%s' argument %d is declared '%s' but parameter '%s' ranges "
+                 "over '%s'", nm, k + 1, p->sorts[pi->argsort[k]].name,
+                 intern_name(p->syms, h->args[k].name),
+                 p->sorts[r->vars[f].sort].name);
+    }
+    if (p->value_def[vi] == ri)                    /* the winning registration */
+        check_expr(p, h->lhs_root, r->vars, r->nvars);
+}
+
+/* #82: a value definition must not read itself, directly or through other
+ * values — the read is an inline expansion, so a cycle is infinite regress. */
+static bool value_cycle_dfs(parser *p, int vi, bool *onstack, bool *done);
+
+static bool expr_value_cycle(parser *p, int e, bool *onstack, bool *done)
+{
+    if (e < 0) return false;
+    ex_node *n = &p->exprs[e];
+    switch (n->kind) {
+    case EX_CONST: case EX_ROLL: return false;
+    case EX_LOAD: {
+        int vj = find_value(p, n->pred);
+        return vj >= 0 && value_cycle_dfs(p, vj, onstack, done);
+    }
+    case EX_CALL:
+        for (int k = 0; k < n->nargs; k++)
+            if (expr_value_cycle(p, n->cargs[k], onstack, done)) return true;
+        return false;
+    case EX_NEG: return expr_value_cycle(p, n->lhs, onstack, done);
+    default:     return expr_value_cycle(p, n->lhs, onstack, done) ||
+                        expr_value_cycle(p, n->rhs, onstack, done);
+    }
+}
+
+static bool value_cycle_dfs(parser *p, int vi, bool *onstack, bool *done)
+{
+    if (done[vi]) return false;
+    if (onstack[vi]) return true;
+    onstack[vi] = true;
+    int ri = p->value_def[vi];
+    bool cyc = ri >= 0 &&
+        expr_value_cycle(p, p->rules[ri].head.lhs_root, onstack, done);
+    onstack[vi] = false;
+    done[vi] = true;
+    return cyc;
+}
+
 static void semantic_pass(parser *p)
 {
     resolve_entities(p);
@@ -2690,9 +2997,26 @@ static void semantic_pass(parser *p)
     check_fluent_bounds(p);
     check_functions(p);
 
+    /* value definitions register first (#82), so any read checked below can
+     * see whether its definition exists regardless of declaration order */
+    for (int i = 0; i < p->nrules; i++)
+        if (p->rules[i].head.is_valuedef) register_valuedef(p, i);
+
     for (int i = 0; i < p->nrules; i++) {
         ast_rule *r = &p->rules[i];
+        if (r->head.is_valuedef) {
+            check_valuedef(p, i);
+            for (int j = i + 1; j < p->nrules; j++)
+                if (strcmp(r->label, p->rules[j].label) == 0)
+                    serr(p, p->rules[j].line, p->rules[j].col,
+                         "duplicate rule label '%s'", r->label);
+            continue;
+        }
         resolve_vars(p, r->vars, r->nvars, "a rule");
+        if (r->nbody == 0)
+            serr(p, r->line, r->col,
+                 "a rule needs a body — only a value definition "
+                 "(`rule L: => v(…) = expr`) may omit it");
         for (int b = 0; b < r->nbody; b++)
             check_atom(p, &r->body[b], r->vars, r->nvars, true, false, false, "a rule body");
         check_atom(p, &r->head, r->vars, r->nvars, false, false, false, "a rule head");
@@ -2703,7 +3027,7 @@ static void semantic_pass(parser *p)
                  "reification; set the value with an `action … causes` instead",
                  intern_name(p->syms, r->head.pred),
                  intern_name(p->syms, r->head.value));
-        if (r->head.is_guard)
+        if (r->head.is_guard || r->head.is_expr_guard)
             serr(p, r->head.line, r->head.col,
                  "a rule cannot conclude a numeric comparison — guards are "
                  "read-only inputs derived from the value store (§5.8)");
@@ -2715,6 +3039,17 @@ static void semantic_pass(parser *p)
             if (strcmp(r->label, p->rules[j].label) == 0)
                 serr(p, p->rules[j].line, p->rules[j].col,
                      "duplicate rule label '%s'", r->label);
+    }
+
+    /* #82: cyclic value definitions are infinite inline regress — reject */
+    {
+        bool onstack[MAX_FLUENTS] = { false }, done[MAX_FLUENTS] = { false };
+        for (int i = 0; i < p->nvaluedecls; i++)
+            if (!done[i] && value_cycle_dfs(p, i, onstack, done))
+                serr(p, p->valuedecls[i].line, p->valuedecls[i].col,
+                     "the definition of '%s' reads itself (directly or through "
+                     "other values) — value definitions cannot be cyclic",
+                     intern_name(p->syms, p->valuedecls[i].pred));
     }
 
     for (int i = 0; i < p->nactions; i++) {
@@ -2933,6 +3268,9 @@ static bool expr_fold(parser *p, int e, long *out)
     }
 }
 
+static void emit_value_inline(parser *p, uint32_t pred, const uint32_t *rargs,
+                              expr_ins *code, int *pos);
+
 /* Emit RPN bytecode for expr node `e` under `binding`, folding constant
  * subtrees and resolving fluent reads to their ground value-store atom. */
 static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
@@ -2948,6 +3286,11 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
         uint32_t args[MAX_ARGS];
         for (int k = 0; k < n->nargs; k++)
             args[k] = resolve_arg(vars, nvars, binding, n->args[k]);
+        pred_info *vp = find_pred(p, n->pred);
+        if (vp && vp->is_value) {              /* inline the definition (#82) */
+            emit_value_inline(p, n->pred, args, code, pos);
+            return;
+        }
         uint32_t g = ground_pred(p, n->pred, args, n->nargs);
         if (*pos < MAX_CODE) { code[*pos].op = EXPR_LOAD; code[(*pos)++].arg = (long)g; }
         return;
@@ -2985,6 +3328,30 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
                : n->kind == EX_MUL ? EXPR_MUL : n->kind == EX_DIV ? EXPR_DIV
                : n->kind == EX_MIN ? EXPR_MIN                     : EXPR_MAX;
     if (*pos < MAX_CODE) { code[*pos].op = op; code[(*pos)++].arg = 0; }
+}
+
+/* Inline a value read (#82): emit the definition's expression under the read's
+ * resolved arguments. Because a value has ONE definition (one expr tree), every
+ * reader of `v(a,b)` emits the same EX_ROLL nodes under the same binding — so
+ * the §5.10 site key (node, binding, tag) is identical and all readers share
+ * the draw: one die, testable twice. Distinct bindings (other targets) still
+ * key apart and draw independently, which is what fireball relies on. */
+static void emit_value_inline(parser *p, uint32_t pred, const uint32_t *rargs,
+                              expr_ins *code, int *pos)
+{
+    int vi = find_value(p, pred);
+    int ri = vi >= 0 ? p->value_def[vi] : -1;
+    if (ri < 0) return;                        /* reported in the check pass */
+    ast_rule *d = &p->rules[ri];
+    uint32_t sub[MAX_ARGS] = { 0 };
+    for (int k = 0; k < d->head.nargs; k++) {
+        int f = var_index(d->vars, d->nvars, d->head.args[k].name);
+        if (f >= 0) sub[f] = rargs[k];
+    }
+    if (++p->vdepth > MAX_ARGS * 2) { p->vdepth--; return; }   /* cycle backstop;
+                                          * cycles are rejected in the semantic pass */
+    emit_expr(p, d->head.lhs_root, d->vars, d->nvars, sub, code, pos);
+    p->vdepth--;
 }
 
 static void inst_name(parser *p, char *buf, size_t n, const char *label,
@@ -3210,6 +3577,7 @@ static void ground_inits(parser *p)
 
 static void ground_rule(parser *p, ast_rule *r)
 {
+    if (r->head.is_valuedef) return;   /* #82: inlined at read sites, never a dl rule */
     bool of = false;
     long total = instance_count(p, r->vars, r->nvars, &of);
     if (of) {
@@ -4194,6 +4562,13 @@ static void ground_sup(parser *p, ast_sup *s)
         serr(p, s->bline, s->bcol, "unknown rule label '%s' in superiority", s->b);
         return;
     }
+    if (ra->head.is_valuedef || rb->head.is_valuedef) {
+        serr(p, s->aline, s->acol,
+             "superiority over a value definition ('%s' > '%s') arrives with "
+             "layered definitions — a later slice of #82",
+             s->a, s->b);
+        return;
+    }
     emit_sup_edges(p, ra, rb, s->bline, s->bcol);
 }
 
@@ -4269,7 +4644,8 @@ static void check_orphans(parser *p)
     for (int i = 0; i < p->nrefs; i++) {
         uint32_t a = p->refs[i].pred;
         pred_info *pi = find_pred(p, a);
-        if (is_fluent_pred(p, a) || is_head_pred(p, a) || (pi && pi->is_provider))
+        if (is_fluent_pred(p, a) || is_head_pred(p, a) ||
+            (pi && (pi->is_provider || pi->is_value)))
             continue;
         warn(p, p->refs[i].line, p->refs[i].col,
              "'%s' is used as a condition but is never a declared fluent or "
@@ -4375,6 +4751,7 @@ static void compute_taint(parser *p, bool *taint)
         changed = false;
         for (int i = 0; i < p->nrules; i++) {
             ast_rule *r = &p->rules[i];
+            if (r->head.is_valuedef) continue;     /* #82: not a dl rule */
             int hp = pred_idx(p, r->head.pred);
             if (hp < 0 || taint[hp]) continue;
             bool bad = !rule_eligible(p, r);
@@ -4414,6 +4791,7 @@ static void emit_sort_lanes(parser *p, int S, const bool *taint)
     int laned[MAX_RULES], nlaned = 0;
     for (int i = 0; i < p->nrules; i++) {
         ast_rule *r = &p->rules[i];
+        if (r->head.is_valuedef) continue;         /* #82: not a dl rule */
         int hp = pred_idx(p, r->head.pred);
         if (hp < 0 || taint[hp] || r->nvars != 1 || r->vars[0].sort != S)
             continue;
@@ -5329,6 +5707,12 @@ static story_model *harvest_model(parser *p)
         sm_add_sym(m, nm, STORY_SYM_PROVIDER, p->providers[i].line, p->providers[i].col, det);
         sm_add_ref(m, nm, STORY_OCC_DECL, p->providers[i].line, p->providers[i].col);
     }
+    for (int i = 0; i < p->nvaluedecls; i++) {     /* derived values (#82) */
+        const char *nm = intern_name(p->syms, p->valuedecls[i].pred);
+        build_fluent_detail(det, sizeof det, p, &p->valuedecls[i], "value");
+        sm_add_sym(m, nm, STORY_SYM_VALUE, p->valuedecls[i].line, p->valuedecls[i].col, det);
+        sm_add_ref(m, nm, STORY_OCC_DECL, p->valuedecls[i].line, p->valuedecls[i].col);
+    }
     for (int i = 0; i < p->nfunctions; i++) {
         const char *nm = intern_name(p->syms, p->functions[i].name);
         size_t off = 0; det[0] = '\0';
@@ -5461,6 +5845,7 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
         case TK_STATE:  parse_state(p);  break;
         case TK_PROVIDER: parse_provider(p); break;
         case TK_FUNCTION: parse_function(p); break;
+        case TK_VALUE:  parse_value(p);  break;
         case TK_INIT:   parse_init(p);   break;
         case TK_RULE:   parse_rule(p);   break;
         case TK_ACTION: parse_action(p); break;

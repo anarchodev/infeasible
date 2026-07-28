@@ -349,6 +349,7 @@ static int symbol_kind(story_sym_kind k)
         case STORY_SYM_ENUM:     return 10;  /* Enum      */
         case STORY_SYM_ACTION:   return 6;   /* Method    */
         case STORY_SYM_RULE:     return 24;  /* Event     */
+        case STORY_SYM_VALUE:    return 13;  /* Variable  */
     }
     return 13;   /* Variable — unreachable fallback */
 }
@@ -448,6 +449,7 @@ static const char *sym_kind_word(story_sym_kind k)
         case STORY_SYM_ENUM:     return "enum";
         case STORY_SYM_ACTION:   return "action";
         case STORY_SYM_RULE:     return "rule";
+        case STORY_SYM_VALUE:    return "value";
     }
     return "atom";
 }
