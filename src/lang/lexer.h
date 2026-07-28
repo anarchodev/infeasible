@@ -45,6 +45,7 @@ typedef enum {
     TK_MINUSEQ,    /* -=  additive effect */
     TK_PLUS,       /* +                   */
     TK_STAR,       /* *                   */
+    TK_SLASH,      /* /  division; both comment forms are consumed first */
     TK_DOTDOT,     /* ..  range           */
     TK_PRIME       /* '   next-state mark (ramification bodies, §5.4) */
 } tok_kind;

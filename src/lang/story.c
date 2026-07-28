@@ -71,7 +71,8 @@ typedef struct {
  * nodes are the closed arithmetic set. Grounding walks the tree per instance,
  * folding constant subtrees and emitting VM bytecode for the rest. */
 typedef enum {
-    EX_CONST, EX_LOAD, EX_ROLL, EX_CALL, EX_ADD, EX_SUB, EX_MUL, EX_NEG, EX_MIN, EX_MAX
+    EX_CONST, EX_LOAD, EX_ROLL, EX_CALL, EX_ADD, EX_SUB, EX_MUL, EX_DIV, EX_NEG,
+    EX_MIN, EX_MAX
 } ex_kind;
 /* EX_CALL (§5.6): a value-returning function-provider call `f(e1, …, ek)`.
  * `pred` = the function name; `nargs` = k; `cargs[0..k)` = child expr indices. */
@@ -603,7 +604,7 @@ static void parse_entity(parser *p)
 /* ---- effect-expression parser (§5.8) --------------------------------
  *
  *   expr   := term (('+'|'-') term)*
- *   term   := factor ('*' factor)*
+ *   term   := factor (('*'|'/') factor)*      -- '/' floors (rounds toward -inf)
  *   factor := '-' factor | INT | ('min'|'max') '(' expr ',' expr ')'
  *           | IDENT [ '(' arg (',' arg)* ')' ]        -- a numeric fluent read
  *           | '(' expr ')'
@@ -746,11 +747,17 @@ static int parse_term(parser *p)
 {
     int l = parse_factor(p);
     if (l < 0) return -1;
-    while (p->cur.kind == TK_STAR) {
+    while (p->cur.kind == TK_STAR || p->cur.kind == TK_SLASH) {
+        bool isdiv = p->cur.kind == TK_SLASH;
         token o = p->cur; advance(p);
         int r = parse_factor(p);
         if (r < 0) return -1;
-        int n = alloc_expr(p, EX_MUL, o.line, o.col);
+        long dv;
+        if (isdiv && expr_fold(p, r, &dv) && dv == 0) {
+            fail(p, o.line, o.col, "division by a constant zero");
+            return -1;
+        }
+        int n = alloc_expr(p, isdiv ? EX_DIV : EX_MUL, o.line, o.col);
         if (n < 0) return -1;
         p->exprs[n].lhs = l; p->exprs[n].rhs = r; l = n;
     }
@@ -2888,6 +2895,10 @@ static bool expr_fold(parser *p, int e, long *out)
         case EX_ADD: *out = a + b; break;
         case EX_SUB: *out = a - b; break;
         case EX_MUL: *out = a * b; break;
+        case EX_DIV:                       /* floored, matching EXPR_DIV exactly */
+            if (b == 0) return false;      /* stays dynamic: the VM defines x/0 = 0 */
+            *out = a / b - ((a % b != 0 && (a < 0) != (b < 0)) ? 1 : 0);
+            break;
         case EX_MIN: *out = a < b ? a : b; break;
         case EX_MAX: *out = a > b ? a : b; break;
         default: return false;
@@ -2945,8 +2956,8 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
     emit_expr(p, n->lhs, vars, nvars, binding, code, pos);
     emit_expr(p, n->rhs, vars, nvars, binding, code, pos);
     expr_op op = n->kind == EX_ADD ? EXPR_ADD : n->kind == EX_SUB ? EXPR_SUB
-               : n->kind == EX_MUL ? EXPR_MUL : n->kind == EX_MIN ? EXPR_MIN
-                                                                  : EXPR_MAX;
+               : n->kind == EX_MUL ? EXPR_MUL : n->kind == EX_DIV ? EXPR_DIV
+               : n->kind == EX_MIN ? EXPR_MIN                     : EXPR_MAX;
     if (*pos < MAX_CODE) { code[*pos].op = op; code[(*pos)++].arg = 0; }
 }
 

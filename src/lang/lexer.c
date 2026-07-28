@@ -115,6 +115,7 @@ token lexer_next(lexer *lx)
     case '@':  t.kind = TK_AT;    break;   /* band annotation (§6.2) */
     case '&':  t.kind = TK_AMP;   break;
     case '*':  t.kind = TK_STAR;  break;
+    case '/':  t.kind = TK_SLASH; break;   /* comments consumed in skip_ws */
     case '\'': t.kind = TK_PRIME; break;   /* postfix next-state mark (§5.4) */
     case '.': if (*lx->p == '.') { adv(lx); t.kind = TK_DOTDOT; }
               else                 t.kind = TK_ERROR;
@@ -199,6 +200,7 @@ const char *tok_kind_name(tok_kind k)
     case TK_MINUSEQ:  return "'-='";
     case TK_PLUS:     return "'+'";
     case TK_STAR:     return "'*'";
+    case TK_SLASH:    return "'/'";
     case TK_DOTDOT:   return "'..'";
     case TK_PRIME:    return "'''";
     }
