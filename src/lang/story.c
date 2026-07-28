@@ -246,6 +246,8 @@ typedef struct {
     bool         err_flag;        /* an error hit in the current declaration */
     bool         ground_matched;  /* ground eligible rules via the join matcher
                                    * (#28) rather than the eager odometer */
+    bool         sparse;          /* #92 (tick-time only): skip the boolean state
+                                   * cross-product; declare fluents on touch */
     factindex   *fidx;            /* base-fluent extension index, built from init
                                    * facts when ground_matched (the matcher scans it) */
     int          ndecls;          /* declarations parsed so far (header must be first) */
@@ -2951,6 +2953,33 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
 static void inst_name(parser *p, char *buf, size_t n, const char *label,
                       var_bind *vars, int nvars, const uint32_t *binding);
 
+/* #92 sparse universe: declare a boolean state fluent the grounder just
+ * referenced — the compile-time half of the touched set (the runtime half is
+ * world_set's schema hook). Filters itself: only plain boolean state preds
+ * (mv/num/cell keep the dense declaration), only in sparse mode, and only on
+ * first touch (declare + decl provenance + index structure, exactly what the
+ * dense odometer attached). */
+static const char *prov_str(parser *p, int line, char *buf, size_t n);
+
+static void touch_ground_fluent(parser *p, uint32_t atom, uint32_t pred,
+                                const uint32_t *args, int nargs)
+{
+    if (!p->sparse || world_has_fluent(p->w, atom))
+        return;
+    pred_info *pi = find_pred(p, pred);
+    if (!pi || !pi->is_fluent || pi->is_mv || pi->is_num)
+        return;
+    world_declare_fluent(p->w, atom);
+    for (int i = 0; i < p->nfluents; i++)          /* decl span for inertia prov */
+        if (p->fluents[i].pred == pred) {
+            char pbuf[MAX_NAME + 24];
+            world_set_fluent_prov(p->w, atom,
+                prov_str(p, p->fluents[i].line, pbuf, sizeof pbuf));
+            break;
+        }
+    world_set_fluent_struct(p->w, atom, pred, args, nargs);
+}
+
 static dl_lit ground_lit(parser *p, ast_atom *at, var_bind *vars, int nvars,
                          const uint32_t *binding)
 {
@@ -2986,6 +3015,7 @@ static dl_lit ground_lit(parser *p, ast_atom *at, var_bind *vars, int nvars,
         pred_info *pi = find_pred(p, at->pred);
         if (pi && pi->is_provider)                 /* a computed relation (§5.6) */
             world_declare_provider_atom(p->w, g, at->pred, args, at->nargs);
+        touch_ground_fluent(p, g, at->pred, args, at->nargs);   /* #92 */
     }
     return at->neg ? dl_neg(g) : dl_pos(g);
 }
@@ -3051,6 +3081,13 @@ static void declare_ground_fluents(parser *p)
 {
     for (int i = 0; i < p->nfluents; i++) {
         ast_fluent *f = &p->fluents[i];
+        if (p->sparse && !f->is_num && !f->is_mv)
+            continue;   /* #92: plain boolean state preds are declared on touch
+                         * (inits, ground rules/actions, world_set via the
+                         * schema hook) — never as a cross-product. mv keeps the
+                         * dense family (effects negate every sibling) and
+                         * num/cell are value-store slots, both O(instances)
+                         * kinds an author declares deliberately. */
         var_bind vb[MAX_ARGS];                     /* borrow the odometer path */
         for (int k = 0; k < f->nargs; k++) {
             vb[k].name = INTERN_NONE;
@@ -3058,6 +3095,17 @@ static void declare_ground_fluents(parser *p)
         }
         bool of = false;
         long total = instance_count(p, vb, f->nargs, &of);
+        if (of) {
+            /* Hard error, not silence: instance_count returns 0 on overflow, so
+             * this previously declared NOTHING for an over-large state pred —
+             * every fact/query on it silently no-oped ("loud failures, no
+             * silent caps"). */
+            serr(p, f->line, f->col,
+                 "state '%s' grounds to more than %d instances — split the "
+                 "sorts (§5.2 cardinality cap)",
+                 intern_name(p->syms, f->pred), MAX_INSTANCES);
+            return;
+        }
         uint32_t binding[MAX_ARGS];
         char pbuf[MAX_NAME + 24];
         const char *decl = prov_str(p, f->line, pbuf, sizeof pbuf);
@@ -3118,6 +3166,7 @@ static void ground_inits(parser *p)
         uint32_t atom = a->value != INTERN_NONE
             ? ground_mv_atom(p, a->pred, args, a->nargs, a->value)
             : ground_pred(p, a->pred, args, a->nargs);
+        touch_ground_fluent(p, atom, a->pred, args, a->nargs);  /* #92: mv filtered inside */
         world_set(p->w, atom, true);               /* siblings stay closed-world false */
     }
 }
@@ -3462,12 +3511,27 @@ typedef struct {
     int          view;         /* world_view_new handle, -1 when !island      */
 } m_rule;
 
+typedef struct {               /* #92: one boolean state pred's shape */
+    uint32_t pred;
+    int      nargs;
+    int      argsort[MAX_ARGS];   /* parser sort indices, matching ent_sort */
+} m_schema;
+
 struct story_matcher {
     intern *syms;
     world  *w;
     m_rule *rules;
     int     nrules, caprules;
     long    probes;            /* fact-tuples visited in the last reground (#46) */
+    /* #92 sparse fluent universe: the retained schema — boolean state preds +
+     * entity->sort membership, deep-copied before the parser tables are torn
+     * down (same discipline as the retained rule plan). Backs the
+     * world_schema_fn hook: recognize/decompose ground fluent atoms so the
+     * world can lazily declare on touch and answer the rest closed-world. */
+    m_schema *schemas;
+    int       nschemas;
+    int      *ent_sort;        /* entity atom -> sort index, -1 = not an entity */
+    uint32_t  ent_sort_cap;
 };
 
 static char *m_dup(const char *s)
@@ -3711,6 +3775,92 @@ static void matcher_capture(story_matcher *m, parser *p, ast_rule *r, bool islan
                      : -1;
 }
 
+/* #92: retain the boolean-state-pred schema + entity->sort membership before
+ * the parser tables are freed. Only what the schema hook needs — plain boolean
+ * preds (mv/num/cell stay densely declared and are never recognized here). */
+static void matcher_capture_schema(story_matcher *m, parser *p)
+{
+    for (int i = 0; i < p->nfluents; i++) {
+        ast_fluent *f = &p->fluents[i];
+        if (f->is_num || f->is_mv)
+            continue;
+        m->schemas = realloc(m->schemas,
+                             (size_t)(m->nschemas + 1) * sizeof *m->schemas);
+        m_schema *s = &m->schemas[m->nschemas++];
+        s->pred = f->pred;
+        s->nargs = f->nargs;
+        for (int k = 0; k < f->nargs; k++)
+            s->argsort[k] = decode_sort(p, -(int)f->argsort[k] - 2,
+                                        f->line, f->col, "");
+    }
+    for (int e = 0; e < p->nents; e++) {
+        uint32_t a = p->ents[e].atom;
+        if (a >= m->ent_sort_cap) {
+            uint32_t nc = m->ent_sort_cap ? m->ent_sort_cap : 64;
+            while (nc <= a) nc *= 2;
+            m->ent_sort = realloc(m->ent_sort, (size_t)nc * sizeof *m->ent_sort);
+            for (uint32_t k = m->ent_sort_cap; k < nc; k++) m->ent_sort[k] = -1;
+            m->ent_sort_cap = nc;
+        }
+        m->ent_sort[a] = p->ents[e].sort;
+    }
+}
+
+/* The schema hook (#92). LOCKSTEP with build_term — the single ground-name
+ * printer: this accepts EXACTLY "pred(e1,..,ek)" (bare pred at arity 0) for a
+ * retained boolean state pred whose args are entities of the declared sorts,
+ * and rejects every other spelling — mv "p(a)=v", guard "p(a)<=5", primed
+ * "p(a)'" all fail the final-char-is-')' / bare-pred test. intern_find_n
+ * probes substrings without interning, so recognizing (or rejecting) an atom
+ * never mutates the table. Pure: a function of the retained schema + intern
+ * contents at call time (I4). */
+static bool matcher_schema_thunk(void *ctx, uint32_t atom, uint32_t *pred,
+                                 uint32_t *args, int *nargs)
+{
+    story_matcher *m = ctx;
+    const char *name = intern_name(m->syms, atom);
+    const char *lp = strchr(name, '(');
+    if (!lp) {                                     /* arity 0: atom IS the pred */
+        for (int i = 0; i < m->nschemas; i++)
+            if (m->schemas[i].pred == atom && m->schemas[i].nargs == 0) {
+                *pred = atom;
+                *nargs = 0;
+                return true;
+            }
+        return false;
+    }
+    uint32_t pa = intern_find_n(m->syms, name, (uint32_t)(lp - name));
+    if (pa == INTERN_NONE)
+        return false;
+    const m_schema *s = NULL;
+    for (int i = 0; i < m->nschemas; i++)
+        if (m->schemas[i].pred == pa && m->schemas[i].nargs > 0) { s = &m->schemas[i]; break; }
+    if (!s)
+        return false;
+    size_t len = strlen(name);
+    if (name[len - 1] != ')')
+        return false;
+    const char *tok = lp + 1, *end = name + len - 1;
+    int k = 0;
+    while (tok < end) {
+        const char *c = memchr(tok, ',', (size_t)(end - tok));
+        const char *te = c ? c : end;
+        if (te == tok || k >= s->nargs)
+            return false;
+        uint32_t e = intern_find_n(m->syms, tok, (uint32_t)(te - tok));
+        if (e == INTERN_NONE || e >= m->ent_sort_cap ||
+            m->ent_sort[e] != s->argsort[k])
+            return false;
+        args[k++] = e;
+        tok = te + 1;
+    }
+    if (k != s->nargs)
+        return false;
+    *pred = pa;
+    *nargs = k;
+    return true;
+}
+
 /* Materialize-on-why (#80): the world hands back one stored view row; re-emit
  * it through the normal matched-rule path so world_why renders the exact trace
  * full emission would have. */
@@ -3754,6 +3904,8 @@ void story_matcher_free(story_matcher *m)
     if (!m) return;
     for (int i = 0; i < m->nrules; i++) { free(m->rules[i].label); free(m->rules[i].prov); }
     free(m->rules);
+    free(m->schemas);
+    free(m->ent_sort);
     free(m);
 }
 
@@ -5242,6 +5394,8 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
 {
     parser *p = calloc(1, sizeof *p);
     p->ground_matched = matched || mret != NULL;
+    p->sparse = mret != NULL;     /* #92: dense universe only for eager +
+                                   * compile-time-matched modes */
     p->rules = calloc(MAX_RULES, sizeof *p->rules);
     p->actions = calloc(MAX_ACTIONS, sizeof *p->actions);
     p->binders = calloc(MAX_BINDERS, sizeof *p->binders);
@@ -5314,6 +5468,7 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
                     else
                         ground_rule(p, &p->rules[i]);
                 world_matched_checkpoint(p->w);       /* boundary: static | matched */
+                matcher_capture_schema(m, p);         /* #92: outlive the parser */
             } else {
                 for (int i = 0; i < p->nrules; i++) {
                     if (p->ground_matched && rule_matchable(p, &p->rules[i]))
@@ -5399,5 +5554,6 @@ story_matcher *story_compile_matcher(const char *src, const char *srcname,
      * world_query / world_step builds the initial layer. */
     world_set_reground_fn(w, matcher_reground_thunk, m);
     world_set_materialize_fn(w, matcher_materialize_thunk, m);   /* islands (#80) */
+    world_set_schema_fn(w, matcher_schema_thunk, m);   /* sparse universe (#92) */
     return m;
 }

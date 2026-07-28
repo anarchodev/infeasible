@@ -70,6 +70,29 @@ uint32_t intern_id(intern *t, const char *name)
     return id;
 }
 
+static uint32_t fnv1a_n(const char *s, uint32_t n)
+{
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < n; i++) {
+        h ^= (unsigned char)s[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+uint32_t intern_find_n(const intern *t, const char *s, uint32_t len)
+{
+    uint32_t i = fnv1a_n(s, len) & (t->nslots - 1);
+    while (t->slots[i]) {
+        uint32_t id = t->slots[i] - 1;
+        const char *nm = t->names[id];
+        if (strncmp(nm, s, len) == 0 && nm[len] == '\0')
+            return id;
+        i = (i + 1) & (t->nslots - 1);
+    }
+    return INTERN_NONE;
+}
+
 const char *intern_name(const intern *t, uint32_t id)
 {
     return id < t->count ? t->names[id] : "<bad-atom>";
