@@ -129,6 +129,9 @@ struct world {
      * Grown geometrically; slot value -1 = absent. Fluents/nums are append-only. */
     int *fluent_of; uint32_t fluent_of_cap;
     int *num_of;    uint32_t num_of_cap;
+    int *guard_of;  uint32_t guard_of_cap;   /* guard atom  -> guards index  */
+    int *prov_of;   uint32_t prov_of_cap;    /* provider atom -> provs index */
+    int *eguard_of; uint32_t eguard_of_cap;  /* expr-guard atom -> eguards index */
     jrule *jrules; int njr, capjr;
     jsup *jsups; int njs, capjs;
     int jr_matched_base;                   /* watermark: static | matched rules (#28) */
@@ -212,6 +215,17 @@ struct world {
     uint32_t *loc_atom;           /* reverse: schema loc -> intern atom (#68 names)*/
     uint32_t loc_atom_cap;
     uint32_t *fl_loc, *pr_loc;    /* per fluent: schema ids of f and f'          */
+    /* The jfam-only SPARSE location map (#77): only atoms the judgment rules
+     * actually reference (heads/bodies, static + matched) plus lazily-
+     * materialized query atoms — never the fluent sweep, primed twins, or step
+     * atoms the dense map carries for the step family. Append-only like the
+     * dense map (#67), so the cached jfam's columns keep their meaning across
+     * re-grounds. Everything outside it answers through the exact lazy path in
+     * query_jfam. */
+    uint32_t *jloc_of;            /* intern atom -> jfam schema atom, ~0u absent */
+    uint32_t jloc_cap, njloc;
+    uint32_t *jloc_atom;          /* reverse: jfam schema atom -> intern atom    */
+    uint32_t jloc_atom_cap;
     /* jfam incremental reuse (#68): the static-rule watermark in the cached jfam
      * dlcol, and how far its atom names have been emitted. */
     int jfam_wm_rules, jfam_wm_body, jfam_wm_sups; uint32_t jfam_named;
@@ -280,6 +294,8 @@ void world_free(world *w)
     free(w->lane_map);
     free(w->loc_of);
     free(w->loc_atom);
+    free(w->jloc_of);
+    free(w->jloc_atom);
     free(w->fl_loc);
     free(w->pr_loc);
     arena_release(&w->a);
@@ -295,6 +311,9 @@ void world_free(world *w)
     free(w->fl_args);
     free(w->fluent_of);
     free(w->num_of);
+    free(w->guard_of);
+    free(w->prov_of);
+    free(w->eguard_of);
     free(w->jrules);
     free(w->jsups);
     free(w->srules);
@@ -499,11 +518,16 @@ long world_get_num(const world *w, uint32_t atom)
     return i >= 0 ? w->nums[i].value : 0;
 }
 
+static int guard_index(const world *w, uint32_t atom)
+{
+    return atom < w->guard_of_cap ? w->guard_of[atom] : -1;
+}
+
 void world_add_guard(world *w, uint32_t guard, uint32_t num,
                      world_cmp op, long threshold)
 {
-    for (int i = 0; i < w->ng; i++)          /* dedup: one atom per (fluent,op,thr) */
-        if (w->guards[i].guard == guard) return;
+    if (guard_index(w, guard) >= 0) return;  /* dedup: one atom per (fluent,op,thr) */
+    atom_map_set(&w->guard_of, &w->guard_of_cap, guard, w->ng);
     GROW(w->guards, w->ng, w->capg);
     w->guards[w->ng].guard = guard;
     w->guards[w->ng].num = num;
@@ -526,12 +550,17 @@ void world_set_fn_provider_fn(world *w, world_fn_provider_fn fn, void *ctx)
     w->fn_provider_ctx = ctx;
 }
 
+static int prov_index(const world *w, uint32_t atom)
+{
+    return atom < w->prov_of_cap ? w->prov_of[atom] : -1;
+}
+
 void world_declare_provider_atom(world *w, uint32_t atom, uint32_t pred,
                                  const uint32_t *args, int nargs)
 {
     if (nargs > 4) nargs = 4;
-    for (int i = 0; i < w->nprov; i++)       /* dedup: one entry per ground atom */
-        if (w->provs[i].atom == atom) return;
+    if (prov_index(w, atom) >= 0) return;    /* dedup: one entry per ground atom */
+    atom_map_set(&w->prov_of, &w->prov_of_cap, atom, w->nprov);
     GROW(w->provs, w->nprov, w->capprov);
     w->provs[w->nprov].atom = atom;
     w->provs[w->nprov].pred = pred;
@@ -550,13 +579,15 @@ static bool provider_holds(const world *w, int i)
 
 /* Load every ground provider atom as a closed-world fact from the callback —
  * mirrors the numeric-guard load; consulted fresh each solve (positions/state may
- * have changed), constant within the solve so the fixpoint's re-reads agree. */
-static void load_providers(world *w, dlcol *f)
+ * have changed), constant within the solve so the fixpoint's re-reads agree.
+ * `of`/`cap` name the target family's location map (the shared dense map today;
+ * the jfam-only sparse map once the judgment family stops sweeping fluents). */
+static void load_providers(world *w, dlcol *f, const uint32_t *of, uint32_t cap)
 {
     for (int i = 0; i < w->nprov; i++) {
         uint32_t pa = w->provs[i].atom;
-        if (pa < w->loc_cap && w->loc_of[pa] != LOC_NONE)
-            dlcol_add_fact(f, (dl_lit){ w->loc_of[pa], !provider_holds(w, i) }, 0);
+        if (pa < cap && of[pa] != LOC_NONE)
+            dlcol_add_fact(f, (dl_lit){ of[pa], !provider_holds(w, i) }, 0);
     }
 }
 
@@ -605,12 +636,17 @@ static bool guard_holds(const world *w, int g)
 
 static long eval_expr(const world *w, const expr_ins *code, int n);
 
+static int eguard_index(const world *w, uint32_t atom)
+{
+    return atom < w->eguard_of_cap ? w->eguard_of[atom] : -1;
+}
+
 void world_add_expr_guard(world *w, uint32_t guard,
                           const expr_ins *lhs, int nlhs,
                           const expr_ins *rhs, int nrhs, world_cmp op)
 {
-    for (int i = 0; i < w->neguard; i++)     /* dedup: one entry per ground atom */
-        if (w->eguards[i].guard == guard) return;
+    if (eguard_index(w, guard) >= 0) return; /* dedup: one entry per ground atom */
+    atom_map_set(&w->eguard_of, &w->eguard_of_cap, guard, w->neguard);
     GROW(w->eguards, w->neguard, w->capeguard);
     expr_ins *l = arena_alloc(&w->a, (size_t)(nlhs ? nlhs : 1) * sizeof *l);
     expr_ins *r = arena_alloc(&w->a, (size_t)(nrhs ? nrhs : 1) * sizeof *r);
@@ -633,12 +669,22 @@ static bool guard_holds_expr(const world *w, int i)
 }
 
 /* Load every ground expression guard as a closed-world fact (like numeric guards). */
-static void load_eguards(world *w, dlcol *f)
+static void load_eguards(world *w, dlcol *f, const uint32_t *of, uint32_t cap)
 {
     for (int i = 0; i < w->neguard; i++) {
         uint32_t ga = w->eguards[i].guard;
-        if (ga < w->loc_cap && w->loc_of[ga] != LOC_NONE)
-            dlcol_add_fact(f, (dl_lit){ w->loc_of[ga], !guard_holds_expr(w, i) }, 0);
+        if (ga < cap && of[ga] != LOC_NONE)
+            dlcol_add_fact(f, (dl_lit){ of[ga], !guard_holds_expr(w, i) }, 0);
+    }
+}
+
+/* Load every ground numeric-comparison guard the same way. */
+static void load_guards(world *w, dlcol *f, const uint32_t *of, uint32_t cap)
+{
+    for (int g = 0; g < w->ng; g++) {
+        uint32_t ga = w->guards[g].guard;
+        if (ga < cap && of[ga] != LOC_NONE)
+            dlcol_add_fact(f, (dl_lit){ of[ga], !guard_holds(w, g) }, 0);
     }
 }
 
@@ -778,6 +824,43 @@ static void solve_lane_iter(world *w, lane_family *lf, int it);
 static void solve_step_family(world *w, const uint32_t *actions, int nactions);
 static void solve_step_family_vals(world *w, const bool *vals,
                                    const uint32_t *actions, int nactions);
+static uint32_t jassign_loc(world *w, uint32_t atom);
+static void emit_atom_names_range(dlcol *f, const world *w, const uint32_t *atomv,
+                                  uint32_t from, uint32_t to);
+
+/* Exact verdict for an atom OUTSIDE the sparse judgment family (#77): no
+ * judgment rule concludes or attacks it, so its verdict is a pure function of
+ * its own fact — precisely what the dense family's fact load concluded for it.
+ * Row order matters and mirrors the dense behavior class by class:
+ *   - a declared fluent answers closed-world from the value store (the world.h
+ *     contract; the dense family loaded f or ~f for every declared fluent);
+ *   - otherwise, an atom the dense map never located is not in the theory at
+ *     all (never-declared, or a registered-but-unreferenced guard/provider —
+ *     the landmark carve-out) -> UNDECIDED, exactly as before;
+ *   - a guard/provider/expr-guard atom the dense map located (e.g. referenced
+ *     only by a step-rule body) was loaded as a closed-world fact -> its
+ *     holds() verdict;
+ *   - anything else the dense map located (primed, action, step-only atoms)
+ *     had a location but no rules and no fact: refuted, both polarities.
+ * Pure: mutates nothing (world_why materializes instead, so traces render). */
+static dl_verdict lazy_judgment_verdict(const world *w, dl_lit q)
+{
+    int i = fluent_index(w, q.atom);
+    if (i >= 0)
+        return q.neg != w->vals[i] ? DL_PROVED : DL_REFUTED;
+    if (q.atom >= w->loc_cap || w->loc_of[q.atom] == LOC_NONE)
+        return DL_UNDECIDED;                       /* absent: unmentioned atom */
+    int g = guard_index(w, q.atom);
+    if (g >= 0)
+        return q.neg != guard_holds(w, g) ? DL_PROVED : DL_REFUTED;
+    int p = prov_index(w, q.atom);
+    if (p >= 0)
+        return q.neg != provider_holds(w, p) ? DL_PROVED : DL_REFUTED;
+    int e = eguard_index(w, q.atom);
+    if (e >= 0)
+        return q.neg != guard_holds_expr(w, e) ? DL_PROVED : DL_REFUTED;
+    return DL_REFUTED;         /* located, rule-less, fact-less: -d both ways */
+}
 
 /* The N=1 judgment path: the proven route, and the oracle world_lanes_check
  * measures the lane families against. */
@@ -786,10 +869,11 @@ static dl_verdict query_jfam(world *w, dl_lit q)
     ensure_jfam(w);
     if (!w->jfam_solved)
         solve_judgment_family(w);
-    if (q.atom >= w->loc_cap || w->loc_of[q.atom] == LOC_NONE)
-        return DL_UNDECIDED;                       /* absent: unmentioned atom */
-    dl_lit loc = { w->loc_of[q.atom], q.neg };
-    return dlcol_defeasible(w->jfam, loc, 0);
+    if (q.atom < w->jloc_cap && w->jloc_of[q.atom] != LOC_NONE) {
+        dl_lit loc = { w->jloc_of[q.atom], q.neg };
+        return dlcol_defeasible(w->jfam, loc, 0);
+    }
+    return lazy_judgment_verdict(w, q);
 }
 
 dl_verdict world_query(world *w, dl_lit q)
@@ -817,14 +901,30 @@ dl_verdict world_query(world *w, dl_lit q)
 void world_why(world *w, dl_lit q, FILE *out)
 {
     ensure_jfam(w);
+    if (q.atom >= w->jloc_cap || w->jloc_of[q.atom] == LOC_NONE) {
+        /* outside the sparse family. If the dense map never saw it either (and
+         * it is no fluent), it is not in the theory — same message as always. */
+        if ((q.atom >= w->loc_cap || w->loc_of[q.atom] == LOC_NONE)
+            && fluent_index(w, q.atom) < 0) {
+            fprintf(out, "why %s%s?\n  (not in the theory — no rule or fact)\n",
+                    q.neg ? "~" : "", intern_name(w->syms, q.atom));
+            return;
+        }
+        /* Lazily materialize it into the jfam so the trace renders: append a
+         * location (append-only, so the cached family stays valid), grow the
+         * columns, name the tail, re-solve. The next solve's fact load picks
+         * the atom up (fluent / guard / provider) via the jloc gate, so the
+         * trace is byte-identical to the dense family's. NOT a structural
+         * edit: struct_ver stays put (bumping it would force a re-ground). */
+        jassign_loc(w, q.atom);
+        dlcol_ensure_atoms(w->jfam, (int)w->njloc);
+        emit_atom_names_range(w->jfam, w, w->jloc_atom, w->jfam_named, w->njloc);
+        w->jfam_named = w->njloc;
+        w->jfam_solved = false;
+    }
     if (!w->jfam_solved)
         solve_judgment_family(w);
-    if (q.atom >= w->loc_cap || w->loc_of[q.atom] == LOC_NONE) {
-        fprintf(out, "why %s%s?\n  (not in the theory — no rule or fact)\n",
-                q.neg ? "~" : "", intern_name(w->syms, q.atom));
-        return;
-    }
-    dl_lit loc = { w->loc_of[q.atom], q.neg };
+    dl_lit loc = { w->jloc_of[q.atom], q.neg };
     dlcol_why(w->jfam, loc, 0, out);
 }
 
@@ -1244,9 +1344,10 @@ static uint32_t assign_loc(world *w, uint32_t atom, uint32_t *n)
     return w->loc_of[atom];
 }
 
-static dl_lit loc_lit(const world *w, dl_lit l)
+/* Rewrite a literal into a family's location space (`of` = its atom->loc map). */
+static dl_lit map_lit(const uint32_t *of, dl_lit l)
 {
-    dl_lit m = { w->loc_of[l.atom], l.neg };
+    dl_lit m = { of[l.atom], l.neg };
     return m;
 }
 
@@ -1268,6 +1369,46 @@ static void grow_loc_of(world *w)
         w->loc_of = realloc(w->loc_of, (size_t)na * sizeof *w->loc_of);
         for (uint32_t k = w->loc_cap; k < na; k++) w->loc_of[k] = LOC_NONE;
         w->loc_cap = na;
+    }
+}
+
+/* ---- the jfam-only sparse map (#77): same append-only discipline (#67),
+ * separate space. The dense map interleaves f, f' from location 0 for the step
+ * family's sake; the judgment family never reads a primed atom, so sizing it to
+ * the dense space made every solve sweep ~2x all declared fluents. The sparse
+ * map holds only judgment-rule atoms + lazily-materialized query atoms. */
+
+static uint32_t jassign_loc(world *w, uint32_t atom)
+{
+    if (atom >= w->jloc_cap) {                     /* grow atom -> loc to intern size */
+        uint32_t na = intern_count(w->syms);
+        w->jloc_of = realloc(w->jloc_of, (size_t)na * sizeof *w->jloc_of);
+        for (uint32_t k = w->jloc_cap; k < na; k++) w->jloc_of[k] = LOC_NONE;
+        w->jloc_cap = na;
+    }
+    if (w->jloc_of[atom] == LOC_NONE) {
+        uint32_t loc = w->njloc++;
+        w->jloc_of[atom] = loc;
+        if (loc >= w->jloc_atom_cap) {             /* grow the reverse loc -> atom map */
+            uint32_t nc = w->jloc_atom_cap ? w->jloc_atom_cap : 64;
+            while (nc <= loc) nc *= 2;
+            w->jloc_atom = realloc(w->jloc_atom, (size_t)nc * sizeof *w->jloc_atom);
+            w->jloc_atom_cap = nc;
+        }
+        w->jloc_atom[loc] = atom;
+    }
+    return w->jloc_of[atom];
+}
+
+/* jfam locations for jrules[from, to) heads/bodies, in rule order (I4:
+ * deterministic given the same add/re-ground sequence). No fluent sweep, no
+ * primed twins, no step rules — that is the whole point. */
+static void assign_jlocs_range(world *w, int from, int to)
+{
+    for (int j = from; j < to; j++) {
+        jassign_loc(w, w->jrules[j].head.atom);
+        for (int i = 0; i < w->jrules[j].nbody; i++)
+            jassign_loc(w, w->jrules[j].body[i].atom);
     }
 }
 
@@ -1325,14 +1466,17 @@ static void emit_atom_names(dlcol *f, const world *w)
 /* Name only the schema locations [from,to) — the atoms a re-ground newly added
  * (#68). Append-only locations (#67) guarantee an atom's location is fixed, so a
  * name set once is never wrong; only the new tail needs naming. */
-static void emit_atom_names_range(dlcol *f, const world *w, uint32_t from, uint32_t to)
+static void emit_atom_names_range(dlcol *f, const world *w, const uint32_t *atomv,
+                                  uint32_t from, uint32_t to)
 {
     for (uint32_t loc = from; loc < to; loc++)
-        dlcol_set_atom_name(f, loc, intern_name(w->syms, w->loc_atom[loc]));
+        dlcol_set_atom_name(f, loc, intern_name(w->syms, atomv[loc]));
 }
 
-/* Add jrules[from,to) as columnar rules (no superiority — that is added once). */
-static void emit_judgment_rule_range(dlcol *f, const world *w, int from, int to)
+/* Add jrules[from,to) as columnar rules (no superiority — that is added once),
+ * rewritten through the target family's location map `of`. */
+static void emit_judgment_rule_range(dlcol *f, const world *w, const uint32_t *of,
+                                     int from, int to)
 {
     dl_lit lbuf[64];
     dl_lit *body = lbuf;
@@ -1345,8 +1489,8 @@ static void emit_judgment_rule_range(dlcol *f, const world *w, int from, int to)
             bodycap = r->nbody;
         }
         for (int i = 0; i < r->nbody; i++)
-            body[i] = loc_lit(w, r->body[i]);
-        int h = dlcol_add_rule(f, r->name, r->kind, loc_lit(w, r->head),
+            body[i] = map_lit(of, r->body[i]);
+        int h = dlcol_add_rule(f, r->name, r->kind, map_lit(of, r->head),
                                body, r->nbody);
         if (r->prov)
             dlcol_set_prov(f, h, r->prov);
@@ -1359,7 +1503,7 @@ static void emit_judgment_rule_range(dlcol *f, const world *w, int from, int to)
  * leading slice of the step family (primed bodies may read these conclusions). */
 static void emit_judgment_rules(dlcol *f, const world *w)
 {
-    emit_judgment_rule_range(f, w, 0, w->njr);
+    emit_judgment_rule_range(f, w, w->loc_of, 0, w->njr);
     for (int j = 0; j < w->njs; j++)
         dlcol_add_sup(f, w->jsups[j].winner, w->jsups[j].loser);
 }
@@ -1377,26 +1521,30 @@ static void emit_judgment_rules(dlcol *f, const world *w)
 static void emit_judgment_family(world *w)
 {
     if (w->jfam && w->jfam_static_ver == w->static_ver) {
-        assign_locs_matched(w);        /* only the matched jrules — no O(fluents) rescan */
+        assign_locs_matched(w);        /* dense map: world_atom_loc's schedule (#67) */
+        assign_jlocs_range(w, w->jr_matched_base, w->njr);
         dlcol_truncate_rules(w->jfam, w->jfam_wm_rules, w->jfam_wm_body, w->jfam_wm_sups);
-        dlcol_ensure_atoms(w->jfam, (int)w->nloc);
-        emit_atom_names_range(w->jfam, w, w->jfam_named, w->nloc);
-        w->jfam_named = w->nloc;
+        dlcol_ensure_atoms(w->jfam, (int)w->njloc);
+        emit_atom_names_range(w->jfam, w, w->jloc_atom, w->jfam_named, w->njloc);
+        w->jfam_named = w->njloc;
     } else {
-        assign_locs(w);                /* full: fluents + static rules + step rules */
+        assign_locs(w);                /* dense map keeps its schedule: fluents +
+                                        * rules + step rules (the step family and
+                                        * the lazy path's located/absent line) */
+        assign_jlocs_range(w, 0, w->njr);          /* sparse: judgment atoms only */
         if (w->jfam) dlcol_free(w->jfam);
-        w->jfam = dlcol_new((int)w->nloc, 1);
-        emit_atom_names_range(w->jfam, w, 0, w->nloc);
-        emit_judgment_rule_range(w->jfam, w, 0, w->jr_matched_base);   /* static */
+        w->jfam = dlcol_new((int)w->njloc, 1);
+        emit_atom_names_range(w->jfam, w, w->jloc_atom, 0, w->njloc);
+        emit_judgment_rule_range(w->jfam, w, w->jloc_of, 0, w->jr_matched_base); /* static */
         for (int j = 0; j < w->njs; j++)                              /* static sups */
             dlcol_add_sup(w->jfam, w->jsups[j].winner, w->jsups[j].loser);
         w->jfam_wm_rules = dlcol_rule_count(w->jfam);
         w->jfam_wm_body  = dlcol_body_count(w->jfam);
         w->jfam_wm_sups  = dlcol_sup_count(w->jfam);
-        w->jfam_named    = w->nloc;
+        w->jfam_named    = w->njloc;
         w->jfam_static_ver = w->static_ver;
     }
-    emit_judgment_rule_range(w->jfam, w, w->jr_matched_base, w->njr); /* matched suffix */
+    emit_judgment_rule_range(w->jfam, w, w->jloc_of, w->jr_matched_base, w->njr); /* matched suffix */
     w->jfam_solved = false;
 }
 
@@ -1448,12 +1596,12 @@ static void emit_step_family(world *w)
         }
         int bi = 0;
         for (int i = 0; i < r->nbody; i++)
-            body[bi++] = loc_lit(w, r->body[i].primed
+            body[bi++] = map_lit(w->loc_of, r->body[i].primed
                                         ? primed_lit(w, r->body[i].lit)
                                         : r->body[i].lit);
         if (r->action != INTERN_NONE) {
             dl_lit act = { r->action, false };
-            body[bi++] = loc_lit(w, act);
+            body[bi++] = map_lit(w->loc_of, act);
         }
         for (int e = 0; e < r->neffects; e++) {
             dl_lit eff = r->effects[e];
@@ -1525,19 +1673,18 @@ static void solve_judgment_family(world *w)
 {
     dlcol *f = w->jfam;
     dlcol_clear_facts(f);
-    for (int i = 0; i < w->nfl; i++) {
-        dl_lit l = { w->fl_loc[i], !w->vals[i] };   /* f if true, ~f if false */
-        dlcol_add_fact(f, l, 0);
+    /* Closed-world facts for the family's OWN atoms only (#77): iterate the
+     * sparse locations, not the declared-fluent sweep — O(jfam atoms) where the
+     * dense map is O(all fluents ever declared). A declared fluent outside the
+     * family answers through lazy_judgment_verdict instead. */
+    for (uint32_t loc = 0; loc < w->njloc; loc++) {
+        int i = fluent_index(w, w->jloc_atom[loc]);
+        if (i >= 0)
+            dlcol_add_fact(f, (dl_lit){ loc, !w->vals[i] }, 0);  /* f or ~f */
     }
-    for (int g = 0; g < w->ng; g++) {
-        uint32_t ga = w->guards[g].guard;
-        if (ga < w->loc_cap && w->loc_of[ga] != LOC_NONE) {
-            dl_lit l = { w->loc_of[ga], !guard_holds(w, g) };
-            dlcol_add_fact(f, l, 0);
-        }
-    }
-    load_providers(w, f);
-    load_eguards(w, f);
+    load_guards(w, f, w->jloc_of, w->jloc_cap);
+    load_providers(w, f, w->jloc_of, w->jloc_cap);
+    load_eguards(w, f, w->jloc_of, w->jloc_cap);
     dlcol_solve(f);
     w->jfam_solved = true;
 }
@@ -1654,15 +1801,9 @@ static void solve_step_family_vals(world *w, const bool *vals,
         }
     }
     /* numeric guard atoms feed judgment rules inside the step theory too */
-    for (int g = 0; g < w->ng; g++) {
-        uint32_t ga = w->guards[g].guard;
-        if (ga < w->loc_cap && w->loc_of[ga] != LOC_NONE) {
-            dl_lit l = { w->loc_of[ga], !guard_holds(w, g) };
-            dlcol_add_fact(f, l, 0);
-        }
-    }
-    load_providers(w, f);
-    load_eguards(w, f);
+    load_guards(w, f, w->loc_of, w->loc_cap);
+    load_providers(w, f, w->loc_of, w->loc_cap);
+    load_eguards(w, f, w->loc_of, w->loc_cap);
     dlcol_solve(f);
 }
 
