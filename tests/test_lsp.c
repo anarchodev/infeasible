@@ -54,6 +54,14 @@
     "rule r1: a => x\n" \
     "rule r2: x & b => y"
 
+/* UTF-16 position fixture: a mid-line block comment with a 2-byte character
+ * (é = C3 A9) sits before `ax` on L1, so `ax`'s BYTE column (17) and its
+ * UTF-16 column (16) differ by one. Pins that the protocol boundary reports /
+ * accepts UTF-16, not bytes.  L1: rule r: /* é *​/ ax => bx                 */
+#define SRC_UTF8 \
+    "state ( ax )\n" \
+    "rule r: /* \xC3\xA9 */ ax => bx"
+
 /* Capture sink: accumulate every emitted body, newline-separated, for strstr. */
 static void cap_emit(void *ud, const char *body, size_t len)
 {
@@ -407,6 +415,40 @@ static int test_call_hierarchy(void)
     return 0;
 }
 
+/* Position encoding: LSP characters are UTF-16 code units, but the compiler
+ * emits byte columns. A 2-byte char before `ax` on L1 makes them differ (byte
+ * 17 vs UTF-16 16); check both the outgoing and incoming remap. */
+static int test_utf16(void)
+{
+    lsp_server *s = lsp_new();
+    strbuf cap; sb_init(&cap);
+    strbuf msg; sb_init(&msg);
+    const char *uri = "file:///u.story";
+
+    build_open(&msg, uri, SRC_UTF8);
+    dispatch(s, &cap, msg.buf);
+    sb_reset(&cap);
+
+    /* OUTGOING: references from ax's (ASCII) decl includes its L1 body use,
+     * whose reported character must be the UTF-16 column 16, not the byte 17. */
+    build_pos_req(&msg, "textDocument/references", uri, 0, 8, 40);
+    dispatch(s, &cap, msg.buf);
+    CHECK(strstr(cap.buf, "\"line\":1,\"character\":16") != NULL);
+    CHECK(strstr(cap.buf, "\"line\":1,\"character\":17") == NULL);
+    sb_reset(&cap);
+
+    /* INCOMING: a position at UTF-16 column 16 on L1 must resolve to `ax`
+     * (byte 17 in the model) -> definition returns its decl. Without the
+     * remap, column 16 would land on the space before `ax` and miss. */
+    build_pos_req(&msg, "textDocument/definition", uri, 1, 16, 41);
+    dispatch(s, &cap, msg.buf);
+    CHECK(strstr(cap.buf, "\"line\":0,\"character\":8") != NULL);
+
+    sb_free(&msg); sb_free(&cap);
+    lsp_free(s);
+    return 0;
+}
+
 /* The minimal JSON layer: parse a nested object, typed accessors, escapes,
  * and rejection of malformed input. */
 static int test_json(void)
@@ -451,6 +493,7 @@ int main(void)
     if (test_navigation())  return 1;
     if (test_hover())       return 1;
     if (test_call_hierarchy()) return 1;
+    if (test_utf16())       return 1;
     printf("test_lsp: all passed\n");
     return 0;
 }

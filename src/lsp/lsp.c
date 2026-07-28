@@ -106,11 +106,8 @@ static const char *at_pos(const char *text, int line, int col)
     return p;
 }
 
-/* Width of the identifier under a diagnostic's start, so the squiggle covers
- * the offending token rather than a single caret. Falls back to one column.
- * NOTE: columns are byte offsets; LSP characters are UTF-16 code units. Equal
- * for ASCII .story sources — the non-ASCII remap is deferred (a known LSP
- * subtlety, revisit alongside multibyte identifiers). */
+/* Width (in bytes) of the identifier under a diagnostic's start, so the
+ * squiggle covers the offending token rather than a single caret. */
 static int token_width(const char *text, int line, int col)
 {
     if (!text || line < 1 || col < 1) return 1;
@@ -120,21 +117,79 @@ static int token_width(const char *text, int line, int col)
     return n > 0 ? n : 1;
 }
 
-static void emit_diagnostic(strbuf *sb, const story_diag *d, const char *text)
-{
-    int line0 = d->line > 0 ? d->line - 1 : 0;
-    int col0  = d->col  > 0 ? d->col  - 1 : 0;
-    int end   = col0 + token_width(text, d->line, d->col);
+/* --- position encoding ---------------------------------------------------
+ * The compiler and span model produce BYTE columns; LSP `character` fields are
+ * UTF-16 code units. Equal for ASCII (the whole .story identifier grammar), so
+ * a non-ASCII character can only appear in a comment — but one to the left of a
+ * token on the same line still shifts every column after it. Convert at the
+ * protocol boundary using the document text, so jumps land exactly. LSP's
+ * default position encoding is UTF-16, which is what we speak. */
 
-    sb_raw(sb, "{\"range\":{\"start\":{\"line\":");
-    sb_int(sb, line0);
+static const char *line_start(const char *text, int line1)
+{
+    const char *p = text;
+    for (int l = 1; l < line1 && *p; p++)
+        if (*p == '\n') l++;
+    return p;
+}
+
+/* Bytes and UTF-16 units spanned by the UTF-8 lead byte `c`. */
+static void utf8_step(unsigned char c, int *nbytes, int *units)
+{
+    if      (c < 0x80) { *nbytes = 1; *units = 1; }
+    else if (c < 0xE0) { *nbytes = 2; *units = 1; }
+    else if (c < 0xF0) { *nbytes = 3; *units = 1; }
+    else               { *nbytes = 4; *units = 2; }   /* astral -> surrogate pair */
+}
+
+/* 0-based BYTE column -> 0-based UTF-16 column on 1-based `line1`. */
+static int byte_to_utf16(const char *text, int line1, int byte_col)
+{
+    const char *p = line_start(text, line1);
+    int b = 0, u = 0;
+    while (b < byte_col && p[b] && p[b] != '\n') {
+        int nb, un; utf8_step((unsigned char)p[b], &nb, &un);
+        b += nb; u += un;
+    }
+    return u;
+}
+
+/* 0-based UTF-16 column -> 0-based BYTE column on 1-based `line1`. */
+static int utf16_to_byte(const char *text, int line1, int utf16_col)
+{
+    const char *p = line_start(text, line1);
+    int b = 0, u = 0;
+    while (u < utf16_col && p[b] && p[b] != '\n') {
+        int nb, un; utf8_step((unsigned char)p[b], &nb, &un);
+        b += nb; u += un;
+    }
+    return b;
+}
+
+/* 1-based (line,col) + byte length -> an LSP Range (0-based, UTF-16, half-open
+ * end), remapping columns against `text`. */
+static void write_range(strbuf *sb, const char *text, int line, int col, int len)
+{
+    int l0 = line > 0 ? line - 1 : 0;
+    int cb = col  > 0 ? col  - 1 : 0;                 /* byte col, 0-based */
+    int start = byte_to_utf16(text, line, cb);
+    int end   = byte_to_utf16(text, line, cb + len);
+    sb_raw(sb, "{\"start\":{\"line\":");
+    sb_int(sb, l0);
     sb_raw(sb, ",\"character\":");
-    sb_int(sb, col0);
+    sb_int(sb, start);
     sb_raw(sb, "},\"end\":{\"line\":");
-    sb_int(sb, line0);
+    sb_int(sb, l0);
     sb_raw(sb, ",\"character\":");
     sb_int(sb, end);
-    sb_raw(sb, "}},\"severity\":");
+    sb_raw(sb, "}}");
+}
+
+static void emit_diagnostic(strbuf *sb, const story_diag *d, const char *text)
+{
+    sb_raw(sb, "{\"range\":");
+    write_range(sb, text, d->line, d->col, token_width(text, d->line, d->col));
+    sb_raw(sb, ",\"severity\":");
     sb_int(sb, d->sev == STORY_ERROR ? LSP_SEV_ERROR : LSP_SEV_WARNING);
     sb_raw(sb, ",\"source\":\"infeasible\",\"message\":");
     sb_jstr(sb, d->msg);
@@ -253,28 +308,13 @@ static const story_occ *occ_at(const story_model *m, int line, int col)
     return NULL;
 }
 
-/* 1-based (line,col,len) -> an LSP Range (0-based, half-open on the end). */
-static void write_range(strbuf *sb, int line, int col, int len)
-{
-    int l0 = line > 0 ? line - 1 : 0;
-    int c0 = col  > 0 ? col  - 1 : 0;
-    sb_raw(sb, "{\"start\":{\"line\":");
-    sb_int(sb, l0);
-    sb_raw(sb, ",\"character\":");
-    sb_int(sb, c0);
-    sb_raw(sb, "},\"end\":{\"line\":");
-    sb_int(sb, l0);
-    sb_raw(sb, ",\"character\":");
-    sb_int(sb, c0 + len);
-    sb_raw(sb, "}}");
-}
-
-static void write_location(strbuf *sb, const char *uri, const story_occ *o)
+static void write_location(strbuf *sb, const char *uri, const char *text,
+                           const story_occ *o)
 {
     sb_raw(sb, "{\"uri\":");
     sb_jstr(sb, uri);
     sb_raw(sb, ",\"range\":");
-    write_range(sb, o->line, o->col, o->len);
+    write_range(sb, text, o->line, o->col, o->len);
     sb_char(sb, '}');
 }
 
@@ -295,15 +335,19 @@ static int symbol_kind(story_sym_kind k)
     return 13;   /* Variable — unreachable fallback */
 }
 
-/* params.position -> 1-based line/col; document text via the store. */
+/* params.position -> 1-based line and 1-based BYTE col (matching the model);
+ * the incoming character is a UTF-16 unit, remapped against the document text. */
 static lsp_doc *nav_target(lsp_server *s, const json *msg, int *line, int *col)
 {
     const json *params = json_get(msg, "params");
     const char *uri = json_str(json_get(json_get(params, "textDocument"), "uri"));
     const json *pos = json_get(params, "position");
-    *line = (int)json_int(json_get(pos, "line"), 0) + 1;
-    *col  = (int)json_int(json_get(pos, "character"), 0) + 1;
-    return uri ? doc_find(s, uri) : NULL;
+    int line1 = (int)json_int(json_get(pos, "line"), 0) + 1;
+    int uchar = (int)json_int(json_get(pos, "character"), 0);
+    lsp_doc *d = uri ? doc_find(s, uri) : NULL;
+    *line = line1;
+    *col  = (d ? utf16_to_byte(d->text, line1, uchar) : uchar) + 1;
+    return d;
 }
 
 static const char *nav_uri(const json *msg)
@@ -332,7 +376,7 @@ static void on_definition(lsp_server *s, const json *msg, const json *id,
                      occs[i].role == STORY_OCC_HEAD) &&
                     strcmp(occs[i].name, hit->name) == 0) {
                     if (emitted++) sb_char(&rb, ',');
-                    write_location(&rb, uri, &occs[i]);
+                    write_location(&rb, uri, d->text, &occs[i]);
                 }
             }
         }
@@ -365,7 +409,7 @@ static void on_references(lsp_server *s, const json *msg, const json *id,
                 if (strcmp(occs[i].name, hit->name) != 0) continue;
                 if (!incl && occs[i].role == STORY_OCC_DECL) continue;
                 if (emitted++) sb_char(&rb, ',');
-                write_location(&rb, uri, &occs[i]);
+                write_location(&rb, uri, d->text, &occs[i]);
             }
         }
         story_model_free(m);
@@ -464,7 +508,7 @@ static void on_hover(lsp_server *s, const json *msg, const json *id,
             sb_raw(&rb, "{\"contents\":{\"kind\":\"markdown\",\"value\":");
             sb_jstr(&rb, md.buf);
             sb_raw(&rb, "},\"range\":");
-            write_range(&rb, hit->line, hit->col, hit->len);
+            write_range(&rb, d->text, hit->line, hit->col, hit->len);
             sb_char(&rb, '}');
             sb_free(&md);
         }
@@ -525,8 +569,8 @@ static const char *atom_kind_word(const story_model *m, const char *name)
     return "conclusion";
 }
 
-static void write_ch_item(strbuf *sb, const char *uri, const story_model *m,
-                          const char *name)
+static void write_ch_item(strbuf *sb, const char *uri, const char *text,
+                          const story_model *m, const char *name)
 {
     const story_occ *r = repr_occ(m, name);
     sb_raw(sb, "{\"name\":");
@@ -538,9 +582,9 @@ static void write_ch_item(strbuf *sb, const char *uri, const story_model *m,
     sb_raw(sb, ",\"uri\":");
     sb_jstr(sb, uri);
     sb_raw(sb, ",\"range\":");
-    if (r) write_range(sb, r->line, r->col, r->len); else sb_raw(sb, ZERO_RANGE);
+    if (r) write_range(sb, text, r->line, r->col, r->len); else sb_raw(sb, ZERO_RANGE);
     sb_raw(sb, ",\"selectionRange\":");
-    if (r) write_range(sb, r->line, r->col, r->len); else sb_raw(sb, ZERO_RANGE);
+    if (r) write_range(sb, text, r->line, r->col, r->len); else sb_raw(sb, ZERO_RANGE);
     sb_char(sb, '}');
 }
 
@@ -559,7 +603,7 @@ static void on_prepare_call_hierarchy(lsp_server *s, const json *msg, const json
         if (hit) {
             have = true;
             sb_char(&rb, '[');
-            write_ch_item(&rb, uri, m, hit->name);
+            write_ch_item(&rb, uri, d->text, m, hit->name);
             sb_char(&rb, ']');
         }
         story_model_free(m);
@@ -601,9 +645,9 @@ static void on_incoming_calls(lsp_server *s, const json *msg, const json *id,
             if (seen) seen[occs[i].rule] = 1;
             if (emitted++) sb_char(&rb, ',');
             sb_raw(&rb, "{\"from\":");
-            write_ch_item(&rb, uri, m, h->name);
+            write_ch_item(&rb, uri, d->text, m, h->name);
             sb_raw(&rb, ",\"fromRanges\":[");
-            write_range(&rb, occs[i].line, occs[i].col, occs[i].len);
+            write_range(&rb, d->text, occs[i].line, occs[i].col, occs[i].len);
             sb_raw(&rb, "]}");
         }
         free(seen);
@@ -642,9 +686,9 @@ static void on_outgoing_calls(lsp_server *s, const json *msg, const json *id,
                 seen[nseen++] = occs[j].name;
                 if (emitted++) sb_char(&rb, ',');
                 sb_raw(&rb, "{\"to\":");
-                write_ch_item(&rb, uri, m, occs[j].name);
+                write_ch_item(&rb, uri, d->text, m, occs[j].name);
                 sb_raw(&rb, ",\"fromRanges\":[");
-                write_range(&rb, occs[j].line, occs[j].col, occs[j].len);
+                write_range(&rb, d->text, occs[j].line, occs[j].col, occs[j].len);
                 sb_raw(&rb, "]}");
             }
         }
@@ -673,9 +717,9 @@ static void on_document_symbol(lsp_server *s, const json *msg, const json *id,
             sb_raw(&rb, ",\"kind\":");
             sb_int(&rb, symbol_kind(syms[i].kind));
             sb_raw(&rb, ",\"range\":");
-            write_range(&rb, syms[i].line, syms[i].col, syms[i].len);
+            write_range(&rb, d->text, syms[i].line, syms[i].col, syms[i].len);
             sb_raw(&rb, ",\"selectionRange\":");
-            write_range(&rb, syms[i].line, syms[i].col, syms[i].len);
+            write_range(&rb, d->text, syms[i].line, syms[i].col, syms[i].len);
             sb_char(&rb, '}');
         }
         story_model_free(m);
