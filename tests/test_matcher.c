@@ -25,10 +25,23 @@
         fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); return 1; } \
     } while (0)
 
+/* host geometry for `sees(X, Y)`: true iff the ordered pair is in the fixed set */
+typedef struct { uint32_t x[8], y[8]; int n; } seeset;
+static bool sees_cb(void *ctx, uint32_t pred, const uint32_t *args, int nargs)
+{
+    (void)pred;
+    const seeset *s = ctx;
+    if (nargs < 2) return false;
+    for (int i = 0; i < s->n; i++)
+        if (s->x[i] == args[0] && s->y[i] == args[1]) return true;
+    return false;
+}
+
 static const char *STORY =
     "scene bench\n"
     "sort actor\n"
     "entity ( a, b, c : actor )\n"
+    "provider sees(actor, actor)\n"
     "state (\n"
     "  adj(actor, actor)\n"
     "  awake(actor)\n"
@@ -52,6 +65,9 @@ static const char *STORY =
     /* matchable WITH a numeric guard filter: awake(X) generates, hp(X) <= 5 is
      * carried into the rule and solver-evaluated (hp(a)=3 passes) */
     "rule critical(X: actor): awake(X) & hp(X) <= 5 => critical(X)\n"
+    /* matchable WITH a provider filter: awake(X), awake(Y) generate; sees(X,Y) is
+     * a host relation carried into the rule and consulted by the solver */
+    "rule spot(X: actor, Y: actor): awake(X) & awake(Y) & sees(X, Y) => spotted(X, Y)\n"
     /* NOT matchable: guard-ONLY body, no positive generator to enumerate X from
      * (compute_bound_vars would bind X via the guard, but the matcher can't) */
     "rule hurt(X: actor): hp(X) <= 5 => hurt(X)\n"
@@ -80,6 +96,11 @@ int main(void)
     CHECK(A && B);
     CHECK(dga.nerrors == 0 && dgb.nerrors == 0);
 
+    /* same provider callback on both worlds: sees(a,b) holds */
+    seeset ss = { { intern_id(sy, "a") }, { intern_id(sy, "b") }, 1 };
+    world_set_provider_fn(A, sees_cb, &ss);
+    world_set_provider_fn(B, sees_cb, &ss);
+
     /* sanity: the matcher actually fired (fewer or equal, and the right facts) */
     CHECK(world_query(A, dl_pos(intern_id(sy, "threat(a,b)"))) == DL_PROVED);
     CHECK(world_query(B, dl_pos(intern_id(sy, "threat(a,b)"))) == DL_PROVED);
@@ -92,6 +113,9 @@ int main(void)
     CHECK(world_query(B, dl_pos(intern_id(sy, "ready(c)"))) != DL_PROVED);
     /* numeric-guard filter: critical(a) fires (awake(a) & hp(a)=3 <= 5) */
     CHECK(world_query(B, dl_pos(intern_id(sy, "critical(a)"))) == DL_PROVED);
+    /* provider filter: spotted(a,b) fires (awake(a) & awake(b) & sees(a,b)) */
+    CHECK(world_query(B, dl_pos(intern_id(sy, "spotted(a,b)"))) == DL_PROVED);
+    CHECK(world_query(B, dl_pos(intern_id(sy, "spotted(b,c)"))) != DL_PROVED);  /* c not awake */
 
     /* The equivalence: the two worlds PROVE exactly the same literals — every
      * atom, both polarities. Provability is the guarantee the matcher owes and
@@ -104,15 +128,17 @@ int main(void)
      * Judgments are not closed-world (only fluents are), so nothing that is
      * PROVED ever moves — that is the theorem, and it holds exactly.
      *
-     * Internal numeric-guard landmark atoms ("hp(b)<=5") are excluded: they are
-     * closed-world only once world_add_guard registers them, which happens per
-     * EMITTED instance, so an unregistered guard is proved in eager but undecided
+     * Internal LANDMARK atoms — numeric guards ("hp(b)<=5") and provider relations
+     * ("sees(a,b)") — are excluded: they are closed-world only once
+     * world_add_guard / world_declare_provider_atom registers them, which happens
+     * per EMITTED instance, so an unregistered one is proved in eager but undecided
      * in the matcher. It never reaches a judgment (no emitted rule references it),
      * so it is a compiler-internal atom, not part of the host-visible contract. */
     uint32_t n = intern_count(sy);
     int diffs = 0;
     for (uint32_t id = 1; id < n; id++) {
-        if (strpbrk(intern_name(sy, id), "<>")) continue;   /* guard landmark */
+        const char *nm = intern_name(sy, id);
+        if (strpbrk(nm, "<>") || strncmp(nm, "sees(", 5) == 0) continue;  /* landmark */
         for (int neg = 0; neg < 2; neg++) {
             dl_lit q = neg ? dl_neg(id) : dl_pos(id);
             bool pa = world_query(A, q) == DL_PROVED;

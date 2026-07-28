@@ -39,10 +39,24 @@
         fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); return 1; } \
     } while (0)
 
+/* host geometry for `sees(X, Y)`: true iff the ordered pair is in the fixed set.
+ * Deterministic and identical for both worlds, so registered atoms agree. */
+typedef struct { uint32_t x[8], y[8]; int n; } seeset;
+static bool sees_cb(void *ctx, uint32_t pred, const uint32_t *args, int nargs)
+{
+    (void)pred;
+    const seeset *s = ctx;
+    if (nargs < 2) return false;
+    for (int i = 0; i < s->n; i++)
+        if (s->x[i] == args[0] && s->y[i] == args[1]) return true;
+    return false;
+}
+
 static const char *STORY =
     "scene tt\n"
     "sort actor\n"
     "entity ( a, b, c : actor )\n"
+    "provider sees(actor, actor)\n"
     "state (\n"
     "  adj(actor, actor)\n"
     "  awake(actor)\n"
@@ -69,6 +83,11 @@ static const char *STORY =
      * so weak(b) never holds even once b wakes. Exercises the tick-time guard
      * emit path (m_ground_lit guard branch + world_add_guard) across regrounds. */
     "rule weak(X: actor): awake(X) & hp(X) <= 5 => weak(X)\n"
+    /* matchable WITH a provider filter: awake(X), awake(Y) generate; sees(X,Y) is
+     * a host-answered relation carried into the rule and consulted by the solver.
+     * Exercises the tick-time provider emit path (m_ground_lit provider branch +
+     * world_declare_provider_atom) across regrounds. sees(a,b) is in the host set. */
+    "rule spot(X: actor, Y: actor): awake(X) & awake(Y) & sees(X, Y) => spotted(X, Y)\n"
     /* STATIC superiority (Tweety): both rules are non-matchable (in a `>` pair),
      * so they are ground once — and the `>` must SURVIVE every re-ground. If the
      * matched-layer reset truncated the superiority array (the bug the watermark
@@ -90,27 +109,29 @@ static char *why_str(world *w, dl_lit q)
     return buf;
 }
 
-/* An internal numeric-guard landmark atom ("hp(b)<=5"), not a host-queried
- * judgment. Its closed-world truth is asserted only once world_add_guard has
- * registered it — which happens per EMITTED instance. Eager grounds every
- * sort^k instance (registering the guard for all bindings), the matcher only the
- * generator-satisfying ones, so an unregistered guard is PROVED in eager but
- * UNDECIDED in the matcher. That divergence never reaches a judgment: an
- * unregistered guard is referenced by no emitted rule, so it changes no verdict
- * a host can query. Excluded from the sweep like the judgment-head artifact. */
-static int is_guard_atom(const char *name)
+/* An internal LANDMARK atom — a numeric guard ("hp(b)<=5") or a provider relation
+ * ("sees(a,b)") — not a host-queried judgment. Its closed-world truth is asserted
+ * only once world_add_guard / world_declare_provider_atom has registered it, which
+ * happens per EMITTED instance. Eager grounds every sort^k instance (registering
+ * the landmark for all bindings), the matcher only the generator-satisfying ones,
+ * so an unregistered landmark is PROVED in eager but UNDECIDED in the matcher.
+ * That divergence never reaches a judgment: an unregistered landmark is referenced
+ * by no emitted rule, so it changes no verdict a host can query. Excluded from the
+ * sweep like the judgment-head artifact. */
+static int is_landmark_atom(const char *name)
 {
-    return strpbrk(name, "<>") != NULL;   /* <=, <, >=, > — never in a normal atom */
+    return strpbrk(name, "<>") != NULL       /* guard: <=, <, >=, > */
+        || strncmp(name, "sees(", 5) == 0;   /* the story's one provider relation */
 }
 
-/* Every (non-guard) atom, both polarities: the two worlds must PROVE exactly the
- * same literals (same provability contract as test_matcher). Returns diff count. */
+/* Every (non-landmark) atom, both polarities: the two worlds must PROVE exactly
+ * the same literals (same provability contract as test_matcher). Returns diffs. */
 static int provability_diffs(world *A, world *B, intern *sy)
 {
     uint32_t n = intern_count(sy);
     int diffs = 0;
     for (uint32_t id = 1; id < n; id++) {
-        if (is_guard_atom(intern_name(sy, id))) continue;
+        if (is_landmark_atom(intern_name(sy, id))) continue;
         for (int neg = 0; neg < 2; neg++) {
             dl_lit q = neg ? dl_neg(id) : dl_pos(id);
             bool pa = world_query(A, q) == DL_PROVED;
@@ -151,6 +172,12 @@ int main(void)
     CHECK(dga.nerrors == 0 && dgb.nerrors == 0);
     CHECK(story_matcher_world(M) == B);    /* sanity: matcher's world is B */
 
+    /* the same provider callback on both worlds: sees(a,b) and sees(b,c) hold */
+    seeset ss = { { intern_id(sy, "a"), intern_id(sy, "b") },
+                  { intern_id(sy, "b"), intern_id(sy, "c") }, 2 };
+    world_set_provider_fn(A, sees_cb, &ss);
+    world_set_provider_fn(B, sees_cb, &ss);
+
     dl_lit t_ab = dl_pos(intern_id(sy, "threatens(a,b)"));
     dl_lit t_bc = dl_pos(intern_id(sy, "threatens(b,c)"));
     dl_lit not_flies_a = dl_neg(intern_id(sy, "flies(a)"));   /* nofly > fly decides it */
@@ -158,6 +185,7 @@ int main(void)
     dl_lit hunts_b = dl_pos(intern_id(sy, "hunts(b)"));       /* tracks awake(b) */
     dl_lit weak_a = dl_pos(intern_id(sy, "weak(a)"));         /* hp(a)=3 <= 5: guard passes */
     dl_lit weak_b = dl_pos(intern_id(sy, "weak(b)"));         /* hp(b)=8 > 5: guard fails */
+    dl_lit spot_ab = dl_pos(intern_id(sy, "spotted(a,b)"));   /* awake(a,b) & sees(a,b) */
 
     /* t=0: only awake(a). alarm(a,b) fires -> threatens(a,b); threatens(b,c) needs awake(b). */
     CHECK(world_query(A, t_ab) == DL_PROVED);
@@ -169,6 +197,7 @@ int main(void)
     CHECK(world_query(B, hunts_b) != DL_PROVED);       /* b not awake yet */
     CHECK(world_query(B, weak_a) == DL_PROVED);        /* awake(a) & hp(a)=3 <= 5 */
     CHECK(world_query(B, weak_b) != DL_PROVED);        /* b not awake yet */
+    CHECK(world_query(B, spot_ab) != DL_PROVED);       /* b not awake: no awake(a)&awake(b) */
     CHECK(provability_diffs(A, B, sy) == 0);
     CHECK(why_same(A, B, t_ab));
     CHECK(why_same(A, B, weak_a));                     /* guard landmark atom in the trace */
@@ -191,9 +220,11 @@ int main(void)
     CHECK(world_query(B, hunts_a) != DL_PROVED);     /* ~penguin(a) still prunes it */
     CHECK(world_query(B, weak_b) != DL_PROVED);      /* awake(b) now, but hp(b)=8 > 5: guard prunes */
     CHECK(world_query(B, weak_a) == DL_PROVED);      /* still awake, hp(a) still 3 */
+    CHECK(world_query(B, spot_ab) == DL_PROVED);     /* awake(a) & awake(b) & sees(a,b): fires */
     CHECK(provability_diffs(A, B, sy) == 0);
     CHECK(why_same(A, B, t_bc));                     /* freshly-materialized trace */
     CHECK(why_same(A, B, hunts_b));                  /* negated body literal in the trace */
+    CHECK(why_same(A, B, spot_ab));                  /* provider landmark atom in the trace */
 
     /* step 2 — sleep(a): the matched set SHRINKS. awake(a) is now false, so the
      * only support for threatens(a,b) is gone; re-grounding must DROP that
@@ -209,6 +240,7 @@ int main(void)
     CHECK(world_query(B, t_bc) == DL_PROVED);        /* awake(b) still true */
     CHECK(world_query(B, not_flies_a) == DL_PROVED); /* `>` still intact after 2 regrounds */
     CHECK(world_query(B, weak_a) != DL_PROVED);      /* awake(a) gone: guard rule drops too */
+    CHECK(world_query(B, spot_ab) != DL_PROVED);     /* awake(a) gone: provider rule drops too */
     CHECK(provability_diffs(A, B, sy) == 0);
     CHECK(why_same(A, B, t_bc));
 
