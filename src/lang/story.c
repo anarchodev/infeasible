@@ -16,6 +16,7 @@
 #define MAX_SORTS      32
 #define MAX_ENTS       (1 << 20)   /* sanity ceiling; entities grow on the heap */
 #define MAX_MEMPOOL    1024    /* membership-list values across a file (#95) */
+#define MAX_LAYERS     8       /* guarded definitions per value (#82/#94) */
 #define MAX_FLUENTS    256     /* fluent *predicate* schemas */
 #define MAX_PREDS      512     /* predicate registry (fluents + heads) */
 #define MAX_RULES      256
@@ -83,9 +84,11 @@ typedef struct {
 typedef enum {
     EX_CONST, EX_LOAD, EX_ROLL, EX_CALL, EX_ADD, EX_SUB, EX_MUL, EX_DIV, EX_NEG,
     EX_MIN, EX_MAX,
-    EX_TEST   /* `test([~]p(args))` (#86): a literal's solved verdict as 0/1.
-               * `pred`/`args` = the literal; `konst` = 1 for a `~` literal.
-               * Effect-side only until #87 stratification. */
+    EX_TEST,  /* `test([~]p(args))` (#86): a literal's solved verdict as 0/1.
+               * `pred`/`args` = the literal; `konst` = 1 for a `~` literal. */
+    EX_PRIOR  /* `prior` (#82/#94): inside a layered definition's expression,
+               * the value that would have held without this definition —
+               * compiles to EXPR_P over the chain's running value. */
 } ex_kind;
 /* EX_CALL (§5.6): a value-returning function-provider call `f(e1, …, ek)`.
  * `pred` = the function name; `nargs` = k; `cargs[0..k)` = child expr indices. */
@@ -119,6 +122,9 @@ typedef struct {
     bool         has_guard;
     ast_atom     guard[MAX_BODY];
     int          nguard;
+    int          vclass;          /* valuedef layer class (#94): 0 override,
+                                   * 1 prior+e, 2 max(prior,e), 3 min(prior,e),
+                                   * 4 general prior use */
     /* grounding results, in odometer order (var 0 most significant) */
     struct { int handle; } *insts;
     int          ninst;
@@ -311,7 +317,14 @@ typedef struct {
                                    * (-1 until an `as` typed contribution is seen) */
     bool has_pguards;             /* #87: any primed numeric guard — strata exist,
                                    * step lanes bail, world steps N=1 */
-    int value_def[MAX_FLUENTS];           /* per value: defining rule index, -1 = none */
+    int value_def[MAX_FLUENTS];           /* per value: the BASE definition (the one
+                                           * unconditional rule), -1 = none yet */
+    int vdefs[MAX_FLUENTS][MAX_LAYERS + 1];   /* all defs, declaration order (#82/#94) */
+    int nvdefs[MAX_FLUENTS];
+    int value_layers[MAX_FLUENTS][MAX_LAYERS];/* guarded defs, CHAIN order (bottom->top) */
+    int value_nlayers[MAX_FLUENTS];
+    int *vmark_of; uint32_t vmark_cap;    /* marker atom -> grounded flag (dedup) */
+    bool in_valuedef_expr;                /* `prior` legality context */
     int vdepth;                           /* value-inline recursion depth (cycle backstop) */
     ast_rule   *rules;            /* heap; MAX_RULES */
     int nrules;
@@ -705,6 +718,11 @@ static int parse_factor(parser *p)
         bool ismin = ident_is(id, "min"), ismax = ident_is(id, "max");
         bool isdivup = ident_is(id, "divup");
         advance(p);
+        if (ident_is(id, "prior") && p->cur.kind != TK_LPAREN) {
+            /* `prior` (#82/#94): the value a layered definition would have had
+             * without this layer; legality (definitions only) checked later */
+            return alloc_expr(p, EX_PRIOR, id.line, id.col);
+        }
         if (ident_is(id, "roll") && p->cur.kind == TK_LPAREN) {   /* roll(sides[, tag]) */
             advance(p);
             long sides, tag = 0;
@@ -2360,9 +2378,14 @@ static bool expr_has_test(parser *p, int e, int depth)
     case EX_CONST: case EX_ROLL: return false;
     case EX_LOAD: {
         int vi = find_value(p, n->pred);
-        if (vi < 0 || p->value_def[vi] < 0) return false;
-        return expr_has_test(p, p->rules[p->value_def[vi]].head.lhs_root,
-                             depth + 1);
+        if (vi < 0) return false;
+        for (int d = 0; d < p->nvdefs[vi]; d++) {
+            ast_rule *dr = &p->rules[p->vdefs[vi][d]];
+            if (dr->nbody > 0 || dr->has_guard)    /* layered: markers tested */
+                return true;
+            if (expr_has_test(p, dr->head.lhs_root, depth + 1)) return true;
+        }
+        return false;
     }
     case EX_CALL:
         for (int k = 0; k < n->nargs; k++)
@@ -2389,7 +2412,7 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
         pred_info *pi = find_pred(p, n->pred);
         if (pi && pi->is_value) {              /* a derived-value read (#82) */
             int vi = find_value(p, n->pred);
-            if (vi >= 0 && p->value_def[vi] < 0) {
+            if (vi >= 0 && p->nvdefs[vi] == 0) {
                 serr(p, n->line, n->col,
                      "value '%s' has no definition — write "
                      "`rule <label>: => %s(…) = expr`",
@@ -2458,6 +2481,13 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
         }
         return;
     }
+    case EX_PRIOR:
+        if (!p->in_valuedef_expr)
+            serr(p, n->line, n->col,
+                 "`prior` is only meaningful inside a value definition's "
+                 "expression — it names the value the layers below would have "
+                 "produced (#82)");
+        return;
     case EX_TEST: {                            /* `test([~]p(args))` (#86) */
         note_ref(p, n->pred, n->line, n->col);
         pred_info *ti = find_pred(p, n->pred);
@@ -2646,29 +2676,29 @@ static bool rule_has_test_guard(parser *p, const ast_rule *r)
     return false;
 }
 
-static void check_tested_cone(parser *p, const ex_node *tn)
+static void check_tested_cone_pred(parser *p, uint32_t pred, int line, int col)
 {
-    pred_info *pi = find_pred(p, tn->pred);
+    pred_info *pi = find_pred(p, pred);
     if (!pi || pi->is_fluent || pi->is_provider || !pi->is_head)
         return;             /* load-time input, or unknown (orphan warns) */
     bool seen[MAX_PREDS] = { false };
     uint32_t queue[MAX_PREDS];
-    int qh = 0, qt = 0, ti = pred_idx(p, tn->pred);
+    int qh = 0, qt = 0, ti = pred_idx(p, pred);
     if (ti >= 0) seen[ti] = true;
-    queue[qt++] = tn->pred;
+    queue[qt++] = pred;
     while (qh < qt) {
         uint32_t q = queue[qh++];
         for (int i = 0; i < p->nrules; i++) {
             ast_rule *r = &p->rules[i];
             if (r->head.is_valuedef || r->head.pred != q) continue;
             if (rule_has_test_guard(p, r)) {
-                serr(p, tn->line, tn->col,
+                serr(p, line, col,
                      "test(%s…) in a guard: '%s' is itself derived through a "
                      "test(…) guard (rule '%s'), so it does not settle below "
                      "this guard — nested test guards are a later stratum "
                      "(§5.8); derive one side from state instead",
-                     intern_name(p->syms, tn->pred),
-                     intern_name(p->syms, tn->pred), r->label);
+                     intern_name(p->syms, pred),
+                     intern_name(p->syms, pred), r->label);
                 return;
             }
             for (int pass = 0; pass < 2; pass++) {
@@ -2688,20 +2718,41 @@ static void check_tested_cone(parser *p, const ex_node *tn)
     }
 }
 
-static void check_guard_test_nodes(parser *p, int e)
+static void check_guard_test_nodes(parser *p, int e, int depth)
 {
-    if (e < 0) return;
+    if (e < 0 || depth > 2 * MAX_ARGS) return;   /* cycles error in their own pass */
     ex_node *n = &p->exprs[e];
     switch (n->kind) {
-    case EX_TEST:  check_tested_cone(p, n); return;
-    case EX_CONST: case EX_ROLL: case EX_LOAD: return;   /* value defs reject test */
-    case EX_CALL:
-        for (int k = 0; k < n->nargs; k++) check_guard_test_nodes(p, n->cargs[k]);
+    case EX_TEST:  check_tested_cone_pred(p, n->pred, n->line, n->col); return;
+    case EX_CONST: case EX_ROLL: return;
+    case EX_LOAD: {
+        /* a LAYERED value read in a guard tests its markers (#82/#94): every
+         * definition body must settle in pass A — its preds' cones test-free
+         * (test-guards inside definition bodies are rejected upstream) */
+        int vj = find_value(p, n->pred);
+        if (vj < 0) return;
+        for (int d = 0; d < p->nvdefs[vj]; d++) {
+            ast_rule *dr = &p->rules[p->vdefs[vj][d]];
+            for (int pass2 = 0; pass2 < 2; pass2++) {
+                ast_atom *ats = pass2 ? dr->guard : dr->body;
+                int nat = pass2 ? dr->nguard : dr->nbody;
+                for (int b = 0; b < nat; b++)
+                    if (!ats[b].is_expr_guard && !ats[b].is_member)
+                        check_tested_cone_pred(p, ats[b].pred,
+                                               ats[b].line, ats[b].col);
+            }
+            check_guard_test_nodes(p, dr->head.lhs_root, depth + 1);
+        }
         return;
-    case EX_NEG:   check_guard_test_nodes(p, n->lhs); return;
+    }
+    case EX_CALL:
+        for (int k = 0; k < n->nargs; k++)
+            check_guard_test_nodes(p, n->cargs[k], depth);
+        return;
+    case EX_NEG:   check_guard_test_nodes(p, n->lhs, depth); return;
     default:
-        check_guard_test_nodes(p, n->lhs);
-        check_guard_test_nodes(p, n->rhs);
+        check_guard_test_nodes(p, n->lhs, depth);
+        check_guard_test_nodes(p, n->rhs, depth);
         return;
     }
 }
@@ -2725,8 +2776,8 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
         /* test(…) in a guard is admissible when every tested atom settles in
          * pass A of the two-phase solve (#86 guard half — advantage's home);
          * a tested judgment derived through another test-guard is rejected */
-        check_guard_test_nodes(p, at->lhs_root);
-        check_guard_test_nodes(p, at->rhs_root);
+        check_guard_test_nodes(p, at->lhs_root, 0);
+        check_guard_test_nodes(p, at->rhs_root, 0);
         check_expr(p, at->lhs_root, vars, nvars);
         check_expr(p, at->rhs_root, vars, nvars);
         return;
@@ -3285,29 +3336,66 @@ static void check_functions(parser *p)
 }
 
 /* Register a value definition's rule index (#82) — a pre-pass, so a read
- * checked anywhere in the rules loop can already see whether a definition
- * exists regardless of declaration order. */
+ * checked anywhere in the rules loop can already see whether definitions
+ * exist regardless of declaration order. All defs collect here; the base is
+ * chosen and the chain ordered in order_value_layers below. */
 static void register_valuedef(parser *p, int ri)
 {
     ast_rule *r = &p->rules[ri];
     int vi = find_value(p, r->head.pred);          /* parse gated on this */
     if (vi < 0) return;
-    if (p->value_def[vi] >= 0) {
+    if (p->nvdefs[vi] >= MAX_LAYERS + 1) {
         serr(p, r->line, r->col,
-             "'%s' already has a definition ('%s') — multiple definitions "
-             "ordered by superiority are a later slice of #82",
-             intern_name(p->syms, r->head.pred),
-             p->rules[p->value_def[vi]].label);
+             "'%s' has too many definitions (max %d — one base + %d layers)",
+             intern_name(p->syms, r->head.pred), MAX_LAYERS + 1, MAX_LAYERS);
         return;
     }
-    p->value_def[vi] = ri;
+    p->vdefs[vi][p->nvdefs[vi]++] = ri;
 }
 
-/* Validate a value definition `rule L(vars): => v(args) = expr` (#82, slice 1:
- * exactly one unconditional definition per value; guards, layering via
- * superiority, and `prior` are the next slice). A definition is never a dl
- * rule — it is inlined at every read site, grounds nothing, and joins no
- * fixpoint; that is why the whole rules pipeline skips it. */
+/* Does expr subtree e mention `prior` anywhere? */
+static bool expr_has_prior(parser *p, int e)
+{
+    if (e < 0) return false;
+    ex_node *n = &p->exprs[e];
+    switch (n->kind) {
+    case EX_PRIOR: return true;
+    case EX_CONST: case EX_ROLL: case EX_LOAD: return false;
+    case EX_CALL:
+        for (int k = 0; k < n->nargs; k++)
+            if (expr_has_prior(p, n->cargs[k])) return true;
+        return false;
+    case EX_NEG: return expr_has_prior(p, n->lhs);
+    default:     return expr_has_prior(p, n->lhs) || expr_has_prior(p, n->rhs);
+    }
+}
+
+/* Classify a definition's combination class (#94): the commutation check is
+ * BY CLASS — `prior + e` layers commute with each other (addition), and so do
+ * `max(prior, e)` / `min(prior, e)` layers among themselves; an override (no
+ * `prior`) or a general prior use (e.g. halve/double — the §5.8 witness for
+ * why floored scalings do NOT commute) must be totally ordered by `>`. */
+static int valuedef_class(parser *p, int e)
+{
+    if (!expr_has_prior(p, e)) return 0;           /* override */
+    ex_node *n = &p->exprs[e];
+    int a = n->lhs, b = n->rhs;
+    bool la = a >= 0 && p->exprs[a].kind == EX_PRIOR;
+    bool lb = b >= 0 && p->exprs[b].kind == EX_PRIOR;
+    if ((la && !lb && b >= 0 && !expr_has_prior(p, b)) ||
+        (lb && !la && a >= 0 && !expr_has_prior(p, a))) {
+        if (n->kind == EX_ADD) return 1;
+        if (n->kind == EX_MAX) return 2;
+        if (n->kind == EX_MIN) return 3;
+    }
+    return 4;                                      /* general: order it explicitly */
+}
+
+/* Validate a value definition `rule L(vars): [body] => v(args) = expr`
+ * (#82/#94). A definition is never a dl rule — its BODY grounds to a marker
+ * judgment (`body => label(binding)`) on first read, and its expression is
+ * inlined into the chain program at every read site; the whole rules pipeline
+ * skips the definition itself. */
 static void check_valuedef(parser *p, int ri)
 {
     ast_rule *r = &p->rules[ri];
@@ -3326,11 +3414,20 @@ static void check_valuedef(parser *p, int ri)
              "definitions is what will make '%s' layerable, #82)", nm);
         return;
     }
-    if (r->nbody > 0 || r->has_guard) {
+    /* guarded definitions (#82 layering): the body is an ordinary conjunct,
+     * checked like a rule body; it must not itself contain a test-bearing
+     * guard (the marker has to settle in pass A of the two-phase solve) */
+    for (int b = 0; b < r->nbody; b++)
+        check_atom(p, &r->body[b], r->vars, r->nvars, true, false, false,
+                   "a value-definition body");
+    for (int g = 0; g < r->nguard; g++)
+        check_atom(p, &r->guard[g], r->vars, r->nvars, true, false, false,
+                   "a value-definition `unless` guard");
+    if (rule_has_test_guard(p, r)) {
         serr(p, r->line, r->col,
-             "a guarded value definition is a later slice of #82 — '%s' takes "
-             "exactly one unconditional definition for now (layered definitions "
-             "need superiority + `prior`)", nm);
+             "a test(…) guard in a value definition's body — the definition's "
+             "marker must settle in the first solve pass (§5.8); derive the "
+             "condition from state instead");
         return;
     }
     int vi = find_value(p, h->pred);
@@ -3369,8 +3466,10 @@ static void check_valuedef(parser *p, int ri)
              "directly in the effect instead");
         return;
     }
-    if (p->value_def[vi] == ri)                    /* the winning registration */
-        check_expr(p, h->lhs_root, r->vars, r->nvars);
+    p->in_valuedef_expr = true;                    /* `prior` legal here */
+    check_expr(p, h->lhs_root, r->vars, r->nvars);
+    p->in_valuedef_expr = false;
+    r->vclass = valuedef_class(p, h->lhs_root);
 }
 
 /* #82: a value definition must not read itself, directly or through other
@@ -3402,12 +3501,124 @@ static bool value_cycle_dfs(parser *p, int vi, bool *onstack, bool *done)
     if (done[vi]) return false;
     if (onstack[vi]) return true;
     onstack[vi] = true;
-    int ri = p->value_def[vi];
-    bool cyc = ri >= 0 &&
-        expr_value_cycle(p, p->rules[ri].head.lhs_root, onstack, done);
+    bool cyc = false;
+    for (int d = 0; d < p->nvdefs[vi] && !cyc; d++)   /* every definition's expr */
+        cyc = expr_value_cycle(p, p->rules[p->vdefs[vi][d]].head.lhs_root,
+                               onstack, done);
     onstack[vi] = false;
     done[vi] = true;
     return cyc;
+}
+
+/* ---- #82/#94: choose the base, order the chain, check well-formedness ----
+ *
+ * Per value: exactly ONE unconditional definition (the base — #94's "a base
+ * must exist", made static; it keeps every value total, so reads stay legal
+ * in guards and effects exactly as in the single-definition slice). Guarded
+ * definitions form the chain above it, ordered by the EXISTING superiority
+ * relation over rule labels: `a > b` places a ABOVE b. The order need only be
+ * partial: unordered pairs are legal iff both are layers of the SAME class
+ * (add/add, max/max, min/min — commutative by construction, #94); an override
+ * or a general prior use must be comparable to every other guarded def, since
+ * its result depends on position. Ties fall back to declaration order, which
+ * by then is semantically irrelevant. */
+static void order_value_layers(parser *p)
+{
+    for (int vi = 0; vi < p->nvaluedecls; vi++) {
+        int nds = p->nvdefs[vi];
+        if (nds == 0) continue;
+        const char *vn = intern_name(p->syms, p->valuedecls[vi].pred);
+
+        /* the base: exactly one unconditional, prior-free definition */
+        int base = -1;
+        int gl[MAX_LAYERS], ngl = 0;               /* guarded defs, decl order */
+        for (int d = 0; d < nds; d++) {
+            int ri = p->vdefs[vi][d];
+            ast_rule *r = &p->rules[ri];
+            if (r->nbody == 0 && !r->has_guard) {
+                if (base >= 0) {
+                    serr(p, r->line, r->col,
+                         "'%s' has two unconditional definitions ('%s' and "
+                         "'%s') — exactly one is the base; give the other a "
+                         "body (#94)", vn, p->rules[base].label, r->label);
+                    return;
+                }
+                base = ri;
+                if (expr_has_prior(p, r->head.lhs_root)) {
+                    serr(p, r->line, r->col,
+                         "`prior` in the base definition of '%s' has nothing "
+                         "beneath it (#94)", vn);
+                    return;
+                }
+            } else {
+                gl[ngl++] = ri;                    /* bounded by register cap */
+            }
+        }
+        if (base < 0) {
+            serr(p, p->valuedecls[vi].line, p->valuedecls[vi].col,
+                 "'%s' needs an unconditional base definition — every guarded "
+                 "definition layers on or overrides the value the base "
+                 "provides (#94: a base must exist)", vn);
+            return;
+        }
+        p->value_def[vi] = base;
+
+        /* superiority among the guarded defs: above[i][j] = i beats j */
+        bool above[MAX_LAYERS][MAX_LAYERS] = { { false } };
+        for (int e = 0; e < p->nsups; e++) {
+            int wi = -1, li = -1;
+            for (int i = 0; i < ngl; i++) {
+                if (strcmp(p->sups[e].a, p->rules[gl[i]].label) == 0) wi = i;
+                if (strcmp(p->sups[e].b, p->rules[gl[i]].label) == 0) li = i;
+            }
+            if (wi >= 0 && li >= 0) above[wi][li] = true;
+        }
+        for (int k = 0; k < ngl; k++)              /* transitive closure */
+            for (int i = 0; i < ngl; i++)
+                for (int j = 0; j < ngl; j++)
+                    if (above[i][k] && above[k][j]) above[i][j] = true;
+
+        /* well-formedness: comparability where order matters (#94) */
+        for (int i = 0; i < ngl; i++)
+            for (int j = i + 1; j < ngl; j++) {
+                if (above[i][j] || above[j][i]) continue;
+                int ci = p->rules[gl[i]].vclass, cj = p->rules[gl[j]].vclass;
+                bool needs_order = ci == 0 || cj == 0 || ci == 4 || cj == 4 ||
+                                   ci != cj;
+                if (needs_order)
+                    serr(p, p->rules[gl[j]].line, p->rules[gl[j]].col,
+                         "definitions '%s' and '%s' of '%s' can both apply but "
+                         "are not ordered, and their combination does not "
+                         "commute — add a superiority edge ('%s > %s' or the "
+                         "reverse) (#94)",
+                         p->rules[gl[i]].label, p->rules[gl[j]].label, vn,
+                         p->rules[gl[i]].label, p->rules[gl[j]].label);
+            }
+        if (above[0][0]) { /* unreachable; keeps -Wunused honest */ }
+
+        /* chain order, bottom -> top: repeatedly take the declaration-earliest
+         * def that beats no unplaced def (its losers are all placed) */
+        bool placed[MAX_LAYERS] = { false };
+        int nplaced = 0;
+        while (nplaced < ngl) {
+            int pick = -1;
+            for (int i = 0; i < ngl && pick < 0; i++) {
+                if (placed[i]) continue;
+                bool ok = true;
+                for (int j = 0; j < ngl && ok; j++)
+                    if (!placed[j] && above[i][j]) ok = false;
+                if (ok) pick = i;
+            }
+            if (pick < 0) {
+                serr(p, p->rules[gl[0]].line, p->rules[gl[0]].col,
+                     "superiority among the definitions of '%s' is cyclic", vn);
+                return;
+            }
+            placed[pick] = true;
+            p->value_layers[vi][nplaced++] = gl[pick];
+        }
+        p->value_nlayers[vi] = ngl;
+    }
 }
 
 /* ---- §5.8 stratification (#87) -------------------------------------
@@ -3582,6 +3793,8 @@ static void semantic_pass(parser *p)
                 serr(p, p->rules[j].line, p->rules[j].col,
                      "duplicate rule label '%s'", r->label);
     }
+
+    order_value_layers(p);             /* #82/#94: base + chain + commute checks */
 
     /* #82: cyclic value definitions are infinite inline regress — reject */
     {
@@ -3805,6 +4018,7 @@ static bool expr_fold(parser *p, int e, long *out)
     case EX_ROLL:  return false;              /* a fresh draw — never a constant */
     case EX_CALL:  return false;              /* a host call — never a constant */
     case EX_TEST:  return false;              /* a solved verdict — never a constant */
+    case EX_PRIOR: return false;              /* the chain's running value */
     case EX_NEG:
         if (!expr_fold(p, n->lhs, &a)) return false;
         *out = -a; return true;
@@ -3877,6 +4091,10 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
         }
         return;
     }
+    if (n->kind == EX_PRIOR) {                 /* the chain's running value (#82) */
+        if (*pos < MAX_CODE) { code[*pos].op = EXPR_P; code[(*pos)++].arg = 0; }
+        return;
+    }
     if (n->kind == EX_TEST) {
         /* ground the tested literal exactly as a body atom would be: declare
          * provider atoms, touch sparse fluents — so the solve loads its facts
@@ -3914,21 +4132,102 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
  * the §5.10 site key (node, binding, tag) is identical and all readers share
  * the draw: one die, testable twice. Distinct bindings (other targets) still
  * key apart and draw independently, which is what fireball relies on. */
-static void emit_value_inline(parser *p, uint32_t pred, const uint32_t *rargs,
-                              expr_ins *code, int *pos)
+static bool members_ok(parser *p, ast_atom *body, int n, var_bind *vars,
+                       int nvars, const uint32_t *binding);
+static dl_lit ground_lit(parser *p, ast_atom *at, var_bind *vars, int nvars,
+                         const uint32_t *binding);
+static const char *prov_str(parser *p, int line, char *buf, size_t n);
+
+static void emit_valuedef_sub(parser *p, ast_rule *d, const uint32_t *rargs,
+                              uint32_t *sub)
 {
-    int vi = find_value(p, pred);
-    int ri = vi >= 0 ? p->value_def[vi] : -1;
-    if (ri < 0) return;                        /* reported in the check pass */
-    ast_rule *d = &p->rules[ri];
-    uint32_t sub[MAX_ARGS] = { 0 };
+    (void)p;
     for (int k = 0; k < d->head.nargs; k++) {
         int f = var_index(d->vars, d->nvars, d->head.args[k].name);
         if (f >= 0) sub[f] = rargs[k];
     }
-    if (++p->vdepth > MAX_ARGS * 2) { p->vdepth--; return; }   /* cycle backstop;
-                                          * cycles are rejected in the semantic pass */
-    emit_expr(p, d->head.lhs_root, d->vars, d->nvars, sub, code, pos);
+}
+
+/* Ground a layered definition's MARKER for one binding (#82/#94): a defeasible
+ * judgment `body => label(binding)` (plus the `unless` defeater), deduped by
+ * the marker atom, so every read site of every rule shares ONE marker per
+ * (definition, binding). The marker is what the chain's EXPR_TEST consults —
+ * an ordinary literal, so `why?` names the layer that applied. A statically
+ * failed #95 membership grounds nothing: the marker stays unconcluded. */
+static uint32_t ensure_marker_grounded(parser *p, int ri, const uint32_t *rargs)
+{
+    ast_rule *d = &p->rules[ri];
+    uint32_t lbl = intern_id(p->syms, d->label);
+    uint32_t m = ground_pred(p, lbl, rargs, d->head.nargs);
+    if (m < p->vmark_cap && p->vmark_of[m] >= 0) return m;
+    atom_map_set(&p->vmark_of, &p->vmark_cap, m, 1);
+    uint32_t sub[MAX_ARGS] = { 0 };
+    emit_valuedef_sub(p, d, rargs, sub);
+    char pbuf[MAX_NAME + 24];
+    if (members_ok(p, d->body, d->nbody, d->vars, d->nvars, sub)) {
+        dl_lit body[MAX_BODY];
+        int nb = 0;
+        for (int b = 0; b < d->nbody; b++)
+            if (!d->body[b].is_member)
+                body[nb++] = ground_lit(p, &d->body[b], d->vars, d->nvars, sub);
+        int h = world_add_rule(p->w, intern_name(p->syms, m), DL_DEFEASIBLE,
+                               dl_pos(m), body, nb);
+        world_set_rule_prov(p->w, h, prov_str(p, d->line, pbuf, sizeof pbuf));
+        if (d->has_guard &&
+            members_ok(p, d->guard, d->nguard, d->vars, d->nvars, sub)) {
+            dl_lit g2[MAX_BODY];
+            int ng = 0;
+            for (int b = 0; b < d->nguard; b++)
+                if (!d->guard[b].is_member)
+                    g2[ng++] = ground_lit(p, &d->guard[b], d->vars, d->nvars, sub);
+            char gname[MAX_GROUND + 8];
+            snprintf(gname, sizeof gname, "%s.unless", intern_name(p->syms, m));
+            int gh = world_add_rule(p->w, gname, DL_DEFEATER, dl_neg(m), g2, ng);
+            world_set_rule_prov(p->w, gh, prov_str(p, d->line, pbuf, sizeof pbuf));
+        }
+    }
+    return m;
+}
+
+/* Inline a value read (#82/#94): the chain program. Base expression first,
+ * then per layer (chain order, bottom to top) the branch-free blend
+ *     v' = v + test(marker)·(f(v) − v)
+ * — DESIGN §5.8's evaluate-all-and-mask shape. `prior` inside f reads the
+ * running value through the prior stack, so nested value chains compose. An
+ * override's f ignores prior and the same blend selects it outright. Roll
+ * sites stay keyed by (definition node, binding), so every reader of one
+ * value shares every die, exactly as in the single-definition slice. */
+static void emit_value_inline(parser *p, uint32_t pred, const uint32_t *rargs,
+                              expr_ins *code, int *pos)
+{
+    int vi = find_value(p, pred);
+    int base = vi >= 0 ? p->value_def[vi] : -1;
+    if (base < 0) return;                      /* reported in the check pass */
+    if (++p->vdepth > MAX_ARGS * 2) { p->vdepth--; return; }   /* cycle backstop */
+    ast_rule *bd = &p->rules[base];
+    uint32_t sub[MAX_ARGS] = { 0 };
+    emit_valuedef_sub(p, bd, rargs, sub);
+    emit_expr(p, bd->head.lhs_root, bd->vars, bd->nvars, sub, code, pos);
+    for (int L = 0; L < p->value_nlayers[vi]; L++) {
+        int ri = p->value_layers[vi][L];
+        ast_rule *ld = &p->rules[ri];
+        uint32_t lsub[MAX_ARGS] = { 0 };
+        emit_valuedef_sub(p, ld, rargs, lsub);
+        long targ = (long)ensure_marker_grounded(p, ri, rargs) << 1;
+#define VEMIT(o, a) do { if (*pos < MAX_CODE) {         code[*pos].op = (o); code[(*pos)++].arg = (a); } } while (0)
+        VEMIT(EXPR_PPUSH, 0);                  /* v -> prior slot   */
+        VEMIT(EXPR_P, 0);                      /* [v]               */
+        VEMIT(EXPR_TEST, targ);                /* [v, t]            */
+        emit_expr(p, ld->head.lhs_root, ld->vars, ld->nvars, lsub, code, pos);
+        VEMIT(EXPR_MUL, 0);                    /* [v, t*f]          */
+        VEMIT(EXPR_ADD, 0);                    /* [v + t*f]         */
+        VEMIT(EXPR_TEST, targ);
+        VEMIT(EXPR_P, 0);
+        VEMIT(EXPR_MUL, 0);                    /* [.., t*v]         */
+        VEMIT(EXPR_SUB, 0);                    /* [v + t*(f - v)]   */
+        VEMIT(EXPR_PPOP, 0);
+#undef VEMIT
+    }
     p->vdepth--;
 }
 
@@ -5238,9 +5537,18 @@ static void ground_sup(parser *p, ast_sup *s)
         return;
     }
     if (ra->head.is_valuedef || rb->head.is_valuedef) {
+        /* #82/#94: `>` between two definitions of ONE value orders its layer
+         * chain — consumed by order_value_layers, nothing to ground here */
+        if (ra->head.is_valuedef && rb->head.is_valuedef &&
+            ra->head.pred == rb->head.pred)
+            return;
         serr(p, s->aline, s->acol,
-             "superiority over a value definition ('%s' > '%s') arrives with "
-             "layered definitions — a later slice of #82",
+             ra->head.is_valuedef != rb->head.is_valuedef
+                 ? "'%s' > '%s' mixes a value definition with an ordinary rule "
+                   "— superiority orders definitions of ONE value, or ordinary "
+                   "rules among themselves"
+                 : "'%s' > '%s' orders definitions of two DIFFERENT values — "
+                   "each value's chain orders independently",
              s->a, s->b);
         return;
     }

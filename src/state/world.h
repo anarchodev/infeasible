@@ -192,6 +192,16 @@ typedef enum {
                    * front end rejects a tested judgment whose cone contains a
                    * test-bearing guard (nesting), and still rejects test() in
                    * clamp bounds and value definitions. */
+    ,
+    /* Layered derived-value chains (#82/#94): a value's definitions compile to
+     * one branch-free program — base expr, then per layer (in superiority
+     * order) the evaluate-and-mask blend v' = v + test(marker)·(f(v) − v),
+     * where `prior` inside f reads the running value below. The prior STACK
+     * (not a register) lets a nested value's chain evaluate inside f without
+     * clobbering the outer layer's prior. */
+    EXPR_PPUSH,   /* pop the running value onto the prior stack (enter a layer) */
+    EXPR_P,       /* push the top of the prior stack (`prior` reads) */
+    EXPR_PPOP     /* drop the top prior slot (leave a layer) */
 } expr_op;
 typedef struct { expr_op op; long arg; } expr_ins;
 

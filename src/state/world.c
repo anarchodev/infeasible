@@ -2051,7 +2051,8 @@ static bool lit_solved_proved(const world *w, uint32_t atom, bool neg);
 static long eval_expr(const world *w, const expr_ins *code, int n)
 {
     long st[64];
-    int sp = 0;
+    long pstk[16];                /* layered-value prior stack (#82/#94) */
+    int sp = 0, psp = 0;
     for (int i = 0; i < n; i++) {
         switch (code[i].op) {
         case EXPR_CONST: st[sp++] = code[i].arg; break;
@@ -2090,6 +2091,9 @@ static long eval_expr(const world *w, const expr_ins *code, int n)
             st[sp++] = lit_solved_proved(w, atom, code[i].arg & 1) ? 1 : 0;
             break;
         }
+        case EXPR_PPUSH: if (psp < 16) pstk[psp++] = st[--sp]; break;
+        case EXPR_P:     st[sp++] = psp > 0 ? pstk[psp-1] : 0; break;
+        case EXPR_PPOP:  if (psp > 0) psp--; break;
         }
     }
     return sp ? st[sp-1] : 0;
