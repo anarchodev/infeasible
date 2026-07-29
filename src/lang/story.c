@@ -2622,6 +2622,90 @@ static void check_value_read(parser *p, ast_atom *at, bool in_effect)
          "definitions (#82)", nm, nm);
 }
 
+/* ---- #86 guard half: test(…) admissibility in expression guards --------
+ *
+ * A test-bearing guard evaluates in pass B of the two-phase solve, against
+ * the settled pass-A result — so every tested atom must be fully decided by
+ * pass A. Base fluents and providers are load-time inputs (always settled);
+ * a DERIVED judgment is admissible iff its backward cone contains no
+ * test-bearing guard (else its own verdict waits on pass B — circular).
+ * Single-level nesting is exactly what the two-phase engine makes sound. */
+
+static int pred_idx(parser *p, uint32_t pred);     /* defined below */
+
+static bool rule_has_test_guard(parser *p, const ast_rule *r)
+{
+    for (int b = 0; b < r->nbody; b++)
+        if (r->body[b].is_expr_guard &&
+            (expr_has_test(p, r->body[b].lhs_root, 0) ||
+             expr_has_test(p, r->body[b].rhs_root, 0))) return true;
+    for (int g = 0; g < r->nguard; g++)
+        if (r->guard[g].is_expr_guard &&
+            (expr_has_test(p, r->guard[g].lhs_root, 0) ||
+             expr_has_test(p, r->guard[g].rhs_root, 0))) return true;
+    return false;
+}
+
+static void check_tested_cone(parser *p, const ex_node *tn)
+{
+    pred_info *pi = find_pred(p, tn->pred);
+    if (!pi || pi->is_fluent || pi->is_provider || !pi->is_head)
+        return;             /* load-time input, or unknown (orphan warns) */
+    bool seen[MAX_PREDS] = { false };
+    uint32_t queue[MAX_PREDS];
+    int qh = 0, qt = 0, ti = pred_idx(p, tn->pred);
+    if (ti >= 0) seen[ti] = true;
+    queue[qt++] = tn->pred;
+    while (qh < qt) {
+        uint32_t q = queue[qh++];
+        for (int i = 0; i < p->nrules; i++) {
+            ast_rule *r = &p->rules[i];
+            if (r->head.is_valuedef || r->head.pred != q) continue;
+            if (rule_has_test_guard(p, r)) {
+                serr(p, tn->line, tn->col,
+                     "test(%s…) in a guard: '%s' is itself derived through a "
+                     "test(…) guard (rule '%s'), so it does not settle below "
+                     "this guard — nested test guards are a later stratum "
+                     "(§5.8); derive one side from state instead",
+                     intern_name(p->syms, tn->pred),
+                     intern_name(p->syms, tn->pred), r->label);
+                return;
+            }
+            for (int pass = 0; pass < 2; pass++) {
+                ast_atom *ats = pass ? r->guard : r->body;
+                int nat = pass ? r->nguard : r->nbody;
+                for (int b = 0; b < nat; b++) {
+                    if (ats[b].is_expr_guard || ats[b].is_member) continue;
+                    int bi = pred_idx(p, ats[b].pred);
+                    if (bi >= 0 && p->preds[bi].is_head && !seen[bi] &&
+                        qt < MAX_PREDS) {
+                        seen[bi] = true;
+                        queue[qt++] = ats[b].pred;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void check_guard_test_nodes(parser *p, int e)
+{
+    if (e < 0) return;
+    ex_node *n = &p->exprs[e];
+    switch (n->kind) {
+    case EX_TEST:  check_tested_cone(p, n); return;
+    case EX_CONST: case EX_ROLL: case EX_LOAD: return;   /* value defs reject test */
+    case EX_CALL:
+        for (int k = 0; k < n->nargs; k++) check_guard_test_nodes(p, n->cargs[k]);
+        return;
+    case EX_NEG:   check_guard_test_nodes(p, n->lhs); return;
+    default:
+        check_guard_test_nodes(p, n->lhs);
+        check_guard_test_nodes(p, n->rhs);
+        return;
+    }
+}
+
 /* Validate one atom against the schema: predicate known, arity matches, and
  * every argument is a bound variable or a declared entity (with a sort check
  * for fluent atoms). `note` records condition refs for orphan analysis;
@@ -2638,13 +2722,11 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
                  "a comparison guard can't appear in a `causes` clause");
             return;
         }
-        if (expr_has_test(p, at->lhs_root, 0) || expr_has_test(p, at->rhs_root, 0)) {
-            serr(p, at->line, at->col,
-                 "test(…) in a guard feeds the fixpoint that derives the tested "
-                 "atom — that needs the §5.8 stratifier (#87); effects only for "
-                 "now");
-            return;
-        }
+        /* test(…) in a guard is admissible when every tested atom settles in
+         * pass A of the two-phase solve (#86 guard half — advantage's home);
+         * a tested judgment derived through another test-guard is rejected */
+        check_guard_test_nodes(p, at->lhs_root);
+        check_guard_test_nodes(p, at->rhs_root);
         check_expr(p, at->lhs_root, vars, nvars);
         check_expr(p, at->rhs_root, vars, nvars);
         return;

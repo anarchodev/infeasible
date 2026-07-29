@@ -13,9 +13,10 @@
  *  - replay stability (§5.10): because rolls are keyed lookups, a die drawn
  *    and multiplied by 0 perturbs nothing — the base draw is identical in a
  *    world where the modifier applies and one where it does not;
- *  - the stratification boundary (#87) holds as located errors: test(…) is
- *    rejected in expression guards, clamp bounds, and value definitions
- *    (where it could flow into a guard through an inlined read). */
+ *  - the #86 GUARD half: test(…) in expression guards — base fluents from
+ *    the store, derived judgments via the two-phase solve (advantage!), in
+ *    judgment rules, step rules, and composed with #87 strata; NESTED test
+ *    guards, clamp bounds, and value definitions stay located errors. */
 
 #include "lang/story.h"
 #include "state/world.h"
@@ -46,6 +47,11 @@ static int step1(world *w, intern *sy, const char *action)
     int r = world_step(w, &a, 1, err, sizeof err);
     if (r) fprintf(stderr, "  step %s: %s\n", action, err);
     return r;
+}
+
+static dl_verdict q(world *w, intern *sy, const char *atom)
+{
+    return world_query(w, (dl_lit){ intern_id(sy, atom), false });
 }
 
 static long num(world *w, intern *sy, const char *atom)
@@ -173,12 +179,117 @@ static int test_replay_stability(void)
     return 0;
 }
 
+/* --- the #86 guard half: test(…) in expression guards ------------------- */
+
+/* base-fluent tests in judgment guards, answered on the two-phase jfam */
+static int test_guard_base_fluent(void)
+{
+    const char *src =
+        "state ( blessed  waited )\n"
+        "init blessed\n"
+        "rule strong: 0 + test(blessed)  * 10 >= 10 => strong\n"
+        "rule frail:  0 + test(~blessed) * 10 >= 10 => frail\n"
+        "action curse: causes ~blessed & waited\n";
+
+    intern *sy = intern_new();
+    world *w = compile_ok(src, sy);
+    CHECK(w != NULL);
+    CHECK(q(w, sy, "strong") == DL_PROVED);
+    CHECK(q(w, sy, "frail") == DL_REFUTED);
+    CHECK(step1(w, sy, "curse") == 0);
+    CHECK(q(w, sy, "strong") == DL_REFUTED);       /* the guard follows state */
+    CHECK(q(w, sy, "frail") == DL_PROVED);
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
+/* advantage, the headline: a DERIVED condition tested inside the d20 guard.
+ * `max(d1, roll * test(adv))` — when adv is refuted the second arm dies and
+ * hit ≡ hitbase (both read the SAME named-roll die, so this is deterministic
+ * per tick, not statistical); when adv holds, hitbase ⇒ hit and the extra
+ * die rescues some ticks. */
+static int test_guard_advantage(void)
+{
+    const char *src =
+        "sort actor\n"
+        "entity ( bran, grik : actor )\n"
+        "state ( prone(actor)  waited )\n"
+        "value d1(actor, actor) : int\n"
+        "rule dv(A: actor, T: actor): => d1(A, T) = roll(20)\n"
+        "rule adv(A: actor, T: actor): prone(T) => adv(A, T)\n"
+        "rule hit(A: actor, T: actor):\n"
+        "    max(d1(A, T), roll(20, 7) * test(adv(A, T))) >= 11 => hit(A, T)\n"
+        "rule hitbase(A: actor, T: actor): d1(A, T) >= 11 => hitbase(A, T)\n"
+        "action wait: causes waited\n"
+        "action topple(X: actor): causes prone(X)\n";
+
+    intern *sy = intern_new();
+    world *w = compile_ok(src, sy);
+    CHECK(w != NULL);
+    world_set_seed(w, 20260729uLL);
+
+    for (int t = 0; t < 20; t++) {                 /* no advantage: identical */
+        CHECK(q(w, sy, "hit(bran,grik)") == q(w, sy, "hitbase(bran,grik)"));
+        CHECK(step1(w, sy, "wait") == 0);
+    }
+    CHECK(step1(w, sy, "topple(grik)") == 0);
+    bool saw_rescue = false;
+    for (int t = 0; t < 40; t++) {                 /* advantage: max of two */
+        dl_verdict vh = q(w, sy, "hit(bran,grik)");
+        dl_verdict vb = q(w, sy, "hitbase(bran,grik)");
+        if (vb == DL_PROVED) CHECK(vh == DL_PROVED);   /* max only helps */
+        if (vh == DL_PROVED && vb != DL_PROVED) saw_rescue = true;
+        CHECK(step1(w, sy, "wait") == 0);
+    }
+    CHECK(saw_rescue);                             /* the second die did work */
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
+/* a test-guard in a ramification body, composed with #87 strata: dead only
+ * lands when the dying unit was hexed — a derived judgment consulted from a
+ * stratum-1 rule, all in one tick */
+static int test_guard_in_step_with_strata(void)
+{
+    const char *src =
+        "sort unit\n"
+        "entity ( u0, u1 : unit )\n"
+        "state ( cursed(unit)  dead(unit)  hp(unit) : int in 0 .. 20 )\n"
+        "init ( hp(u0) = 10  hp(u1) = 10  cursed(u0) )\n"
+        "rule hex(X: unit): cursed(X) => hexed(X)\n"
+        "rule perish(X: unit):\n"
+        "    hp(X)' <= 0 & 0 + test(hexed(X)) >= 1 causes dead(X)\n"
+        "action strike(T: unit): causes hp(T) -= 12\n";
+
+    intern *sy = intern_new();
+    world *w = compile_ok(src, sy);
+    CHECK(w != NULL);
+
+    CHECK(step1(w, sy, "strike(u0)") == 0);        /* hexed: dead same tick */
+    CHECK(num(w, sy, "hp(u0)") == 0);
+    CHECK(q(w, sy, "dead(u0)") == DL_PROVED);
+    CHECK(step1(w, sy, "strike(u1)") == 0);        /* not hexed: dies flagless */
+    CHECK(num(w, sy, "hp(u1)") == 0);
+    CHECK(q(w, sy, "dead(u1)") == DL_REFUTED);
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
 static int test_errors(void)
 {
     static const struct { const char *src, *msg; } BAD[] = {
-        { "sort actor\nentity a : actor\nstate ( p  q(actor) )\n"
-          "rule r(X: actor): 0 + test(p) >= 1 => q(X)\n",
-          "needs the §5.8 stratifier" },
+        /* guards are legal since the #86 guard half — but NESTED test guards
+         * (a tested judgment derived through another test guard) are not:
+         * the inner one does not settle in pass A of the two-phase solve */
+        { "state p\n"
+          "rule j1: 0 + test(p) >= 1 => qq\n"
+          "rule r2: 0 + test(qq) >= 1 => s\n",
+          "nested test guards" },
         { "state ( p  x : int in 0 .. 5 + test(p) * 2 )\n",
           "may not use test" },
         { "state p\nvalue v : int\nrule d: => v = test(p) * 2\n"
@@ -218,6 +329,9 @@ int main(void)
     if (test_modifiers()) return 1;
     if (test_tri_valued()) return 1;
     if (test_replay_stability()) return 1;
+    if (test_guard_base_fluent()) return 1;
+    if (test_guard_advantage()) return 1;
+    if (test_guard_in_step_with_strata()) return 1;
     if (test_errors()) return 1;
     printf("test_exprtest: all passed\n");
     return 0;

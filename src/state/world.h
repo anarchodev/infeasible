@@ -182,11 +182,16 @@ typedef enum {
                    * a REFUTED derived atom still tests 0 under neg unless
                    * something concludes the negation (base fluents are closed-
                    * world, so their neg flips 0/1 as expected). Branch-free
-                   * modifiers: `base + test(flag) * delta`. Effect/commit-side
-                   * ONLY — a guard-side test feeds the fixpoint that derives
-                   * the tested atom (circular); that is #87's stratification.
-                   * The .story front end rejects it in guards, clamp bounds,
-                   * and value definitions until then. */
+                   * modifiers: `base + test(flag) * delta`. Base fluents and
+                   * provider atoms answer from the store/callback (closed-
+                   * world, load-time inputs); derived judgments read the
+                   * solved family. In EFFECTS this runs commit-side, strictly
+                   * downstream; in expression GUARDS each solve runs two-phase
+                   * (solve without test-guards, evaluate them against the
+                   * settled result, reload, solve) — sound because the .story
+                   * front end rejects a tested judgment whose cone contains a
+                   * test-bearing guard (nesting), and still rejects test() in
+                   * clamp bounds and value definitions. */
 } expr_op;
 typedef struct { expr_op op; long arg; } expr_ins;
 
