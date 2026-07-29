@@ -103,6 +103,10 @@
  *   term    := factor (('*'|'/') factor)*   -- '/' floors (rounds toward -inf, §5.8)
  *   factor  := '-' factor | INT
  *            | ('min'|'max'|'divup') '(' expr ',' expr ')'  -- divup = ceiling div
+ *            | 'test' '(' ['~'] IDENT ['(' arg* ')'] ')'    -- verdict as 0/1 (#86):
+ *                                          -- branch-free modifiers base+flag*delta;
+ *                                          -- effect-side only until #87 (a guard-
+ *                                          -- side test feeds the fixpoint it reads)
  *            | IDENT '(' expr (',' expr)* ')'           -- fn-provider call (§5.6)
  *            | IDENT [ '(' arg (',' arg)* ')' ] | '(' expr ')'
  *   atom    := [ '~' ] IDENT [ '(' arg (',' arg)* ')' ] [ "'" ]
