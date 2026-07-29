@@ -111,7 +111,10 @@
  *            | IDENT [ '(' arg (',' arg)* ')' ] | '(' expr ')'
  *   atom    := [ '~' ] IDENT [ '(' arg (',' arg)* ')' ] [ "'" ]
  *   arg     := IDENT                                    -- a var or an entity
- *   -- postfix "'" = next-state; ramification bodies only (§5.4)
+ *   -- postfix "'" = next-state; ramification bodies only (§5.4). A primed
+ *   -- NUMERIC guard (`hp(X)' <= 0`, the dying trigger) is the §5.8 stratified
+ *   -- case (#87): the compiler orders strata within the tick so the fluent's
+ *   -- writers settle first; primed-numeric cycles are located compile errors
  *
  * Atoms are interned into `syms`; ground atoms intern as "pred(e1,e2)" (the
  * bare name at arity 0), so a host querying the equivalent ground atom sees
