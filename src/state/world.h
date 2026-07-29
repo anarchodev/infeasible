@@ -70,6 +70,25 @@ long world_get_num(const world *w, uint32_t atom);
 void world_add_guard(world *w, uint32_t guard, uint32_t num,
                      world_cmp op, long threshold);
 
+/* §5.8 stratification (#87). A PRIMED guard reads the NEXT value of a numeric
+ * fluent ("if hp' <= 0 then dead" — the dying trigger). The tick then runs in
+ * STRATA: the compiler assigns each step rule a stratum (0 = today's rules)
+ * such that everything that can write a primed-guarded fluent settles below
+ * every rule reading that guard; world_step solves the step theory once per
+ * stratum, commit-computes the numeric pipeline for the fluents each stratum
+ * owns, mints their primed-guard atoms as strict facts, and re-solves for the
+ * strata above. The state write stays atomic at the end and the action log
+ * records ONE step (I4 — replay never sees a half-tick). Commit-time verdict
+ * reads (the #84 response, EXPR_TEST) see the solve of their own stratum —
+ * the latest settled state, never a partially-propagated one; with no primed
+ * guards the world is the degenerate one-stratum case, byte-identical to
+ * today's tick. Primed-numeric CYCLES (a writer of `hp` gated on `hp'`)
+ * genuinely oscillate and are rejected at compile time, in the .story front
+ * end. NOT on the routed lane path — stratified worlds step N=1. */
+void world_add_primed_guard(world *w, uint32_t guard, uint32_t num,
+                            world_cmp op, long threshold);
+void world_set_step_stratum(world *w, int rule, int stratum);
+
 /* Providers (§5.2/§5.6): a computed relation answered host-side (adjacency,
  * range, line-of-sight), consulted at solve time and never stored. The callback
  * answers whether ground `pred(args)` holds; args are entity atoms. Set once by

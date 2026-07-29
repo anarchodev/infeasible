@@ -41,6 +41,7 @@ typedef struct {
     int neffects;
     num_effect *neffs;    /* numeric effects (§5.8 write side) */
     int nneff, capneff;
+    int stratum;          /* §5.8 strata (#87): 0 = settles in the first solve */
 } srule;
 
 /* Per-numeric-fluent commit receipt, rebuilt each successful step. */
@@ -187,6 +188,17 @@ struct world {
     int ndtypes;                        /* size of the closed damage-type enum (#83) */
     struct { uint32_t guard, num; world_cmp op; long threshold; } *guards;
     int ng, capg;
+    /* Primed guards (§5.8 #87): over the NEXT value, minted as strict facts by
+     * the stratum loop once the owning fluent's next value settles. `pg_cur`
+     * holds the facts minted so far this tick — kept after commit so a
+     * why-replay of the final solve sees them; reset at the next step. */
+    struct { uint32_t guard, num; world_cmp op; long threshold; } *pguards;
+    int npg, cappg;
+    struct { uint32_t atom; bool val; } *pg_cur;
+    int npg_cur, cappg_cur;
+    int *num_stratum;                   /* per nums[i]: max writer stratum;
+                                         * recomputed per stratified step */
+    int num_stratum_cap;
     /* Expression guards (§5.8/§5.10): `expr <op> expr` — e.g. roll(20)+atk >= ac.
      * Two RHS-bytecode programs compared at solve time; loads as a fact like a
      * numeric guard. Bytecode is arena-copied. */
@@ -355,6 +367,9 @@ void world_free(world *w)
     free(w->srules);
     free(w->nums);
     free(w->guards);
+    free(w->pguards);
+    free(w->pg_cur);
+    free(w->num_stratum);
     free(w->eguards);
     free(w->provs);
     free(w->rollsites);
@@ -617,6 +632,26 @@ void world_add_guard(world *w, uint32_t guard, uint32_t num,
     w->guards[w->ng].op = op;
     w->guards[w->ng].threshold = threshold;
     w->ng++;
+}
+
+void world_add_primed_guard(world *w, uint32_t guard, uint32_t num,
+                            world_cmp op, long threshold)
+{
+    for (int i = 0; i < w->npg; i++)
+        if (w->pguards[i].guard == guard) return;   /* dedup, like world_add_guard */
+    GROW(w->pguards, w->npg, w->cappg);
+    w->pguards[w->npg].guard = guard;
+    w->pguards[w->npg].num = num;
+    w->pguards[w->npg].op = op;
+    w->pguards[w->npg].threshold = threshold;
+    w->npg++;
+    w->lanes_ok = false;              /* stratified worlds step N=1 (#87) */
+}
+
+void world_set_step_stratum(world *w, int rule, int stratum)
+{
+    if (rule >= 0 && rule < w->nsr && stratum >= 0)
+        w->srules[rule].stratum = stratum;
 }
 
 #define LOC_NONE (~0u)   /* schema location for an atom absent from the family */
@@ -952,6 +987,7 @@ int world_add_step_rule(world *w, const char *name, uint32_t action,
         memcpy(r->effects, effects, (size_t)neffects * sizeof(dl_lit));
     r->neffs = NULL;
     r->nneff = r->capneff = 0;
+    r->stratum = 0;
     w->struct_ver++;             /* structural edit (#63) */
     w->lanes_ok = false;          /* a structural edit stales the lane families */
     return w->nsr++;
@@ -2125,6 +2161,13 @@ static void solve_step_family_vals(world *w, const bool *vals,
     load_guards(w, f, w->loc_of, w->loc_cap);
     load_providers(w, f, w->loc_of, w->loc_cap);
     load_eguards(w, f, w->loc_of, w->loc_cap);
+    /* primed-guard facts minted by settled lower strata (§5.8 #87): strict
+     * inputs about the NEXT value; empty until the stratum loop mints them */
+    for (int i = 0; i < w->npg_cur; i++) {
+        uint32_t a = w->pg_cur[i].atom;
+        if (a < w->loc_cap && w->loc_of[a] != LOC_NONE)
+            dlcol_add_fact(f, (dl_lit){ w->loc_of[a], !w->pg_cur[i].val }, 0);
+    }
     dlcol_solve(f);
 }
 
@@ -2284,7 +2327,7 @@ int world_step(world *w, const uint32_t *actions, int nactions,
      * it bit-parallel across entities. Numerics ride when the family covers them
      * (covers_numeric): the boolean firing solves bit-parallel and the numeric
      * columns commit column-parallel. (w->lanes_ok guards post-compile edits.) */
-    if (w->lanes_ok && w->nsteplanes == 1 &&
+    if (w->lanes_ok && w->nsteplanes == 1 && w->npg == 0 &&
         (w->nnum == 0 || w->steplanes[0].covers_numeric)) {
         int rc = world_step_lanes(w, actions, nactions, err, errsz);
         if (rc == 0) w->tick++;                    /* monotone step counter (§5.10) */
@@ -2293,50 +2336,58 @@ int world_step(world *w, const uint32_t *actions, int nactions,
 
     dlcol *f = w->fam;
 
-    solve_step_family(w, actions, nactions);
+    /* §5.8 strata (#87): with primed guards, the tick runs one solve per
+     * stratum — each solve additionally sees the primed-guard facts minted by
+     * the strata below it; the numeric pipeline runs for the fluents each
+     * stratum owns; the boolean next-state is read from the FINAL solve; and
+     * the state write stays atomic at the very end, so the action log records
+     * ONE step (I4 — replay never sees a half-tick). Zero primed guards is
+     * the degenerate one-stratum case: exactly one solve, today's tick. */
+    int nstrata = 1;
+    for (int s = 0; s < w->nsr; s++)
+        if (w->srules[s].stratum + 1 > nstrata) nstrata = w->srules[s].stratum + 1;
+    if (w->num_stratum_cap < w->nnum) {
+        w->num_stratum = realloc(w->num_stratum,
+                                 (size_t)w->nnum * sizeof *w->num_stratum);
+        w->num_stratum_cap = w->nnum;
+    }
+    for (int i = 0; i < w->nnum; i++) w->num_stratum[i] = 0;
+    for (int s = 0; s < w->nsr; s++)               /* fluent stratum = max writer */
+        for (int e = 0; e < w->srules[s].nneff; e++) {
+            int i = num_index(w, w->srules[s].neffs[e].num_atom);
+            if (i >= 0 && w->srules[s].stratum > w->num_stratum[i])
+                w->num_stratum[i] = w->srules[s].stratum;
+        }
+    w->npg_cur = 0;
 
     int rc = 0;
-    bool *next = malloc((size_t)(w->nfl ? w->nfl : 1) * sizeof *next);
-    for (int i = 0; i < w->nfl; i++) {
-        dl_lit p = { w->pr_loc[i], false };
-        if (dlcol_defeasible(f, p, 0) == DL_PROVED) {
-            next[i] = true;
-        } else if (dlcol_defeasible(f, dl_complement(p), 0) == DL_PROVED) {
-            next[i] = false;
-        } else {
-            if (err)
-                snprintf(err, errsz,
-                         "conflicting or undecided effects on fluent '%s'",
-                         intern_name(w->syms, w->fluents[i]));
-            rc = -1;
-            break;
-        }
-    }
-
     /* numeric commit pipeline (§5.8): base (winning := else inertia) + Σ deltas,
      * clamped to the declared range. Built into scratch + receipts, committed
      * with the boolean state only if nothing is contested. */
     long *nextnum = malloc((size_t)(w->nnum ? w->nnum : 1) * sizeof *nextnum);
-    if (rc == 0 && w->nnum > w->caprcpt) {
+    if (w->nnum > w->caprcpt) {
         w->rcpt = realloc(w->rcpt, (size_t)w->nnum * sizeof *w->rcpt);
         memset(&w->rcpt[w->caprcpt], 0,
                (size_t)(w->nnum - w->caprcpt) * sizeof *w->rcpt);
         w->caprcpt = w->nnum;
     }
-    /* One pass over the step rules — NOT nnum × nsr (that double scan, matching
-     * every fluent against every rule's effects, was the O(N²) crowd wall). Each
-     * fired numeric effect routes to its fluent's accumulator via the O(1) num
-     * index; a second pass over the fluents runs the pipeline (base + Σ deltas,
-     * clamp) and finishes the receipts. Total is O(nsr + effects + nnum). */
-    if (rc == 0 && w->nnum > 0) {
-        struct nacc { long delta, assign_val; const char *rule;
-                      bool have, conflict; } *acc =
-            calloc((size_t)w->nnum, sizeof *acc);
-        /* per-type buckets (#84): commit-time scratch, fixed-width because the
-         * type domain is a closed declared enum; absent entirely when untyped */
-        long *tacc = w->ndtypes > 0
-            ? calloc((size_t)w->nnum * (size_t)w->ndtypes, sizeof *tacc) : NULL;
-        for (int i = 0; i < w->nnum; i++) w->rcpt[i].n = 0;
+    /* One pass over the step rules per stratum — NOT nnum × nsr (that double
+     * scan was the O(N²) crowd wall). Each fired numeric effect routes to its
+     * fluent's accumulator via the O(1) num index, at the stratum the fluent
+     * settles; a per-fluent pass runs the pipeline (base + Σ deltas, clamp)
+     * and finishes the receipts. Accumulators live across the whole tick —
+     * each fluent is touched at exactly one stratum. */
+    struct nacc { long delta, assign_val; const char *rule;
+                  bool have, conflict; } *acc =
+        calloc((size_t)(w->nnum ? w->nnum : 1), sizeof *acc);
+    /* per-type buckets (#84): commit-time scratch, fixed-width because the
+     * type domain is a closed declared enum; absent entirely when untyped */
+    long *tacc = (w->ndtypes > 0 && w->nnum > 0)
+        ? calloc((size_t)w->nnum * (size_t)w->ndtypes, sizeof *tacc) : NULL;
+    for (int i = 0; i < w->nnum; i++) w->rcpt[i].n = 0;
+
+    for (int st = 0; st < nstrata && rc == 0; st++) {
+        solve_step_family(w, actions, nactions);   /* injects pg_cur facts */
 
         for (int s = 0; s < w->nsr; s++) {
             const srule *r = &w->srules[s];
@@ -2345,7 +2396,7 @@ int world_step(world *w, const uint32_t *actions, int nactions,
             for (int e = 0; e < r->nneff; e++) {
                 const num_effect *ef = &r->neffs[e];
                 int i = num_index(w, ef->num_atom);
-                if (i < 0) continue;
+                if (i < 0 || w->num_stratum[i] != st) continue;
                 long v = eval_expr(w, ef->code, ef->ncode);
                 if (ef->op == WORLD_OP_ASSIGN) {
                     world_merge mg = w->nums[i].merge;
@@ -2378,6 +2429,7 @@ int world_step(world *w, const uint32_t *actions, int nactions,
         }
 
         for (int i = 0; rc == 0 && i < w->nnum; i++) {
+            if (w->num_stratum[i] != st) continue;   /* owned by another stratum */
             num_receipt *rcp = &w->rcpt[i];
             if (acc[i].conflict) {
                 if (err)
@@ -2425,8 +2477,52 @@ int world_step(world *w, const uint32_t *actions, int nactions,
             }
             nextnum[i] = val;
         }
-        free(acc);
-        free(tacc);
+
+        /* mint this stratum's primed-guard facts (§5.8 #87): strict inputs
+         * about the settled next values, visible to every solve above. A
+         * pguard's fluent always sits below the top stratum (its readers are
+         * above it by construction), so nothing is minted uselessly. */
+        for (int g = 0; rc == 0 && g < w->npg; g++) {
+            int i = num_index(w, w->pguards[g].num);
+            if (i < 0 || w->num_stratum[i] != st) continue;
+            long v = nextnum[i], t = w->pguards[g].threshold;
+            bool holds;
+            switch (w->pguards[g].op) {
+            case WORLD_CMP_LE: holds = v <= t; break;
+            case WORLD_CMP_LT: holds = v <  t; break;
+            case WORLD_CMP_GE: holds = v >= t; break;
+            case WORLD_CMP_GT: holds = v >  t; break;
+            default:           holds = v == t; break;
+            }
+            if (w->npg_cur == w->cappg_cur) {
+                w->cappg_cur = w->cappg_cur ? w->cappg_cur * 2 : 8;
+                w->pg_cur = realloc(w->pg_cur,
+                                    (size_t)w->cappg_cur * sizeof *w->pg_cur);
+            }
+            w->pg_cur[w->npg_cur].atom = w->pguards[g].guard;
+            w->pg_cur[w->npg_cur].val = holds;
+            w->npg_cur++;
+        }
+    }
+    free(acc);
+    free(tacc);
+
+    /* boolean next-state + contested check, from the FINAL solve */
+    bool *next = malloc((size_t)(w->nfl ? w->nfl : 1) * sizeof *next);
+    for (int i = 0; rc == 0 && i < w->nfl; i++) {
+        dl_lit p = { w->pr_loc[i], false };
+        if (dlcol_defeasible(f, p, 0) == DL_PROVED) {
+            next[i] = true;
+        } else if (dlcol_defeasible(f, dl_complement(p), 0) == DL_PROVED) {
+            next[i] = false;
+        } else {
+            if (err)
+                snprintf(err, errsz,
+                         "conflicting or undecided effects on fluent '%s'",
+                         intern_name(w->syms, w->fluents[i]));
+            rc = -1;
+            break;
+        }
     }
 
     if (rc == 0) {

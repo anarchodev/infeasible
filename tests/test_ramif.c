@@ -9,7 +9,8 @@
  *      torch the instant it dies, because `~alive(X)'` is read next-state. The
  *      surface twin of test_world.c's hand-built torch ramification.
  *   2. the prime's scope, by rejection — `'` outside a ramification body, and a
- *      primed numeric guard / judgment (the deferred §5.8 stratification case),
+ *      primed judgment (deferred) and non-numeric primed guards (#87 landed
+ *      the numeric case — see test_strata),
  *      each a located error. */
 
 #include "lang/story.h"
@@ -145,13 +146,15 @@ static int test_prime_scope(void)
         "action topple(X: actor): requires alive(X)' causes fell(X)\n",
         "only allowed in a ramification body")) return 1;
 
-    /* a primed numeric guard — the deferred §5.8 stratification case */
-    if (expect_reject("primed numeric guard",
+    /* a primed numeric guard is no longer rejected — it is the §5.8
+     * stratified case (#87), pinned end-to-end in test_strata; here only the
+     * NON-numeric misuse stays a rejection */
+    if (expect_reject("primed guard on a boolean",
         "sort actor\n"
         "entity guard : actor\n"
-        "state (hp(actor) : int in 0..20  fell(actor))\n"
-        "rule r(X: actor): hp(X)' <= 0 causes fell(X)\n",
-        "primed numeric guard")) return 1;
+        "state (alive(actor)  fell(actor))\n"
+        "rule r(X: actor): alive(X)' <= 3 causes fell(X)\n",
+        "not a declared numeric fluent")) return 1;
 
     /* a primed judgment — a derived conclusion has no next-state form yet */
     if (expect_reject("primed judgment",

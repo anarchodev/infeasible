@@ -149,6 +149,7 @@ typedef struct {
     int       nreq;
     ast_atom  effects[MAX_BODY];
     int       neff;
+    int       stratum;            /* §5.8 strata (#87), assigned by stratify_steps */
     int       bind_ix[MAX_ACT_BINDERS];   /* indices into parser.binders (§13) */
     int       nbind;
 } ast_action;
@@ -308,6 +309,8 @@ typedef struct {
     int nvaluedecls;
     int dtype_sort;               /* #83: the ONE enum-sort damage types come from
                                    * (-1 until an `as` typed contribution is seen) */
+    bool has_pguards;             /* #87: any primed numeric guard — strata exist,
+                                   * step lanes bail, world steps N=1 */
     int value_def[MAX_FLUENTS];           /* per value: defining rule index, -1 = none */
     int vdepth;                           /* value-inline recursion depth (cycle backstop) */
     ast_rule   *rules;            /* heap; MAX_RULES */
@@ -2682,14 +2685,21 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
                  "body (a `rule … causes …`), not in %s", ctx);
             return;
         }
-        /* Deferred §5.8 stratification case: a primed numeric guard or a primed
-         * judgment needs next-state arithmetic/derivation mid-fixpoint. Only a
-         * boolean or multi-valued fluent read may prime for now. */
+        /* A primed NUMERIC guard (`hp(X)' <= 0` — the dying trigger) is the
+         * §5.8 stratification case, now supported (#87): the compiler assigns
+         * strata (stratify_steps below) and the engine solves once per
+         * stratum, minting the guard's fact when the fluent's next value
+         * settles. Primed JUDGMENTS remain a later slice. */
         if (at->is_guard) {
-            serr(p, at->line, at->col,
-                 "a primed numeric guard (`%s … '`) is not supported yet — it "
-                 "needs the §5.8 primed-guard stratification; test the current "
-                 "value instead", intern_name(p->syms, at->pred));
+            pred_info *pg = find_pred(p, at->pred);
+            if (!pg || !pg->is_fluent || !pg->is_num) {
+                serr(p, at->line, at->col,
+                     "'%s' is compared primed but is not a declared numeric "
+                     "fluent (`%s : int`)",
+                     intern_name(p->syms, at->pred), intern_name(p->syms, at->pred));
+                return;
+            }
+            check_pred_args(p, at->pred, pg, at->args, at->nargs, vars, nvars, ctx);
             return;
         }
         pred_info *pf = find_pred(p, at->pred);
@@ -3318,6 +3328,125 @@ static bool value_cycle_dfs(parser *p, int vi, bool *onstack, bool *done)
     return cyc;
 }
 
+/* ---- §5.8 stratification (#87) -------------------------------------
+ *
+ * A primed numeric guard reads a fluent's NEXT value, so everything that can
+ * write that fluent must settle in a lower stratum than any rule reading the
+ * guard. The analysis is PRED-level (coarser than ground = conservative):
+ *
+ *   stratum(rule R) >= fstrat(N) + 1   for each primed numeric guard over N
+ *                                       in R's body, where fstrat(N) = max
+ *                                       stratum over writers of N;
+ *   stratum(rule R) >= stratum(R')     for each primed BOOLEAN/MV read b' in
+ *                                       R's body and each R' with an effect on
+ *                                       b — the boolean fixpoint evaluates b'
+ *                                       within a solve, so equality suffices,
+ *                                       but the primed-numeric dependencies of
+ *                                       b's writers must propagate through.
+ *
+ * Iterated to fixpoint. Acyclic programs stabilise with strata bounded by the
+ * number of primed-guarded fluents; a program still moving past that bound
+ * has a primed-numeric cycle — which genuinely oscillates ("heal if hp' < 5,
+ * curse if hp' >= 5") — and is rejected with a located error naming the
+ * fluent. Zero primed guards leaves every rule at stratum 0: the degenerate
+ * case, today's single-solve tick. */
+
+static bool action_writes_num(parser *p, const ast_action *a, uint32_t pred)
+{
+    for (int b = 0; b < a->neff; b++)
+        if (a->effects[b].is_num_effect && a->effects[b].pred == pred) return true;
+    for (int bi = 0; bi < a->nbind; bi++) {
+        const ast_binder *bnd = &p->binders[a->bind_ix[bi]];
+        for (int it = 0; it < bnd->nitems; it++)
+            if (bnd->items[it].eff.is_num_effect && bnd->items[it].eff.pred == pred)
+                return true;
+    }
+    return false;
+}
+
+static bool action_writes_bool(parser *p, const ast_action *a, uint32_t pred)
+{
+    for (int b = 0; b < a->neff; b++)
+        if (!a->effects[b].is_num_effect && a->effects[b].pred == pred) return true;
+    for (int bi = 0; bi < a->nbind; bi++) {
+        const ast_binder *bnd = &p->binders[a->bind_ix[bi]];
+        for (int it = 0; it < bnd->nitems; it++)
+            if (!bnd->items[it].eff.is_num_effect && bnd->items[it].eff.pred == pred)
+                return true;
+    }
+    return false;
+}
+
+static void stratify_steps(parser *p)
+{
+    /* count the distinct primed-guarded numeric preds; none -> nothing to do */
+    uint32_t pg[MAX_PREDS];
+    int npgf = 0;
+    for (int i = 0; i < p->nactions; i++)
+        for (int b = 0; b < p->actions[i].nreq; b++) {
+            ast_atom *at = &p->actions[i].requires[b];
+            if (!(at->primed && at->is_guard)) continue;
+            bool seen = false;
+            for (int k = 0; k < npgf && !seen; k++) seen = pg[k] == at->pred;
+            if (!seen && npgf < MAX_PREDS) pg[npgf++] = at->pred;
+        }
+    if (npgf == 0) return;
+    p->has_pguards = true;
+
+    int rounds = npgf + 2;                 /* acyclic depth is bounded by npgf */
+    bool changed = true;
+    while (changed && rounds-- > 0) {
+        changed = false;
+        for (int i = 0; i < p->nactions; i++) {
+            ast_action *a = &p->actions[i];
+            int ns = a->stratum;
+            for (int b = 0; b < a->nreq; b++) {
+                ast_atom *at = &a->requires[b];
+                if (!at->primed) continue;
+                if (at->is_guard) {                /* reader sits ABOVE writers */
+                    for (int j = 0; j < p->nactions; j++)
+                        if (action_writes_num(p, &p->actions[j], at->pred) &&
+                            p->actions[j].stratum + 1 > ns)
+                            ns = p->actions[j].stratum + 1;
+                } else {                           /* primed bool/MV: same solve */
+                    for (int j = 0; j < p->nactions; j++)
+                        if (action_writes_bool(p, &p->actions[j], at->pred) &&
+                            p->actions[j].stratum > ns)
+                            ns = p->actions[j].stratum;
+                }
+            }
+            if (ns > a->stratum) { a->stratum = ns; changed = true; }
+        }
+    }
+    if (changed) {
+        /* still moving past the acyclic bound: a primed-numeric cycle. Name
+         * the first primed guard whose fluent's writers reached the bound. */
+        for (int i = 0; i < p->nactions; i++)
+            for (int b = 0; b < p->actions[i].nreq; b++) {
+                ast_atom *at = &p->actions[i].requires[b];
+                if (!(at->primed && at->is_guard)) continue;
+                for (int j = 0; j < p->nactions; j++)
+                    if (action_writes_num(p, &p->actions[j], at->pred) &&
+                        p->actions[j].stratum > npgf) {
+                        serr(p, at->line, at->col,
+                             "the next value of '%s' depends on itself through "
+                             "primed guards — `%s'` gates a rule that (directly "
+                             "or through other primed reads) writes '%s'; "
+                             "primed-numeric cycles oscillate and have no "
+                             "answer to converge to (§5.8); break the loop or "
+                             "test the current value on one side",
+                             intern_name(p->syms, at->pred),
+                             intern_name(p->syms, at->pred),
+                             intern_name(p->syms, at->pred));
+                        return;
+                    }
+            }
+        /* fallback (shouldn't be reachable): a located error on the first guard */
+        serr(p, p->actions[0].line, p->actions[0].col,
+             "primed-guard cycle detected among step rules (§5.8)");
+    }
+}
+
 static void semantic_pass(parser *p)
 {
     synthesize_enum_sorts(p);          /* #96: before entities resolve */
@@ -3469,6 +3598,7 @@ static void semantic_pass(parser *p)
     }
 
     check_bands(p);
+    stratify_steps(p);                 /* §5.8 strata + cycle rejection (#87) */
 }
 
 /* ---- grounding: emit ground rules into world_* ---------------------- */
@@ -3554,6 +3684,20 @@ static uint32_t ground_guard_atom(parser *p, uint32_t pred, const uint32_t *args
                                   int n, world_cmp op, long threshold)
 {
     return ground_guard_atom_s(p->syms, pred, args, n, op, threshold);
+}
+
+/* A PRIMED guard atom (§5.8 #87) interns with the next-state mark in the
+ * name — "hp(grik)'<=0" — so it can never collide with the current-value
+ * guard "hp(grik)<=0" over the same fluent. */
+static uint32_t ground_pguard_atom(parser *p, uint32_t pred, const uint32_t *args,
+                                   int n, world_cmp op, long threshold)
+{
+    char buf[MAX_GROUND];
+    int off = build_term(p->syms, pred, args, n, buf, sizeof buf);
+    if (off < (int)sizeof buf)
+        snprintf(buf + off, sizeof buf - (size_t)off, "'%s%ld",
+                 cmp_spelling(op), threshold);
+    return intern_id(p->syms, buf);
 }
 
 /* Resolve an argument name to a concrete entity atom under `binding`
@@ -3757,8 +3901,15 @@ static dl_lit ground_lit(parser *p, ast_atom *at, var_bind *vars, int nvars,
     uint32_t g;
     if (at->is_guard) {                            /* numeric landmark guard */
         uint32_t term = ground_pred(p, at->pred, args, at->nargs);
-        g = ground_guard_atom(p, at->pred, args, at->nargs, at->cmp, at->threshold);
-        world_add_guard(p->w, g, term, at->cmp, at->threshold);
+        if (at->primed) {                          /* §5.8 #87: next-value guard,
+                                                    * minted by the stratum loop */
+            g = ground_pguard_atom(p, at->pred, args, at->nargs,
+                                   at->cmp, at->threshold);
+            world_add_primed_guard(p->w, g, term, at->cmp, at->threshold);
+        } else {
+            g = ground_guard_atom(p, at->pred, args, at->nargs, at->cmp, at->threshold);
+            world_add_guard(p->w, g, term, at->cmp, at->threshold);
+        }
     } else if (at->value != INTERN_NONE) {
         /* a join value (`at(X) = c`) resolves through the binding; a literal
          * value (`at(X) = k1`) is not a variable and passes through unchanged. */
@@ -4768,9 +4919,11 @@ static void ground_action(parser *p, ast_action *a)
                 continue;
             conds[ncond].lit = ground_lit(p, &a->requires[b], a->vars, a->nvars, binding);
             /* Bare atom = current state; a postfix `'` (ramification bodies
-             * only) reads the next state (§5.4). Action `requires` are always
-             * current-state — the parser forbids `'` there. */
-            conds[ncond].primed = a->requires[b].primed;
+             * only) reads the next state (§5.4). A primed NUMERIC guard is NOT
+             * marked primed here: its atom is already the next-value guard,
+             * asserted as a strict fact by the stratum loop (§5.8 #87) — the
+             * primed flag would wrongly remap it to a boolean primed column. */
+            conds[ncond].primed = a->requires[b].primed && !a->requires[b].is_guard;
             ncond++;
         }
         /* A multi-valued assignment `f = v` expands to the whole family: the
@@ -4802,6 +4955,7 @@ static void ground_action(parser *p, ast_action *a)
                                                       pi->values[v]));
         }
         int h = world_add_step_rule(p->w, aname, act, conds, ncond, eff, ne);
+        if (a->stratum > 0) world_set_step_stratum(p->w, h, a->stratum);   /* #87 */
         char pbuf[MAX_NAME + 24];
         world_set_step_prov(p->w, h, prov_str(p, a->line, pbuf, sizeof pbuf));
 
@@ -4860,7 +5014,8 @@ static void ground_action(parser *p, ast_action *a)
                     for (int b = 0; b < a->nreq && nbc < MAX_BODY; b++) {
                         if (a->requires[b].is_member) continue;   /* held (#95) */
                         bc[nbc].lit = ground_lit(p, &a->requires[b], cv, ncv, cb);
-                        bc[nbc++].primed = a->requires[b].primed;
+                        bc[nbc++].primed = a->requires[b].primed &&
+                                           !a->requires[b].is_guard;   /* #87 */
                     }
                     for (int b = 0; b < bnd->nwhere && nbc < MAX_BODY; b++) {
                         if (bnd->where[b].is_member) continue;    /* held (#95) */
@@ -4898,6 +5053,8 @@ static void ground_action(parser *p, ast_action *a)
                     char bname[MAX_GROUND];
                     inst_name(p, bname, sizeof bname, a->name, cv, ncv, cb);
                     int h2 = world_add_step_rule(p->w, bname, act, bc, nbc, eff2, ne2);
+                    if (a->stratum > 0)
+                        world_set_step_stratum(p->w, h2, a->stratum);   /* #87 */
                     char pbuf[MAX_NAME + 24];
                     world_set_step_prov(p->w, h2, prov_str(p, bnd->line, pbuf, sizeof pbuf));
                     if (e->is_num_effect) {
@@ -5552,6 +5709,9 @@ static void emit_step_lanes(parser *p)
      * yet — a typed world stays on the N=1 step path (correctness first; the
      * lane-side response is #84's remaining slice). */
     if (p->dtype_sort >= 0)
+        return;
+    /* #87: a stratified world steps one solve per stratum — N=1 only */
+    if (p->has_pguards)
         return;
 
     /* Judgment rules do not block the transition: a judgment never changes a
