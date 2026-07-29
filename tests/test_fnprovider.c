@@ -200,9 +200,70 @@ static int test_errors(void)
     return 0;
 }
 
+/* #93: the unified spelling — `provider neighbor(cell, int) : cell` is the
+ * SAME value function as the `function` keyword (return type => called, not
+ * grounded); a boolean provider in the same block keeps grounding. */
+static int test_unified_provider_spelling(void)
+{
+    const char *src =
+        "domain cell\n"
+        "sort actor\n"
+        "provider (\n"
+        "    neighbor(cell, int) : cell\n"       /* typed: a value function */
+        "    watched(actor)\n"                   /* untyped: a relation */
+        ")\n"
+        "entity ( hero : actor )\n"
+        "state ( at(actor) : cell  alive(actor) )\n"
+        "init alive(hero)\n"
+        "action go_east(X: actor): causes at(X) := neighbor(at(X), 1)\n"
+        "rule seen(X: actor): alive(X) & watched(X) => seen(X)\n";
+
+    SY = intern_new();
+    story_diag di[8];
+    story_diags d = { di, 8, 0, 0 };
+    world *w = story_compile(src, "t.story", SY, &d);
+    if (!w) { fprintf(stderr, "  compile: %s\n", d.count ? d.items[0].msg : "?"); return 1; }
+    CHECK(d.nerrors == 0);
+
+    NEIGHBOR = intern_id(SY, "neighbor");
+    world_set_fn_provider_fn(w, neighbor_fn, NULL);
+    world_set_num(w, intern_id(SY, "at(hero)"), 103);
+
+    char err[128];
+    uint32_t east = intern_id(SY, "go_east(hero)");
+    CHECK(world_step(w, &east, 1, err, sizeof err) == 0);
+    CHECK(at(w, "hero") == 104);              /* called, exactly like `function` */
+
+    world_free(w);
+    intern_free(SY);
+
+    /* misuse: an inline MV domain or a clamp range on a provider */
+    static const struct { const char *src, *msg; } BAD[] = {
+        { "provider mood(actor) : { happy, sad }\nsort actor\n",
+          "doesn't name a callable type" },
+        { "sort actor\nprovider strength(actor) : int in 0 .. 5\n",
+          "no clamp range" },
+    };
+    for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {
+        intern *sy2 = intern_new();
+        story_diag di2[8];
+        story_diags d2 = { di2, 8, 0, 0 };
+        world *w2 = story_compile(BAD[i].src, "t.story", sy2, &d2);
+        CHECK(w2 == NULL || d2.nerrors > 0);
+        bool found = false;
+        for (int k = 0; k < d2.count && !found; k++)
+            found = strstr(d2.items[k].msg, BAD[i].msg) != NULL;
+        CHECK(found);
+        if (w2) world_free(w2);
+        intern_free(sy2);
+    }
+    return 0;
+}
+
 int main(void)
 {
     if (test_directional_move()) return 1;
+    if (test_unified_provider_spelling()) return 1;
     if (test_no_callback())      return 1;
     if (test_errors())           return 1;
     printf("test_fnprovider: all passed\n");

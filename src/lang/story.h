@@ -43,7 +43,8 @@
  * Grammar handled by this slice:
  *
  *   file    := decl*
- *   decl    := sort | enum | entity | state | function | value | init | rule | action | sup
+ *   decl    := sort | enum | entity | state | provider | function | value | init
+ *            | rule | action | sup
  *   sort    := 'sort'   ( IDENT | '(' IDENT (','? IDENT)* ')' )
  *   enum    := 'enum' IDENT '{' IDENT (',' IDENT)* '}'  -- named value domain (§13);
  *                                          -- also legal as an argument sort and a
@@ -60,7 +61,16 @@
  *                                          -- (deltas still sum on top, clamp outermost)
  *            | ':' '{' IDENT (',' IDENT)* '}'           -- inline multi-valued domain
  *            | ':' IDENT                                -- a declared `enum` domain
- *   function:= 'function' IDENT '(' vtype (',' vtype)* ')' ':' vtype -- host fn (§5.6)
+ *   provider:= 'provider' ( fdecl | '(' fdecl* ')' )     -- host-answered (§5.6/#93):
+ *                                          -- no return type = a boolean RELATION
+ *                                          -- (grounded, closed-world facts); a
+ *                                          -- return type (`: int`/`: sortname`) =
+ *                                          -- a value FUNCTION (called from the
+ *                                          -- effect VM, never grounded). The rule:
+ *                                          -- has a return type => called, not
+ *                                          -- grounded.
+ *   function:= 'function' IDENT '(' vtype (',' vtype)* ')' ':' vtype
+ *                                          -- spelling alias for a typed provider
  *   value   := 'value' ( vdecl | '(' vdecl* ')' )       -- engine-derived value (#82)
  *   vdecl   := IDENT [ '(' IDENT* ')' ] ':' 'int'        -- defined by a rule, inlined
  *                                                        -- at reads; roll sites key on
