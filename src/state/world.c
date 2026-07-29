@@ -181,7 +181,8 @@ struct world {
     struct { uint32_t atom; long value, min, max; bool has_range;
              const expr_ins *lo_code; int n_lo;
              const expr_ins *hi_code; int n_hi;
-             num_resp *resp; } *nums;   /* per-type response atoms, NULL = untyped (#84) */
+             num_resp *resp;            /* per-type response atoms, NULL = untyped (#84) */
+             world_merge merge; } *nums;   /* ASSIGN-class algebra (#85) */
     int nnum, capnum;
     int ndtypes;                        /* size of the closed damage-type enum (#83) */
     struct { uint32_t guard, num; world_cmp op; long threshold; } *guards;
@@ -532,8 +533,15 @@ void world_declare_num(world *w, uint32_t atom, long min, long max, bool has_ran
     w->nums[w->nnum].lo_code = NULL; w->nums[w->nnum].n_lo = 0;
     w->nums[w->nnum].hi_code = NULL; w->nums[w->nnum].n_hi = 0;
     w->nums[w->nnum].resp = NULL;
+    w->nums[w->nnum].merge = WORLD_MERGE_REGISTER;
     atom_map_set(&w->num_of, &w->num_of_cap, atom, w->nnum);
     w->nnum++;
+}
+
+void world_set_num_merge(world *w, uint32_t atom, world_merge m)
+{
+    int i = num_index(w, atom);
+    if (i >= 0) w->nums[i].merge = m;
 }
 
 void world_set_dtypes(world *w, int ndtypes)
@@ -2155,8 +2163,11 @@ static int compute_step_lane_numerics(world *w, step_lane_family *sf,
             if (dlcol_defeasible(sf->fam, m, e) != DL_PROVED) continue;   /* did not fire */
             size_t c = (size_t)ef->schema * nent + e;
             if (ef->op == WORLD_OP_ASSIGN) {
-                if (have[c]) { if (ef->konst != aval[c]) confl[c] = true; }
-                else { have[c] = true; aval[c] = ef->konst; }
+                world_merge mg = w->nums[sf->num_cell[c]].merge;   /* #85 */
+                if (!have[c]) { have[c] = true; aval[c] = ef->konst; }
+                else if (mg == WORLD_MERGE_MIN) { if (ef->konst < aval[c]) aval[c] = ef->konst; }
+                else if (mg == WORLD_MERGE_MAX) { if (ef->konst > aval[c]) aval[c] = ef->konst; }
+                else if (ef->konst != aval[c]) confl[c] = true;
             } else {
                 delta[c] += (ef->op == WORLD_OP_ADD) ? ef->konst : -ef->konst;
             }
@@ -2324,12 +2335,23 @@ int world_step(world *w, const uint32_t *actions, int nactions,
                 if (i < 0) continue;
                 long v = eval_expr(w, ef->code, ef->ncode);
                 if (ef->op == WORLD_OP_ASSIGN) {
-                    if (acc[i].have) {
-                        if (v != acc[i].assign_val) acc[i].conflict = true;
-                    } else {
+                    world_merge mg = w->nums[i].merge;
+                    if (!acc[i].have) {
                         acc[i].have = true;
                         acc[i].assign_val = v;
                         acc[i].rule = r->name;
+                    } else if (mg == WORLD_MERGE_MIN) {
+                        if (v < acc[i].assign_val) {
+                            acc[i].assign_val = v;
+                            acc[i].rule = r->name;      /* the extreme's provenance */
+                        }
+                    } else if (mg == WORLD_MERGE_MAX) {
+                        if (v > acc[i].assign_val) {
+                            acc[i].assign_val = v;
+                            acc[i].rule = r->name;
+                        }
+                    } else if (v != acc[i].assign_val) {
+                        acc[i].conflict = true;         /* register: contested (§5.8) */
                     }
                 } else {
                     long d = (ef->op == WORLD_OP_ADD) ? v : -v;
