@@ -123,6 +123,21 @@ int  world_add_roll_site(world *w, int sides, uint64_t site);
  * -> sum of undefeated deltas -> clamp to the declared range. */
 typedef enum { WORLD_OP_ASSIGN, WORLD_OP_ADD, WORLD_OP_SUB } world_numop;
 
+/* Declared merge algebra for the ASSIGN class of one numeric fluent (#85).
+ * The fluent is already a CRDT — `+=`/`-=` a PN-counter, `:=` a
+ * conflict-detecting register (deliberately not last-write-wins: LWW picks an
+ * order among rules, which §5.8 forbids). MIN/MAX extend the closed algebra
+ * set: multiple firing `:=` contributions merge by the extreme instead of
+ * contesting. Commutative and idempotent by construction, so order-free and
+ * non-stacking. Governs the ASSIGN class only — deltas still sum on top of
+ * the merged base, and the declared range clamp stays outermost. Motivating
+ * cases: armor floors, damage caps, "highest bid this tick". Host-supplied
+ * merge functions are deliberately excluded (I4: the engine cannot verify a
+ * host merge commutes, and a non-commutative merge diverges replay silently;
+ * a closed engine-known set stays lanable and `why?`-traceable). */
+typedef enum { WORLD_MERGE_REGISTER, WORLD_MERGE_MIN, WORLD_MERGE_MAX } world_merge;
+void world_set_num_merge(world *w, uint32_t atom, world_merge m);
+
 /* Effect right-hand-side bytecode: a stack VM over `long`. Integer/fixed-point
  * only — §5.8 keeps floats on the renderer side of the I4 replay wall. Evaluated
  * at commit time against the *pre-step* value store (all effects read current

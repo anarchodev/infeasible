@@ -187,6 +187,7 @@ typedef struct {
                                    * one uint32/entity in the value store, host-set/read,
                                    * copied with `:=`; no arithmetic, no int guards */
     bool     has_range;           /* declared `in lo..hi` — the clamp range */
+    int      merge_mode;          /* `merge min|max` (#85): 0 register, 1 min, 2 max */
     long     rmin, rmax;          /* constant bounds (when each side folds) */
     int      rmin_expr, rmax_expr;/* dynamic bound ex_node root, else -1 (§5.8) */
     int      line, col;
@@ -1202,6 +1203,23 @@ static bool parse_fdecl(parser *p, ast_fluent *f)
                 }
                 f->has_range = true;
             }
+            /* `merge min|max` (#85): the ASSIGN-class algebra. Contextual
+             * keyword — a fluent literally named `merge` following an `: int`
+             * in a grouped `state ( … )` will misparse here; the located error
+             * makes the fix obvious. */
+            if (ident_is(p->cur, "merge")) {
+                advance(p);
+                if (ident_is(p->cur, "min"))      f->merge_mode = 1;
+                else if (ident_is(p->cur, "max")) f->merge_mode = 2;
+                else {
+                    char d[64]; tok_desc(p->cur, d, sizeof d);
+                    fail(p, p->cur.line, p->cur.col,
+                         "expected `min` or `max` after `merge` — the algebra "
+                         "set is closed (#85; host merges spend I4), found %s", d);
+                    return false;
+                }
+                advance(p);
+            }
             f->is_num = true;
             return true;
         }
@@ -1361,6 +1379,12 @@ static void parse_value(parser *p)
             fail(p, v->line, v->col,
                  "a value has no clamp range — a range clamps stored state "
                  "(§5.8); a derived value is whatever its definition computes");
+            return;
+        }
+        if (v->merge_mode) {
+            fail(p, v->line, v->col,
+                 "a value has no merge algebra — competing definitions combine "
+                 "by defeat and `prior` (#82/#94), not by merging effects");
             return;
         }
         p->value_def[p->nvaluedecls] = -1;
@@ -3702,6 +3726,9 @@ static void declare_ground_fluents(parser *p)
             if (f->is_num) {                       /* value-store slot, not an atom */
                 uint32_t atom = ground_pred(p, f->pred, binding, f->nargs);
                 world_declare_num(p->w, atom, f->rmin, f->rmax, f->has_range);
+                if (f->merge_mode)                 /* `merge min|max` (#85) */
+                    world_set_num_merge(p->w, atom, f->merge_mode == 1
+                                        ? WORLD_MERGE_MIN : WORLD_MERGE_MAX);
                 if (f->rmin_expr >= 0 || f->rmax_expr >= 0) {
                     /* dynamic clamp: compile each bound per entity, the key sort
                      * name resolving to this instance's binding (§5.8) */

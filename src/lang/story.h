@@ -53,7 +53,11 @@
  *   ebind   := IDENT (',' IDENT)* ':' IDENT            -- names : sort
  *   state   := 'state'  ( fdecl | '(' fdecl* ')' )
  *   fdecl   := IDENT [ '(' IDENT (',' IDENT)* ')' ] [ ftype ]
- *   ftype   := ':' 'int' [ 'in' INT '..' INT ]         -- numeric + clamp range
+ *   ftype   := ':' 'int' [ 'in' INT '..' INT ] [ 'merge' ('min'|'max') ]
+ *                                          -- numeric + clamp range; `merge` (#85):
+ *                                          -- the ASSIGN-class algebra — firing `:=`s
+ *                                          -- take the extreme instead of contesting
+ *                                          -- (deltas still sum on top, clamp outermost)
  *            | ':' '{' IDENT (',' IDENT)* '}'           -- inline multi-valued domain
  *            | ':' IDENT                                -- a declared `enum` domain
  *   function:= 'function' IDENT '(' vtype (',' vtype)* ')' ':' vtype -- host fn (§5.6)
