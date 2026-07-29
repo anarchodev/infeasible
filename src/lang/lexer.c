@@ -59,7 +59,7 @@ static const struct { const char *word; tok_kind kind; } keywords[] = {
     { "bands", TK_BANDS },     { "domain", TK_DOMAIN },
     { "for", TK_FOR },         { "each", TK_EACH },     { "where", TK_WHERE },
     { "when", TK_WHEN },       { "limit", TK_LIMIT },   { "enum", TK_ENUM },
-    { "set", TK_SET },         { "of", TK_OF },
+    { "set", TK_SET },         { "of", TK_OF },     { "as", TK_AS },
 };
 
 static tok_kind keyword_lookup(const char *s, int len)
@@ -176,6 +176,7 @@ const char *tok_kind_name(tok_kind k)
     case TK_WHEN:     return "'when'";
     case TK_LIMIT:    return "'limit'";
     case TK_ENUM:     return "'enum'";
+    case TK_AS:       return "'as'";
     case TK_SET:      return "'set'";
     case TK_OF:       return "'of'";
     case TK_LPAREN:   return "'('";
