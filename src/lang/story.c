@@ -102,6 +102,8 @@ typedef struct {
     int      nargs;           /* EX_LOAD: arg names; EX_CALL: call args */
     ast_arg  args[MAX_ARGS];  /* EX_LOAD */
     int      cargs[MAX_ARGS]; /* EX_CALL: child expr node indices */
+    bool     nprimed;         /* EX_LOAD with postfix ' (#84): read the NEXT value
+                               * a lower stratum committed this tick */
     int      lhs, rhs;        /* child node indices (rhs unused for CONST/LOAD/NEG) */
     int      line, col;
 } ex_node;
@@ -325,6 +327,7 @@ typedef struct {
     int value_nlayers[MAX_FLUENTS];
     int *vmark_of; uint32_t vmark_cap;    /* marker atom -> grounded flag (dedup) */
     bool in_valuedef_expr;                /* `prior` legality context */
+    bool in_ramif_eff;                    /* primed-read legality context (#84) */
     int vdepth;                           /* value-inline recursion depth (cycle backstop) */
     ast_rule   *rules;            /* heap; MAX_RULES */
     int nrules;
@@ -840,6 +843,11 @@ static int parse_factor(parser *p)
         int n = alloc_expr(p, EX_LOAD, id.line, id.col);        /* fluent read */
         if (n < 0) return -1;
         p->exprs[n].pred = intern_tok(p, id);
+        if (p->cur.kind != TK_LPAREN && p->cur.kind == TK_PRIME) {
+            p->exprs[n].nprimed = true;            /* arity-0 primed read (#84) */
+            advance(p);
+            return n;
+        }
         if (p->cur.kind == TK_LPAREN) {
             advance(p);
             for (;;) {
@@ -862,6 +870,10 @@ static int parse_factor(parser *p)
                 break;
             }
             if (!expect(p, TK_RPAREN)) return -1;
+        }
+        if (p->cur.kind == TK_PRIME) {             /* primed numeric read (#84) */
+            p->exprs[n].nprimed = true;
+            advance(p);
         }
         return n;
     }
@@ -2410,6 +2422,23 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
     case EX_LOAD: {
         note_ref(p, n->pred, n->line, n->col);
         pred_info *pi = find_pred(p, n->pred);
+        if (n->nprimed) {                      /* primed numeric read (#84/#87) */
+            if (!p->in_ramif_eff) {
+                serr(p, n->line, n->col,
+                     "a primed read (`%s'`) is only legal in a ramification's "
+                     "effect expression — it reads the next value a lower "
+                     "stratum committed this tick (§5.8)",
+                     intern_name(p->syms, n->pred));
+                return;
+            }
+            if (pi && pi->is_value) {
+                serr(p, n->line, n->col,
+                     "a derived value has no primed form — '%s' is recomputed "
+                     "from state, not committed; read it unprimed",
+                     intern_name(p->syms, n->pred));
+                return;
+            }
+        }
         if (pi && pi->is_value) {              /* a derived-value read (#82) */
             int vi = find_value(p, n->pred);
             if (vi >= 0 && p->nvdefs[vi] == 0) {
@@ -3670,19 +3699,82 @@ static bool action_writes_bool(parser *p, const ast_action *a, uint32_t pred)
     return false;
 }
 
+/* Preds read PRIMED inside an effect expression (#84's LOADN), collected the
+ * same way primed guards are: the reading rule must sit above every writer. */
+static void collect_primed_loads(parser *p, int e, uint32_t *pg, int *npgf)
+{
+    if (e < 0) return;
+    ex_node *n = &p->exprs[e];
+    switch (n->kind) {
+    case EX_LOAD:
+        if (n->nprimed) {
+            bool seen = false;
+            for (int k = 0; k < *npgf && !seen; k++) seen = pg[k] == n->pred;
+            if (!seen && *npgf < MAX_PREDS) pg[(*npgf)++] = n->pred;
+        }
+        return;
+    case EX_CALL:
+        for (int k = 0; k < n->nargs; k++)
+            collect_primed_loads(p, n->cargs[k], pg, npgf);
+        return;
+    case EX_CONST: case EX_ROLL: case EX_TEST: case EX_PRIOR: return;
+    case EX_NEG: collect_primed_loads(p, n->lhs, pg, npgf); return;
+    default:
+        collect_primed_loads(p, n->lhs, pg, npgf);
+        collect_primed_loads(p, n->rhs, pg, npgf);
+        return;
+    }
+}
+
+/* max over primed loads in expr e of (writer stratum + 1) — the same edge a
+ * primed GUARD contributes; a fluent with no writers floors nothing (its next
+ * value is its current value, readable at any stratum). */
+static int primed_read_floor(parser *p, int e)
+{
+    if (e < 0) return 0;
+    ex_node *n = &p->exprs[e];
+    int m = 0, c;
+    switch (n->kind) {
+    case EX_LOAD:
+        if (n->nprimed)
+            for (int j = 0; j < p->nactions; j++)
+                if (action_writes_num(p, &p->actions[j], n->pred) &&
+                    p->actions[j].stratum + 1 > m)
+                    m = p->actions[j].stratum + 1;
+        return m;
+    case EX_CALL:
+        for (int k = 0; k < n->nargs; k++) {
+            c = primed_read_floor(p, n->cargs[k]);
+            if (c > m) m = c;
+        }
+        return m;
+    case EX_CONST: case EX_ROLL: case EX_TEST: case EX_PRIOR: return 0;
+    case EX_NEG: return primed_read_floor(p, n->lhs);
+    default:
+        m = primed_read_floor(p, n->lhs);
+        c = primed_read_floor(p, n->rhs);
+        return c > m ? c : m;
+    }
+}
+
 static void stratify_steps(parser *p)
 {
-    /* count the distinct primed-guarded numeric preds; none -> nothing to do */
+    /* count the distinct primed-guarded/primed-read numeric preds */
     uint32_t pg[MAX_PREDS];
     int npgf = 0;
-    for (int i = 0; i < p->nactions; i++)
-        for (int b = 0; b < p->actions[i].nreq; b++) {
-            ast_atom *at = &p->actions[i].requires[b];
+    for (int i = 0; i < p->nactions; i++) {
+        ast_action *a = &p->actions[i];
+        for (int b = 0; b < a->nreq; b++) {
+            ast_atom *at = &a->requires[b];
             if (!(at->primed && at->is_guard)) continue;
             bool seen = false;
             for (int k = 0; k < npgf && !seen; k++) seen = pg[k] == at->pred;
             if (!seen && npgf < MAX_PREDS) pg[npgf++] = at->pred;
         }
+        for (int b = 0; b < a->neff; b++)
+            if (a->effects[b].is_num_effect)
+                collect_primed_loads(p, a->effects[b].expr_root, pg, &npgf);
+    }
     if (npgf == 0) return;
     p->has_pguards = true;
 
@@ -3708,6 +3800,11 @@ static void stratify_steps(parser *p)
                             ns = p->actions[j].stratum;
                 }
             }
+            for (int b = 0; b < a->neff; b++)      /* primed READS float too (#84) */
+                if (a->effects[b].is_num_effect) {
+                    int fl = primed_read_floor(p, a->effects[b].expr_root);
+                    if (fl > ns) ns = fl;
+                }
             if (ns > a->stratum) { a->stratum = ns; changed = true; }
         }
     }
@@ -3733,6 +3830,31 @@ static void stratify_steps(parser *p)
                              intern_name(p->syms, at->pred));
                         return;
                     }
+            }
+        /* a cycle induced purely through primed READS (#84): name the fluent */
+        for (int i = 0; i < p->nactions; i++)
+            for (int b = 0; b < p->actions[i].neff; b++) {
+                if (!p->actions[i].effects[b].is_num_effect) continue;
+                uint32_t lp[MAX_PREDS];
+                int nlp = 0;
+                collect_primed_loads(p, p->actions[i].effects[b].expr_root,
+                                     lp, &nlp);
+                for (int k = 0; k < nlp; k++)
+                    for (int j = 0; j < p->nactions; j++)
+                        if (action_writes_num(p, &p->actions[j], lp[k]) &&
+                            p->actions[j].stratum > npgf) {
+                            serr(p, p->actions[i].effects[b].line,
+                                 p->actions[i].effects[b].col,
+                                 "the next value of '%s' depends on itself "
+                                 "through a primed read — `%s'` feeds an "
+                                 "effect that (directly or through others) "
+                                 "writes '%s'; break the loop or read the "
+                                 "current value (§5.8)",
+                                 intern_name(p->syms, lp[k]),
+                                 intern_name(p->syms, lp[k]),
+                                 intern_name(p->syms, lp[k]));
+                            return;
+                        }
             }
         /* fallback (shouldn't be reachable): a located error on the first guard */
         serr(p, p->actions[0].line, p->actions[0].col,
@@ -3830,6 +3952,7 @@ static void semantic_pass(parser *p)
         const char *bctx = a->is_ramif ? "a ramification body" : "a `requires` clause";
         for (int b = 0; b < a->nreq; b++)
             check_atom(p, &a->requires[b], ascope, nas, true, false, a->is_ramif, bctx);
+        p->in_ramif_eff = a->is_ramif;         /* primed reads legal here (#84) */
         for (int b = 0; b < a->neff; b++) {
             check_atom(p, &a->effects[b], a->vars, a->nvars, false, true, false, "a `causes` clause");
             if (a->effects[b].value != INTERN_NONE && a->effects[b].neg)
@@ -3840,6 +3963,7 @@ static void semantic_pass(parser *p)
                      intern_name(p->syms, a->effects[b].pred),
                      intern_name(p->syms, a->effects[b].value));
         }
+        p->in_ramif_eff = false;
         /* `for each` binders: resolve bound vars, then check the where/when
          * guards and effects against the combined (action ++ binder) scope. */
         for (int bi = 0; bi < a->nbind; bi++) {
@@ -4066,7 +4190,10 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
             return;
         }
         uint32_t g = ground_pred(p, n->pred, args, n->nargs);
-        if (*pos < MAX_CODE) { code[*pos].op = EXPR_LOAD; code[(*pos)++].arg = (long)g; }
+        if (*pos < MAX_CODE) {
+            code[*pos].op = n->nprimed ? EXPR_LOADN : EXPR_LOAD;   /* #84 */
+            code[(*pos)++].arg = (long)g;
+        }
         return;
     }
     if (n->kind == EX_ROLL) {

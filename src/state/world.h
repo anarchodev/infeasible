@@ -201,7 +201,15 @@ typedef enum {
      * clobbering the outer layer's prior. */
     EXPR_PPUSH,   /* pop the running value onto the prior stack (enter a layer) */
     EXPR_P,       /* push the top of the prior stack (`prior` reads) */
-    EXPR_PPOP     /* drop the top prior slot (leave a layer) */
+    EXPR_PPOP,    /* drop the top prior slot (leave a layer) */
+    EXPR_LOADN    /* primed numeric READ (#87 extension, for #84's modeled
+                   * pipeline): push the NEXT value of the numeric fluent whose
+                   * atom = arg — the value a lower stratum already committed
+                   * this tick. Legal only in ramification effect expressions
+                   * whose rule the stratifier placed above every writer of the
+                   * fluent; a fluent with no writers reads its current value
+                   * (inertia: next == current). The .story front end rejects
+                   * it everywhere else. */
 } expr_op;
 typedef struct { expr_op op; long arg; } expr_ins;
 
