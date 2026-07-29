@@ -15,8 +15,14 @@
  * +/-Partial (defeasible) statuses for every literal.
  *
  * Scaffold implementation: tri-valued fixpoint over ground rules. Correct,
- * not yet Maher-linear (see DESIGN.md 5.2). Cyclic rule graphs may leave
- * literals UNDECIDED; the language compiler will reject cycles. */
+ * not yet Maher-linear (see DESIGN.md 5.2). Cyclic support: supported
+ * literals prove through cycles already (the fixpoint is monotone — cycles
+ * stall, never oscillate); unsupported loop-locked literals stall UNDECIDED
+ * here. The decided semantics (DESIGN.md §5.2, "recursion is Datalog") is:
+ * a defeat-free support cycle is a Datalog SCC — least fixpoint, then
+ * unsupported members complete to REFUTED; a cycle containing an attacked
+ * or defeater-targeted literal is a compile-time error in the language
+ * layer. The completion pass is not implemented here yet. */
 
 typedef struct {
     uint32_t atom;   /* interned id */
