@@ -199,6 +199,9 @@ struct world {
     int *num_stratum;                   /* per nums[i]: max writer stratum;
                                          * recomputed per stratified step */
     int num_stratum_cap;
+    const long *nn_cur;                 /* EXPR_LOADN (#84): the in-progress
+                                         * nextnum during the stratum loop */
+    int cur_stratum;
     /* Expression guards (§5.8/§5.10): `expr <op> expr` — e.g. roll(20)+atk >= ac.
      * Two RHS-bytecode programs compared at solve time; loads as a fact like a
      * numeric guard. Bytecode is arena-copied. `has_test` marks a guard whose
@@ -2091,6 +2094,14 @@ static long eval_expr(const world *w, const expr_ins *code, int n)
             st[sp++] = lit_solved_proved(w, atom, code[i].arg & 1) ? 1 : 0;
             break;
         }
+        case EXPR_LOADN: {   /* primed numeric read (#84 modeled pipeline) */
+            int li = num_index(w, (uint32_t)code[i].arg);
+            st[sp++] = (li >= 0 && w->nn_cur && w->num_stratum &&
+                        w->num_stratum[li] < w->cur_stratum)
+                       ? w->nn_cur[li]
+                       : (li >= 0 ? w->nums[li].value : 0);
+            break;
+        }
         case EXPR_PPUSH: if (psp < 16) pstk[psp++] = st[--sp]; break;
         case EXPR_P:     st[sp++] = psp > 0 ? pstk[psp-1] : 0; break;
         case EXPR_PPOP:  if (psp > 0) psp--; break;
@@ -2468,6 +2479,8 @@ int world_step(world *w, const uint32_t *actions, int nactions,
     for (int i = 0; i < w->nnum; i++) w->rcpt[i].n = 0;
 
     for (int st = 0; st < nstrata && rc == 0; st++) {
+        w->nn_cur = nextnum;                       /* EXPR_LOADN context (#84) */
+        w->cur_stratum = st;
         solve_step_family(w, actions, nactions);   /* injects pg_cur facts */
 
         for (int s = 0; s < w->nsr; s++) {
@@ -2587,6 +2600,7 @@ int world_step(world *w, const uint32_t *actions, int nactions,
     }
     free(acc);
     free(tacc);
+    w->nn_cur = NULL;                              /* commit-loop context down */
 
     /* boolean next-state + contested check, from the FINAL solve */
     bool *next = malloc((size_t)(w->nfl ? w->nfl : 1) * sizeof *next);
