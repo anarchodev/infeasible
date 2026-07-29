@@ -104,9 +104,11 @@
  *   factor  := '-' factor | INT
  *            | ('min'|'max'|'divup') '(' expr ',' expr ')'  -- divup = ceiling div
  *            | 'test' '(' ['~'] IDENT ['(' arg* ')'] ')'    -- verdict as 0/1 (#86):
- *                                          -- branch-free modifiers base+flag*delta;
- *                                          -- effect-side only until #87 (a guard-
- *                                          -- side test feeds the fixpoint it reads)
+ *                                          -- branch-free modifiers base+flag*delta,
+ *                                          -- in effects AND expression guards (the
+ *                                          -- guard evaluates in pass B of the two-
+ *                                          -- phase solve; a tested judgment derived
+ *                                          -- through another test guard is an error)
  *            | IDENT '(' expr (',' expr)* ')'           -- fn-provider call (§5.6)
  *            | IDENT [ '(' arg (',' arg)* ')' ] | '(' expr ')'
  *   atom    := [ '~' ] IDENT [ '(' arg (',' arg)* ')' ] [ "'" ]

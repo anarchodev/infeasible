@@ -201,10 +201,24 @@ struct world {
     int num_stratum_cap;
     /* Expression guards (§5.8/§5.10): `expr <op> expr` — e.g. roll(20)+atk >= ac.
      * Two RHS-bytecode programs compared at solve time; loads as a fact like a
-     * numeric guard. Bytecode is arena-copied. */
+     * numeric guard. Bytecode is arena-copied. `has_test` marks a guard whose
+     * bytecode contains EXPR_TEST (#86 guard half): it cannot evaluate at fact
+     * load (the tested verdict is the fixpoint's OUTPUT), so each solve runs
+     * two-phase — solve without those guards, evaluate them against the
+     * settled result into `tval`, reload with them, solve again. Sound because
+     * the compiler rejects a tested atom whose cone contains a test-bearing
+     * guard, so pass-A verdicts of tested atoms are final. */
     struct { uint32_t guard; const expr_ins *lhs; int nlhs;
-             const expr_ins *rhs; int nrhs; world_cmp op; } *eguards;
+             const expr_ins *rhs; int nrhs; world_cmp op;
+             bool has_test, tval; } *eguards;
     int neguard, capeguard;
+    int n_teg;                    /* # test-bearing eguards (two-phase iff > 0) */
+    bool teg_ready;               /* pass C: load has_test guards from tval */
+    dlcol *tctx_fam;              /* EXPR_TEST eval context override for pass-B
+                                   * evals against a non-step family (jfam);
+                                   * NULL = the step family (fam/loc_of) */
+    const uint32_t *tctx_of;
+    uint32_t tctx_cap;
 
     /* Providers (§5.2/§5.6/§5.10): computed relations answered host-side, never
      * stored. Each ground provider atom records its predicate + entity args; at
@@ -787,6 +801,12 @@ void world_add_expr_guard(world *w, uint32_t guard,
     w->eguards[w->neguard].lhs = l; w->eguards[w->neguard].nlhs = nlhs;
     w->eguards[w->neguard].rhs = r; w->eguards[w->neguard].nrhs = nrhs;
     w->eguards[w->neguard].op = op;
+    bool ht = false;
+    for (int k = 0; k < nlhs && !ht; k++) ht = l[k].op == EXPR_TEST;
+    for (int k = 0; k < nrhs && !ht; k++) ht = r[k].op == EXPR_TEST;
+    w->eguards[w->neguard].has_test = ht;
+    w->eguards[w->neguard].tval = false;
+    if (ht) w->n_teg++;
     w->neguard++;
 }
 
@@ -799,14 +819,39 @@ static bool guard_holds_expr(const world *w, int i)
                   w->eguards[i].op);
 }
 
-/* Load every ground expression guard as a closed-world fact (like numeric guards). */
+/* Load every ground expression guard as a closed-world fact (like numeric
+ * guards). A test-bearing guard (#86) has no value in pass A — its atom stays
+ * unasserted, so nothing gated on it fires yet; in pass C (`teg_ready`) it
+ * loads from `tval`, evaluated between the solves against the settled pass-A
+ * result. Roll-bearing guards re-evaluate identically in both passes (§5.10
+ * keyed lookup — same tick, same draw). */
 static void load_eguards(world *w, dlcol *f, const uint32_t *of, uint32_t cap)
 {
     for (int i = 0; i < w->neguard; i++) {
         uint32_t ga = w->eguards[i].guard;
-        if (ga < cap && of[ga] != LOC_NONE)
-            dlcol_add_fact(f, (dl_lit){ of[ga], !guard_holds_expr(w, i) }, 0);
+        if (ga >= cap || of[ga] == LOC_NONE) continue;
+        bool v;
+        if (w->eguards[i].has_test) {
+            if (!w->teg_ready) continue;           /* pass A: undecided */
+            v = w->eguards[i].tval;
+        } else {
+            v = guard_holds_expr(w, i);
+        }
+        dlcol_add_fact(f, (dl_lit){ of[ga], !v }, 0);
     }
+}
+
+/* Pass B (#86): evaluate the test-bearing guards against the just-settled
+ * family. `tf`/`of`/`cap` become the EXPR_TEST evaluation context, so a
+ * tested judgment reads THIS solve's verdicts, whichever family it is. */
+static void eval_test_guards(world *w, dlcol *tf, const uint32_t *of, uint32_t cap)
+{
+    w->tctx_fam = tf; w->tctx_of = of; w->tctx_cap = cap;
+    for (int i = 0; i < w->neguard; i++)
+        if (w->eguards[i].has_test)
+            w->eguards[i].tval = guard_holds_expr(w, i);
+    w->tctx_fam = NULL;
+    w->teg_ready = true;
 }
 
 /* Load every ground numeric-comparison guard the same way. */
@@ -1968,24 +2013,30 @@ static void ensure_fam(world *w)
 static void solve_judgment_family(world *w)
 {
     dlcol *f = w->jfam;
-    dlcol_clear_facts(f);
-    /* Closed-world facts for the family's OWN atoms only (#77): iterate the
-     * sparse locations, not the declared-fluent sweep — O(jfam atoms) where the
-     * dense map is O(all fluents ever declared). A declared fluent outside the
-     * family answers through lazy_judgment_verdict instead. */
-    for (uint32_t loc = 0; loc < w->njloc; loc++) {
-        int i = fluent_index(w, w->jloc_atom[loc]);
-        if (i >= 0)
-            dlcol_add_fact(f, (dl_lit){ loc, !w->vals[i] }, 0);  /* f or ~f */
-        else if (schema_knows(w, w->jloc_atom[loc]))
-            dlcol_add_fact(f, (dl_lit){ loc, true }, 0);
-            /* #92: a rule references a never-touched fluent — closed-world
-             * false, exactly the fact the dense universe would have loaded */
+    w->teg_ready = false;
+    for (int phase = 0; ; phase++) {               /* two-phase iff test-guards (#86) */
+        dlcol_clear_facts(f);
+        /* Closed-world facts for the family's OWN atoms only (#77): iterate the
+         * sparse locations, not the declared-fluent sweep — O(jfam atoms) where
+         * the dense map is O(all fluents ever declared). A declared fluent
+         * outside the family answers through lazy_judgment_verdict instead. */
+        for (uint32_t loc = 0; loc < w->njloc; loc++) {
+            int i = fluent_index(w, w->jloc_atom[loc]);
+            if (i >= 0)
+                dlcol_add_fact(f, (dl_lit){ loc, !w->vals[i] }, 0);  /* f or ~f */
+            else if (schema_knows(w, w->jloc_atom[loc]))
+                dlcol_add_fact(f, (dl_lit){ loc, true }, 0);
+                /* #92: a rule references a never-touched fluent — closed-world
+                 * false, exactly the fact the dense universe would have loaded */
+        }
+        load_guards(w, f, w->jloc_of, w->jloc_cap);
+        load_providers(w, f, w->jloc_of, w->jloc_cap);
+        load_eguards(w, f, w->jloc_of, w->jloc_cap);
+        dlcol_solve(f);
+        if (phase == 1 || w->n_teg == 0) break;
+        eval_test_guards(w, f, w->jloc_of, w->jloc_cap);
     }
-    load_guards(w, f, w->jloc_of, w->jloc_cap);
-    load_providers(w, f, w->jloc_of, w->jloc_cap);
-    load_eguards(w, f, w->jloc_of, w->jloc_cap);
-    dlcol_solve(f);
+    w->teg_ready = false;
     w->jfam_solved = true;
 }
 
@@ -2088,10 +2139,30 @@ static bool srule_fired(const world *w, const srule *r,
  * the fixpoint settles. */
 static bool lit_solved_proved(const world *w, uint32_t atom, bool neg)
 {
-    if (atom == INTERN_NONE || atom >= w->loc_cap || w->loc_of[atom] == LOC_NONE)
+    if (atom == INTERN_NONE) return false;
+    /* Base fluents are closed-world state: answer from the store — identical
+     * to the fact any solve loads for them, and it keeps test() working when
+     * a SPARSE family carries no location for an atom referenced only inside
+     * test() bytecode. Same for provider atoms (host-answered, load-time). */
+    int fi = fluent_index(w, atom);
+    if (fi >= 0) return neg ? !w->vals[fi] : w->vals[fi];
+    int pvi = prov_index(w, atom);
+    if (pvi >= 0) {
+        bool holds = w->provider_fn &&
+            w->provider_fn(w->provider_ctx, w->provs[pvi].pred,
+                           w->provs[pvi].args, w->provs[pvi].nargs);
+        return neg ? !holds : holds;
+    }
+    /* derived judgments read the solved family — pass-B guard evaluation
+     * (#86) may point EXPR_TEST at a non-step family (the query-layer jfam);
+     * everything else (effects, the #84 response) reads the step family */
+    dlcol *f = w->tctx_fam ? w->tctx_fam : w->fam;
+    const uint32_t *of = w->tctx_fam ? w->tctx_of : w->loc_of;
+    uint32_t cap = w->tctx_fam ? w->tctx_cap : w->loc_cap;
+    if (atom >= cap || of[atom] == LOC_NONE)
         return false;
-    dl_lit loc = { w->loc_of[atom], neg };
-    return dlcol_defeasible(w->fam, loc, 0) == DL_PROVED;
+    dl_lit loc = { of[atom], neg };
+    return dlcol_defeasible(f, loc, 0) == DL_PROVED;
 }
 
 static bool resp_proved(const world *w, uint32_t atom)
@@ -2145,30 +2216,36 @@ static void solve_step_family_vals(world *w, const bool *vals,
                                    const uint32_t *actions, int nactions)
 {
     dlcol *f = w->fam;
-    dlcol_clear_facts(f);
-    for (int i = 0; i < w->nfl; i++) {
-        dl_lit l = { w->fl_loc[i], !vals[i] };
-        dlcol_add_fact(f, l, 0);
-    }
-    for (int i = 0; i < nactions; i++) {
-        uint32_t a = actions[i];
-        if (a < w->loc_cap && w->loc_of[a] != LOC_NONE) {
-            dl_lit l = { w->loc_of[a], false };
+    w->teg_ready = false;
+    for (int phase = 0; ; phase++) {               /* two-phase iff test-guards (#86) */
+        dlcol_clear_facts(f);
+        for (int i = 0; i < w->nfl; i++) {
+            dl_lit l = { w->fl_loc[i], !vals[i] };
             dlcol_add_fact(f, l, 0);
         }
+        for (int i = 0; i < nactions; i++) {
+            uint32_t a = actions[i];
+            if (a < w->loc_cap && w->loc_of[a] != LOC_NONE) {
+                dl_lit l = { w->loc_of[a], false };
+                dlcol_add_fact(f, l, 0);
+            }
+        }
+        /* numeric guard atoms feed judgment rules inside the step theory too */
+        load_guards(w, f, w->loc_of, w->loc_cap);
+        load_providers(w, f, w->loc_of, w->loc_cap);
+        load_eguards(w, f, w->loc_of, w->loc_cap);
+        /* primed-guard facts minted by settled lower strata (§5.8 #87): strict
+         * inputs about the NEXT value; empty until the stratum loop mints them */
+        for (int i = 0; i < w->npg_cur; i++) {
+            uint32_t a = w->pg_cur[i].atom;
+            if (a < w->loc_cap && w->loc_of[a] != LOC_NONE)
+                dlcol_add_fact(f, (dl_lit){ w->loc_of[a], !w->pg_cur[i].val }, 0);
+        }
+        dlcol_solve(f);
+        if (phase == 1 || w->n_teg == 0) break;
+        eval_test_guards(w, f, w->loc_of, w->loc_cap);
     }
-    /* numeric guard atoms feed judgment rules inside the step theory too */
-    load_guards(w, f, w->loc_of, w->loc_cap);
-    load_providers(w, f, w->loc_of, w->loc_cap);
-    load_eguards(w, f, w->loc_of, w->loc_cap);
-    /* primed-guard facts minted by settled lower strata (§5.8 #87): strict
-     * inputs about the NEXT value; empty until the stratum loop mints them */
-    for (int i = 0; i < w->npg_cur; i++) {
-        uint32_t a = w->pg_cur[i].atom;
-        if (a < w->loc_cap && w->loc_of[a] != LOC_NONE)
-            dlcol_add_fact(f, (dl_lit){ w->loc_of[a], !w->pg_cur[i].val }, 0);
-    }
-    dlcol_solve(f);
+    w->teg_ready = false;
 }
 
 static void solve_step_family(world *w, const uint32_t *actions, int nactions)
