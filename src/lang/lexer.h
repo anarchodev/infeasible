@@ -49,6 +49,7 @@ typedef enum {
     TK_STAR,       /* *                   */
     TK_SLASH,      /* /  division; both comment forms are consumed first */
     TK_DOTDOT,     /* ..  range           */
+    TK_DOT,        /* .   expanded-label separator in superiority (#82) */
     TK_PRIME       /* '   next-state mark (ramification bodies, §5.4) */
 } tok_kind;
 

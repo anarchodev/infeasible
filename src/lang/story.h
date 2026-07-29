@@ -72,7 +72,8 @@
  *   function:= 'function' IDENT '(' vtype (',' vtype)* ')' ':' vtype
  *                                          -- spelling alias for a typed provider
  *   value   := 'value' ( vdecl | '(' vdecl* ')' )       -- engine-derived value (#82)
- *   vdecl   := IDENT [ '(' IDENT* ')' ] ':' 'int'        -- defined by a rule, inlined
+ *   vdecl   := IDENT [ '(' IDENT* ')' ] ':' 'int' [ 'kind' IDENT ]
+ *                                                        -- defined by a rule, inlined
  *                                                        -- at reads; roll sites key on
  *                                                        -- the definition, so every
  *                                                        -- reader shares the draw
@@ -83,6 +84,12 @@
  *                ( OP atom [ 'unless' conj ]
  *                | 'causes' effects )                           -- ramification
  *            | 'rule' IDENT [ params ] ':' [ conj ] '=>' IDENT '(' args ')' '=' expr
+ *            | 'rule' IDENT '(' vbind ')' ':' [ conj ] '=>'
+ *                  'kind' IDENT '(' IDENT ')' '=' expr
+ *                                          -- kind modifier (#82): expands into a
+ *                                          -- layer (`prior`-shaped, commuting
+ *                                          -- class) on EVERY value declaring the
+ *                                          -- kind; expanded labels `L.value`
  *                                          -- value definition (#82/#94): ONE
  *                                          -- unconditional base per value, plus
  *                                          -- guarded overrides/layers ordered by
@@ -101,7 +108,9 @@
  *   params  := '(' vbind (',' vbind)* ')'
  *   vbind   := IDENT ':' IDENT                          -- var : sort
  *   OP      := '->' | '=>' | '~>'
- *   sup     := IDENT '>' IDENT                          -- label > label
+ *   sup     := label '>' label ; label := IDENT [ '.' IDENT ]
+ *                                          -- rule labels; the dotted form names a
+ *                                          -- kind modifier's expansion (#82)
  *   conj    := eatom ( '&' eatom )*
  *   eatom   := atom [ cmp INT | '=' IDENT | numop expr ] -- guard / MV / effect
  *            | IDENT ['not'] 'in' '{' IDENT (',' IDENT)* '}'  -- membership (#95):

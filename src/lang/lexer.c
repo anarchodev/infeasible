@@ -118,7 +118,7 @@ token lexer_next(lexer *lx)
     case '/':  t.kind = TK_SLASH; break;   /* comments consumed in skip_ws */
     case '\'': t.kind = TK_PRIME; break;   /* postfix next-state mark (§5.4) */
     case '.': if (*lx->p == '.') { adv(lx); t.kind = TK_DOTDOT; }
-              else                 t.kind = TK_ERROR;
+              else                 t.kind = TK_DOT;
               break;
     case '~': if (*lx->p == '>') { adv(lx); t.kind = TK_SQARROW; }
               else                 t.kind = TK_TILDE;
@@ -204,6 +204,7 @@ const char *tok_kind_name(tok_kind k)
     case TK_STAR:     return "'*'";
     case TK_SLASH:    return "'/'";
     case TK_DOTDOT:   return "'..'";
+    case TK_DOT:      return "'.'";
     case TK_PRIME:    return "'''";
     }
     return "?";

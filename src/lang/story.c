@@ -67,6 +67,9 @@ typedef struct {
     int         lhs_root, rhs_root;   /* the two expr trees, when is_expr_guard */
     bool        is_valuedef;   /* head only: `v(args) = expr` defines a declared
                                 * `value` (#82); lhs_root holds the definition expr */
+    bool        is_kinddef;    /* head only: `kind k(S) = expr` (#82 roll kinds) —
+                                * a modifier expanded onto every value of kind k;
+                                * pred = the kind name, args[0] = the subject var */
     bool        is_member;     /* `X in { v, … }` finite-domain membership (#95):
                                 * args[0] = the element var, mem_ix/mem_n index the
                                 * mempool, `neg` = `not in`. A static grounding
@@ -200,6 +203,9 @@ typedef struct {
                                    * copied with `:=`; no arithmetic, no int guards */
     bool     has_range;           /* declared `in lo..hi` — the clamp range */
     int      merge_mode;          /* `merge min|max` (#85): 0 register, 1 min, 2 max */
+    uint32_t vkind;               /* `kind attack` on a value decl (#82 roll kinds);
+                                   * 0 = none. A kind-modifier rule expands into a
+                                   * layer on every value declaring the kind. */
     long     rmin, rmax;          /* constant bounds (when each side folds) */
     int      rmin_expr, rmax_expr;/* dynamic bound ex_node root, else -1 (§5.8) */
     int      line, col;
@@ -1298,6 +1304,17 @@ static bool parse_fdecl(parser *p, ast_fluent *f)
                 }
                 advance(p);
             }
+            if (ident_is(p->cur, "kind")) {        /* roll kinds (#82) */
+                advance(p);
+                if (p->cur.kind != TK_IDENT) {
+                    char d[64]; tok_desc(p->cur, d, sizeof d);
+                    fail(p, p->cur.line, p->cur.col,
+                         "expected a kind name after `kind`, found %s", d);
+                    return false;
+                }
+                f->vkind = intern_tok(p, p->cur);
+                advance(p);
+            }
             f->is_num = true;
             return true;
         }
@@ -1438,6 +1455,12 @@ static void parse_provider(parser *p)
             fail(p, tmp.line, tmp.col,
                  "a provider result has no clamp range — ranges clamp stored "
                  "state (§5.8); the host computes whatever it computes");
+            return;
+        }
+        if (tmp.vkind != INTERN_NONE) {
+            fail(p, tmp.line, tmp.col,
+                 "`kind` classifies derived values (#82 roll kinds), not "
+                 "host-answered providers");
             return;
         }
         if (tmp.is_num || tmp.is_cell || sortval) {
@@ -1919,6 +1942,41 @@ static void parse_rule(parser *p)
     }
     advance(p);
 
+    if (ident_is(p->cur, "kind")) {                /* kind-modifier head (#82) */
+        advance(p);
+        if (p->cur.kind != TK_IDENT) {
+            char d[64]; tok_desc(p->cur, d, sizeof d);
+            fail(p, p->cur.line, p->cur.col,
+                 "expected a kind name after `kind`, found %s", d);
+            return;
+        }
+        memset(&r->head, 0, sizeof r->head);
+        r->head.is_kinddef = true;
+        r->head.pred = intern_tok(p, p->cur);
+        r->head.line = p->cur.line;
+        r->head.col = p->cur.col;
+        advance(p);
+        if (!expect(p, TK_LPAREN)) return;
+        if (p->cur.kind != TK_IDENT) {
+            char d[64]; tok_desc(p->cur, d, sizeof d);
+            fail(p, p->cur.line, p->cur.col,
+                 "expected the subject variable inside the kind head, found %s", d);
+            return;
+        }
+        r->head.args[0].name = intern_tok(p, p->cur);
+        r->head.args[0].line = p->cur.line;
+        r->head.args[0].col = p->cur.col;
+        r->head.nargs = 1;
+        advance(p);
+        if (!expect(p, TK_RPAREN)) return;
+        if (!expect(p, TK_EQ)) return;
+        int e = parse_expr(p);
+        if (e < 0) return;
+        r->head.lhs_root = e;
+        p->nrules++;
+        return;
+    }
+
     if (!parse_atom(p, &r->head)) return;
 
     if (p->cur.kind == TK_UNLESS) {
@@ -2036,6 +2094,18 @@ static void parse_sup(parser *p)
     copy_ident(s->a, MAX_NAME, p->cur);
     s->aline = p->cur.line; s->acol = p->cur.col;
     advance(p);
+    if (p->cur.kind == TK_DOT) {                   /* expanded label (#82 kinds) */
+        advance(p);
+        if (p->cur.kind != TK_IDENT) {
+            char d[64]; tok_desc(p->cur, d, sizeof d);
+            fail(p, p->cur.line, p->cur.col,
+                 "expected a value name after '.', found %s", d);
+            return;
+        }
+        size_t la = strlen(s->a);
+        snprintf(s->a + la, MAX_NAME - la, ".%.*s", p->cur.len, p->cur.start);
+        advance(p);
+    }
     if (!expect(p, TK_GT)) return;
     if (p->cur.kind != TK_IDENT) {
         char d[64]; tok_desc(p->cur, d, sizeof d);
@@ -2045,6 +2115,18 @@ static void parse_sup(parser *p)
     copy_ident(s->b, MAX_NAME, p->cur);
     s->bline = p->cur.line; s->bcol = p->cur.col;
     advance(p);
+    if (p->cur.kind == TK_DOT) {                   /* expanded label (#82 kinds) */
+        advance(p);
+        if (p->cur.kind != TK_IDENT) {
+            char d[64]; tok_desc(p->cur, d, sizeof d);
+            fail(p, p->cur.line, p->cur.col,
+                 "expected a value name after '.', found %s", d);
+            return;
+        }
+        size_t lb = strlen(s->b);
+        snprintf(s->b + lb, MAX_NAME - lb, ".%.*s", p->cur.len, p->cur.start);
+        advance(p);
+    }
     p->nsups++;
 }
 
@@ -2275,6 +2357,11 @@ static void build_pred_registry(parser *p)
                      "supported yet (#19). A domain is a provider/param arg type "
                      "only", intern_name(p->syms, f->pred), p->sorts[pi->argsort[k]].name);
         }
+        if (f->vkind != INTERN_NONE)
+            serr(p, f->line, f->col,
+                 "`kind` classifies derived values (#82 roll kinds) — '%s' is "
+                 "stored state; declare it with `value` to give it a kind",
+                 intern_name(p->syms, f->pred));
         pi->is_num = f->is_num;
         pi->is_cell = f->is_cell;
         pi->is_mv = f->is_mv;
@@ -2336,7 +2423,7 @@ static void build_pred_registry(parser *p)
     /* rule heads register the conclusion predicates (arity from the head). */
     for (int i = 0; i < p->nrules; i++) {
         ast_atom *h = &p->rules[i].head;
-        if (h->is_valuedef) continue;      /* a definition head is not a boolean conclusion */
+        if (h->is_valuedef || h->is_kinddef) continue;   /* not boolean conclusions */
         pred_info *pi = intern_pred(p, h->pred, h->nargs);
         if (!pi) { serr(p, h->line, h->col, "too many predicates"); return; }
         if (pi->arity != h->nargs)
@@ -3908,6 +3995,138 @@ static void stratify_steps(parser *p)
     }
 }
 
+/* Deep-copy an expression subtree (#82 roll kinds): each expansion of a kind
+ * modifier gets its OWN nodes, so its roll sites key per (value, binding) —
+ * bless's d4 on the spell save and on the death save are different dice. */
+static int clone_expr(parser *p, int e)
+{
+    if (e < 0) return -1;
+    ex_node src = p->exprs[e];                     /* copy before alloc moves */
+    int n = alloc_expr(p, src.kind, src.line, src.col);
+    if (n < 0) return -1;
+    ex_node *d = &p->exprs[n];
+    d->konst = src.konst;
+    d->pred = src.pred;
+    d->nargs = src.nargs;
+    for (int k = 0; k < src.nargs; k++) d->args[k] = src.args[k];
+    d->nprimed = src.nprimed;
+    if (src.kind == EX_CALL)
+        for (int k = 0; k < src.nargs; k++)
+            d->cargs[k] = clone_expr(p, src.cargs[k]);
+    d->lhs = clone_expr(p, src.lhs);
+    d->rhs = clone_expr(p, src.rhs);
+    return n;
+}
+
+/* #82 roll kinds: expand each `rule L(S: sort): body => kind k(S) = expr` into
+ * one LAYER definition per value declaring `kind k` — the modifier is written
+ * once and the grounder quantifies over the kind ("selection is static", #79).
+ * Expanded labels are `L.valuename`, real rule labels, so superiority can
+ * order an expansion against a value-specific layer when #94 demands it. The
+ * subject variable binds each member's FIRST argument (the roller, the same
+ * convention #83 uses for the response subject); remaining member arguments
+ * become fresh parameters the modifier cannot read. Slice restrictions, all
+ * located errors: one subject parameter; the expression must be a commuting
+ * layer shape (prior+e / max / min) so unordered coexistence with other
+ * same-class layers stays legal by construction. */
+static void expand_kind_rules(parser *p)
+{
+    int n0 = p->nrules;                            /* expansions append */
+    for (int i = 0; i < n0; i++) {
+        ast_rule *k = &p->rules[i];
+        if (!k->head.is_kinddef) continue;
+        const char *kn = intern_name(p->syms, k->head.pred);
+        if (k->kind != DL_DEFEASIBLE) {
+            serr(p, k->head.line, k->head.col,
+                 "a kind modifier is defeasible — write '=>'");
+            continue;
+        }
+        if (k->nvars != 1 ||
+            k->vars[0].name != k->head.args[0].name) {
+            serr(p, k->head.line, k->head.col,
+                 "a kind modifier takes exactly one parameter — the subject "
+                 "that binds each member value's first argument");
+            continue;
+        }
+        resolve_vars(p, k->vars, k->nvars, "a kind modifier");
+        int cls = valuedef_class(p, k->head.lhs_root);
+        if (cls != 1 && cls != 2 && cls != 3) {
+            serr(p, k->head.line, k->head.col,
+                 "a kind modifier layers on every member — its expression must "
+                 "mention `prior` in a commuting shape (`prior + e`, "
+                 "`max(prior, e)`, `min(prior, e)`) (#94)");
+            continue;
+        }
+        int members = 0;
+        for (int vi = 0; vi < p->nvaluedecls; vi++) {
+            ast_fluent *v = &p->valuedecls[vi];
+            if (v->vkind != k->head.pred) continue;
+            members++;
+            pred_info *pi = find_pred(p, v->pred);
+            if (v->nargs < 1 || !pi ||
+                pi->argsort[0] != k->vars[0].sort) {
+                serr(p, k->head.line, k->head.col,
+                     "kind '%s' member '%s': its first argument must be the "
+                     "modifier's subject sort '%s'",
+                     kn, intern_name(p->syms, v->pred),
+                     k->vars[0].sort >= 0 ? p->sorts[k->vars[0].sort].name : "?");
+                continue;
+            }
+            if (p->nrules >= MAX_RULES) {
+                serr(p, k->head.line, k->head.col,
+                     "too many rules (max %d) expanding kind '%s'",
+                     MAX_RULES, kn);
+                return;
+            }
+            ast_rule *r = &p->rules[p->nrules];
+            memset(r, 0, sizeof *r);
+            int ll = snprintf(r->label, MAX_NAME, "%s.%s", k->label,
+                              intern_name(p->syms, v->pred));
+            if (ll >= MAX_NAME) {                  /* loud, never silently cut */
+                serr(p, k->head.line, k->head.col,
+                     "expanded label '%s.%s' exceeds %d chars — shorten the "
+                     "modifier or value name", k->label,
+                     intern_name(p->syms, v->pred), MAX_NAME);
+                continue;
+            }
+            r->line = k->line;
+            r->col = k->col;
+            r->kind = DL_DEFEASIBLE;
+            r->nvars = v->nargs;
+            r->vars[0] = k->vars[0];               /* the subject, resolved */
+            for (int a = 1; a < v->nargs; a++) {
+                char vb[16];
+                snprintf(vb, sizeof vb, "__k%d", a);
+                r->vars[a].name = intern_id(p->syms, vb);
+                r->vars[a].sort = pi->argsort[a];  /* resolved index */
+                r->vars[a].line = k->line;
+                r->vars[a].col = k->col;
+            }
+            r->nbody = k->nbody;
+            for (int b = 0; b < k->nbody; b++) r->body[b] = k->body[b];
+            r->nguard = k->nguard;
+            for (int g = 0; g < k->nguard; g++) r->guard[g] = k->guard[g];
+            r->has_guard = k->has_guard;
+            r->head.is_valuedef = true;
+            r->head.pred = v->pred;
+            r->head.line = k->head.line;
+            r->head.col = k->head.col;
+            r->head.nargs = v->nargs;
+            for (int a = 0; a < v->nargs; a++) {
+                r->head.args[a].name = r->vars[a].name;
+                r->head.args[a].line = k->line;
+                r->head.args[a].col = k->col;
+            }
+            r->head.lhs_root = clone_expr(p, k->head.lhs_root);
+            p->nrules++;
+        }
+        if (members == 0)
+            serr(p, k->head.line, k->head.col,
+                 "no value declares `kind %s` — a modifier with no members is "
+                 "a typo or a missing declaration", kn);
+    }
+}
+
 static void semantic_pass(parser *p)
 {
     synthesize_enum_sorts(p);          /* #96: before entities resolve */
@@ -3918,6 +4137,8 @@ static void semantic_pass(parser *p)
     check_fluent_bounds(p);
     check_functions(p);
 
+    expand_kind_rules(p);              /* #82 roll kinds: before defs register */
+
     /* value definitions register first (#82), so any read checked below can
      * see whether its definition exists regardless of declaration order */
     for (int i = 0; i < p->nrules; i++)
@@ -3925,6 +4146,14 @@ static void semantic_pass(parser *p)
 
     for (int i = 0; i < p->nrules; i++) {
         ast_rule *r = &p->rules[i];
+        if (r->head.is_kinddef) {
+            /* validated + expanded in expand_kind_rules; only labels here */
+            for (int j = i + 1; j < p->nrules; j++)
+                if (strcmp(r->label, p->rules[j].label) == 0)
+                    serr(p, p->rules[j].line, p->rules[j].col,
+                         "duplicate rule label '%s'", r->label);
+            continue;
+        }
         if (r->head.is_valuedef) {
             check_valuedef(p, i);
             for (int j = i + 1; j < p->nrules; j++)
@@ -4660,7 +4889,7 @@ static bool members_ok(parser *p, ast_atom *body, int n, var_bind *vars,
 
 static void ground_rule(parser *p, ast_rule *r)
 {
-    if (r->head.is_valuedef) return;   /* #82: inlined at read sites, never a dl rule */
+    if (r->head.is_valuedef || r->head.is_kinddef) return;   /* #82: never dl rules */
     bool of = false;
     long total = instance_count(p, r->vars, r->nvars, &of);
     if (of) {
@@ -4755,6 +4984,7 @@ static bool rule_in_sup(parser *p, ast_rule *r)
 
 static bool rule_matchable(parser *p, ast_rule *r)
 {
+    if (r->head.is_valuedef || r->head.is_kinddef) return false;   /* #82 */
     if (r->nvars < 1 || r->nbody < 1) return false;
     if (r->has_guard) return false;                /* `unless` defeater — later */
     if (r->head.is_num_effect) return false;
@@ -5709,6 +5939,13 @@ static void ground_sup(parser *p, ast_sup *s)
         serr(p, s->bline, s->bcol, "unknown rule label '%s' in superiority", s->b);
         return;
     }
+    if (ra->head.is_kinddef || rb->head.is_kinddef) {
+        serr(p, s->aline, s->acol,
+             "'%s' > '%s': a kind modifier's expansions are the orderable "
+             "rules — target the expanded label (`<modifier>.<value>`)",
+             s->a, s->b);
+        return;
+    }
     if (ra->head.is_valuedef || rb->head.is_valuedef) {
         /* #82/#94: `>` between two definitions of ONE value orders its layer
          * chain — consumed by order_value_layers, nothing to ground here */
@@ -5907,7 +6144,7 @@ static void compute_taint(parser *p, bool *taint)
         changed = false;
         for (int i = 0; i < p->nrules; i++) {
             ast_rule *r = &p->rules[i];
-            if (r->head.is_valuedef) continue;     /* #82: not a dl rule */
+            if (r->head.is_valuedef || r->head.is_kinddef) continue;   /* #82 */
             int hp = pred_idx(p, r->head.pred);
             if (hp < 0 || taint[hp]) continue;
             bool bad = !rule_eligible(p, r);
@@ -5947,7 +6184,7 @@ static void emit_sort_lanes(parser *p, int S, const bool *taint)
     int laned[MAX_RULES], nlaned = 0;
     for (int i = 0; i < p->nrules; i++) {
         ast_rule *r = &p->rules[i];
-        if (r->head.is_valuedef) continue;         /* #82: not a dl rule */
+        if (r->head.is_valuedef || r->head.is_kinddef) continue;       /* #82 */
         int hp = pred_idx(p, r->head.pred);
         if (hp < 0 || taint[hp] || r->nvars != 1 || r->vars[0].sort != S)
             continue;
