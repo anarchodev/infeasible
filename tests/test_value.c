@@ -192,9 +192,11 @@ static int test_errors(void)
           "has no definition" },
         { "value v : int\nrule d1: => v = 3\nrule d2: => v = 4\n"
           "rule r: v >= 1 => q\n",
-          "already has a definition" },
+          "two unconditional definitions" },
+        /* guarded definitions are legal since #82's layering slice — but a
+         * value that has ONLY guarded definitions is missing its base */
         { "state p\nvalue v : int\nrule d: p => v = 3\nrule r: v >= 1 => q\n",
-          "guarded value definition" },
+          "unconditional base definition" },
         { "value v : int\nrule d: -> v = 3\nrule r: v >= 1 => q\n",
           "write '=>'" },
         { "value v : int\nrule d: => v = 3\naction a: causes v := 4\n",
@@ -204,7 +206,7 @@ static int test_errors(void)
           "cannot be cyclic" },
         { "state p\nvalue v : int\nrule d1: => v = 3\nrule q1: p => q\n"
           "d1 > q1\nrule use: v >= 1 => used\n",
-          "later slice of #82" },
+          "mixes a value definition with an ordinary rule" },
         { "value v : int in 0..5\nrule d: => v = 3\n",
           "no clamp range" },
         { "sort actor\nentity a : actor\nvalue w(actor, actor) : int\n"

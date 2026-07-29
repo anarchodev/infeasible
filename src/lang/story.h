@@ -72,10 +72,16 @@
  *   rule    := 'rule' IDENT [ params ] ':' conj                 -- judgment
  *                ( OP atom [ 'unless' conj ]
  *                | 'causes' effects )                           -- ramification
- *            | 'rule' IDENT [ params ] ':' '=>' IDENT '(' args ')' '=' expr
- *                                          -- value definition (#82): body must be
- *                                          -- empty in this slice (one total
- *                                          -- definition per value; layering later)
+ *            | 'rule' IDENT [ params ] ':' [ conj ] '=>' IDENT '(' args ')' '=' expr
+ *                                          -- value definition (#82/#94): ONE
+ *                                          -- unconditional base per value, plus
+ *                                          -- guarded overrides/layers ordered by
+ *                                          -- `>`; `prior` in the expr layers on
+ *                                          -- the chain below (prior+e / max / min
+ *                                          -- commute by class; anything else must
+ *                                          -- be totally ordered). Bodies ground to
+ *                                          -- MARKER judgments `body => label(...)`
+ *                                          -- — ordinary defeasible literals.
  *   action  := 'action' IDENT [ params ] ':' [ 'requires' conj ] 'causes' effects
  *   effects := effitem ( '&' effitem )*                         -- effect body
  *   effitem := eatom | binder                                   -- plain or set-quantified
