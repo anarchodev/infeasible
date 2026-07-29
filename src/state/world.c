@@ -1955,6 +1955,8 @@ static void solve_judgment_family(world *w)
 
 /* ---- numeric write side: expression VM + commit pipeline (§5.8) ---- */
 
+static bool lit_solved_proved(const world *w, uint32_t atom, bool neg);
+
 /* Stack VM over `long`; integer-only. Reads numeric fluents' *current* values
  * (the store double-buffers, so every effect this step sees the pre-step
  * state). Bytecode is compiler-emitted and well-formed; depth 64 covers any
@@ -1994,6 +1996,11 @@ static long eval_expr(const world *w, const expr_ins *code, int n)
             long q = b == 0 ? 0 : a / b;
             if (b != 0 && a % b != 0 && (a < 0) != (b < 0)) q--;
             st[sp-1] = q;
+            break;
+        }
+        case EXPR_TEST: {  /* solved verdict as 0/1 (#86); commit-side only */
+            uint32_t atom = (uint32_t)((unsigned long)code[i].arg >> 1);
+            st[sp++] = lit_solved_proved(w, atom, code[i].arg & 1) ? 1 : 0;
             break;
         }
         }
@@ -2039,15 +2046,21 @@ static bool srule_fired(const world *w, const srule *r,
     return true;
 }
 
-/* Is a response atom defeasibly proved in the solved step theory? An atom no
- * rule mentions has no location — absent, never an error: resistance the
- * author never wrote about simply does not apply. */
-static bool resp_proved(const world *w, uint32_t atom)
+/* Is a literal defeasibly proved in the solved step theory? An atom no rule
+ * mentions has no location — absent (0), never an error. Shared by the typed
+ * response (#84) and EXPR_TEST (#86); both run commit-side, strictly after
+ * the fixpoint settles. */
+static bool lit_solved_proved(const world *w, uint32_t atom, bool neg)
 {
     if (atom == INTERN_NONE || atom >= w->loc_cap || w->loc_of[atom] == LOC_NONE)
         return false;
-    dl_lit loc = { w->loc_of[atom], false };
+    dl_lit loc = { w->loc_of[atom], neg };
     return dlcol_defeasible(w->fam, loc, 0) == DL_PROVED;
+}
+
+static bool resp_proved(const world *w, uint32_t atom)
+{
+    return lit_solved_proved(w, atom, false);
 }
 
 /* The per-type response (#84): scale one type's summed delta by the solved

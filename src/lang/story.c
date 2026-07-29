@@ -82,7 +82,10 @@ typedef struct {
  * folding constant subtrees and emitting VM bytecode for the rest. */
 typedef enum {
     EX_CONST, EX_LOAD, EX_ROLL, EX_CALL, EX_ADD, EX_SUB, EX_MUL, EX_DIV, EX_NEG,
-    EX_MIN, EX_MAX
+    EX_MIN, EX_MAX,
+    EX_TEST   /* `test([~]p(args))` (#86): a literal's solved verdict as 0/1.
+               * `pred`/`args` = the literal; `konst` = 1 for a `~` literal.
+               * Effect-side only until #87 stratification. */
 } ex_kind;
 /* EX_CALL (§5.6): a value-returning function-provider call `f(e1, …, ek)`.
  * `pred` = the function name; `nargs` = k; `cargs[0..k)` = child expr indices. */
@@ -644,6 +647,7 @@ static int find_value(parser *p, uint32_t name)
  *   term   := factor (('*'|'/') factor)*      -- '/' floors (rounds toward -inf)
  *   factor := '-' factor | INT
  *           | ('min'|'max'|'divup') '(' expr ',' expr ')'  -- divup = ceiling div
+ *           | 'test' '(' ['~'] IDENT [ '(' arg* ')' ] ')'  -- verdict as 0/1 (#86)
  *           | IDENT [ '(' arg (',' arg)* ')' ]        -- a numeric fluent read
  *           | '(' expr ')'
  * Returns a node index into p->exprs, or -1 on error. */
@@ -709,6 +713,47 @@ static int parse_factor(parser *p)
             if (n < 0) return -1;
             p->exprs[n].konst = sides;
             p->exprs[n].lhs = (int)tag;
+            return n;
+        }
+        if (ident_is(id, "test") && p->cur.kind == TK_LPAREN) {
+            /* `test([~]p(args))` (#86): a boolean literal's verdict as 0/1 */
+            advance(p);
+            int n = alloc_expr(p, EX_TEST, id.line, id.col);
+            if (n < 0) return -1;
+            if (p->cur.kind == TK_TILDE) { p->exprs[n].konst = 1; advance(p); }
+            if (p->cur.kind != TK_IDENT) {
+                char d[64]; tok_desc(p->cur, d, sizeof d);
+                fail(p, p->cur.line, p->cur.col,
+                     "expected an atom inside test(…), found %s", d);
+                return -1;
+            }
+            p->exprs[n].pred = intern_tok(p, p->cur);
+            advance(p);
+            if (p->cur.kind == TK_LPAREN) {
+                advance(p);
+                for (;;) {
+                    if (p->cur.kind != TK_IDENT) {
+                        char d[64]; tok_desc(p->cur, d, sizeof d);
+                        fail(p, p->cur.line, p->cur.col,
+                             "expected an argument name, found %s", d);
+                        return -1;
+                    }
+                    if (p->exprs[n].nargs >= MAX_ARGS) {
+                        fail(p, p->cur.line, p->cur.col,
+                             "too many arguments (max %d)", MAX_ARGS);
+                        return -1;
+                    }
+                    p->exprs[n].args[p->exprs[n].nargs].name = intern_tok(p, p->cur);
+                    p->exprs[n].args[p->exprs[n].nargs].line = p->cur.line;
+                    p->exprs[n].args[p->exprs[n].nargs].col = p->cur.col;
+                    p->exprs[n].nargs++;
+                    advance(p);
+                    if (p->cur.kind == TK_COMMA) { advance(p); continue; }
+                    break;
+                }
+                if (!expect(p, TK_RPAREN)) return -1;
+            }
+            if (!expect(p, TK_RPAREN)) return -1;
             return n;
         }
         if ((ismin || ismax || isdivup) && p->cur.kind == TK_LPAREN) {
@@ -2292,6 +2337,40 @@ static void check_pred_args(parser *p, uint32_t pred, pred_info *pi,
 static int expr_value_sort(parser *p, int e);      /* defined below check_atom */
 static const char *value_sort_name(parser *p, int s);
 
+/* A pred test(…) can reify (#86): a boolean fluent, a provider relation, or a
+ * derived boolean head — anything whose literal has a verdict in the theory. */
+static bool pi_is_boolean_testable(const pred_info *pi)
+{
+    if (pi->is_num || pi->is_mv || pi->is_cell || pi->is_value) return false;
+    return pi->is_fluent || pi->is_provider || pi->is_head;
+}
+
+/* Does expression tree e contain a test(…), looking THROUGH derived-value
+ * reads into their definitions (#82 inlines them, so a test inside a value
+ * would otherwise smuggle itself into contexts where it is rejected)? */
+static bool expr_has_test(parser *p, int e, int depth)
+{
+    if (e < 0 || depth > 2 * MAX_ARGS) return false;   /* cycles error elsewhere */
+    ex_node *n = &p->exprs[e];
+    switch (n->kind) {
+    case EX_TEST: return true;
+    case EX_CONST: case EX_ROLL: return false;
+    case EX_LOAD: {
+        int vi = find_value(p, n->pred);
+        if (vi < 0 || p->value_def[vi] < 0) return false;
+        return expr_has_test(p, p->rules[p->value_def[vi]].head.lhs_root,
+                             depth + 1);
+    }
+    case EX_CALL:
+        for (int k = 0; k < n->nargs; k++)
+            if (expr_has_test(p, n->cargs[k], depth)) return true;
+        return false;
+    case EX_NEG: return expr_has_test(p, n->lhs, depth);
+    default:     return expr_has_test(p, n->lhs, depth) ||
+                        expr_has_test(p, n->rhs, depth);
+    }
+}
+
 /* Validate an effect-RHS expression tree (§5.8): every fluent read resolves to
  * a declared numeric fluent of matching arity with in-scope args. */
 static void check_expr(parser *p, int e, var_bind *vars, int nvars)
@@ -2376,6 +2455,32 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
         }
         return;
     }
+    case EX_TEST: {                            /* `test([~]p(args))` (#86) */
+        note_ref(p, n->pred, n->line, n->col);
+        pred_info *ti = find_pred(p, n->pred);
+        if (ti && (pi_is_boolean_testable(ti))) {
+            if (ti->arity != n->nargs) {
+                serr(p, n->line, n->col, "'%s' takes %d argument%s but %d given",
+                     intern_name(p->syms, n->pred), ti->arity,
+                     ti->arity == 1 ? "" : "s", n->nargs);
+                return;
+            }
+            check_pred_args(p, n->pred, ti, n->args, n->nargs, vars, nvars,
+                            "a test(…)");
+            return;
+        }
+        if (ti && (ti->is_num || ti->is_mv || ti->is_cell || ti->is_value))
+            serr(p, n->line, n->col,
+                 "test(…) takes a boolean literal — '%s' is %s; %s",
+                 intern_name(p->syms, n->pred),
+                 ti->is_num ? "numeric" : ti->is_value ? "a derived value"
+                            : "not boolean",
+                 ti->is_num || ti->is_value
+                     ? "compare it (`… >= n`) instead of testing it" : "");
+        /* an unregistered pred: leave it to the orphan analysis (note_ref) —
+         * a typo warns; at commit an absent atom simply tests 0 */
+        return;
+    }
     case EX_NEG:
         check_expr(p, n->lhs, vars, nvars);
         return;
@@ -2411,6 +2516,10 @@ static void check_fluent_bounds(parser *p)
                 serr(p, p->exprs[roots[r]].line, p->exprs[roots[r]].col,
                      "a clamp bound may not use `roll()` — the range must be a "
                      "stable value, not a fresh draw");
+            if (expr_has_test(p, roots[r], 0))
+                serr(p, p->exprs[roots[r]].line, p->exprs[roots[r]].col,
+                     "a clamp bound may not use test(…) yet — effects only "
+                     "until the §5.8 stratifier (#87)");
         }
     }
 }
@@ -2524,6 +2633,13 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
         if (in_effect) {
             serr(p, at->line, at->col,
                  "a comparison guard can't appear in a `causes` clause");
+            return;
+        }
+        if (expr_has_test(p, at->lhs_root, 0) || expr_has_test(p, at->rhs_root, 0)) {
+            serr(p, at->line, at->col,
+                 "test(…) in a guard feeds the fixpoint that derives the tested "
+                 "atom — that needs the §5.8 stratifier (#87); effects only for "
+                 "now");
             return;
         }
         check_expr(p, at->lhs_root, vars, nvars);
@@ -3154,6 +3270,13 @@ static void check_valuedef(parser *p, int ri)
                  intern_name(p->syms, h->args[k].name),
                  p->sorts[r->vars[f].sort].name);
     }
+    if (expr_has_test(p, h->lhs_root, 0)) {
+        serr(p, h->line, h->col,
+             "test(…) in a value definition could flow into a guard through a "
+             "value read — that needs the §5.8 stratifier (#87); use test(…) "
+             "directly in the effect instead");
+        return;
+    }
     if (p->value_def[vi] == ri)                    /* the winning registration */
         check_expr(p, h->lhs_root, r->vars, r->nvars);
 }
@@ -3455,6 +3578,7 @@ static bool expr_fold(parser *p, int e, long *out)
     case EX_LOAD:  return false;
     case EX_ROLL:  return false;              /* a fresh draw — never a constant */
     case EX_CALL:  return false;              /* a host call — never a constant */
+    case EX_TEST:  return false;              /* a solved verdict — never a constant */
     case EX_NEG:
         if (!expr_fold(p, n->lhs, &a)) return false;
         *out = -a; return true;
@@ -3478,6 +3602,8 @@ static bool expr_fold(parser *p, int e, long *out)
 
 static void emit_value_inline(parser *p, uint32_t pred, const uint32_t *rargs,
                               expr_ins *code, int *pos);
+static void touch_ground_fluent(parser *p, uint32_t atom, uint32_t pred,
+                                const uint32_t *args, int nargs);
 
 /* Emit RPN bytecode for expr node `e` under `binding`, folding constant
  * subtrees and resolving fluent reads to their ground value-store atom. */
@@ -3522,6 +3648,24 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
         if (*pos < MAX_CODE) {
             code[*pos].op = EXPR_CALL;
             code[(*pos)++].arg = ((long)n->pred << 8) | (long)(n->nargs & 0xff);
+        }
+        return;
+    }
+    if (n->kind == EX_TEST) {
+        /* ground the tested literal exactly as a body atom would be: declare
+         * provider atoms, touch sparse fluents — so the solve loads its facts
+         * and the commit-side verdict read (#86) finds a located literal */
+        uint32_t targs[MAX_ARGS];
+        for (int k = 0; k < n->nargs; k++)
+            targs[k] = resolve_arg(vars, nvars, binding, n->args[k]);
+        uint32_t g = ground_pred(p, n->pred, targs, n->nargs);
+        pred_info *ti = find_pred(p, n->pred);
+        if (ti && ti->is_provider)
+            world_declare_provider_atom(p->w, g, n->pred, targs, n->nargs);
+        touch_ground_fluent(p, g, n->pred, targs, n->nargs);
+        if (*pos < MAX_CODE) {
+            code[*pos].op = EXPR_TEST;
+            code[(*pos)++].arg = ((long)g << 1) | (n->konst ? 1 : 0);
         }
         return;
     }
