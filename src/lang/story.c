@@ -1398,6 +1398,20 @@ static void parse_state(parser *p)
 /* provider := 'provider' ( pdecl | '(' pdecl* ')' ); pdecl := IDENT '(' sort,… ')'
  * A computed relation (§5.6), host-answered — like a boolean fluent decl but with
  * no value type. */
+/* provider := 'provider' ( fdecl | '(' fdecl* ')' ) — the host-answered
+ * declarations, unified on RETURN TYPE exactly like `state` (#93):
+ *
+ *     provider adjacent(actor, actor)          -- no return type: a boolean
+ *                                              -- RELATION, ground atoms
+ *                                              -- registered and loaded as
+ *                                              -- closed-world facts
+ *     provider neighbor(cell, dir) : cell      -- return type: a value
+ *                                              -- FUNCTION, called from the
+ *                                              -- effect VM (EXPR_CALL),
+ *                                              -- never grounded
+ *
+ * The statable rule the split keywords obscured: HAS A RETURN TYPE ⇒ CALLED,
+ * NOT GROUNDED. `function` remains a spelling alias for the typed form. */
 static void parse_provider(parser *p)
 {
     advance(p);                                    /* 'provider' */
@@ -1409,18 +1423,50 @@ static void parse_provider(parser *p)
             fail(p, p->cur.line, p->cur.col, "expected a provider name, found %s", d);
             return;
         }
-        if (p->nproviders >= MAX_FLUENTS) {
-            fail(p, p->cur.line, p->cur.col, "too many providers (max %d)", MAX_FLUENTS);
+        ast_fluent tmp;
+        if (!parse_fdecl(p, &tmp)) return;
+        /* `: sortname` parses as a sort-valued functional type (is_mv with a
+         * val_sort); an inline `{ … }` or a named enum has no callable type */
+        bool sortval = tmp.is_mv && tmp.val_sort != 0;
+        if (tmp.is_mv && !sortval) {
+            fail(p, tmp.line, tmp.col,
+                 "a provider returns `int` or a declared sort/domain — an "
+                 "inline or enum domain doesn't name a callable type (#93)");
             return;
         }
-        ast_fluent *pr = &p->providers[p->nproviders];
-        if (!parse_fdecl(p, pr)) return;
-        if (pr->is_num || pr->is_mv) {
-            fail(p, pr->line, pr->col,
-                 "a provider is a relation, not a typed fluent — drop the `: …`");
+        if (tmp.has_range) {
+            fail(p, tmp.line, tmp.col,
+                 "a provider result has no clamp range — ranges clamp stored "
+                 "state (§5.8); the host computes whatever it computes");
             return;
         }
-        p->nproviders++;
+        if (tmp.is_num || tmp.is_cell || sortval) {
+            /* return type ⇒ a value FUNCTION (#93): same registration as the
+             * `function` keyword — called from the effect VM, never grounded */
+            if (p->nfunctions >= MAX_FLUENTS) {
+                fail(p, tmp.line, tmp.col, "too many functions (max %d)",
+                     MAX_FLUENTS);
+                return;
+            }
+            ast_function *fn = &p->functions[p->nfunctions];
+            memset(fn, 0, sizeof *fn);
+            fn->name = tmp.pred;
+            fn->nargs = tmp.nargs;
+            for (int k = 0; k < tmp.nargs; k++)
+                fn->argsort[k] = ident_atom_is(p, tmp.argsort[k], "int")
+                                 ? INTERN_NONE : tmp.argsort[k];
+            fn->ret = (tmp.is_num && !tmp.is_cell) ? INTERN_NONE : tmp.val_sort;
+            fn->line = tmp.line;
+            fn->col = tmp.col;
+            p->nfunctions++;
+        } else {
+            if (p->nproviders >= MAX_FLUENTS) {
+                fail(p, tmp.line, tmp.col, "too many providers (max %d)",
+                     MAX_FLUENTS);
+                return;
+            }
+            p->providers[p->nproviders++] = tmp;
+        }
     } while (grouped && p->cur.kind == TK_IDENT);
     if (grouped && !expect(p, TK_RPAREN)) return;
 }
