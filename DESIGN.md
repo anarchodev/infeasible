@@ -813,7 +813,10 @@ propagation downstream — so arithmetic still never runs *inside* a propagation
 stratum; the phases repeat per layer. If cyclic, compile error naming the
 loop: primed-numeric cycles genuinely oscillate ("heal if `hp'<5`, curse if
 `hp'>=5`") and have no answer to converge to. A program with no primed
-numeric guards is the degenerate one-stratum case.
+numeric guards is the degenerate one-stratum case. How strata compose with
+the commit pipeline, operator classes, and layered definitions — and the
+cost model for the composition — is consolidated in *"One tick, in
+order"* below.
 
 **Concurrent effects: combine by operator class, never by order.** Two causal
 rules writing the same numeric fluent in one step (two damage sources on one
@@ -885,6 +888,20 @@ so the hatches are shaped for strangers:
    the trace reads "fire 8 → 4 (`tiefling_resistance` beats
    `base_fire_damage`)" — richer than the tooltip it imitates, and each
    roll is §5.10-site-keyed, so the receipt can show the dice.
+   *Status*: the first shipped form is configured, not modeled — #83/#84's
+   per-type commit stage hardcodes the 5e response algebra (immune → 0,
+   resistant XOR vulnerable → floored halve / double, both cancel, PHB
+   p.197) in engine code, because the modeled form is generate-then-apply
+   inside one tick and waits on stratification (#87). Treat it as a
+   scaffold in the `dl.c` sense: golden tests pin its semantics, the
+   modeled form stays the committed endpoint, and equivalence gets
+   validated before the C stage is kept (as a compiler-picked fast path,
+   §6.1's invisible-backing rule) or removed. One caution for the modeled
+   port: floored halving and doubling do not commute (7 → 3 → 6 one way,
+   7 → 14 → 7 the other), so resistance and vulnerability are *not* two
+   stackable multiplicative layers — 5e's both-cancel is a third rule
+   defeating the other two, authored and traced; #94's commutation check
+   will rightly refuse the two-undefeated-layers encoding.
 
 **The receipt is structured data, not only a rendering.** BG3-style floating
 combat text — every hit displaying its source and damage type — is a *view of
@@ -908,6 +925,84 @@ Deliberately not offered: per-rule stage reordering (recreates the conflict
 one level up), timestamps in any costume, and a content-configurable global
 pipeline (fixed stage order is why the system is learnable; MTG's pain is
 the timestamps, not the fixedness).
+
+**One tick, in order — strata, stages, classes, layers (decided).** The
+numeric tier now carries four ordering mechanisms, each introduced for its
+own reason: strata across values (the primed-guard layering above), the
+fixed commit pipeline within one fluent (base → Σ per type → per-type
+response → clamp), operator classes within one accumulator (set before
+add; admissible merges), and layered `prior` definitions within one
+derived value (#82/#94). They compose because their jurisdictions are
+disjoint, and the composition is the decided semantics of a tick:
+
+1. *Strata order values.* The compiler condenses the dependency graph —
+   numeric fluents connected through primed guards; boolean and
+   multi-valued primed reads stay free, the fixpoint being their
+   evaluator — and assigns every numeric fluent to the stratum where its
+   writers settle; a primed-numeric cycle is a located compile error. A
+   tick runs strata in order; the state write is atomic at the end and
+   the action log records one step (I4 — replay never sees a half-tick).
+2. *Within a stratum*, the sandwich above is unchanged: evaluate (guard
+   atoms from the value store plus every settled lower stratum) →
+   propagate (pure fixpoint, no arithmetic) → commit-compute the pipeline
+   for the fluents this stratum owns, then mint their primed guard atoms
+   as strict inputs to the strata above.
+3. *Within one fluent's pipeline*, operator classes order contributions;
+   *within one derived value*, `prior` chains order definitions by
+   superiority, commutation-checked by class (#94). Nothing anywhere
+   orders by declaration, commit time, or timestamp — the prohibition at
+   the top of this passage holds at every level.
+
+One corollary is decided with it — **commit-time visibility**: a judgment
+consulted from the commit (a per-type response atom, a verdict tested in
+an effect expression) reads the fixpoint as settled at its own stratum —
+the latest settled state, never a partially-propagated one. The shipped
+#84 behaviour (responses solved over the pre-step state) is exactly this
+rule in the degenerate one-stratum world, so landing strata changes no
+existing world's replay; golden tests pin each side (pre-step in a
+one-stratum world; a resistance concluded in a lower stratum of the same
+tick applies to damage committed above it).
+
+*Cost model* — why the modeled pipeline fits the lane budget:
+
+- **Strata do not multiply the fixpoint.** The committed M3 evaluator is
+  an SCC-condensed weak-topological sweep (§5.2) — dependency order
+  already *is* the evaluation order. Strata add arithmetic hooks at the
+  boundaries where a primed-numeric arc crosses, not extra sweeps:
+  propagation stays ~one pass (the decided-skip freezes everything
+  settled below), and each boundary costs one pipeline pass over that
+  stratum's fluents plus a threshold re-bucket per written value (one
+  binary search; bit-column compares on lanes). The stratum count is
+  static and small — 5e's damage → `hp'` → `dead'` → on-death cascade is
+  three. No primed numeric guards ⇒ zero boundaries ⇒ today's tick.
+- **Everything event-shaped is event-priced.** Typed buckets are commit
+  scratch keyed by fired effects — O(events), never O(N × types) storage
+  — and a `prior` chain walks only where a definition actually fired
+  (no-reference-no-walk is static, #82). A 100k-unit battle in which 5k
+  units take damage prices the pipeline at 5k.
+- **Layer programs compile like expressions.** A value head's definitions
+  sort once at build (superiority is static) into a fixed sequence of
+  (guard, class-op, expr) triples — bytecode, like the effect VM. N=1
+  evaluation is a short chain walk; on lanes it is evaluate-all-and-mask:
+  per layer the guard is an already-solved bit column and the update is
+  `v = select(mask, f(v), v)` — branch-free, 64-wide masks, vectorizable
+  arithmetic. This is the same loop shape as the configured response
+  stage (three mask reads and a scale), generalized from a hardcoded 3 to
+  a static K, with K ≈ 2–5 in 5e material — a bounded constant factor,
+  not a new asymptotic.
+- **Anchors and the adoption gate.** `bench_slice` steps a 100k-unit
+  battle in 2.5 ms/tick (judge+step ≈ 1.2 ms of it); the numeric commit
+  is a fraction of the step share, so even 5× on commit arithmetic
+  leaves order-of-magnitude headroom against a 16 ms frame. The gate is
+  the prototype-before-adopt playbook: extend the 5e bench with a
+  typed-damage tick, require the modeled pipeline within ~2× of the
+  configured stage at 100k and both inside budget. If modeled misses,
+  the configured stage survives as the compiler-picked fast path for the
+  response shapes it matches, and the modeled form remains the semantics
+  it must agree with.
+- **Space is unchanged.** Layer programs mint no atoms (numbers never
+  become atoms); guard atoms exist only for authored comparisons;
+  accumulators and layer scratch die at commit. The save gains nothing.
 
 **Implementation shape: the value store is entity-indexed arrays.**
 Interning makes the obvious "map" degenerate into something better: entity
