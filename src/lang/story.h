@@ -135,8 +135,10 @@
  *                                          -- kind atoms (`k(V, …)`, constants
  *                                          -- and `_` facets) select the member
  *                                          -- set against the `fact`s; expands
- *                                          -- into a layer (`prior`-shaped,
- *                                          -- commuting class) per member, the
+ *                                          -- into a layer (any `prior` shape,
+ *                                          -- #144: non-commuting ones must be
+ *                                          -- totally ordered per member —
+ *                                          -- usually one #145 blanket) — the
  *                                          -- subject tuple binding its leading
  *                                          -- args (V(A) = roller, V(A,T) adds
  *                                          -- the target); expanded labels `L.value`
