@@ -239,6 +239,68 @@ static int test_blanket_ordering(void)
     return 0;
 }
 
+/* --- #143: cross-value links — Rage lands on the DAMAGE roll -------------
+ * `dmg_of(value, value)` is a LINK predicate (a kind with two value
+ * positions); the modifier binds a second value parameter through it, so
+ * the selector runs over attacks while the modified value is the linked
+ * damage roll. The attack itself is untouched. */
+static int test_cross_value_links(void)
+{
+    const char *src =
+        "sort actor\nentity bran : actor\n"
+        "enum reach { melee, ranged }\n"
+        "state ( raging(actor)  a1(actor) : int  d1v(actor) : int  d2v(actor) : int )\n"
+        "value ( attack(value, reach)  dmg_of(value, value)\n"
+        "        sword_atk(actor) : int  bow_atk(actor) : int\n"
+        "        sword_dmg(actor) : int  bow_dmg(actor) : int )\n"
+        "fact ( attack(sword_atk, melee)  attack(bow_atk, ranged)\n"
+        "       dmg_of(sword_atk, sword_dmg)  dmg_of(bow_atk, bow_dmg) )\n"
+        "rule w1(X: actor): => sword_atk(X) = 10\n"
+        "rule w2(X: actor): => bow_atk(X) = 10\n"
+        "rule w3(X: actor): => sword_dmg(X) = 10\n"
+        "rule w4(X: actor): => bow_dmg(X) = 10\n"
+        "rule rage(A: actor, V: value, W: value):\n"
+        "    attack(V, melee) & dmg_of(V, W) & raging(A) => W(A) = prior + 2\n"
+        "action snap(X: actor): causes a1(X) := sword_atk(X)\n"
+        "                            & d1v(X) := sword_dmg(X) & d2v(X) := bow_dmg(X)\n"
+        "action r(X: actor): causes raging(X)\n";
+
+    intern *sy = intern_new();
+    world *w = compile_ok(src, sy);
+    CHECK(w != NULL);
+    CHECK(step1(w, sy, "r(bran)") == 0);
+    CHECK(step1(w, sy, "snap(bran)") == 0);
+    CHECK(num(w, sy, "d1v(bran)") == 12);  /* melee-linked damage: +2      */
+    CHECK(num(w, sy, "d2v(bran)") == 10);  /* ranged-linked: unselected    */
+    CHECK(num(w, sy, "a1(bran)") == 10);   /* the ATTACK roll: untouched   */
+    world_free(w);
+    intern_free(sy);
+
+    /* an unselected link parameter is a located error */
+    {
+        const char *bad =
+            "sort actor\nentity a : actor\nstate ( raging(actor)  q(actor) : int )\n"
+            "value ( attack(value)  s(actor) : int )\n"
+            "fact attack(s)\n"
+            "rule bs(X: actor): => s(X) = 10\n"
+            "rule m(A: actor, V: value, W: value):\n"
+            "    attack(V) & raging(A) => W(A) = prior + 2\n"
+            "action p(X: actor): causes q(X) := s(X)\n";
+        intern *sy2 = intern_new();
+        story_diag di[8];
+        story_diags d = { di, 8, 0, 0 };
+        world *w2 = story_compile(bad, "t.story", sy2, &d);
+        bool found = false;
+        for (int k = 0; k < d.count && !found; k++)
+            found = strstr(d.items[k].msg,
+                           "value parameter 'W' is not selected") != NULL;
+        CHECK((w2 == NULL || d.nerrors > 0) && found);
+        if (w2) world_free(w2);
+        intern_free(sy2);
+    }
+    return 0;
+}
+
 /* --- a rolled modifier: one die per (member, binding), cloned sites --- */
 static int test_cloned_dice(void)
 {
@@ -425,8 +487,6 @@ static int test_errors(void)
           "belong to kind predicates" },
         { "sort actor\nentity a : actor\nvalue s(value, actor) : int\n",
           "drop the `: int`" },
-        { "value k(value, value)\n",
-          "exactly one `value`-sorted argument" },
         /* functor discipline */
         { "sort actor\nentity a : actor\nstate ( blessed(actor)  q(actor) : int )\n"
           "value ( save(value)  s(actor) : int )\n"
@@ -517,6 +577,7 @@ int main(void)
     if (test_bless_all_saves()) return 1;
     if (test_expanded_ordering()) return 1;
     if (test_blanket_ordering()) return 1;
+    if (test_cross_value_links()) return 1;
     if (test_cloned_dice()) return 1;
     if (test_facets_and_products()) return 1;
     if (test_two_role_binding()) return 1;

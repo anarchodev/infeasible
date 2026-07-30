@@ -25,9 +25,10 @@
 //     union within one file, the degenerate module case.
 //
 // Gaps found and filed (per the probe ground rule):
-//   - #143: cross-value links (`dmg_of(V)`) — real Rage lands +2 on the
-//     DAMAGE roll of melee weapon attacks; this file scopes Rage to the
-//     attack-roll-adjacent formulation and the damage half waits there.
+//   - #143 (found here, then LANDED): real Rage lands +2 on the DAMAGE
+//     roll of melee weapon attacks — `dmg_of(value, value)` is a LINK
+//     predicate and the modifier binds a second value parameter through
+//     it; the Rage below is now the faithful spelling.
 //   - #144: ordered non-commuting kind modifiers — resistance halves
 //     (`prior / 2`) and penalties subtract (`prior - e`); the commuting
 //     class (#94) excludes both even when explicitly ordered, so the ward
@@ -62,6 +63,7 @@ value ( save(value, ability)
         magical(value)
         uses_melee_weapon(value)
         thrown_mode(value)
+        dmg_of(value, value)           // the attack's damage roll (#143)
         // derived below — nobody asserts these
         d20(value)  bless_roll(value)  brutal(value)
 
@@ -83,7 +85,8 @@ fact ( save(spell_save, wis)   save(con_save, con)
        attack(firebolt_atk, ranged, spell)
        uses_melee_weapon(dagger_throw)  thrown_mode(dagger_throw)
        damage(sword_dmg, slashing)
-       damage(firebolt_dmg, fire)      magical(firebolt_dmg) )
+       damage(firebolt_dmg, fire)      magical(firebolt_dmg)
+       dmg_of(sword_atk, sword_dmg)    dmg_of(firebolt_atk, firebolt_dmg) )
 
 // ---- the hierarchy: d20 ⊇ saves, checks, attacks (overlapping, no tree) ----
 
@@ -128,9 +131,11 @@ rule bless(A: actor, V: value):
 rule halfling_luck(A: actor, V: value):
     d20(V) & lucky(A) => V(A) = max(prior, 2)
 
-// the product cross-cuts: three axes over one attack space
-rule rage(A: actor, V: value):
-    attack(V, melee, weapon) & raging(A)  => V(A) = prior + 2
+// the product cross-cuts: three axes over one attack space. Rage is the
+// faithful PHB sentence (#143): "+2 to the DAMAGE roll of melee weapon
+// attacks" — selected over attacks, landed on the LINKED damage value.
+rule rage(A: actor, V: value, W: value):
+    attack(V, melee, weapon) & dmg_of(V, W) & raging(A) => W(A) = prior + 2
 rule bracers_of_archery(A: actor, V: value):
     attack(V, ranged, weapon) & archer(A) => V(A) = prior + 2
 rule war_caster_wand(A: actor, V: value):
@@ -146,9 +151,11 @@ rule brutal_ward(A: actor, V: value):
 // sentence ONCE; the grounder desugars to the dotted pairs over the
 // modifiers' shared members (a specific `a.v > b.v` would override):
 halfling_luck > bless
-halfling_luck > rage
 halfling_luck > bracers_of_archery
 halfling_luck > war_caster_wand
+// Rage now lands on damage values (no member shared with Luck); it meets
+// the ward's min cap on sword_dmg — one blanket line orders them:
+brutal_ward > rage
 
 // ---- host-facing snapshots -------------------------------------------------
 

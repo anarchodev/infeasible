@@ -231,6 +231,12 @@ typedef struct {
  * a meta-sorted binder is consumed by the functor expansion, or is an error). */
 #define SORT_METAVALUE (-1000000)
 
+/* pred_info.argsort sentinel: a `value`-sorted argument position of a kind
+ * predicate (#124/#143 — a kind may have several: link predicates like
+ * `dmg_of(value, value)` join value variables across positions). Distinct
+ * from -1 so a failed sort decode is never mistaken for a value position. */
+#define KARG_VALUE (-1000001)
+
 typedef struct { char a[MAX_NAME], b[MAX_NAME]; int aline, acol, bline, bcol; } ast_sup;
 
 /* A named priority ladder (`bands stat_stack: base < condition < feat`, §6.2):
@@ -1607,10 +1613,11 @@ static void parse_value(parser *p)
         int nmeta = 0;
         for (int k = 0; k < v->nargs; k++)
             if (v->argsort[k] == p->metaval) nmeta++;
-        if (!v->is_num && !v->is_mv && !v->is_cell && nmeta == 1) {
-            /* a KIND PREDICATE (#124): boolean, one `value`-sorted argument;
-             * populated by `fact`s, selected in modifier bodies, erased at
-             * build — never a runtime value */
+        if (!v->is_num && !v->is_mv && !v->is_cell && nmeta >= 1) {
+            /* a KIND PREDICATE (#124): boolean, with one or more
+             * `value`-sorted arguments (#143 — several = a LINK predicate,
+             * joining value variables); populated by `fact`s, selected in
+             * modifier bodies, erased at build — never a runtime value */
             v->is_kindpred = true;
             if (p->nkindpreds >= MAX_FLUENTS) {
                 fail(p, v->line, v->col, "too many kind predicates (max %d)",
@@ -1620,14 +1627,7 @@ static void parse_value(parser *p)
             p->kindpreds[p->nkindpreds++] = *v;
             continue;
         }
-        if (nmeta > 1) {
-            fail(p, v->line, v->col,
-                 "a kind predicate takes exactly one `value`-sorted argument "
-                 "(#124 slice 1) — '%s' declares %d",
-                 intern_name(p->syms, v->pred), nmeta);
-            return;
-        }
-        if (nmeta == 1) {
+        if (nmeta >= 1) {
             fail(p, v->line, v->col,
                  "a `value`-sorted argument marks a KIND predicate, which is "
                  "boolean — drop the `: int` on '%s', or drop the `value` arg",
@@ -2639,8 +2639,8 @@ static void build_pred_registry(parser *p)
         pi->kval_pos = -1;
         for (int k = 0; k < v->nargs; k++) {
             if (v->argsort[k] == p->metaval) {
-                pi->argsort[k] = -1;
-                pi->kval_pos = k;
+                pi->argsort[k] = KARG_VALUE;
+                if (pi->kval_pos < 0) pi->kval_pos = k;   /* first, for hints */
             } else {
                 pi->argsort[k] = decode_sort(p, -(int)v->argsort[k] - 2,
                                              v->line, v->col,
@@ -4314,7 +4314,7 @@ static void check_kfacts(parser *p)
             continue;
         }
         for (int k = 0; k < kf->nargs; k++) {
-            if (k == pi->kval_pos) {
+            if (pi->argsort[k] == KARG_VALUE) {
                 if (find_value(p, kf->args[k]) < 0)
                     serr(p, kf->line, kf->col,
                          "'%s' is not a declared value — the `value` position "
@@ -4432,15 +4432,15 @@ static void kind_check_args(parser *p, ast_atom *at, pred_info *pi,
         }
         int vi = var_index(vars, nvars, nm);
         if (vi >= 0) {
-            int want = a == pi->kval_pos ? SORT_METAVALUE : pi->argsort[a];
-            if (want != -2 && vars[vi].sort != want &&
-                !(a == pi->kval_pos && vars[vi].sort == SORT_METAVALUE))
+            int want = pi->argsort[a] == KARG_VALUE ? SORT_METAVALUE
+                                                    : pi->argsort[a];
+            if (vars[vi].sort != want)
                 serr(p, at->args[a].line, at->args[a].col,
                      "'%s' has the wrong sort for this position of '%s'",
                      intern_name(p->syms, nm), intern_name(p->syms, at->pred));
             continue;
         }
-        if (a == pi->kval_pos) {
+        if (pi->argsort[a] == KARG_VALUE) {
             if (find_value(p, nm) < 0)
                 serr(p, at->args[a].line, at->args[a].col,
                      "'%s' is not a declared value", intern_name(p->syms, nm));
@@ -4558,13 +4558,14 @@ static void solve_kind_stratum(parser *p)
         pred_info *pi = find_pred(p, p->kindpreds[ki].pred);
         long total = 1;
         for (int a = 0; a < pi->arity; a++)
-            total *= kdim_size(p, a == pi->kval_pos ? SORT_METAVALUE
-                                                    : pi->argsort[a]);
+            total *= kdim_size(p, pi->argsort[a] == KARG_VALUE
+                                  ? SORT_METAVALUE : pi->argsort[a]);
         for (long ix = 0; ix < total; ix++) {
             uint32_t args[MAX_ARGS];
             long rem = ix;
             for (int a = 0; a < pi->arity; a++) {
-                int s = a == pi->kval_pos ? SORT_METAVALUE : pi->argsort[a];
+                int s = pi->argsort[a] == KARG_VALUE ? SORT_METAVALUE
+                                                     : pi->argsort[a];
                 long d = kdim_size(p, s);
                 args[a] = kdim_at(p, s, rem % d);
                 rem /= d;
@@ -4604,8 +4605,8 @@ static void solve_kind_stratum(parser *p)
                 if (at->is_member || !bp || !bp->is_kindpred) continue;
                 if (at->args[a].name != wild) continue;
                 dims[ndims].name = wild;
-                dims[ndims].sort = a == bp->kval_pos ? SORT_METAVALUE
-                                                     : bp->argsort[a];
+                dims[ndims].sort = bp->argsort[a] == KARG_VALUE
+                                       ? SORT_METAVALUE : bp->argsort[a];
                 dims[ndims].line = at->line;
                 dims[ndims].col = at->col;
                 wdim[b][a] = ndims++;
@@ -4823,20 +4824,35 @@ static void expand_kind_rules(parser *p)
             }
             for (int a = 0; a < ka->nargs && !bad; a++) {
                 uint32_t nm = ka->args[a].name;
-                if (a == pi->kval_pos) {
-                    if (nm != k->head.pred) {
+                int vi = var_index(k->vars, k->nvars, nm);
+                if (pi->argsort[a] == KARG_VALUE) {
+                    /* a value position (#143): the functor variable, any
+                     * other `value`-sorted parameter (a LINK join), a
+                     * declared value symbol, or `_` */
+                    if (vi >= 0) {
+                        if (k->vars[vi].sort != SORT_METAVALUE) {
+                            serr(p, ka->args[a].line, ka->args[a].col,
+                                 "'%s' fills a value position of '%s' but is "
+                                 "not a `value`-sorted parameter",
+                                 intern_name(p->syms, nm),
+                                 intern_name(p->syms, ka->pred));
+                            bad = true;
+                        }
+                        continue;
+                    }
+                    if (nm == wild)
+                        continue;
+                    if (find_value(p, nm) < 0) {
                         serr(p, ka->args[a].line, ka->args[a].col,
-                             "the value position of '%s' must select the "
-                             "functor variable '%s'",
-                             intern_name(p->syms, ka->pred),
-                             intern_name(p->syms, k->head.pred));
+                             "'%s' is not a declared value",
+                             intern_name(p->syms, nm));
                         bad = true;
                     }
                     continue;
                 }
                 if (nm == wild)
                     continue;                      /* wildcard facet */
-                if (var_index(k->vars, k->nvars, nm) >= 0) {
+                if (vi >= 0) {
                     serr(p, ka->args[a].line, ka->args[a].col,
                          "a variable facet ('%s') needs the derived-kind "
                          "stratum (#125) — this slice takes a constant or `_`",
@@ -4860,6 +4876,27 @@ static void expand_kind_rules(parser *p)
             ksel[nksel++] = b;
         }
         if (bad) continue;
+        /* every value parameter — the functor variable and any link-joined
+         * one — must be selected by at least one kind atom */
+        for (int vv = 0; vv < k->nvars && !bad; vv++) {
+            if (k->vars[vv].sort != SORT_METAVALUE)
+                continue;
+            bool seen = false;
+            for (int q = 0; q < nksel && !seen; q++) {
+                ast_atom *ka = &k->body[ksel[q]];
+                for (int a = 0; a < ka->nargs && !seen; a++)
+                    seen = ka->args[a].name == k->vars[vv].name;
+            }
+            if (!seen) {
+                serr(p, k->vars[vv].line, k->vars[vv].col,
+                     "the value parameter '%s' is not selected by any kind "
+                     "atom — add `<kind>(%s, …)` to the body",
+                     intern_name(p->syms, k->vars[vv].name),
+                     intern_name(p->syms, k->vars[vv].name));
+                bad = true;
+            }
+        }
+        if (bad) continue;
         if (nksel == 0) {
             serr(p, k->head.line, k->head.col,
                  "the functor variable '%s' is not selected by any kind atom "
@@ -4868,43 +4905,80 @@ static void expand_kind_rules(parser *p)
                  intern_name(p->syms, k->head.pred));
             continue;
         }
+        /* the link-joined value parameters, enumerated jointly below */
+        int ovv[MAX_ARGS], novv = 0;
+        for (int vv = 0; vv < k->nvars; vv++)
+            if (k->vars[vv].sort == SORT_METAVALUE &&
+                k->vars[vv].name != k->head.pred)
+                ovv[novv++] = vv;
 
         int matched = 0;
         for (int vi = 0; vi < p->nvaluedecls; vi++) {
             ast_fluent *v = &p->valuedecls[vi];
             pred_info *vpi = find_pred(p, v->pred);
-            bool sel = true;
-            for (int s = 0; s < nksel && sel; s++) {
-                /* #125: selection queries the solved kind stratum — a fact
-                 * and a derived membership answer identically. Wildcard
-                 * facets are existential: any member of the position's
-                 * domain proved. */
-                ast_atom *ka = &k->body[ksel[s]];
-                pred_info *pi = find_pred(p, ka->pred);
-                uint32_t args[MAX_ARGS];
-                int wpos[MAX_ARGS], nw = 0;
-                for (int a = 0; a < pi->arity; a++) {
-                    if (a == pi->kval_pos)             args[a] = v->pred;
-                    else if (ka->args[a].name == wild) wpos[nw++] = a;
-                    else                               args[a] = ka->args[a].name;
+            /* #125/#143: selection queries the solved kind stratum — a fact
+             * and a derived membership answer identically. The functor
+             * variable is fixed to this member; link-joined value parameters
+             * are EXISTENTIAL, enumerated jointly (consistent across atoms);
+             * `_` wildcards stay per-atom existentials over the position's
+             * domain. Selected iff some joint assignment proves them all. */
+            long jtotal = 1;
+            for (int q = 0; q < novv; q++)
+                jtotal *= p->nvaluedecls ? p->nvaluedecls : 1;
+            bool sel = false;
+            for (long jix = 0; jix < jtotal && !sel; jix++) {
+                uint32_t assign[MAX_ARGS];         /* per ovv slot */
+                long jrem = jix;
+                for (int q = 0; q < novv; q++) {
+                    assign[q] = p->valuedecls[jrem % p->nvaluedecls].pred;
+                    jrem /= p->nvaluedecls;
                 }
-                long total = 1;
-                for (int wq = 0; wq < nw; wq++)
-                    total *= domain_size(p, pi->argsort[wpos[wq]]);
-                bool any = false;
-                for (long ix = 0; ix < total && !any; ix++) {
-                    long rem = ix;
-                    for (int wq = 0; wq < nw; wq++) {
-                        long d = domain_size(p, pi->argsort[wpos[wq]]);
-                        args[wpos[wq]] = domain_at(p, pi->argsort[wpos[wq]],
-                                                   rem % d);
-                        rem /= d;
+                bool all = true;
+                for (int q2 = 0; q2 < nksel && all; q2++) {
+                    ast_atom *ka = &k->body[ksel[q2]];
+                    pred_info *pi = find_pred(p, ka->pred);
+                    uint32_t args[MAX_ARGS];
+                    int wpos[MAX_ARGS], wsort[MAX_ARGS], nw = 0;
+                    for (int a = 0; a < pi->arity; a++) {
+                        uint32_t nm = ka->args[a].name;
+                        int isv = pi->argsort[a] == KARG_VALUE;
+                        if (nm == k->head.pred) {
+                            args[a] = v->pred;
+                            continue;
+                        }
+                        int oq = -1;
+                        for (int q3 = 0; q3 < novv && oq < 0; q3++)
+                            if (k->vars[ovv[q3]].name == nm) oq = q3;
+                        if (oq >= 0) {
+                            args[a] = assign[oq];
+                            continue;
+                        }
+                        if (nm == wild) {
+                            wpos[nw] = a;
+                            wsort[nw] = isv ? SORT_METAVALUE : pi->argsort[a];
+                            nw++;
+                            continue;
+                        }
+                        args[a] = nm;              /* a constant symbol */
                     }
-                    uint32_t ga = ground_pred(p, ka->pred, args, pi->arity);
-                    any = p->kres &&
-                          dl_defeasible(p->kres, dl_pos(ga)) == DL_PROVED;
+                    long total = 1;
+                    for (int wq = 0; wq < nw; wq++)
+                        total *= kdim_size(p, wsort[wq]);
+                    bool any = false;
+                    for (long ix = 0; ix < total && !any; ix++) {
+                        long rem = ix;
+                        for (int wq = 0; wq < nw; wq++) {
+                            long dsz = kdim_size(p, wsort[wq]);
+                            args[wpos[wq]] = kdim_at(p, wsort[wq], rem % dsz);
+                            rem /= dsz;
+                        }
+                        uint32_t ga = ground_pred(p, ka->pred, args, pi->arity);
+                        any = p->kres &&
+                              dl_defeasible(p->kres, dl_pos(ga)) == DL_PROVED;
+                    }
+                    all = any;
                 }
-                sel = any;
+                sel = all;
             }
             if (!sel)
                 continue;
@@ -4980,12 +5054,14 @@ static void expand_kind_rules(parser *p)
                     uint32_t args[MAX_ARGS];
                     bool ok = true;
                     for (int a = 0; a < pi->arity; a++) {
-                        if (a == pi->kval_pos)
+                        uint32_t nm = ka->args[a].name;
+                        if (nm == k->head.pred)
                             args[a] = p->valuedecls[vi].pred;
-                        else if (ka->args[a].name == wild)
-                            ok = false;            /* skip wild for the hint */
+                        else if (nm == wild ||
+                                 var_index(k->vars, k->nvars, nm) >= 0)
+                            ok = false;    /* wild / link var: skip for the hint */
                         else
-                            args[a] = ka->args[a].name;
+                            args[a] = nm;
                     }
                     bool prv = ok && p->kres &&
                         dl_defeasible(p->kres,

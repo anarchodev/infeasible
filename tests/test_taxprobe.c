@@ -107,12 +107,14 @@ int main(void)
     CHECK(num(w, sy, "ss(bran)") == 12);   /* save: 10 + d4(2); Luck no-op    */
     CHECK(num(w, sy, "cs(bran)") == 12);   /* save: its own die               */
     CHECK(num(w, sy, "ath(bran)") == 10);  /* check: Bless does NOT cover it  */
-    CHECK(num(w, sy, "swa(bran)") == 14);  /* attack: d4 + Rage (melee wpn)   */
+    CHECK(num(w, sy, "swa(bran)") == 12);  /* attack: d4 only — Rage moved to
+                                            * the DAMAGE roll (#143)          */
     CHECK(num(w, sy, "bwa(bran)") == 13);  /* attack: d4 + Bracers (rgd wpn)  */
     CHECK(num(w, sy, "fba(bran)") == 14);  /* attack: d4 + wand (`_`, spell)  */
     /* the thrown dagger: ranged-weapon BY DEFEAT — Bracers yes, Rage NO */
     CHECK(num(w, sy, "dta(bran)") == 14);  /* 10 + d4(2) + 2, and not +2 more */
-    /* brutal: nonmagical slashing capped; magical fire untouched */
+    /* damage: Rage's +2 lands on the LINKED sword_dmg (#143), and the
+     * brutal ward's cap applies above it (blanket-ordered): min(10+2, 8) */
     CHECK(num(w, sy, "swd(bran)") == 8);
     CHECK(num(w, sy, "fbd(bran)") == 10);
     /* initiative: a check — Bless ignores it, Luck floors it (1 -> 2) */
