@@ -330,6 +330,22 @@ int  world_add_step_rule(world *w, const char *name, uint32_t action,
                          const step_cond *body, int nbody,
                          const dl_lit *effects, int neffects);
 
+/* `split` (#121): designate ONE finite-domain fluent family (its MV-erased
+ * value atoms, all previously declared) for per-value step-schema
+ * specialization. Zero semantic content — a compilation hint (same species
+ * as `merge`): each step selects a cached schema by the PRE-step value,
+ * omitting rules statically dead under it (an unprimed positive body cond on
+ * another value atom) and the inertia of fluents no live rule writes or
+ * reads primed; excluded fluents commit by copy. Detection is syntactic and
+ * dumb: negated or primed reads of the split fluent never filter (the rule
+ * stays in every schema — the .story compiler rejects primed reads of a
+ * split fluent outright). No unique value true -> the full schema. Also
+ * upgrades #119's loudness: an action whose every rule is dead under the
+ * current value is a -1-with-err ("matches no live step rule while
+ * '<value>'"), state untouched. Returns 0; -1 if a split is already set,
+ * nvals is outside 2..31, or a value atom is not a declared fluent. */
+int  world_set_split(world *w, const uint32_t *value_atoms, int nvals);
+
 /* Attach a numeric effect to a step rule (its world_add_step_rule handle).
  * `code`/`ncode` is the RHS bytecode; the world copies it. */
 void world_add_num_effect(world *w, int rule, uint32_t num_atom,

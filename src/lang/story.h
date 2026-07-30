@@ -59,8 +59,15 @@
  *                                          -- the ASSIGN-class algebra — firing `:=`s
  *                                          -- take the extreme instead of contesting
  *                                          -- (deltas still sum on top, clamp outermost)
- *            | ':' '{' IDENT (',' IDENT)* '}'           -- inline multi-valued domain
- *            | ':' IDENT                                -- a declared `enum` domain
+ *            | ':' '{' IDENT (',' IDENT)* '}' [ 'split' ] -- inline multi-valued domain
+ *            | ':' IDENT [ 'split' ]                    -- a declared `enum` domain
+ *                                          -- `split` (#121): per-value step-
+ *                                          -- schema specialization on this ONE
+ *                                          -- arity-0 mode fluent; zero semantic
+ *                                          -- content (same species as `merge`).
+ *                                          -- A primed read of a split fluent is
+ *                                          -- a located error (selection is by
+ *                                          -- the pre-step value)
  *   provider:= 'provider' ( fdecl | '(' fdecl* ')' )     -- host-answered (§5.6/#93):
  *                                          -- no return type = a boolean RELATION
  *                                          -- (grounded, closed-world facts); a

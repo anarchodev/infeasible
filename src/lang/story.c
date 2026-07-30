@@ -208,6 +208,8 @@ typedef struct {
                                    * layer on every value declaring the kind. */
     long     rmin, rmax;          /* constant bounds (when each side folds) */
     int      rmin_expr, rmax_expr;/* dynamic bound ex_node root, else -1 (§5.8) */
+    bool     is_split;            /* `split` (#121): per-value step-schema
+                                   * specialization hint; MV arity-0 only */
     int      line, col;
 } ast_fluent;
 
@@ -325,6 +327,7 @@ typedef struct {
                                    * (-1 until an `as` typed contribution is seen) */
     bool has_pguards;             /* #87: any primed numeric guard — strata exist,
                                    * step lanes bail, world steps N=1 */
+    uint32_t split_pred;          /* the ONE `split` fluent (#121), 0 = none */
     int value_def[MAX_FLUENTS];           /* per value: the BASE definition (the one
                                            * unconditional rule), -1 = none yet */
     int vdefs[MAX_FLUENTS][MAX_LAYERS + 1];   /* all defs, declaration order (#82/#94) */
@@ -1223,6 +1226,40 @@ static void parse_enum(parser *p)
  * multi-valued fluent, out of this slice. */
 static int find_sort(parser *p, uint32_t name_atom);   /* defined below */
 
+/* Optional `split` (#121) after a finite MV domain — a contextual keyword like
+ * `merge`, a compilation hint with zero semantic content: the step schema
+ * specializes per value of this fluent. One per world; the schema switches on
+ * ONE mode value, so the fluent must be arity-0; the world-side liveness mask
+ * is 31 bits (generous, and loud rather than silently capped). */
+static bool parse_split_opt(parser *p, ast_fluent *f)
+{
+    if (!ident_is(p->cur, "split"))
+        return true;
+    token t = p->cur;
+    advance(p);
+    if (f->nargs > 0) {
+        fail(p, t.line, t.col,
+             "`split` needs an arity-0 fluent — the step schema specializes on "
+             "one mode value (phase, day/night), not one per entity");
+        return false;
+    }
+    if (f->nvalues > 31) {
+        fail(p, t.line, t.col,
+             "`split` domain too large: %d values (max 31)", f->nvalues);
+        return false;
+    }
+    if (p->split_pred) {
+        fail(p, t.line, t.col,
+             "duplicate `split` — one split fluent per world (#121); '%s' "
+             "already carries it",
+             intern_name(p->syms, p->split_pred));
+        return false;
+    }
+    f->is_split = true;
+    p->split_pred = f->pred;
+    return true;
+}
+
 static bool parse_fdecl(parser *p, ast_fluent *f)
 {
     memset(f, 0, sizeof *f);
@@ -1315,6 +1352,12 @@ static bool parse_fdecl(parser *p, ast_fluent *f)
                 f->vkind = intern_tok(p, p->cur);
                 advance(p);
             }
+            if (ident_is(p->cur, "split")) {
+                fail(p, p->cur.line, p->cur.col,
+                     "`split` needs a finite value domain (`: { … }` or an "
+                     "enum) — a numeric fluent has no per-value schemas (#121)");
+                return false;
+            }
             f->is_num = true;
             return true;
         }
@@ -1325,7 +1368,7 @@ static bool parse_fdecl(parser *p, ast_fluent *f)
                 f->nvalues = p->enums[ei].nvalues;
                 for (int v = 0; v < f->nvalues; v++) f->values[v] = p->enums[ei].values[v];
                 advance(p);
-                return true;
+                return parse_split_opt(p, f);      /* optional `split` (#121) */
             }
             int si = find_sort(p, intern_tok(p, p->cur));
             if (si >= 0 && !p->sorts[si].is_domain) {
@@ -1386,6 +1429,8 @@ static bool parse_fdecl(parser *p, ast_fluent *f)
                  "a value domain needs at least two values");
             return false;
         }
+        if (!parse_split_opt(p, f))               /* optional `split` (#121) */
+            return false;
     }
     return true;
 }
@@ -3142,6 +3187,14 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
                  intern_name(p->syms, at->pred), intern_name(p->syms, at->pred));
             return;
         }
+        if (at->primed && at->pred == p->split_pred) {
+            serr(p, at->line, at->col,
+                 "primed read of the split fluent — schema selection is by the "
+                 "PRE-step value (#121), so `%s' = …` cannot be phase-filtered; "
+                 "read it unprimed, or drop `split`",
+                 intern_name(p->syms, at->pred));
+            return;
+        }
         bool in_domain = false;
         for (int i = 0; i < pi->nvalues; i++)
             if (pi->values[i] == at->value) { in_domain = true; break; }
@@ -4827,12 +4880,21 @@ static void declare_ground_fluents(parser *p)
                 }
             }
             else if (f->is_mv) {                   /* one boolean atom per value */
+                uint32_t vat[MAX_DOMAIN];
                 for (int v = 0; v < f->nvalues; v++) {
                     uint32_t a = ground_mv_atom(p, f->pred, binding, f->nargs,
                                                 f->values[v]);
                     world_declare_fluent(p->w, a);
                     world_set_fluent_prov(p->w, a, decl);
+                    vat[v] = a;
                 }
+                /* `split` (#121): hand the world the family's value atoms —
+                 * arity-0 (parse-enforced), so this binding loop runs once */
+                if (f->is_split &&
+                    world_set_split(p->w, vat, f->nvalues) != 0)
+                    fail(p, f->line, f->col,
+                         "internal: the world rejected `split` on '%s'",
+                         intern_name(p->syms, f->pred));
             } else {
                 uint32_t a = ground_pred(p, f->pred, binding, f->nargs);
                 world_declare_fluent(p->w, a);

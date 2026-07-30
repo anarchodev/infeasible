@@ -32,7 +32,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 enable_testing()
-foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse test_scene test_bands test_clamp test_setparam test_domain test_intargs test_functional test_store test_fnprovider test_ground test_mv test_numeric test_numpipe test_numeff test_ramif test_prov test_lanes test_binder test_numlane test_binderlane test_judgstep test_provider test_safety test_cardinality test_spatial test_factindex test_matcher test_ticktime test_selectivity test_dlcol_incr test_locstable test_matchview test_sparsejfam test_sparseuniverse test_lazyq test_inits test_model test_lsp test_div test_value test_enumarg test_dtype test_merge test_exprtest test_strata test_layers test_modeled test_kinds test_reaction)
+foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse test_scene test_bands test_clamp test_setparam test_domain test_intargs test_functional test_store test_fnprovider test_ground test_mv test_numeric test_numpipe test_numeff test_ramif test_prov test_lanes test_binder test_numlane test_binderlane test_judgstep test_provider test_safety test_cardinality test_spatial test_factindex test_matcher test_ticktime test_selectivity test_dlcol_incr test_locstable test_matchview test_sparsejfam test_sparseuniverse test_lazyq test_inits test_model test_lsp test_div test_value test_enumarg test_dtype test_merge test_exprtest test_strata test_layers test_modeled test_kinds test_reaction test_split)
   add_executable(${t} tests/${t}.c)
   target_link_libraries(${t} PRIVATE infeasible_core)
   add_test(NAME ${t} COMMAND ${t})
