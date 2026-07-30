@@ -205,15 +205,31 @@ typedef struct {
                                    * copied with `:=`; no arithmetic, no int guards */
     bool     has_range;           /* declared `in lo..hi` — the clamp range */
     int      merge_mode;          /* `merge min|max` (#85): 0 register, 1 min, 2 max */
-    uint32_t vkind;               /* `kind attack` on a value decl (#82 roll kinds);
-                                   * 0 = none. A kind-modifier rule expands into a
-                                   * layer on every value declaring the kind. */
     long     rmin, rmax;          /* constant bounds (when each side folds) */
     int      rmin_expr, rmax_expr;/* dynamic bound ex_node root, else -1 (§5.8) */
     bool     is_split;            /* `split` (#121): per-value step-schema
                                    * specialization hint; MV arity-0 only */
+    bool     is_kindpred;         /* #124: a boolean `value` decl with one
+                                   * `value`-sorted argument — a kind predicate,
+                                   * populated by `fact`s, consumed at build */
     int      line, col;
 } ast_fluent;
+
+/* #124: a kind membership fact — `fact save(spell_save, wis)`. Args are bare
+ * symbols, vocabulary-checked in the semantic pass (the value-sorted position
+ * names a declared value; enum/entity positions name members/entities). */
+typedef struct {
+    uint32_t pred;
+    uint32_t args[MAX_ARGS];
+    int      nargs;
+    int      line, col;
+} ast_kfact;
+
+#define MAX_KFACTS 4096               /* generous; overflow is a loud error */
+
+/* var_bind.sort sentinel: the #124 `value` meta-sort (never a real sort index;
+ * a meta-sorted binder is consumed by the functor expansion, or is an error). */
+#define SORT_METAVALUE (-1000000)
 
 typedef struct { char a[MAX_NAME], b[MAX_NAME]; int aline, acol, bline, bcol; } ast_sup;
 
@@ -256,6 +272,9 @@ typedef struct {
     bool     is_provider;         /* a computed relation, host-answered (§5.6) */
     bool     is_value;            /* an engine-derived value (#82): defined by a
                                    * rule, inlined at read sites, never stored */
+    bool     is_kindpred;         /* #124: a kind predicate — build-time-only,
+                                   * populated by `fact`s, erased at grounding */
+    int      kval_pos;            /* its `value`-sorted argument position */
 } pred_info;
 
 /* A value-returning function provider (§5.6): `function f(t1,…) : ret`. Unlike a
@@ -324,6 +343,18 @@ typedef struct {
     ast_function functions[MAX_FLUENTS];  /* value-returning fn providers (§5.6) */
     int nfunctions;
     ast_fluent  valuedecls[MAX_FLUENTS];  /* engine-derived values (#82): `value v(…) : int` */
+    ast_fluent  kindpreds[MAX_FLUENTS];   /* #124 kind predicates: boolean `value`
+                                           * decls with one `value`-sorted arg */
+    int nkindpreds;
+    ast_kfact   kfacts[MAX_KFACTS];       /* #124 membership facts */
+    int nkfacts;
+    uint32_t    metaval;                  /* the interned "value" meta-sort name —
+                                           * LAZY (metaval()): interning it eagerly
+                                           * would shift every later atom id and so
+                                           * every §5.10 roll-site key in worlds
+                                           * that never use kinds. 0 = not yet
+                                           * interned; compares false against any
+                                           * real atom (INTERN_NONE is 0). */
     int nvaluedecls;
     int dtype_sort;               /* #83: the ONE enum-sort damage types come from
                                    * (-1 until an `as` typed contribution is seen) */
@@ -1262,6 +1293,14 @@ static bool parse_split_opt(parser *p, ast_fluent *f)
     return true;
 }
 
+/* The "value" meta-sort atom, interned on FIRST use (see the field note). */
+static uint32_t metaval(parser *p)
+{
+    if (!p->metaval)
+        p->metaval = intern_id(p->syms, "value");
+    return p->metaval;
+}
+
 static bool parse_fdecl(parser *p, ast_fluent *f)
 {
     memset(f, 0, sizeof *f);
@@ -1274,7 +1313,10 @@ static bool parse_fdecl(parser *p, ast_fluent *f)
     if (p->cur.kind == TK_LPAREN) {
         advance(p);
         for (;;) {
-            if (p->cur.kind != TK_IDENT) {
+            /* `value` (a keyword) is legal as an argument sort: the #124
+             * meta-sort whose elements are the declared value symbols — the
+             * mark of a kind predicate. parse_value validates placement. */
+            if (p->cur.kind != TK_IDENT && p->cur.kind != TK_VALUE) {
                 char d[64]; tok_desc(p->cur, d, sizeof d);
                 fail(p, p->cur.line, p->cur.col,
                      "expected a sort name, found %s", d);
@@ -1285,7 +1327,8 @@ static bool parse_fdecl(parser *p, ast_fluent *f)
                      "too many fluent arguments (max %d)", MAX_ARGS);
                 return false;
             }
-            f->argsort[f->nargs++] = intern_tok(p, p->cur);
+            f->argsort[f->nargs++] = p->cur.kind == TK_VALUE
+                                     ? metaval(p) : intern_tok(p, p->cur);
             advance(p);
             if (p->cur.kind == TK_COMMA) { advance(p); continue; }
             break;
@@ -1343,16 +1386,14 @@ static bool parse_fdecl(parser *p, ast_fluent *f)
                 }
                 advance(p);
             }
-            if (ident_is(p->cur, "kind")) {        /* roll kinds (#82) */
-                advance(p);
-                if (p->cur.kind != TK_IDENT) {
-                    char d[64]; tok_desc(p->cur, d, sizeof d);
-                    fail(p, p->cur.line, p->cur.col,
-                         "expected a kind name after `kind`, found %s", d);
-                    return false;
-                }
-                f->vkind = intern_tok(p, p->cur);
-                advance(p);
+            if (ident_is(p->cur, "kind")) {        /* removed surface (#124) */
+                fail(p, p->cur.line, p->cur.col,
+                     "the `kind` keyword is gone (#124) — a kind is facts: "
+                     "declare `value <kind>(value, …)`, assert membership with "
+                     "`fact <kind>(%s, …)`, and select in the modifier body "
+                     "(`<kind>(V, …)` with `V : value`, head `V(A) = …`)",
+                     intern_name(p->syms, f->pred));
+                return false;
             }
             if (ident_is(p->cur, "split")) {
                 fail(p, p->cur.line, p->cur.col,
@@ -1504,12 +1545,6 @@ static void parse_provider(parser *p)
                  "state (§5.8); the host computes whatever it computes");
             return;
         }
-        if (tmp.vkind != INTERN_NONE) {
-            fail(p, tmp.line, tmp.col,
-                 "`kind` classifies derived values (#82 roll kinds), not "
-                 "host-answered providers");
-            return;
-        }
         if (tmp.is_num || tmp.is_cell || sortval) {
             /* return type ⇒ a value FUNCTION (#93): same registration as the
              * `function` keyword — called from the effect VM, never grounded */
@@ -1563,10 +1598,41 @@ static void parse_value(parser *p)
         }
         ast_fluent *v = &p->valuedecls[p->nvaluedecls];
         if (!parse_fdecl(p, v)) return;
+        int nmeta = 0;
+        for (int k = 0; k < v->nargs; k++)
+            if (v->argsort[k] == p->metaval) nmeta++;
+        if (!v->is_num && !v->is_mv && !v->is_cell && nmeta == 1) {
+            /* a KIND PREDICATE (#124): boolean, one `value`-sorted argument;
+             * populated by `fact`s, selected in modifier bodies, erased at
+             * build — never a runtime value */
+            v->is_kindpred = true;
+            if (p->nkindpreds >= MAX_FLUENTS) {
+                fail(p, v->line, v->col, "too many kind predicates (max %d)",
+                     MAX_FLUENTS);
+                return;
+            }
+            p->kindpreds[p->nkindpreds++] = *v;
+            continue;
+        }
+        if (nmeta > 1) {
+            fail(p, v->line, v->col,
+                 "a kind predicate takes exactly one `value`-sorted argument "
+                 "(#124 slice 1) — '%s' declares %d",
+                 intern_name(p->syms, v->pred), nmeta);
+            return;
+        }
+        if (nmeta == 1) {
+            fail(p, v->line, v->col,
+                 "a `value`-sorted argument marks a KIND predicate, which is "
+                 "boolean — drop the `: int` on '%s', or drop the `value` arg",
+                 intern_name(p->syms, v->pred));
+            return;
+        }
         if (!v->is_num || v->is_mv || v->is_cell) {
             fail(p, v->line, v->col,
-                 "a value needs a return type, and only `: int` is supported "
-                 "in this slice (#82) — enum-valued values are a later slice");
+                 "a value needs a return type (only `: int` in this slice, "
+                 "#82) — or a `value`-sorted argument to be a kind predicate "
+                 "(#124)");
             return;
         }
         if (v->has_range) {
@@ -1592,6 +1658,59 @@ static int find_function(parser *p, uint32_t name)
     for (int i = 0; i < p->nfunctions; i++)
         if (p->functions[i].name == name) return i;
     return -1;
+}
+
+/* fact := 'fact' ( katom | '(' katom* ')' ) — #124 kind membership. Contextual
+ * keyword (like `merge`): a rule label literally named `fact` in a superiority
+ * line misparses here with a located error, same trade the other contextual
+ * keywords make. Args are bare symbols, vocabulary-checked in the semantic
+ * pass against the kind predicate's declared argument sorts. */
+static void parse_fact(parser *p)
+{
+    advance(p);                                    /* 'fact' */
+    bool grouped = false;
+    if (p->cur.kind == TK_LPAREN) { grouped = true; advance(p); }
+    do {
+        if (p->cur.kind != TK_IDENT) {
+            char d[64]; tok_desc(p->cur, d, sizeof d);
+            fail(p, p->cur.line, p->cur.col,
+                 "expected a kind predicate name, found %s", d);
+            return;
+        }
+        if (p->nkfacts >= MAX_KFACTS) {
+            fail(p, p->cur.line, p->cur.col,
+                 "too many facts (max %d) — raise MAX_KFACTS", MAX_KFACTS);
+            return;
+        }
+        ast_kfact *kf = &p->kfacts[p->nkfacts];
+        memset(kf, 0, sizeof *kf);
+        kf->pred = intern_tok(p, p->cur);
+        kf->line = p->cur.line;
+        kf->col = p->cur.col;
+        advance(p);
+        if (!expect(p, TK_LPAREN)) return;
+        for (;;) {
+            if (p->cur.kind != TK_IDENT) {
+                char d[64]; tok_desc(p->cur, d, sizeof d);
+                fail(p, p->cur.line, p->cur.col,
+                     "expected a symbol (a value, enum member, or entity), "
+                     "found %s", d);
+                return;
+            }
+            if (kf->nargs >= MAX_ARGS) {
+                fail(p, p->cur.line, p->cur.col,
+                     "too many fact arguments (max %d)", MAX_ARGS);
+                return;
+            }
+            kf->args[kf->nargs++] = intern_tok(p, p->cur);
+            advance(p);
+            if (p->cur.kind == TK_COMMA) { advance(p); continue; }
+            break;
+        }
+        if (!expect(p, TK_RPAREN)) return;
+        p->nkfacts++;
+    } while (grouped && p->cur.kind == TK_IDENT);
+    if (grouped && !expect(p, TK_RPAREN)) return;
 }
 
 /* One type token in a function signature: a declared sort/domain name, or `int`.
@@ -1770,7 +1889,7 @@ static bool parse_params(parser *p, var_bind *vars, int *nvars, ast_action *act)
             fail(p, nm.line, nm.col, "too many variables (max %d)", MAX_ARGS);
             return false;
         }
-        if (p->cur.kind != TK_IDENT) {
+        if (p->cur.kind != TK_IDENT && p->cur.kind != TK_VALUE) {
             char d[64]; tok_desc(p->cur, d, sizeof d);
             fail(p, p->cur.line, p->cur.col, "expected a sort name, found %s", d);
             return false;
@@ -1779,8 +1898,10 @@ static bool parse_params(parser *p, var_bind *vars, int *nvars, ast_action *act)
         v->name = intern_tok(p, nm);
         v->line = nm.line;
         v->col = nm.col;
-        /* encode the sort name atom for resolution in the semantic pass */
-        v->sort = -(int)intern_tok(p, p->cur) - 2;
+        /* encode the sort name atom for resolution in the semantic pass;
+         * `V : value` (a keyword) binds over the #124 meta-sort */
+        v->sort = -(int)(p->cur.kind == TK_VALUE ? metaval(p)
+                                                 : intern_tok(p, p->cur)) - 2;
         (*nvars)++;
         advance(p);
         if (p->cur.kind == TK_COMMA) { advance(p); continue; }
@@ -1989,39 +2110,70 @@ static void parse_rule(parser *p)
     }
     advance(p);
 
-    if (ident_is(p->cur, "kind")) {                /* kind-modifier head (#82) */
-        advance(p);
-        if (p->cur.kind != TK_IDENT) {
-            char d[64]; tok_desc(p->cur, d, sizeof d);
-            fail(p, p->cur.line, p->cur.col,
-                 "expected a kind name after `kind`, found %s", d);
-            return;
-        }
-        memset(&r->head, 0, sizeof r->head);
-        r->head.is_kinddef = true;
-        r->head.pred = intern_tok(p, p->cur);
-        r->head.line = p->cur.line;
-        r->head.col = p->cur.col;
-        advance(p);
-        if (!expect(p, TK_LPAREN)) return;
-        if (p->cur.kind != TK_IDENT) {
-            char d[64]; tok_desc(p->cur, d, sizeof d);
-            fail(p, p->cur.line, p->cur.col,
-                 "expected the subject variable inside the kind head, found %s", d);
-            return;
-        }
-        r->head.args[0].name = intern_tok(p, p->cur);
-        r->head.args[0].line = p->cur.line;
-        r->head.args[0].col = p->cur.col;
-        r->head.nargs = 1;
-        advance(p);
-        if (!expect(p, TK_RPAREN)) return;
-        if (!expect(p, TK_EQ)) return;
-        int e = parse_expr(p);
-        if (e < 0) return;
-        r->head.lhs_root = e;
-        p->nrules++;
+    if (ident_is(p->cur, "kind")) {                /* removed surface (#124) */
+        fail(p, p->cur.line, p->cur.col,
+             "`=> kind k(A) = …` is gone (#124) — bind the kind in the body: "
+             "add a parameter `V : value`, select with `k(V, …)` in the body, "
+             "and write the head as `V(A) = …`");
         return;
+    }
+
+    /* Functor-position modifier head (#124): `V(A[, T]) = expr` where V is a
+     * rule parameter over the `value` meta-sort. Looks higher-order, grounds
+     * first-order: the semantic pass matches the body's kind atoms against
+     * the `fact` set and flattens one layer per member value (HiLog move).
+     * Detected here so parse_atom's MV machinery never sees the variable. */
+    if (p->cur.kind == TK_IDENT) {
+        uint32_t hv = intern_tok(p, p->cur);
+        for (int k = 0; k < r->nvars; k++) {
+            if (r->vars[k].name != hv)
+                continue;
+            if (r->vars[k].sort != -(int)p->metaval - 2) {
+                /* a rule parameter can never head a conclusion — the only
+                 * variable legal in functor position is a `value`-sorted one */
+                fail(p, p->cur.line, p->cur.col,
+                     "'%s' is a rule parameter — only a `value`-sorted "
+                     "parameter may stand in functor position (`V(A) = …` "
+                     "with `V : value`)", intern_name(p->syms, hv));
+                return;
+            }
+            token vt = p->cur;
+            advance(p);
+            memset(&r->head, 0, sizeof r->head);
+            r->head.is_kinddef = true;             /* rides #115's guards/expansion */
+            r->head.pred = hv;                     /* the functor VARIABLE */
+            r->head.line = vt.line;
+            r->head.col = vt.col;
+            if (!expect(p, TK_LPAREN)) return;
+            for (;;) {
+                if (p->cur.kind != TK_IDENT) {
+                    char d[64]; tok_desc(p->cur, d, sizeof d);
+                    fail(p, p->cur.line, p->cur.col,
+                         "expected a subject variable in the functor head, "
+                         "found %s", d);
+                    return;
+                }
+                if (r->head.nargs >= MAX_ARGS) {
+                    fail(p, p->cur.line, p->cur.col,
+                         "too many subject variables (max %d)", MAX_ARGS);
+                    return;
+                }
+                r->head.args[r->head.nargs].name = intern_tok(p, p->cur);
+                r->head.args[r->head.nargs].line = p->cur.line;
+                r->head.args[r->head.nargs].col = p->cur.col;
+                r->head.nargs++;
+                advance(p);
+                if (p->cur.kind == TK_COMMA) { advance(p); continue; }
+                break;
+            }
+            if (!expect(p, TK_RPAREN)) return;
+            if (!expect(p, TK_EQ)) return;
+            int e = parse_expr(p);
+            if (e < 0) return;
+            r->head.lhs_root = e;
+            p->nrules++;
+            return;
+        }
     }
 
     if (!parse_atom(p, &r->head)) return;
@@ -2404,11 +2556,6 @@ static void build_pred_registry(parser *p)
                      "supported yet (#19). A domain is a provider/param arg type "
                      "only", intern_name(p->syms, f->pred), p->sorts[pi->argsort[k]].name);
         }
-        if (f->vkind != INTERN_NONE)
-            serr(p, f->line, f->col,
-                 "`kind` classifies derived values (#82 roll kinds) — '%s' is "
-                 "stored state; declare it with `value` to give it a kind",
-                 intern_name(p->syms, f->pred));
         pi->is_num = f->is_num;
         pi->is_cell = f->is_cell;
         pi->is_mv = f->is_mv;
@@ -2467,6 +2614,52 @@ static void build_pred_registry(parser *p)
                                          v->line, v->col, "a value declaration");
     }
 
+    /* kind predicates (#124): build-time-only vocabulary — registered so fact
+     * checking and modifier selection see arity + arg sorts, never a runtime
+     * object. The `value`-sorted position gets argsort -1 + kval_pos. */
+    for (int i = 0; i < p->nkindpreds; i++) {
+        ast_fluent *v = &p->kindpreds[i];
+        pred_info *pi = find_pred(p, v->pred);
+        if (pi && (pi->is_fluent || pi->is_provider || pi->is_value ||
+                   pi->is_kindpred)) {
+            serr(p, v->line, v->col, "'%s' is already declared",
+                 intern_name(p->syms, v->pred));
+            continue;
+        }
+        pi = intern_pred(p, v->pred, v->nargs);
+        if (!pi) { serr(p, v->line, v->col, "too many predicates"); return; }
+        pi->is_kindpred = true;
+        pi->arity = v->nargs;
+        pi->kval_pos = -1;
+        for (int k = 0; k < v->nargs; k++) {
+            if (v->argsort[k] == p->metaval) {
+                pi->argsort[k] = -1;
+                pi->kval_pos = k;
+            } else {
+                pi->argsort[k] = decode_sort(p, -(int)v->argsort[k] - 2,
+                                             v->line, v->col,
+                                             "a kind predicate declaration");
+            }
+        }
+    }
+
+    /* the meta-sort never keys a runtime object (#124 acceptance): a
+     * `value`-sorted argument on stored state or a provider is an error */
+    for (int i = 0; i < p->nfluents; i++)
+        for (int k = 0; k < p->fluents[i].nargs; k++)
+            if (p->fluents[i].argsort[k] == p->metaval)
+                serr(p, p->fluents[i].line, p->fluents[i].col,
+                     "`value`-sorted arguments belong to kind predicates "
+                     "(`value k(value, …)`) — '%s' is stored state, a runtime "
+                     "object", intern_name(p->syms, p->fluents[i].pred));
+    for (int i = 0; i < p->nproviders; i++)
+        for (int k = 0; k < p->providers[i].nargs; k++)
+            if (p->providers[i].argsort[k] == p->metaval)
+                serr(p, p->providers[i].line, p->providers[i].col,
+                     "`value`-sorted arguments belong to kind predicates "
+                     "(`value k(value, …)`) — '%s' is host-answered, a runtime "
+                     "relation", intern_name(p->syms, p->providers[i].pred));
+
     /* rule heads register the conclusion predicates (arity from the head). */
     for (int i = 0; i < p->nrules; i++) {
         ast_atom *h = &p->rules[i].head;
@@ -2484,6 +2677,12 @@ static void build_pred_registry(parser *p)
 static void resolve_vars(parser *p, var_bind *vars, int nvars, const char *what)
 {
     for (int i = 0; i < nvars; i++) {
+        if (vars[i].sort == SORT_METAVALUE)
+            continue;                              /* already resolved */
+        if (vars[i].sort == -(int)p->metaval - 2) {
+            vars[i].sort = SORT_METAVALUE;         /* the #124 meta-sort */
+            continue;
+        }
         vars[i].sort = decode_sort(p, vars[i].sort, vars[i].line, vars[i].col, what);
         if (vars[i].sort >= 0 && p->sorts[vars[i].sort].is_domain)
             serr(p, vars[i].line, vars[i].col,
@@ -2976,6 +3175,19 @@ static void check_guard_test_nodes(parser *p, int e, int depth)
 static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
                        bool note, bool in_effect, bool allow_prime, const char *ctx)
 {
+    {   /* #124: kind predicates are build-time vocabulary — the only place
+         * one may appear is a functor modifier's body (which never reaches
+         * this checker; its selection is consumed at expansion) */
+        pred_info *kpi = find_pred(p, at->pred);
+        if (kpi && kpi->is_kindpred) {
+            serr(p, at->line, at->col,
+                 "'%s' is a kind predicate — build-time only, readable in a "
+                 "functor modifier's body (`%s(V, …)` with `V : value`); "
+                 "derived kinds at runtime land with #125",
+                 intern_name(p->syms, at->pred));
+            return;
+        }
+    }
     if (at->is_expr_guard) {                        /* `expr <op> expr` guard */
         if (in_effect) {
             serr(p, at->line, at->col,
@@ -4073,37 +4285,102 @@ static int clone_expr(parser *p, int e)
     return n;
 }
 
-/* #82 roll kinds: expand each `rule L(S: sort): body => kind k(S) = expr` into
- * one LAYER definition per value declaring `kind k` — the modifier is written
- * once and the grounder quantifies over the kind ("selection is static", #79).
- * Expanded labels are `L.valuename`, real rule labels, so superiority can
- * order an expansion against a value-specific layer when #94 demands it. The
- * subject variable binds each member's FIRST argument (the roller, the same
- * convention #83 uses for the response subject); remaining member arguments
- * become fresh parameters the modifier cannot read. Slice restrictions, all
- * located errors: one subject parameter; the expression must be a commuting
- * layer shape (prior+e / max / min) so unordered coexistence with other
- * same-class layers stays legal by construction. */
+/* #124 fact checking: every membership fact names a declared kind predicate,
+ * matches its arity, and every argument is vocabulary — the value position
+ * names a declared `: int` value, other positions name members of their sort
+ * (entities or enum members). Typos die here, not silently match nothing. */
+static void check_kfacts(parser *p)
+{
+    for (int i = 0; i < p->nkfacts; i++) {
+        ast_kfact *kf = &p->kfacts[i];
+        pred_info *pi = find_pred(p, kf->pred);
+        if (!pi || !pi->is_kindpred) {
+            serr(p, kf->line, kf->col,
+                 "'%s' is not a declared kind predicate — declare "
+                 "`value %s(value, …)` first",
+                 intern_name(p->syms, kf->pred), intern_name(p->syms, kf->pred));
+            continue;
+        }
+        if (kf->nargs != pi->arity) {
+            serr(p, kf->line, kf->col,
+                 "'%s' takes %d arguments, this fact has %d",
+                 intern_name(p->syms, kf->pred), pi->arity, kf->nargs);
+            continue;
+        }
+        for (int k = 0; k < kf->nargs; k++) {
+            if (k == pi->kval_pos) {
+                if (find_value(p, kf->args[k]) < 0)
+                    serr(p, kf->line, kf->col,
+                         "'%s' is not a declared value — the `value` position "
+                         "of '%s' names a `value … : int` declaration",
+                         intern_name(p->syms, kf->args[k]),
+                         intern_name(p->syms, kf->pred));
+                continue;
+            }
+            int s = pi->argsort[k];
+            if (s < 0) continue;                   /* decode already reported */
+            bool in = false;
+            for (int e = 0; e < domain_size(p, s) && !in; e++)
+                in = domain_at(p, s, e) == kf->args[k];
+            if (!in)
+                serr(p, kf->line, kf->col,
+                     "'%s' is not a member of sort '%s'",
+                     intern_name(p->syms, kf->args[k]), p->sorts[s].name);
+        }
+    }
+}
+
+/* #124 kinds-are-facts: expand each functor-position modifier
+ *
+ *     rule L(A: actor, V: value): k(V, …) & body => V(A[, T]) = expr
+ *
+ * into one LAYER definition per declared value whose memberships satisfy the
+ * body's kind-atom conjunction (matched against the `fact` set — constants
+ * and `_` wildcards, this slice). The kind atoms are consumed by selection;
+ * the runtime body rides into every expansion. Everything downstream is
+ * #115's machinery unchanged: expanded labels `L.valuename` (real, orderable
+ * by `>`), per-(member, binding) roll sites via expression clones, and the
+ * commuting-layer shape check so unordered coexistence stays legal. The
+ * subject tuple binds each member's leading arguments (V(A) = arg 0, the #83
+ * roller convention; V(A, T) adds the target — Dodge-shaped selection);
+ * members whose arity or leading sorts do not fit simply do not match, and a
+ * modifier matching nothing is an orphan-style warning, not an error. */
 static void expand_kind_rules(parser *p)
 {
+    uint32_t wild = 0;                             /* interned on first use —
+                                                    * never perturb kind-free
+                                                    * worlds' atom streams */
     int n0 = p->nrules;                            /* expansions append */
     for (int i = 0; i < n0; i++) {
         ast_rule *k = &p->rules[i];
         if (!k->head.is_kinddef) continue;
-        const char *kn = intern_name(p->syms, k->head.pred);
+        if (!wild) wild = intern_id(p->syms, "_");
+        resolve_vars(p, k->vars, k->nvars, "a kind modifier");
         if (k->kind != DL_DEFEASIBLE) {
             serr(p, k->head.line, k->head.col,
                  "a kind modifier is defeasible — write '=>'");
             continue;
         }
-        if (k->nvars != 1 ||
-            k->vars[0].name != k->head.args[0].name) {
-            serr(p, k->head.line, k->head.col,
-                 "a kind modifier takes exactly one parameter — the subject "
-                 "that binds each member value's first argument");
-            continue;
+        int nsubj = k->head.nargs;
+        int subj[MAX_ARGS];
+        bool bad = false;
+        for (int a = 0; a < nsubj && !bad; a++) {
+            int si = var_index(k->vars, k->nvars, k->head.args[a].name);
+            if (si < 0) {
+                serr(p, k->head.args[a].line, k->head.args[a].col,
+                     "functor head argument '%s' is not a rule parameter",
+                     intern_name(p->syms, k->head.args[a].name));
+                bad = true;
+            } else if (k->vars[si].sort == SORT_METAVALUE) {
+                serr(p, k->head.args[a].line, k->head.args[a].col,
+                     "a functor head's subject binds an entity-sorted "
+                     "parameter, not `value`");
+                bad = true;
+            } else {
+                subj[a] = si;
+            }
         }
-        resolve_vars(p, k->vars, k->nvars, "a kind modifier");
+        if (bad) continue;
         int cls = valuedef_class(p, k->head.lhs_root);
         if (cls != 1 && cls != 2 && cls != 3) {
             serr(p, k->head.line, k->head.col,
@@ -4112,25 +4389,120 @@ static void expand_kind_rules(parser *p)
                  "`max(prior, e)`, `min(prior, e)`) (#94)");
             continue;
         }
-        int members = 0;
-        for (int vi = 0; vi < p->nvaluedecls; vi++) {
-            ast_fluent *v = &p->valuedecls[vi];
-            if (v->vkind != k->head.pred) continue;
-            members++;
-            pred_info *pi = find_pred(p, v->pred);
-            if (v->nargs < 1 || !pi ||
-                pi->argsort[0] != k->vars[0].sort) {
-                serr(p, k->head.line, k->head.col,
-                     "kind '%s' member '%s': its first argument must be the "
-                     "modifier's subject sort '%s'",
-                     kn, intern_name(p->syms, v->pred),
-                     k->vars[0].sort >= 0 ? p->sorts[k->vars[0].sort].name : "?");
+
+        /* split the body: kind atoms are the SELECTION, the rest is runtime */
+        int ksel[MAX_BODY], nksel = 0;
+        ast_atom rbody[MAX_BODY];
+        int nrbody = 0;
+        for (int b = 0; b < k->nbody && !bad; b++) {
+            ast_atom *ka = &k->body[b];
+            pred_info *pi = find_pred(p, ka->pred);
+            if (!pi || !pi->is_kindpred) {
+                rbody[nrbody++] = *ka;
                 continue;
             }
+            if (ka->neg || ka->primed || ka->value != INTERN_NONE) {
+                serr(p, ka->line, ka->col,
+                     "this slice selects with positive kind-atom conjunctions "
+                     "— negation and derived kinds land with #125");
+                bad = true;
+                break;
+            }
+            if (ka->nargs != pi->arity) {
+                serr(p, ka->line, ka->col, "'%s' takes %d arguments, not %d",
+                     intern_name(p->syms, ka->pred), pi->arity, ka->nargs);
+                bad = true;
+                break;
+            }
+            for (int a = 0; a < ka->nargs && !bad; a++) {
+                uint32_t nm = ka->args[a].name;
+                if (a == pi->kval_pos) {
+                    if (nm != k->head.pred) {
+                        serr(p, ka->args[a].line, ka->args[a].col,
+                             "the value position of '%s' must select the "
+                             "functor variable '%s'",
+                             intern_name(p->syms, ka->pred),
+                             intern_name(p->syms, k->head.pred));
+                        bad = true;
+                    }
+                    continue;
+                }
+                if (nm == wild)
+                    continue;                      /* wildcard facet */
+                if (var_index(k->vars, k->nvars, nm) >= 0) {
+                    serr(p, ka->args[a].line, ka->args[a].col,
+                         "a variable facet ('%s') needs the derived-kind "
+                         "stratum (#125) — this slice takes a constant or `_`",
+                         intern_name(p->syms, nm));
+                    bad = true;
+                    continue;
+                }
+                int s = pi->argsort[a];
+                if (s >= 0) {
+                    bool in = false;
+                    for (int e = 0; e < domain_size(p, s) && !in; e++)
+                        in = domain_at(p, s, e) == nm;
+                    if (!in) {
+                        serr(p, ka->args[a].line, ka->args[a].col,
+                             "'%s' is not a member of sort '%s'",
+                             intern_name(p->syms, nm), p->sorts[s].name);
+                        bad = true;
+                    }
+                }
+            }
+            ksel[nksel++] = b;
+        }
+        if (bad) continue;
+        if (nksel == 0) {
+            serr(p, k->head.line, k->head.col,
+                 "the functor variable '%s' is not selected by any kind atom "
+                 "— add `<kind>(%s, …)` to the body",
+                 intern_name(p->syms, k->head.pred),
+                 intern_name(p->syms, k->head.pred));
+            continue;
+        }
+
+        int matched = 0;
+        for (int vi = 0; vi < p->nvaluedecls; vi++) {
+            ast_fluent *v = &p->valuedecls[vi];
+            pred_info *vpi = find_pred(p, v->pred);
+            bool sel = true;
+            for (int s = 0; s < nksel && sel; s++) {
+                ast_atom *ka = &k->body[ksel[s]];
+                pred_info *pi = find_pred(p, ka->pred);
+                bool any = false;
+                for (int f = 0; f < p->nkfacts && !any; f++) {
+                    ast_kfact *kf = &p->kfacts[f];
+                    if (kf->pred != ka->pred || kf->nargs != pi->arity ||
+                        kf->args[pi->kval_pos] != v->pred)
+                        continue;
+                    bool m = true;
+                    for (int a = 0; a < ka->nargs && m; a++) {
+                        if (a == pi->kval_pos) continue;
+                        uint32_t nm = ka->args[a].name;
+                        if (nm != wild && nm != kf->args[a]) m = false;
+                    }
+                    any = m;
+                }
+                sel = any;
+            }
+            if (!sel)
+                continue;
+            /* the member must fit the subject tuple: enough arguments, and
+             * the leading sorts equal the bound parameters' sorts */
+            if (!vpi || v->nargs < nsubj)
+                continue;
+            bool fit = true;
+            for (int a = 0; a < nsubj && fit; a++)
+                fit = vpi->argsort[a] == k->vars[subj[a]].sort;
+            if (!fit)
+                continue;
+            matched++;
+
             if (p->nrules >= MAX_RULES) {
                 serr(p, k->head.line, k->head.col,
-                     "too many rules (max %d) expanding kind '%s'",
-                     MAX_RULES, kn);
+                     "too many rules (max %d) expanding modifier '%s'",
+                     MAX_RULES, k->label);
                 return;
             }
             ast_rule *r = &p->rules[p->nrules];
@@ -4148,17 +4520,18 @@ static void expand_kind_rules(parser *p)
             r->col = k->col;
             r->kind = DL_DEFEASIBLE;
             r->nvars = v->nargs;
-            r->vars[0] = k->vars[0];               /* the subject, resolved */
-            for (int a = 1; a < v->nargs; a++) {
+            for (int a = 0; a < nsubj; a++)
+                r->vars[a] = k->vars[subj[a]];     /* the subjects, resolved */
+            for (int a = nsubj; a < v->nargs; a++) {
                 char vb[16];
                 snprintf(vb, sizeof vb, "__k%d", a);
                 r->vars[a].name = intern_id(p->syms, vb);
-                r->vars[a].sort = pi->argsort[a];  /* resolved index */
+                r->vars[a].sort = vpi->argsort[a]; /* resolved index */
                 r->vars[a].line = k->line;
                 r->vars[a].col = k->col;
             }
-            r->nbody = k->nbody;
-            for (int b = 0; b < k->nbody; b++) r->body[b] = k->body[b];
+            r->nbody = nrbody;
+            for (int b = 0; b < nrbody; b++) r->body[b] = rbody[b];
             r->nguard = k->nguard;
             for (int g = 0; g < k->nguard; g++) r->guard[g] = k->guard[g];
             r->has_guard = k->has_guard;
@@ -4175,10 +4548,11 @@ static void expand_kind_rules(parser *p)
             r->head.lhs_root = clone_expr(p, k->head.lhs_root);
             p->nrules++;
         }
-        if (members == 0)
-            serr(p, k->head.line, k->head.col,
-                 "no value declares `kind %s` — a modifier with no members is "
-                 "a typo or a missing declaration", kn);
+        if (matched == 0)
+            warn(p, k->line, k->col,
+                 "modifier '%s' matches no member value — its kind atoms "
+                 "select nothing (missing `fact`s, or no selected value fits "
+                 "the %d-argument subject tuple)", k->label, nsubj);
     }
 }
 
@@ -4192,7 +4566,30 @@ static void semantic_pass(parser *p)
     check_fluent_bounds(p);
     check_functions(p);
 
-    expand_kind_rules(p);              /* #82 roll kinds: before defs register */
+    check_kfacts(p);                   /* #124: membership vocabulary first */
+    expand_kind_rules(p);              /* #124 kinds-are-facts: before defs register */
+
+    /* #124 staging boundary: a `value`-sorted binder exists only to feed a
+     * functor-modifier head this slice — anywhere else (a rule concluding a
+     * kind, an action over values) is the derived-kind stratum, #125 */
+    for (int i = 0; i < p->nrules; i++) {
+        ast_rule *r = &p->rules[i];
+        if (r->head.is_kinddef) continue;
+        for (int v = 0; v < r->nvars; v++)
+            if (r->vars[v].sort == SORT_METAVALUE ||
+                r->vars[v].sort == -(int)p->metaval - 2)
+                serr(p, r->vars[v].line, r->vars[v].col,
+                     "a `value`-sorted parameter outside a functor-modifier "
+                     "head — derived kind rules (`… => k(V)`) land with #125; "
+                     "this slice's `V : value` only feeds a `V(A) = …` head");
+    }
+    for (int i = 0; i < p->nactions; i++)
+        for (int v = 0; v < p->actions[i].nvars; v++)
+            if (p->actions[i].vars[v].sort == SORT_METAVALUE ||
+                p->actions[i].vars[v].sort == -(int)p->metaval - 2)
+                serr(p, p->actions[i].vars[v].line, p->actions[i].vars[v].col,
+                     "an action cannot range over `value` — values are "
+                     "build-time vocabulary, not runtime objects");
 
     /* value definitions register first (#82), so any read checked below can
      * see whether its definition exists regardless of declaration order */
@@ -7609,7 +8006,10 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
         case TK_RULE:   parse_rule(p);   break;
         case TK_ACTION: parse_action(p); break;
         case TK_BANDS:  parse_bands(p);  break;
-        case TK_IDENT:  parse_sup(p);    break;
+        case TK_IDENT:
+            if (ident_is(p->cur, "fact")) parse_fact(p);   /* #124 membership */
+            else                          parse_sup(p);
+            break;
         default: {
             char d[64]; tok_desc(p->cur, d, sizeof d);
             fail(p, p->cur.line, p->cur.col,

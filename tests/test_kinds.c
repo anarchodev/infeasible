@@ -1,20 +1,34 @@
-/* Golden test for roll kinds (#82, the second half of its title): a value
- * declares `kind save`, and a KIND MODIFIER written once —
+/* Golden test for kinds-are-facts (#124, EPIC #123 slice 1): a kind is the
+ * boolean case of `value` over the built-in `value` meta-sort, membership is
+ * `fact`s, and a modifier written once —
  *
- *     rule bless_save(A: actor): blessed(A) => kind save(A) = prior + 4
+ *     value save(value)
+ *     fact ( save(spell_save)  save(contest) )
+ *     rule bless_save(A: actor, V: value):
+ *         save(V) & blessed(A) => V(A) = prior + 4
  *
- * — expands into a layer on EVERY value of that kind ("selection is static",
- * #79: the grounder quantifies over the kind). Expanded labels are
- * `<modifier>.<value>`, real rule labels, so #94's ordering demands are
- * satisfiable with ordinary superiority. Pinned:
+ * — selects by ordinary body atoms and expands, per member, through #115's
+ * layer machinery UNCHANGED (the functor variable `V(A)` is the HiLog move:
+ * looks higher-order, grounds first-order). The prior semantic pins survive
+ * the re-spell — that is the proof the machinery did:
  *  - one sentence hits members of different arities (subject = first arg);
  *  - expansions coexist unordered with value-specific layers of the same
  *    class, and mixed classes demand (and accept) explicit `>` on the
- *    expanded labels;
+ *    expanded labels `<modifier>.<value>`;
  *  - a rolled modifier clones per member: the d4 on one save is not the d4
- *    on another (distinct sites), while readers of one value still share;
- *  - misuse: no members, non-layer shapes, extra parameters, `>` on the
- *    unexpanded label, `kind` on stored state. */
+ *    on another (distinct sites), while readers of one value still share.
+ *
+ * New pins, the strictly-greater power: faceted selection (`save(V, dex)`
+ * hits only dex-saves), product cross-cutting (Rage / Bracers / wand on one
+ * attack space — the taxonomy is a product, not a tree), multi-membership
+ * (one value in two kinds, both modifiers stack), two-role subjects
+ * (`V(A, T)` — Dodge keys on the target), and the matches-nothing WARNING.
+ *
+ * Misuse: located errors for the meta-sort on stored state / providers /
+ * `: int` values, an unselected functor variable, a non-`value` variable in
+ * functor position, fact vocabulary (unknown kind, arity, non-members), kind
+ * atoms in runtime rules, `value`-binders outside modifiers — and the grace
+ * messages pointing the removed #115 `kind` keyword at the new spelling. */
 
 #include "lang/story.h"
 #include "state/world.h"
@@ -59,12 +73,14 @@ static int test_bless_all_saves(void)
         "sort actor\n"
         "entity ( bran, grik : actor )\n"
         "state ( blessed(actor)  wise(actor)  av(actor) : int  bv(actor) : int )\n"
-        "value ( spell_save(actor)       : int kind save\n"
-        "        contest(actor, actor)   : int kind save )\n"
+        "value ( save(value)\n"
+        "        spell_save(actor)       : int\n"
+        "        contest(actor, actor)   : int )\n"
+        "fact ( save(spell_save)  save(contest) )\n"
         "rule base_ss(X: actor):            => spell_save(X) = 10\n"
         "rule base_ct(X: actor, Y: actor):  => contest(X, Y) = 8\n"
         "// the modifier, written once\n"
-        "rule bless_save(A: actor): blessed(A) => kind save(A) = prior + 4\n"
+        "rule bless_save(A: actor, V: value): save(V) & blessed(A) => V(A) = prior + 4\n"
         "// a value-specific add layer: same class, unordered, commutes\n"
         "rule wisdom(X: actor): wise(X) => spell_save(X) = prior + 1\n"
         "action snap(X: actor): causes av(X) := spell_save(X)\n"
@@ -104,10 +120,11 @@ static int test_expanded_ordering(void)
         "sort actor\n"
         "entity bran : actor\n"
         "state ( blessed(actor)  lucky(actor)  av(actor) : int )\n"
-        "value spell_save(actor) : int kind save\n"
+        "value ( save(value)  spell_save(actor) : int )\n"
+        "fact save(spell_save)\n"
         "rule base_ss(X: actor): => spell_save(X) = 10\n"
-        "rule bless_save(A: actor): blessed(A) => kind save(A) = prior + 4\n"
-        "rule floor_save(A: actor): lucky(A)   => kind save(A) = max(prior, 13)\n"
+        "rule bless_save(A: actor, V: value): save(V) & blessed(A) => V(A) = prior + 4\n"
+        "rule floor_save(A: actor, V: value): save(V) & lucky(A)   => V(A) = max(prior, 13)\n"
         "action snap(X: actor): causes av(X) := spell_save(X)\n"
         "action b(X: actor): causes blessed(X)\n"
         "action l(X: actor): causes lucky(X)\n";
@@ -151,11 +168,13 @@ static int test_cloned_dice(void)
         "sort actor\n"
         "entity bran : actor\n"
         "state ( blessed(actor)  waited  av(actor) : int  bv(actor) : int )\n"
-        "value ( s1(actor) : int kind save\n"
-        "        s2(actor) : int kind save )\n"
+        "value ( save(value)\n"
+        "        s1(actor) : int\n"
+        "        s2(actor) : int )\n"
+        "fact ( save(s1)  save(s2) )\n"
         "rule b1(X: actor): => s1(X) = 10\n"
         "rule b2(X: actor): => s2(X) = 10\n"
-        "rule bd(A: actor): blessed(A) => kind save(A) = prior + roll(4, 9)\n"
+        "rule bd(A: actor, V: value): save(V) & blessed(A) => V(A) = prior + roll(4, 9)\n"
         "action snap(X: actor): causes av(X) := s1(X) & bv(X) := s2(X)\n"
         "action b(X: actor): causes blessed(X) & waited\n";
 
@@ -181,35 +200,214 @@ static int test_cloned_dice(void)
     return 0;
 }
 
-/* --- misuse --- */
+/* --- facets + products: the cross-cutting selection a flat kind can't say --- */
+static int test_facets_and_products(void)
+{
+    const char *src =
+        "sort actor\n"
+        "enum ability { str, dex, wis }\n"
+        "enum reach   { melee, ranged }\n"
+        "enum source  { weapon, spell }\n"
+        "entity bran : actor\n"
+        "state ( raging(actor)  archer(actor)  warcaster(actor)  keen(actor)\n"
+        "        v1(actor) : int  v2(actor) : int  v3(actor) : int  v4(actor) : int )\n"
+        "value ( save(value, ability)\n"
+        "        attack(value, reach, source)\n"
+        "        dex_save(actor)  : int\n"
+        "        wis_save(actor)  : int\n"
+        "        sword(actor)     : int\n"
+        "        bow(actor)       : int\n"
+        "        firebolt(actor)  : int )\n"
+        "fact ( save(dex_save, dex)  save(wis_save, wis)\n"
+        "       attack(sword, melee, weapon)\n"
+        "       attack(bow, ranged, weapon)\n"
+        "       attack(firebolt, ranged, spell)\n"
+        "       // multi-membership: the firebolt attack is also a dex-save-ish\n"
+        "       // contest for the target — one value, two kinds\n"
+        "       save(firebolt, dex) )\n"
+        "rule bs1(X: actor): => dex_save(X) = 10\n"
+        "rule bs2(X: actor): => wis_save(X) = 10\n"
+        "rule bs3(X: actor): => sword(X)    = 10\n"
+        "rule bs4(X: actor): => bow(X)      = 10\n"
+        "rule bs5(X: actor): => firebolt(X) = 10\n"
+        "// faceted: only dex-saves\n"
+        "rule cat_grace(A: actor, V: value): save(V, dex) & keen(A) => V(A) = prior + 1\n"
+        "// products cross-cutting one attack space on different axes\n"
+        "rule rage(A: actor, V: value):    attack(V, melee, weapon)  & raging(A)    => V(A) = prior + 2\n"
+        "rule bracers(A: actor, V: value): attack(V, ranged, weapon) & archer(A)    => V(A) = prior + 4\n"
+        "rule wand(A: actor, V: value):    attack(V, _, spell)       & warcaster(A) => V(A) = prior + 8\n"
+        "action snap(X: actor): causes v1(X) := dex_save(X) & v2(X) := sword(X)\n"
+        "                            & v3(X) := bow(X)      & v4(X) := firebolt(X)\n"
+        "action all(X: actor): causes raging(X) & archer(X) & warcaster(X) & keen(X)\n";
+
+    intern *sy = intern_new();
+    world *w = compile_ok(src, sy);
+    CHECK(w != NULL);
+
+    CHECK(step1(w, sy, "all(bran)") == 0);
+    CHECK(step1(w, sy, "snap(bran)") == 0);
+    CHECK(num(w, sy, "v1(bran)") == 11);   /* dex_save: cat_grace only        */
+    CHECK(num(w, sy, "v2(bran)") == 12);   /* sword: rage only                */
+    CHECK(num(w, sy, "v3(bran)") == 14);   /* bow: bracers only               */
+    /* firebolt: wand (ranged,spell matches `_`,spell) AND cat_grace (it is
+     * also a dex-save member) — multi-membership stacks, same add class */
+    CHECK(num(w, sy, "v4(bran)") == 19);
+
+    /* wis_save exists but nothing modifies it (keen is dex-facet only) */
+    long wq = num(w, sy, "v1(bran)");
+    (void)wq;
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
+/* --- two-role subjects: V(A, T) — the Dodge shape keys on the target --- */
+static int test_two_role_binding(void)
+{
+    const char *src =
+        "sort actor\n"
+        "entity ( bran, grik : actor )\n"
+        "state ( dodging(actor)  av(actor) : int  bv(actor) : int )\n"
+        "value ( targeted(value)\n"
+        "        grapple(actor, actor) : int )\n"
+        "fact targeted(grapple)\n"
+        "rule bg(X: actor, Y: actor): => grapple(X, Y) = 10\n"
+        "// \"attacks against a dodging target\" — the guard reads the SECOND role\n"
+        "rule dodge(A: actor, T: actor, V: value):\n"
+        "    targeted(V) & dodging(T) => V(A, T) = prior + 5\n"
+        "action snap(X: actor): causes av(X) := grapple(X, grik)\n"
+        "                            & bv(X) := grapple(X, bran)\n"
+        "action d(X: actor): causes dodging(X)\n";
+
+    intern *sy = intern_new();
+    world *w = compile_ok(src, sy);
+    CHECK(w != NULL);
+
+    CHECK(step1(w, sy, "snap(bran)") == 0);
+    CHECK(num(w, sy, "av(bran)") == 10);
+    CHECK(num(w, sy, "bv(bran)") == 10);
+
+    CHECK(step1(w, sy, "d(grik)") == 0);           /* grik dodges */
+    CHECK(step1(w, sy, "snap(bran)") == 0);
+    CHECK(num(w, sy, "av(bran)") == 15);           /* vs grik: modified */
+    CHECK(num(w, sy, "bv(bran)") == 10);           /* vs bran: untouched */
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
+/* --- a modifier that selects nothing is a WARNING, never silent --- */
+static int test_matches_nothing_warning(void)
+{
+    const char *src =
+        "sort actor\nentity a : actor\n"
+        "state ( blessed(actor)  q(actor) : int )\n"
+        "value ( save(value)  s(actor) : int )\n"
+        "// no facts: the kind is empty\n"
+        "rule bs(X: actor): => s(X) = 10\n"
+        "rule m(A: actor, V: value): save(V) & blessed(A) => V(A) = prior + 4\n"
+        "action p(X: actor): causes q(X) := s(X)\n";
+
+    intern *sy = intern_new();
+    story_diag di[8];
+    story_diags d = { di, 8, 0, 0 };
+    world *w = story_compile(src, "t.story", sy, &d);
+    CHECK(w != NULL && d.nerrors == 0);            /* compiles */
+    bool found = false;
+    for (int k = 0; k < d.count && !found; k++)
+        found = d.items[k].sev == STORY_WARNING &&
+                strstr(d.items[k].msg, "matches no member") != NULL;
+    CHECK(found);
+    CHECK(step1(w, sy, "p(a)") == 0);              /* and still runs */
+    CHECK(num(w, sy, "q(a)") == 10);
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
+/* --- misuse: located errors, and the grace messages for the old surface --- */
 static int test_errors(void)
 {
     static const struct { const char *src, *msg; } BAD[] = {
+        /* the removed #115 keyword, both spellings, pointed at the new one */
+        { "sort actor\nentity a : actor\n"
+          "value s(actor) : int kind save\n",
+          "keyword is gone" },
         { "sort actor\nentity a : actor\nstate blessed(actor)\n"
           "rule m(A: actor): blessed(A) => kind save(A) = prior + 4\n",
-          "no value declares" },
+          "kind k(A)" },
+        { "sort actor\nentity a : actor\nstate hp(actor) : int kind save\n",
+          "keyword is gone" },
+        /* the meta-sort never keys a runtime object */
+        { "state marked(value)\n",
+          "belong to kind predicates" },
+        { "provider near(value)\n",
+          "belong to kind predicates" },
+        { "sort actor\nentity a : actor\nvalue s(value, actor) : int\n",
+          "drop the `: int`" },
+        { "value k(value, value)\n",
+          "exactly one `value`-sorted argument" },
+        /* functor discipline */
         { "sort actor\nentity a : actor\nstate ( blessed(actor)  q(actor) : int )\n"
-          "value s(actor) : int kind save\n"
+          "value ( save(value)  s(actor) : int )\n"
+          "fact save(s)\n"
           "rule bs(X: actor): => s(X) = 10\n"
-          "rule m(A: actor): blessed(A) => kind save(A) = 3\n"
+          "rule m(A: actor, V: value): blessed(A) => V(A) = prior + 1\n"
+          "action p(X: actor): causes q(X) := s(X)\n",
+          "not selected by any kind atom" },
+        { "sort actor\nentity a : actor\nstate ( blessed(actor)  q(actor) : int )\n"
+          "value ( save(value)  s(actor) : int )\n"
+          "fact save(s)\n"
+          "rule bs(X: actor): => s(X) = 10\n"
+          "rule m(A: actor): blessed(A) => A(A) = prior + 1\n"
+          "action p(X: actor): causes q(X) := s(X)\n",
+          "only a `value`-sorted parameter" },
+        { "sort actor\nentity a : actor\nstate ( blessed(actor)  q(actor) : int )\n"
+          "value ( save(value)  s(actor) : int )\n"
+          "fact save(s)\n"
+          "rule bs(X: actor): => s(X) = 10\n"
+          "rule m(A: actor, V: value): save(V) & blessed(A) => V(A) = 3\n"
           "action p(X: actor): causes q(X) := s(X)\n",
           "must mention `prior`" },
+        /* sup targets the expanded label, as before */
         { "sort actor\nentity a : actor\nstate ( blessed(actor)  q(actor) : int )\n"
-          "value s(actor) : int kind save\n"
+          "value ( save(value)  s(actor) : int )\n"
+          "fact save(s)\n"
           "rule bs(X: actor): => s(X) = 10\n"
-          "rule m(A: actor, B: actor): blessed(A) => kind save(A) = prior + 1\n"
-          "action p(X: actor): causes q(X) := s(X)\n",
-          "exactly one parameter" },
-        { "sort actor\nentity a : actor\nstate ( blessed(actor)  q(actor) : int )\n"
-          "value s(actor) : int kind save\n"
-          "rule bs(X: actor): => s(X) = 10\n"
-          "rule m(A: actor): blessed(A) => kind save(A) = prior + 1\n"
+          "rule m(A: actor, V: value): save(V) & blessed(A) => V(A) = prior + 1\n"
           "rule other(X: actor): blessed(X) => zz(X)\n"
           "m > other\n"
           "action p(X: actor): causes q(X) := s(X)\n",
           "target the expanded label" },
-        { "sort actor\nentity a : actor\nstate hp(actor) : int kind save\n",
-          "stored state" },
+        /* the staging boundary: kinds are build-time */
+        { "sort actor\nentity a : actor\nstate blessed(actor)\n"
+          "value ( save(value)  s(actor) : int )\n"
+          "fact save(s)\n"
+          "rule bs(X: actor): => s(X) = 10\n"
+          "rule j(X: actor): save(X) => q(X)\n",
+          "build-time only" },
+        { "sort actor\nentity a : actor\nstate blessed(actor)\n"
+          "value ( save(value)  s(actor) : int )\n"
+          "rule bs(X: actor): => s(X) = 10\n"
+          "rule j(V: value): blessed(a) => q(a)\n",
+          "land with #125" },
+        /* fact vocabulary */
+        { "value s : int\nrule d: => s = 3\nfact zap(s)\n",
+          "not a declared kind predicate" },
+        { "value ( save(value)  s : int )\nrule d: => s = 3\n"
+          "fact save(s, s)\n",
+          "takes 1 arguments" },
+        { "value ( save(value)  s : int )\nrule d: => s = 3\n"
+          "fact save(nope)\n",
+          "not a declared value" },
+        { "sort actor\nentity a : actor\n"
+          "enum ability { dex, wis }\n"
+          "value ( save(value, ability)  s(actor) : int )\n"
+          "rule d(X: actor): => s(X) = 10\n"
+          "fact save(s, str)\n",
+          "not a member of sort" },
     };
     for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {
         intern *sy = intern_new();
@@ -241,6 +439,9 @@ int main(void)
     if (test_bless_all_saves()) return 1;
     if (test_expanded_ordering()) return 1;
     if (test_cloned_dice()) return 1;
+    if (test_facets_and_products()) return 1;
+    if (test_two_role_binding()) return 1;
+    if (test_matches_nothing_warning()) return 1;
     if (test_errors()) return 1;
     printf("test_kinds: all passed\n");
     return 0;
