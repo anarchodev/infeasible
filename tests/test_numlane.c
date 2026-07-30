@@ -30,6 +30,7 @@ static const char *SRC_L =
     "action heal(X: unit):   causes hp(X) := 20\n"
     "action ignite(X: unit): causes on_fire(X)\n"
     "action douse(X: unit):  causes ~on_fire(X)\n"
+    "exclusive ignite(X), douse(X)\n"
     "rule burn(X: unit): on_fire(X) causes hp(X) -= 5\n";
 
 /* identical numerics, plus a 2-var action -> emit_step_lanes bails -> N=1 oracle.
@@ -44,6 +45,7 @@ static const char *SRC_N =
     "action heal(X: unit):   causes hp(X) := 20\n"
     "action ignite(X: unit): causes on_fire(X)\n"
     "action douse(X: unit):  causes ~on_fire(X)\n"
+    "exclusive ignite(X), douse(X)\n"
     "rule burn(X: unit): on_fire(X) causes hp(X) -= 5\n"
     "action pin(A: unit, B: unit): causes shielded(A)\n";   /* 2-var -> N=1 (never cast) */
 

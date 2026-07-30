@@ -103,7 +103,7 @@ static int test_cascade(void)
         "sort unit\n"
         "entity ( u0, u1 : unit )\n"
         "state (\n"
-        "    dead(unit)  buried(unit)  mourned(unit)\n"
+        "    dead(unit)  buried(unit)  mourned(unit)  waited\n"
         "    hp(unit)   : int in 0 .. 20\n"
         "    gold(unit) : int\n"
         "    loot : int\n"
@@ -118,7 +118,7 @@ static int test_cascade(void)
         "// stratum 2: gated on gold' (a stratum-1 fluent)\n"
         "rule bury(X: unit): gold(X)' <= 0 & dead(X)' causes buried(X)\n"
         "action strike(T: unit): causes hp(T) -= 12\n"
-        "action wait: causes ~buried(u1)\n";
+        "action wait: causes waited\n";
 
     intern *sy = intern_new();
     world *w = compile_ok(src, sy);
@@ -148,29 +148,46 @@ static int test_cascade(void)
 }
 
 /* --- atomicity: a contested assign in an upper stratum aborts the WHOLE
- *     tick — the stratum-0 damage must not have been committed --- */
+ *     tick — the stratum-0 damage must not have been committed.
+ *     Since #160 the conflicting pair cannot COMPILE (test_conflict pins the
+ *     error), so the runtime guard is defense in depth for raw `world_*`
+ *     hosts — build the contested world by hand to keep it pinned. --- */
 static int test_atomic_abort(void)
 {
-    const char *src =
-        "sort unit\n"
-        "entity u0 : unit\n"
-        "state ( dead(unit)  hp(unit) : int in 0 .. 20  gold(unit) : int )\n"
-        "init ( hp(u0) = 10  gold(u0) = 7 )\n"
-        "rule perish(X: unit):  hp(X)' <= 0 causes dead(X) & gold(X) := 0\n"
-        "rule pilfer(X: unit):  hp(X)' <= 0 causes gold(X) := 3\n"
-        "action strike(T: unit): causes hp(T) -= 12\n";
-
     intern *sy = intern_new();
-    world *w = compile_ok(src, sy);
-    CHECK(w != NULL);
+    world *w = world_new(sy);
+    uint32_t dead = intern_id(sy, "dead"), hp = intern_id(sy, "hp"),
+             gold = intern_id(sy, "gold"), pg = intern_id(sy, "hp'<=0"),
+             strike = intern_id(sy, "strike");
+    world_declare_fluent(w, dead);
+    world_declare_num(w, hp, 0, 20, true);
+    world_declare_num(w, gold, 0, 0, false);
+    world_set_num(w, hp, 10);
+    world_set_num(w, gold, 7);
+    world_add_primed_guard(w, pg, hp, WORLD_CMP_LE, 0);
 
-    uint32_t a = intern_id(sy, "strike(u0)");
+    step_cond none = { { 0, false }, false };
+    int h0 = world_add_step_rule(w, "strike", strike, &none, 0, NULL, 0);
+    expr_ins c12[1] = { { EXPR_CONST, 12 } };
+    world_add_num_effect(w, h0, hp, WORLD_OP_SUB, c12, 1);
+
+    step_cond pc = { { pg, false }, false };
+    dl_lit deff = dl_pos(dead);
+    int h1 = world_add_step_rule(w, "perish", INTERN_NONE, &pc, 1, &deff, 1);
+    world_set_step_stratum(w, h1, 1);
+    expr_ins c0[1] = { { EXPR_CONST, 0 } };
+    world_add_num_effect(w, h1, gold, WORLD_OP_ASSIGN, c0, 1);
+    int h2 = world_add_step_rule(w, "pilfer", INTERN_NONE, &pc, 1, NULL, 0);
+    world_set_step_stratum(w, h2, 1);
+    expr_ins c3[1] = { { EXPR_CONST, 3 } };
+    world_add_num_effect(w, h2, gold, WORLD_OP_ASSIGN, c3, 1);
+
     char err[128];
-    CHECK(world_step(w, &a, 1, err, sizeof err) == -1);
+    CHECK(world_step(w, &strike, 1, err, sizeof err) == -1);
     CHECK(strstr(err, "conflicting") != NULL);
-    CHECK(num(w, sy, "hp(u0)") == 10);             /* stratum 0 NOT committed */
-    CHECK(num(w, sy, "gold(u0)") == 7);
-    CHECK(q(w, sy, "dead(u0)") == DL_REFUTED);
+    CHECK(world_get_num(w, hp) == 10);             /* stratum 0 NOT committed */
+    CHECK(world_get_num(w, gold) == 7);
+    CHECK(world_query(w, dl_pos(dead)) == DL_REFUTED);
     CHECK(world_tick(w) == 0);                     /* no half-tick in the log */
 
     world_free(w);

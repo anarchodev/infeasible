@@ -97,7 +97,8 @@ static const char *STORY =
     "nofly > fly\n"
     /* actions flip the fluent the matchable rule reads */
     "action wake(X: actor):  causes awake(X)\n"
-    "action sleep(X: actor): causes ~awake(X)\n";
+    "action sleep(X: actor): causes ~awake(X)\n"
+    "exclusive wake(X), sleep(X)\n";
 
 /* Capture world_why(w, q) into a malloc'd string. */
 static char *why_str(world *w, dl_lit q)

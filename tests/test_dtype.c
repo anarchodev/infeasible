@@ -93,6 +93,7 @@ static const char *SRC =
     "action flamewave: causes for each T : actor : hp(T) -= 4 as fire\n"
     "action enrage(X: actor):  causes raging(X)\n"
     "action calm(X: actor):    causes ~raging(X)\n"
+    "exclusive enrage(X), calm(X)\n"
     "action soak(X: actor):    causes soaked(X)\n";
 
 static int test_pipeline(void)

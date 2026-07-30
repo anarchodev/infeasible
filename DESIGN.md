@@ -1552,7 +1552,7 @@ one.
 
 | runtime failure | kind | static answer |
 |---|---|---|
-| contested boolean / multi-valued fluent | authoring | **conflictable pairs (#98)**: complementary-effect writers that could co-fire warn at compile unless their conditions provably exclude it |
+| contested boolean / multi-valued fluent | authoring | **conflictable pairs (#98, ERROR severity since #160)**: complementary-effect writers that could co-fire refuse to compile unless their conditions provably exclude it or a #159 `exclusive` group covers the collision |
 | conflicting merge-less `:=` on one numeric | authoring | same pass, numeric side — including a writer colliding with *itself* when a scope variable is missing from the target and the value varies with the binding |
 | arithmetic over a partial derived value | authoring | **the static safety rule (#116)**: an arithmetic read of a partial value is a located error unless the same rule's condition also reads it |
 | solver UNDECIDED from cyclic rule graphs | authoring | **the §5.2 cycle rule (#109)**: unattacked support-SCCs complete to REFUTED via the Datalog fixpoint; attacked cycles are a located error |
@@ -1582,21 +1582,27 @@ self-documenting conjunct — the Elm trade, the same one #98's exclusivity
 conditions ask for below. On the M2 boundary a partial value reads as the
 option pair `(defined, value)`, never an exception.
 
-**The conflictable-pair contract (#98).** Warning severity, never an error,
-and — decided against the issue's first sketch — **resolved pairs stay
-quiet**: the zero-warning state must be *reachable*, or the contract below
-is vacuous. What warns is exactly what can go wrong: step-effect pairs
-(complementary booleans, different multi-valued values, merge-less `:=`)
-whose conditions do not provably exclude co-firing, judgment pairs nothing
+**The conflictable-pair contract (#98, hardened by #160).** Two severities,
+principled: **step-effect pairs are errors** — a contested step has no
+meaning to ship (the `-1` is per-step, with no principled recovery), and
+with #159 every safe construction has a checkable spelling, so the flip
+costs no expressiveness. **Judgment pairs stay warnings** — a contested
+judgment is defined, sometimes intended semantics (REFUTED both polarities
+is ambiguity blocking's answer, pinned by the unresolved-conflict golden),
+and its hazard, the silent null, is answered by visibility. Resolved and
+covered pairs stay quiet in both cases: the clean state must be
+*reachable*, or the contract below is vacuous. What fires is exactly what
+can go wrong: step-effect pairs (complementary booleans, different
+multi-valued values, merge-less `:=`) whose conditions do not provably
+exclude co-firing and no `exclusive` group covers, judgment pairs nothing
 orders (no covering `>` — a *teammate's* edge counts, team defeat's static
 shadow; band edges count, having desugared to `>`), and strict-vs-strict
 conflicts, which superiority can never order. Exclusivity is judged under
 the collision's unifier — complementary literal, distinct multi-valued
 constants, disjoint comparison intervals, disjoint membership lists — and
-is conservative in the direction a warning needs: exclusivity the compiler
-cannot see warns, and one more condition is the fix. Resolving every flag
-is the author's totality proof, exactly Elm's "handle the case you know is
-impossible". The *report* on resolved pairs — band edge / explicit `>` /
+is conservative in the direction the diagnostic needs: exclusivity the
+compiler cannot see fires, and one more condition (or one `exclusive`
+declaration) is the fix — Elm's "handle the case you know is impossible". The *report* on resolved pairs — band edge / explicit `>` /
 which team member beats which attacker — is tooling surface (§6.1 hover),
 not a diagnostic. One reading note the warnings rely on: under ambiguity
 blocking a contested literal reads **REFUTED on both polarities** — an
@@ -1612,7 +1618,7 @@ pre-solve, state untouched. Taxonomically this *reclassifies* the covered
 conflictable pairs from authoring to host-protocol: the #98 pass treats a
 pair whose collision forces key equality as exclusive (a collision that
 leaves a key free — an arity-0 fluent — is deliberately not covered and
-still warns), and the §6.3 binding retires the runtime check for bound
+still refuses to compile), and the §6.3 binding retires the runtime check for bound
 hosts by refusing to construct a violating action set. The construct obeys
 this section's own rule — a new `-1` path may enter the language only with
 its static-or-typed-boundary answer attached, and this one arrives with the
@@ -1628,22 +1634,27 @@ only in cyclic SCCs no rule attacks, and only for entities where every
 blur; that gate is what lets #116's tri-valuedness and #109's completion
 coexist in one solve.
 
-**The contract.** A story that compiles with **zero errors and zero
-warnings** cannot take the contested or undefined step paths, and — with
-#109 — cannot be handed a solver UNDECIDED by a two-valued consumer. The
-remaining `-1`s are host-protocol, and the M2 typed binding retires those
-for bound hosts: *a clean, zero-warning compile plus a bound host never
-observes `world_step -1`*. Honest boundaries, stated: a host that bypasses
+**The contract.** A story that **compiles** cannot take the contested or
+undefined step paths (#160 made the step-side pairs errors, so the
+zero-warning rider is gone from this half), and — with #109 — cannot be
+handed a solver UNDECIDED by a two-valued consumer. Zero warnings still
+buys the judgment-side guarantee (no silently-REFUTED nulls nothing
+orders). The remaining `-1`s are host-protocol — an unknown or split-dead
+action atom, an `exclusive`-group violation — and the M2 typed binding
+retires those for bound hosts: *a compile plus a bound host never observes
+`world_step -1`*. Honest boundaries, stated: a host that bypasses
 the binding with raw atoms keeps today's loud `-1`s (deliberately — the
 check is the protocol); provider callbacks are a trust boundary (host-
 answered facts are inputs, not proofs) and sit outside the claim; and the
 claim is per-story, carried by the author's zero-warning obligation, not a
 global theorem about the language.
 
-*Status*: the three compile-side rows are landed and pinned
-(`test_partial`, `test_conflict`, `test_cycle`; #116/#98/#109); the
-host-protocol rows wait on the §6.3 artifact (M2), and the contract's full
-sentence should be re-stated there when the binding ships.
+*Status*: the compile-side rows are landed and pinned (`test_partial`,
+`test_conflict`, `test_cycle`, `test_excl`; #116/#98/#109/#159/#160 — the
+step-side severity flip swept every example and test story clean, and
+fixed a real latent bug in reaction5e's open-vs-skip window on the way);
+the host-protocol rows wait on the §6.3 artifact (M2), and the contract's
+full sentence should be re-stated there when the binding ships.
 
 ### Invariants (compiler/engine enforced)
 

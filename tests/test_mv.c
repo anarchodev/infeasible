@@ -57,13 +57,10 @@ static int test_mv_door(void)
         free(src); intern_free(sy);
         return 1;
     }
-    /* the jam_* writers exist to PIN the contested step below — #98 now
-     * surfaces that pair at compile time as warnings (never errors); every
-     * diagnostic must be that conflict, and nothing else */
+    /* zero-diagnostic since #160: the deliberate flip-flop pair moved out of
+     * the example (a contested pair no longer compiles — pinned below) */
     CHECK(diags.nerrors == 0);
-    CHECK(diags.count > 0);
-    for (int i = 0; i < diags.count && i < diags.cap; i++)
-        CHECK(strstr(diags.items[i].msg, "conflicting effects on 'door'") != NULL);
+    CHECK(diags.count == 0);
 
     /* value-atoms intern as "door=<v>" — the erasure the compiler emits */
     uint32_t locked   = intern_id(sy, "door=locked"),
@@ -71,9 +68,7 @@ static int test_mv_door(void)
              open     = intern_id(sy, "door=open"),
              can_pass = intern_id(sy, "can_pass(hero)"),
              a_unlock = intern_id(sy, "unlock(hero)"),
-             a_shove  = intern_id(sy, "shove(hero)"),
-             a_jopen  = intern_id(sy, "jam_open"),
-             a_jclose = intern_id(sy, "jam_closed");
+             a_shove  = intern_id(sy, "shove(hero)");
     char err[256];
 
     /* init: exactly one value holds */
@@ -95,18 +90,6 @@ static int test_mv_door(void)
     CHECK(world_step(w, &a_shove, 1, err, sizeof err) == 0);
     CHECK(world_get(w, open) && !world_get(w, closed) && !world_get(w, locked));
     CHECK(world_query(w, dl_pos(can_pass)) == DL_PROVED);
-
-    /* flip-flop: two writers force different values in one step -> contested,
-     * returns -1 with the state untouched (door stays open) */
-    uint32_t both[2] = { a_jopen, a_jclose };
-    err[0] = '\0';
-    CHECK(world_step(w, both, 2, err, sizeof err) == -1);
-    CHECK(err[0] != '\0');
-    CHECK(world_get(w, open) && !world_get(w, closed) && !world_get(w, locked));
-
-    /* a single writer commits exactly one value */
-    CHECK(world_step(w, &a_jclose, 1, err, sizeof err) == 0);
-    CHECK(world_get(w, closed) && !world_get(w, open) && !world_get(w, locked));
 
     world_free(w);
     intern_free(sy);
@@ -150,6 +133,15 @@ static int test_mv_errors(void)
         return 1;
     /* a one-value domain is rejected */
     if (expect_error("state d : { only }", "at least two values")) return 1;
+    /* the flip-flop that used to live in mv_door.story: a contested pair is
+     * a COMPILE error now (#160), not a runtime -1 (which test_multival
+     * still pins at the world_* level, as defense in depth) */
+    if (expect_error("state door : { open, closed }\n"
+                     "init door = closed\n"
+                     "action jam_open:   causes door = open\n"
+                     "action jam_closed: causes door = closed\n",
+                     "conflicting effects on 'door'"))
+        return 1;
     return 0;
 }
 
