@@ -4790,13 +4790,19 @@ static void expand_kind_rules(parser *p)
         }
         if (bad) continue;
         int cls = valuedef_class(p, k->head.lhs_root);
-        if (cls != 1 && cls != 2 && cls != 3) {
+        if (cls == 0) {
             serr(p, k->head.line, k->head.col,
                  "a kind modifier layers on every member — its expression must "
-                 "mention `prior` in a commuting shape (`prior + e`, "
-                 "`max(prior, e)`, `min(prior, e)`) (#94)");
+                 "mention `prior` (an override would REPLACE each member's "
+                 "definition; write per-value definitions for that)");
             continue;
         }
+        /* #144: any `prior`-mentioning shape is admitted. The commuting
+         * classes (`prior + e`, max, min) coexist unordered as before;
+         * a NON-commuting shape (`prior / 2`, `prior - e`) expands like any
+         * other and #94's per-member ordering check then demands it be
+         * totally ordered against its neighbors — one kind-level `A > B`
+         * (#145) usually says all of it. */
 
         /* split the body: kind atoms are the SELECTION, the rest is runtime */
         int ksel[MAX_BODY], nksel = 0;

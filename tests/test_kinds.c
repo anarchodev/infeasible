@@ -239,6 +239,79 @@ static int test_blanket_ordering(void)
     return 0;
 }
 
+/* --- #144: ordered non-commuting kind modifiers --------------------------
+ * Resistance HALVES and penalties SUBTRACT — general `prior`-shapes expand
+ * like any modifier, and #94's per-member check demands total ordering,
+ * which one #145 blanket line supplies. Unordered stays rejected. */
+static int test_noncommuting_modifiers(void)
+{
+    static const char *FMT =
+        "sort actor\nentity bran : actor\n"
+        "state ( raging(actor)  warded(actor)  av(actor) : int  bv(actor) : int )\n"
+        "value ( brutal(value)  d1(actor) : int  d2(actor) : int )\n"
+        "fact ( brutal(d1)  brutal(d2) )\n"
+        "rule w1(X: actor): => d1(X) = 10\n"
+        "rule w2(X: actor): => d2(X) = 9\n"
+        "rule enrage(A: actor, V: value): brutal(V) & raging(A) => V(A) = prior + 4\n"
+        "rule resist(A: actor, V: value): brutal(V) & warded(A) => V(A) = prior / 2\n"
+        "%s"
+        "action snap(X: actor): causes av(X) := d1(X) & bv(X) := d2(X)\n"
+        "action r(X: actor): causes raging(X)\n"
+        "action w(X: actor): causes warded(X)\n";
+
+    /* unordered halving + add: rejected per member (#94) */
+    {
+        char src[2048];
+        snprintf(src, sizeof src, FMT, "");
+        intern *sy = intern_new();
+        story_diag di[8];
+        story_diags d = { di, 8, 0, 0 };
+        world *w = story_compile(src, "t.story", sy, &d);
+        bool found = false;
+        for (int k = 0; k < d.count && !found; k++)
+            found = strstr(d.items[k].msg, "not ordered") != NULL;
+        CHECK((w == NULL || d.nerrors > 0) && found);
+        if (w) world_free(w);
+        intern_free(sy);
+    }
+    /* one blanket line orders it everywhere: halve AFTER the add */
+    {
+        char src[2048];
+        snprintf(src, sizeof src, FMT, "resist > enrage\n");
+        intern *sy = intern_new();
+        world *w = compile_ok(src, sy);
+        CHECK(w != NULL);
+        CHECK(step1(w, sy, "r(bran)") == 0);
+        CHECK(step1(w, sy, "w(bran)") == 0);
+        CHECK(step1(w, sy, "snap(bran)") == 0);
+        CHECK(num(w, sy, "av(bran)") == 7);        /* (10+4)/2 */
+        CHECK(num(w, sy, "bv(bran)") == 6);        /* (9+4)/2, floored */
+        world_free(w);
+        intern_free(sy);
+    }
+    /* a penalty subtracts — and a LONE non-commuting layer needs no order */
+    {
+        const char *src =
+            "sort actor\nentity bran : actor\n"
+            "state ( tired(actor)  av(actor) : int )\n"
+            "value ( chk(value)  c1(actor) : int )\n"
+            "fact chk(c1)\n"
+            "rule w1(X: actor): => c1(X) = 10\n"
+            "rule fatigue(A: actor, V: value): chk(V) & tired(A) => V(A) = prior - 3\n"
+            "action snap(X: actor): causes av(X) := c1(X)\n"
+            "action t(X: actor): causes tired(X)\n";
+        intern *sy = intern_new();
+        world *w = compile_ok(src, sy);
+        CHECK(w != NULL);
+        CHECK(step1(w, sy, "t(bran)") == 0);
+        CHECK(step1(w, sy, "snap(bran)") == 0);
+        CHECK(num(w, sy, "av(bran)") == 7);        /* 10 - 3 */
+        world_free(w);
+        intern_free(sy);
+    }
+    return 0;
+}
+
 /* --- #143: cross-value links — Rage lands on the DAMAGE roll -------------
  * `dmg_of(value, value)` is a LINK predicate (a kind with two value
  * positions); the modifier binds a second value parameter through it, so
@@ -578,6 +651,7 @@ int main(void)
     if (test_expanded_ordering()) return 1;
     if (test_blanket_ordering()) return 1;
     if (test_cross_value_links()) return 1;
+    if (test_noncommuting_modifiers()) return 1;
     if (test_cloned_dice()) return 1;
     if (test_facets_and_products()) return 1;
     if (test_two_role_binding()) return 1;
