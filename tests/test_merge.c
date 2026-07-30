@@ -190,7 +190,8 @@ static const char *LANE_BASE =
     "rule a(X: unit): angry(X) causes threat(X) := 10\n"
     "rule s(X: unit): scary(X) causes threat(X) := 7\n"
     "action provoke(X: unit): causes angry(X)\n"
-    "action calm(X: unit):    causes ~angry(X)\n";
+    "action calm(X: unit):    causes ~angry(X)\n"
+    "exclusive provoke(X), calm(X)\n";
 
 static int test_lane_vs_n1(void)
 {

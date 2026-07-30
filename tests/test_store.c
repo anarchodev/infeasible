@@ -61,6 +61,7 @@ static int test_copy_move(void)
         "entity ( aria, ally : actor )\n"
         "state ( at(actor) : cell )\n"
         "action follow(X: actor, Y: actor): causes at(X) := at(Y)\n"
+        "exclusive follow(X, _)\n"
         "rule together(X: actor, Y: actor): same_cell(X, Y) => grouped(X, Y)\n";
 
     SY = intern_new();

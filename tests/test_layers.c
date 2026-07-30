@@ -82,6 +82,7 @@ static int test_ac_chain(void)
         "action snap(X: unit):    causes acv(X) := ac(X)\n"
         "action wear(X: unit):    causes worn(X)\n"
         "action strip(X: unit):   causes ~worn(X)\n"
+        "exclusive wear(X), strip(X)\n"
         "action enchant(X: unit): causes mage(X)\n";
 
     intern *sy = intern_new();

@@ -8109,26 +8109,33 @@ static bool cp_excl_covers_self(parser *p, const cp_writer *w2,
     return false;
 }
 
-static void cp_warn_step(parser *p, const cp_writer *a, const cp_writer *b,
-                         bool assign)
+/* #160: step-side conflictable pairs are ERRORS — a contested step has no
+ * meaning to ship (the `-1` is per-step and has no principled recovery), and
+ * with #159 every safe construction has a checkable spelling. The judgment
+ * side stays a warning (contested judgments are defined, sometimes intended
+ * semantics; their hazard — the silent null — is answered by visibility). */
+static void cp_err_step(parser *p, const cp_writer *a, const cp_writer *b,
+                        bool assign)
 {
     const char *an = intern_name(p->syms, a->eff->pred);
+    bool acts = !a->is_ramif && !b->is_ramif;
     if (assign)
-        warn(p, b->line, b->col,
+        serr(p, b->line, b->col,
              "%s '%s' and %s '%s' can fire in the same step and both assign "
-             "(`:=`) '%s' — conflicting assigns are a contested-step error "
-             "(§5.8); declare `merge min|max` on '%s', or make their "
-             "conditions exclusive (#98)",
+             "(`:=`) '%s' — conflicting assigns are a contested step (§5.8); "
+             "declare `merge min|max` on '%s', make their conditions "
+             "exclusive%s (#160)",
              a->is_ramif ? "ramification" : "action", a->owner,
-             b->is_ramif ? "ramification" : "action", b->owner, an, an);
+             b->is_ramif ? "ramification" : "action", b->owner, an, an,
+             acts ? ", or declare the actions `exclusive` (#159)" : "");
     else
-        warn(p, b->line, b->col,
+        serr(p, b->line, b->col,
              "%s '%s' and %s '%s' can fire in the same step with conflicting "
-             "effects on '%s' — a step where both apply is a contested-step "
-             "error, not a defeat (§5.8); make their conditions exclusive "
-             "(#98)",
+             "effects on '%s' — a step where both apply is a contested step, "
+             "not a defeat (§5.8); make their conditions exclusive%s (#160)",
              a->is_ramif ? "ramification" : "action", a->owner,
-             b->is_ramif ? "ramification" : "action", b->owner, an);
+             b->is_ramif ? "ramification" : "action", b->owner, an,
+             acts ? ", or declare the actions `exclusive` (#159)" : "");
 }
 
 static void cp_check_writer_pair(parser *p, const cp_writer *a,
@@ -8181,7 +8188,7 @@ static void cp_check_writer_pair(parser *p, const cp_writer *a,
     if (cp_excl_covers_pair(p, &u, a, b))
         return;                            /* #159: a declared group rejects
                                             * the co-submission at step time */
-    cp_warn_step(p, a, b, assign);
+    cp_err_step(p, a, b, assign);
 }
 
 /* SELF collision: one writer template, two bindings landing on one ground
@@ -8210,22 +8217,23 @@ static void cp_check_writer_self(parser *p, const cp_writer *w)
         if (!cp_expr_varies(p, e->expr_root, (var_bind *)w->vars, w->nvars,
                             covered, 0))
             return;                            /* same value from every binding */
-        warn(p, w->line, w->col,
+        serr(p, w->line, w->col,
              "%s '%s' can fire more than once in one step (bindings differing "
              "on '%s') and assign (`:=`) '%s' a value that varies with the "
-             "binding — a contested-step error (§5.8); include '%s' in the "
-             "target's arguments, or make the value independent of it (#98)",
+             "binding — a contested step (§5.8); include '%s' in the "
+             "target's arguments, make the value independent of it, or "
+             "declare the action self-`exclusive` (#159/#160)",
              w->is_ramif ? "ramification" : "action", w->owner,
              intern_name(p->syms, missing_var), an,
              intern_name(p->syms, missing_var));
     } else if (e->value != INTERN_NONE) {
         int vi = var_index((var_bind *)w->vars, w->nvars, e->value);
         if (vi < 0 || covered[vi]) return;     /* constant, or binding-tied */
-        warn(p, w->line, w->col,
+        serr(p, w->line, w->col,
              "%s '%s' can fire more than once in one step (bindings differing "
              "on '%s') and set '%s' to a value that varies with the binding — "
-             "a contested-step error (§5.8); include '%s' in the target's "
-             "arguments (#98)",
+             "a contested step (§5.8); include '%s' in the target's "
+             "arguments, or declare the action self-`exclusive` (#159/#160)",
              w->is_ramif ? "ramification" : "action", w->owner,
              intern_name(p->syms, e->value), an,
              intern_name(p->syms, e->value));

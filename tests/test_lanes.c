@@ -342,6 +342,7 @@ static const char *STEP =
     "state (armed(actor) alert(actor))\n"
     "action arm(X: actor): causes armed(X)\n"
     "action disarm(X: actor): causes ~armed(X)\n"
+    "exclusive arm(X), disarm(X)\n"
     "rule wary(X: actor): armed(X)' causes alert(X)\n"
     "init (armed(thug))\n";
 
@@ -406,16 +407,17 @@ static int test_step_lanes(void)
         free(buf);
     }
 
-    /* contested transition on the routed path: arm and disarm the same entity in
-     * one step — two causal rules concluding armed(guard)' and ~armed(guard)',
-     * neither superior, so the fluent is undecided. world_step must reject it
-     * (-1) without mutating, naming the offending fluent, exactly as N=1 does. */
+    /* co-submitting arm and disarm for one entity: since #159/#160 the story
+     * DECLARES the pair exclusive (it could not compile otherwise), so the
+     * rejection is the pre-solve protocol check — before routing, before any
+     * solve — and atomicity is trivial. The routed contested read-off stays
+     * as defense in depth for hand-built worlds (test_world pins it). */
     bool was_armed = world_get(w, intern_id(sy, "armed(guard)"));
     uint32_t disarm_guard = intern_id(sy, "disarm(guard)");
     uint32_t clash[2] = { arm_guard, disarm_guard };
     err[0] = '\0';
     CHECK(world_step(w, clash, 2, err, sizeof err) == -1);
-    CHECK(strstr(err, "armed(guard)") != NULL);
+    CHECK(strstr(err, "declared exclusive") != NULL);
     CHECK(world_get(w, intern_id(sy, "armed(guard)")) == was_armed);  /* unmutated */
 
     world_free(w);

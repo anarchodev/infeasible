@@ -147,7 +147,8 @@ static int test_step_gating(void)
              "action snap(X: actor): requires defined spell_dc(X)\n"
              "  causes dcv(X) := spell_dc(X)\n"
              "action snap2(X: actor): requires spell_dc(X) >= 0\n"
-             "  causes dcv(X) := spell_dc(X)\n");
+             "  causes dcv(X) := spell_dc(X)\n"
+             "exclusive snap(X), snap2(X)\n");
     world *w = compile_ok(src, sy);
     CHECK(w != NULL);
 

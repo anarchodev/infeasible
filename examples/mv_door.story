@@ -2,7 +2,9 @@
 // slice: a `: { … }` value domain, an `init` assignment, value guards in
 // `requires`/rule bodies, and `causes` effects that erase to the whole value
 // family (chosen value + sibling negations) so exactly one value holds each
-// tick and a flip-flop is a contested step. tests/test_mv.c pins all of it.
+// tick. A flip-flop (two writers forcing different values in one step) is
+// REFUSED AT COMPILE since #160 — test_mv.c pins the located error, and the
+// runtime contested guard stays pinned at the world_* level (test_multival).
 //
 // The engine stays propositional: door = v is the boolean atom "door=v", and
 // this file compiles to the same shape test_multival.c builds by hand.
@@ -34,7 +36,3 @@ action shove(X: actor):
     requires door = closed
     causes   door = open
 
-// two always-applicable writers of different values — stepping both is a
-// contested step (the multi-valued flip-flop), rejected with state untouched
-action jam_open:   causes door = open
-action jam_closed: causes door = closed

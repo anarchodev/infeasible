@@ -37,6 +37,23 @@ static world *compile_ok(const char *src, intern *sy)
     return (w && d.nerrors == 0) ? w : NULL;
 }
 
+/* Does the source FAIL to compile with an error containing `frag`? */
+static int nerr(const char *src, const char *frag)
+{
+    intern *sy = intern_new();
+    story_diag di[16];
+    story_diags d = { di, 16, 0, 0 };
+    world *w = story_compile(src, "t.story", sy, &d);
+    int hit = 0;
+    if (w == NULL && d.nerrors > 0) {
+        for (int i = 0; i < d.count && i < d.cap; i++)
+            if (strstr(di[i].msg, frag)) hit = 1;
+    }
+    if (w) world_free(w);
+    intern_free(sy);
+    return hit;
+}
+
 /* count diagnostics containing `frag`; -1 = compile error */
 static int nwarn(const char *src, const char *frag)
 {
@@ -156,17 +173,18 @@ static int test_warning_coverage(void)
 {
     /* covered: pos(G) collision forces G equal, the group keys G */
     CHECK(nwarn(EW_SRC, "both assign") == 0);
-    /* the same pair WITHOUT the declaration warns (control) */
+    /* the same pair WITHOUT the declaration is a #160 error (control) */
     static const char *NO_DECL =
         "sort actor\n"
         "entity ( g1 : actor  g2 : actor )\n"
         "state pos(actor) : int\n"
         "action east(G: actor): causes pos(G) := 1\n"
         "action west(G: actor): causes pos(G) := 9\n";
-    CHECK(nwarn(NO_DECL, "both assign") == 1);
+    CHECK(nerr(NO_DECL, "both assign") == 1);
 
     /* NOT covered: the mode collision leaves G free — wake(g1)+sleep(g2)
-     * passes the group but contests at commit */
+     * would pass the group and contest at commit, so since #160 the keyed
+     * group does NOT rescue the compile: still an error */
     static const char *MODE_KEYED =
         "sort actor\n"
         "entity ( g1 : actor  g2 : actor )\n"
@@ -175,20 +193,7 @@ static int test_warning_coverage(void)
         "action wake(G: actor):  causes mode = alert\n"
         "action sleep(G: actor): causes mode = calm\n"
         "exclusive wake(G), sleep(G)\n";
-    CHECK(nwarn(MODE_KEYED, "conflicting effects on 'mode'") == 1);
-    {
-        intern *sy = intern_new();
-        world *w = compile_ok(MODE_KEYED, sy);
-        char err[192] = "";
-        CHECK(w != NULL);
-        CHECK(step2(w, sy, "wake(g1)", "sleep(g1)", err, sizeof err) == -1);
-        CHECK(strstr(err, "declared exclusive") != NULL);   /* protocol first */
-        CHECK(step2(w, sy, "wake(g1)", "sleep(g2)", err, sizeof err) == -1);
-        CHECK(strstr(err, "conflicting or undecided") != NULL);  /* the warned
-                                                * contest, exactly as flagged */
-        world_free(w);
-        intern_free(sy);
-    }
+    CHECK(nerr(MODE_KEYED, "conflicting effects on 'mode'") == 1);
     /* an all-wildcard group forbids ANY co-submission: covered */
     static const char *MODE_WILD =
         "sort actor\n"
@@ -210,7 +215,7 @@ static int test_warning_coverage(void)
     CHECK(nwarn(STRIKE, "more than once in one step") == 0);
 
     /* an uncovered BINDER var collides within ONE submitted action — no
-     * protocol group can forbid it; the warning must survive */
+     * protocol group can forbid it; since #160 that is an error */
     static const char *BINDER =
         "sort actor\n"
         "entity ( a1 : actor  a2 : actor )\n"
@@ -218,7 +223,7 @@ static int test_warning_coverage(void)
         "action tally_up: causes for each T: actor where marked(T):\n"
         "    tally := hp(T)\n"
         "exclusive tally_up\n";
-    CHECK(nwarn(BINDER, "more than once in one step") == 1);
+    CHECK(nerr(BINDER, "more than once in one step") == 1);
 
     return 0;
 }
@@ -261,12 +266,14 @@ static int test_errors(void)
         }
         intern_free(sy);
     }
-    /* single member keying every position forbids nothing: a warning */
-    {
-        char src[1024];
-        snprintf(src, sizeof src, "%s%s", HDR, "exclusive strike(A, T)\n");
-        CHECK(nwarn(src, "keys every argument") == 1);
-    }
+    /* single member keying every position forbids nothing: a warning (on a
+     * minimal source — HDR's east/west pair is itself a #160 error now) */
+    CHECK(nwarn("sort actor\n"
+                "entity g1 : actor\n"
+                "state pos(actor) : int\n"
+                "action strike(A: actor, T: actor): causes pos(A) := 2\n"
+                "exclusive strike(A, T)\n",
+                "keys every argument") == 1);
     return 0;
 }
 

@@ -97,13 +97,15 @@ static int test_story_div(void)
         "action halve:     causes d := hp / 2\n"
         "// floored on the VM path: (0-7)/2 stays dynamic via the hp read\n"
         "action neg_halve: causes d := (0 - hp) / 2\n"
+        "exclusive halve, neg_halve\n"
         "// fully constant: folds at compile time, and the fold must floor too\n"
         "action cfold:     causes d := (0 - 7) / 2\n"
         "// precedence ('/' binds like '*') and left associativity\n"
         "action prec:      causes d := 8 - 6 / 2\n"
         "action leftassoc: causes d := hp / 2 * 2\n"
         "// a divisor that is zero at runtime (not foldably zero): defined 0\n"
-        "action divz:      causes d := hp / z\n";
+        "action divz:      causes d := hp / z\n"
+        "exclusive halve, neg_halve, cfold, prec, leftassoc, divz\n";
 
     intern *sy = intern_new();
     world *w = compile_ok(src, sy);
@@ -148,6 +150,7 @@ static int test_divup(void)
         "action exact:    causes d := divup(8, 2)\n"
         "// runtime zero divisor: still the defined 0\n"
         "action divz:     causes d := divup(hp, z)\n"
+        "exclusive halfup, neghalf, cfold, exact, divz\n"
         "// usable as a guard lead, like min/max\n"
         "rule sturdy_check: divup(hp, 2) >= 4 -> sturdy\n";
 

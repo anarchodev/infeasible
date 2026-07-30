@@ -59,6 +59,7 @@ static int test_move_join_inertia(void)
         "state ( at(actor) : cell  on_fire(cell) )\n"
         "init ( at(aria) = k0  on_fire(k1) )\n"
         "action move(X: actor, to: cell): causes at(X) = to\n"
+        "exclusive move(X, _)\n"
         "rule on_burning(X: actor, c: cell): at(X) = c & on_fire(c) => burning(X)\n";
 
     SY = intern_new();

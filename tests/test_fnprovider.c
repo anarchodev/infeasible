@@ -62,7 +62,8 @@ static int test_directional_move(void)
         "entity ( hero : actor )\n"
         "state ( at(actor) : cell )\n"
         "action go_east(X: actor): causes at(X) := neighbor(at(X), 1)\n"
-        "action go_west(X: actor): causes at(X) := neighbor(at(X), -1)\n";
+        "action go_west(X: actor): causes at(X) := neighbor(at(X), -1)\n"
+        "exclusive go_east(X), go_west(X)\n";
 
     SY = intern_new();
     story_diag di[8];

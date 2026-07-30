@@ -60,6 +60,8 @@ state (
     atk_mod(actor) : int              // the modifier, snapshotted at declaration
 
     has_shield(actor)              // knows Shield (slot bookkeeping elided)
+    window_due                     // some declared attack can open the window
+                                   // (reified so open-vs-skip is one atom, #160)
     shielded(actor)                // Shield is up (until end of turn, simplified)
     reacted(actor)                 // this turn's reaction is spent
 
@@ -127,13 +129,20 @@ action pass(T: actor):             // a DECLINED open window must be logged (I4)
 
 // ---- phase advancement: ramifications only ---------------------------------
 
-// a declared attack opens the window — or skips it when it cannot open
-// (`~has_shield` is closed-world over a base fluent, so the skip is provable;
-// gating entry on the hit itself needs a primed judgment — #131)
-rule to_react(A: actor, T: actor):
-    phase = declare & pending(A, T)' & has_shield(T)   causes phase = react
+// a declared attack opens the window — or skips it when it cannot open.
+// The open-or-skip decision is REIFIED into one atom (`window_due`, set by a
+// ramification, read primed by both): to_react and skip_react branch on
+// window_due' vs ~window_due', which the #160 conflictable-pair check can
+// SEE is exclusive — the per-(A,T) formulation looked exclusive but was not
+// (two pendings on targets with mixed shield states contested `phase`).
+// Reifying also fixes that latent bug: the window opens if it can open for
+// ANYONE. (Gating entry on the hit itself needs a primed judgment — #131.)
+rule mark_window(A: actor, T: actor):
+    phase = declare & pending(A, T)' & has_shield(T)   causes window_due
+rule to_react:
+    phase = declare & window_due'                      causes phase = react
 rule skip_react(A: actor, T: actor):
-    phase = declare & pending(A, T)' & ~has_shield(T)  causes phase = resolve
+    phase = declare & pending(A, T)' & ~window_due'    causes phase = resolve
 
 rule after_react(T: actor):
     phase = react & reacted(T)'                        causes phase = resolve
@@ -158,4 +167,4 @@ rule expire_bless(X: actor):
 rule drop_shield(X: actor): phase = cleanup & shielded(X)  causes ~shielded(X)
 rule clear_react(X: actor): phase = cleanup & reacted(X)   causes ~reacted(X)
 
-rule next_turn: phase = cleanup causes phase = declare
+rule next_turn: phase = cleanup causes phase = declare & ~window_due

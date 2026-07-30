@@ -83,6 +83,7 @@ static const char *SRC =
     "                          + test(~fierce(bran)) * 7\n"
     "action bless(X: actor): causes blessed(X)\n"
     "action curse(X: actor): causes ~blessed(X)\n"
+    "exclusive bless(X), curse(X)\n"
     "action enrage(X: actor): causes raging(X)\n";
 
 static int test_modifiers(void)
@@ -149,7 +150,8 @@ static int test_replay_stability(void)
         "action zap(T: actor):\n"
         "    causes hp(T) -= roll(8, 1) + test(blessed(bran)) * roll(4, 2)\n"
         "action bless(X: actor): causes blessed(X)\n"
-        "action curse(X: actor): causes ~blessed(X)\n";
+        "action curse(X: actor): causes ~blessed(X)\n"
+    "exclusive bless(X), curse(X)\n";
 
     intern *sa = intern_new(), *sb = intern_new();
     world *A = compile_ok(src, sa), *B = compile_ok(src, sb);
