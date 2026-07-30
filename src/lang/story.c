@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7481,6 +7482,510 @@ static void desugar_bands(parser *p)
     }
 }
 
+/* ---- #98 conflictable pairs (EPIC #154) -------------------------------
+ *
+ * The static answer to two silent/loud failure classes:
+ *
+ *  1. STEP side (the contested `-1`s): two step-emitting constructs whose
+ *     effects can land on the SAME ground atom with conflicting content —
+ *     complementary boolean effects, multi-valued effects with different
+ *     values, or merge-less `:=` assigns — and whose conditions do not
+ *     exclude co-firing. A step where both fire is the runtime contested
+ *     error; the warning moves it to compile time. Acceptance (the epic's
+ *     totality contract): a zero-warning story cannot take those paths.
+ *  2. JUDGMENT side (the silently-REFUTED null, §6.2): two concluding rules
+ *     with complementary heads and nothing deciding the conflict — no `>`
+ *     (hand-written or band-desugared, both live in p->sups after
+ *     desugar_bands), no team member ordered over the opponent, no exclusive
+ *     bodies. Under team defeat both sides read REFUTED whenever both fire.
+ *     Two STRICT rules are their own case: superiority never orders the
+ *     strict layer, so a co-firing pair is a definite contradiction.
+ *
+ * Everything is RULE-TEMPLATE level (ground pairs explode at scale): two
+ * atoms may collide when their argument lists unify — variables are
+ * wildcards, entities constants — and a collision's substitution is a set of
+ * equivalence classes over (side, name) terms. Conditions exclude co-firing
+ * when some pair of them is complementary UNDER that substitution: opposite
+ * polarity on one atom, different multi-valued constants, disjoint numeric
+ * comparison intervals, or disjoint #95 membership lists. Conservative both
+ * ways a warning needs: a pair that cannot collide never warns; a pair whose
+ * exclusivity we cannot see does (one self-documenting condition is the
+ * fix — the same Elm trade as #116's safety rule).
+ *
+ * Warning severity, never an error: resolved pairs stay quiet (a resolved
+ * pair cannot contest, and the zero-warning contract must be reachable);
+ * the "how does every pair resolve" report is LSP-surface work on #98.
+ * Defeaters are excluded — a blocked head reads UNDECIDED by intent, and a
+ * defeater never concludes, so it cannot contest a step. */
+
+#define MAX_UNIF (4 * MAX_ARGS)
+
+typedef struct { int side; uint32_t name; } cp_term;   /* side 2 = constant */
+
+typedef struct {
+    cp_term t[MAX_UNIF];
+    int     cls[MAX_UNIF];                 /* class id per term */
+    int     n;
+} cp_subst;
+
+/* A name is a variable of `vars` or a constant (entity / enum value / int). */
+static bool cp_is_var(var_bind *vars, int nvars, uint32_t name)
+{
+    return var_index(vars, nvars, name) >= 0;
+}
+
+static int cp_find(cp_subst *u, int side, uint32_t name)
+{
+    for (int i = 0; i < u->n; i++)
+        if (u->t[i].side == side && u->t[i].name == name) return i;
+    return -1;
+}
+
+static int cp_intern(cp_subst *u, int side, uint32_t name)
+{
+    int i = cp_find(u, side, name);
+    if (i >= 0) return i;
+    if (u->n >= MAX_UNIF) return -1;       /* saturated: give up conservatively */
+    u->t[u->n].side = side;
+    u->t[u->n].name = name;
+    u->cls[u->n] = u->n;
+    return u->n++;
+}
+
+static int cp_root(cp_subst *u, int i)
+{
+    while (u->cls[i] != i) i = u->cls[i];
+    return i;
+}
+
+/* Union the classes of terms a and b. Two DISTINCT constants in one class
+ * mean the unification is impossible: returns false. */
+static bool cp_union(cp_subst *u, int a, int b)
+{
+    if (a < 0 || b < 0) return true;       /* saturated: assume unifiable */
+    int ra = cp_root(u, a), rb = cp_root(u, b);
+    if (ra == rb) return true;
+    if (u->t[ra].side == 2 && u->t[rb].side == 2)
+        return u->t[ra].name == u->t[rb].name;
+    if (u->t[ra].side == 2) { int t = ra; ra = rb; rb = t; }   /* const as root */
+    u->cls[ra] = rb;
+    return true;
+}
+
+static int cp_term_of(cp_subst *u, var_bind *vars, int nvars, int side,
+                      uint32_t name)
+{
+    return cp_intern(u, cp_is_var(vars, nvars, name) ? side : 2, name);
+}
+
+/* Are two argument terms provably EQUAL under the substitution? (Same class,
+ * or the same constant.) Interns on demand; unknown terms are never equal. */
+static bool cp_args_equal(cp_subst *u, var_bind *va, int na, uint32_t a,
+                          var_bind *vb, int nb, uint32_t b)
+{
+    int ia = cp_term_of(u, va, na, 0, a);
+    int ib = cp_term_of(u, vb, nb, 1, b);
+    if (ia < 0 || ib < 0) return false;
+    int ra = cp_root(u, ia), rb = cp_root(u, ib);
+    if (ra == rb) return true;
+    return u->t[ra].side == 2 && u->t[rb].side == 2 &&
+           u->t[ra].name == u->t[rb].name;
+}
+
+/* Unify two atoms' argument lists into `u`. False = they can never name the
+ * same ground atom (distinct constants at some position). */
+static bool cp_unify_args(cp_subst *u, const ast_atom *a, var_bind *va, int na,
+                          const ast_atom *b, var_bind *vb, int nb)
+{
+    if (a->nargs != b->nargs) return false;
+    for (int k = 0; k < a->nargs; k++)
+        if (!cp_union(u, cp_term_of(u, va, na, 0, a->args[k].name),
+                         cp_term_of(u, vb, nb, 1, b->args[k].name)))
+            return false;
+    return true;
+}
+
+/* Comparison guard as a closed interval [lo, hi]. */
+static void cp_guard_range(const ast_atom *g, long *lo, long *hi)
+{
+    switch (g->cmp) {
+    case WORLD_CMP_LE: *lo = LONG_MIN;         *hi = g->threshold;     break;
+    case WORLD_CMP_LT: *lo = LONG_MIN;         *hi = g->threshold - 1; break;
+    case WORLD_CMP_GE: *lo = g->threshold;     *hi = LONG_MAX;         break;
+    case WORLD_CMP_GT: *lo = g->threshold + 1; *hi = LONG_MAX;         break;
+    default:           *lo = g->threshold;     *hi = g->threshold;     break;
+    }
+}
+
+/* Are two condition atoms complementary under the substitution — can they
+ * never hold together? The recognized shapes: opposite polarity on one
+ * (boolean, same primedness) atom; different multi-valued constants on one
+ * fluent; disjoint comparison intervals on one numeric; disjoint #95
+ * membership lists on one variable. */
+static bool cp_conds_exclusive(parser *p, cp_subst *u,
+                               const ast_atom *ca, var_bind *va, int na,
+                               const ast_atom *cb, var_bind *vb, int nb)
+{
+    if (ca->is_expr_guard || cb->is_expr_guard) return false;
+    if (ca->is_member && cb->is_member) {      /* disjoint membership lists */
+        if (ca->neg || cb->neg) return false;
+        if (!cp_args_equal(u, va, na, ca->args[0].name,
+                              vb, nb, cb->args[0].name))
+            return false;
+        for (int i = 0; i < ca->mem_n; i++)
+            for (int j = 0; j < cb->mem_n; j++)
+                if (p->mempool[ca->mem_ix + i] == p->mempool[cb->mem_ix + j])
+                    return false;
+        return true;
+    }
+    if (ca->is_member || cb->is_member) return false;
+    if (ca->pred != cb->pred || ca->nargs != cb->nargs) return false;
+    if (ca->primed != cb->primed) return false;
+    for (int k = 0; k < ca->nargs; k++)
+        if (!cp_args_equal(u, va, na, ca->args[k].name,
+                              vb, nb, cb->args[k].name))
+            return false;
+    if (ca->is_guard && cb->is_guard) {        /* disjoint numeric intervals */
+        long la, ha, lb, hb;
+        cp_guard_range(ca, &la, &ha);
+        cp_guard_range(cb, &lb, &hb);
+        return ha < lb || hb < la;
+    }
+    if (ca->is_guard || cb->is_guard) return false;
+    if (ca->value != INTERN_NONE && cb->value != INTERN_NONE) {
+        /* different multi-valued CONSTANTS exclude; join values (variables)
+         * exclude nothing we can see */
+        if (ca->neg || cb->neg) return false;
+        if (cp_is_var(va, na, ca->value) || cp_is_var(vb, nb, cb->value))
+            return false;
+        return ca->value != cb->value;
+    }
+    if (ca->value != INTERN_NONE || cb->value != INTERN_NONE) return false;
+    return ca->neg != cb->neg;                 /* p vs ~p */
+}
+
+/* Does any pair drawn from the two condition groups exclude co-firing? */
+static bool cp_groups_exclusive(parser *p, cp_subst *u,
+                                ast_atom *const *ga, const int *na, int ng_a,
+                                var_bind *va, int nva,
+                                ast_atom *const *gb, const int *nb, int ng_b,
+                                var_bind *vb, int nvb)
+{
+    for (int i = 0; i < ng_a; i++)
+        for (int x = 0; x < na[i]; x++)
+            for (int j = 0; j < ng_b; j++)
+                for (int y = 0; y < nb[j]; y++) {
+                    cp_subst save = *u;    /* interning must not leak between
+                                            * candidate pairs' arg probes */
+                    if (cp_conds_exclusive(p, &save, &ga[i][x], va, nva,
+                                           &gb[j][y], vb, nvb))
+                        return true;
+                }
+    return false;
+}
+
+/* One step-side writer: an effect atom with its owning construct's variable
+ * scope and condition groups. */
+typedef struct {
+    ast_atom   *eff;
+    const char *owner;                     /* action / ramification name */
+    bool        is_ramif;
+    var_bind    vars[3 * MAX_ARGS];
+    int         nvars;
+    ast_atom   *conds[3];
+    int         nconds[3];
+    int         ng;
+    int         line, col;
+} cp_writer;
+
+/* Does expression `e` vary across bindings that agree on the effect's own
+ * arguments — i.e. does it read a scope variable OUTSIDE `covered`, or draw a
+ * roll (§5.10 keys sites by the FULL binding)? Such an expression can hand
+ * two colliding instances different values. */
+static bool cp_expr_varies(parser *p, int e, var_bind *vars, int nvars,
+                           const bool *covered, int depth)
+{
+    if (e < 0 || depth > 2 * MAX_ARGS) return false;
+    ex_node *n = &p->exprs[e];
+    switch (n->kind) {
+    case EX_CONST: return false;
+    case EX_ROLL:  return true;
+    case EX_LOAD: case EX_TEST: {
+        for (int k = 0; k < n->nargs; k++) {
+            int vi = var_index(vars, nvars, n->args[k].name);
+            if (vi >= 0 && !covered[vi]) return true;
+        }
+        return false;
+    }
+    case EX_CALL:
+        for (int k = 0; k < n->nargs; k++)
+            if (cp_expr_varies(p, n->cargs[k], vars, nvars, covered, depth + 1))
+                return true;
+        return false;
+    case EX_NEG: case EX_PRIOR:
+        return cp_expr_varies(p, n->lhs, vars, nvars, covered, depth + 1);
+    default:
+        return cp_expr_varies(p, n->lhs, vars, nvars, covered, depth + 1) ||
+               cp_expr_varies(p, n->rhs, vars, nvars, covered, depth + 1);
+    }
+}
+
+static int cp_fluent_merge(parser *p, uint32_t pred)
+{
+    for (int i = 0; i < p->nfluents; i++)
+        if (p->fluents[i].pred == pred) return p->fluents[i].merge_mode;
+    return 0;
+}
+
+static void cp_warn_step(parser *p, const cp_writer *a, const cp_writer *b,
+                         bool assign)
+{
+    const char *an = intern_name(p->syms, a->eff->pred);
+    if (assign)
+        warn(p, b->line, b->col,
+             "%s '%s' and %s '%s' can fire in the same step and both assign "
+             "(`:=`) '%s' — conflicting assigns are a contested-step error "
+             "(§5.8); declare `merge min|max` on '%s', or make their "
+             "conditions exclusive (#98)",
+             a->is_ramif ? "ramification" : "action", a->owner,
+             b->is_ramif ? "ramification" : "action", b->owner, an, an);
+    else
+        warn(p, b->line, b->col,
+             "%s '%s' and %s '%s' can fire in the same step with conflicting "
+             "effects on '%s' — a step where both apply is a contested-step "
+             "error, not a defeat (§5.8); make their conditions exclusive "
+             "(#98)",
+             a->is_ramif ? "ramification" : "action", a->owner,
+             b->is_ramif ? "ramification" : "action", b->owner, an);
+}
+
+static void cp_check_writer_pair(parser *p, const cp_writer *a,
+                                 const cp_writer *b)
+{
+    ast_atom *ea = a->eff, *eb = b->eff;
+    if (ea->pred != eb->pred) return;
+    bool na = ea->is_num_effect, nb2 = eb->is_num_effect;
+    if (na != nb2) return;
+    bool conflict, assign = false;
+    if (na) {                                  /* numeric / cell `:=` pair */
+        if (ea->numop != WORLD_OP_ASSIGN || eb->numop != WORLD_OP_ASSIGN)
+            return;                            /* deltas sum, never contest */
+        if (cp_fluent_merge(p, ea->pred)) return;   /* #85 merge absorbs */
+        long ka, kb;
+        if (expr_fold(p, ea->expr_root, &ka) && expr_fold(p, eb->expr_root, &kb)
+            && ka == kb)
+            return;                            /* identical constants agree */
+        conflict = true;
+        assign = true;
+    } else if (ea->value != INTERN_NONE && eb->value != INTERN_NONE) {
+        conflict = true;                       /* provably-equal values checked
+                                                * below, under the unifier */
+    } else if (ea->value == INTERN_NONE && eb->value == INTERN_NONE) {
+        conflict = ea->neg != eb->neg;         /* p vs ~p */
+    } else {
+        return;
+    }
+    if (!conflict) return;
+
+    cp_subst u = { .n = 0 };
+    if (!cp_unify_args(&u, ea, (var_bind *)a->vars, a->nvars,
+                           eb, (var_bind *)b->vars, b->nvars))
+        return;                                /* can never collide */
+    if (!na && ea->value != INTERN_NONE) {
+        /* MV pair: provably the same value = the identical effect */
+        bool va = cp_is_var((var_bind *)a->vars, a->nvars, ea->value);
+        bool vb = cp_is_var((var_bind *)b->vars, b->nvars, eb->value);
+        if (!va && !vb && ea->value == eb->value) return;
+        if ((va || vb) &&
+            cp_args_equal(&u, (var_bind *)a->vars, a->nvars, ea->value,
+                              (var_bind *)b->vars, b->nvars, eb->value))
+            return;
+    }
+    if (cp_groups_exclusive(p, &u, a->conds, a->nconds, a->ng,
+                            (var_bind *)a->vars, a->nvars,
+                            b->conds, b->nconds, b->ng,
+                            (var_bind *)b->vars, b->nvars))
+        return;
+    cp_warn_step(p, a, b, assign);
+}
+
+/* SELF collision: one writer template, two bindings landing on one ground
+ * atom — possible exactly when a scope variable is absent from the effect's
+ * argument list (a `for each` var: within one firing; an action var: a host
+ * may pass several instances of the action in one step). Contests only when
+ * the assigned content can differ between the two bindings. */
+static void cp_check_writer_self(parser *p, const cp_writer *w)
+{
+    ast_atom *e = w->eff;
+    bool covered[3 * MAX_ARGS] = { false };
+    bool missing = false;
+    uint32_t missing_var = 0;
+    for (int i = 0; i < w->nvars; i++) {
+        for (int k = 0; k < e->nargs; k++)
+            if (e->args[k].name == w->vars[i].name) covered[i] = true;
+        if (!covered[i] && !missing) { missing = true; missing_var = w->vars[i].name; }
+    }
+    if (!missing) return;
+    const char *an = intern_name(p->syms, e->pred);
+    if (e->is_num_effect) {
+        if (e->numop != WORLD_OP_ASSIGN || cp_fluent_merge(p, e->pred)) return;
+        if (!cp_expr_varies(p, e->expr_root, (var_bind *)w->vars, w->nvars,
+                            covered, 0))
+            return;                            /* same value from every binding */
+        warn(p, w->line, w->col,
+             "%s '%s' can fire more than once in one step (bindings differing "
+             "on '%s') and assign (`:=`) '%s' a value that varies with the "
+             "binding — a contested-step error (§5.8); include '%s' in the "
+             "target's arguments, or make the value independent of it (#98)",
+             w->is_ramif ? "ramification" : "action", w->owner,
+             intern_name(p->syms, missing_var), an,
+             intern_name(p->syms, missing_var));
+    } else if (e->value != INTERN_NONE) {
+        int vi = var_index((var_bind *)w->vars, w->nvars, e->value);
+        if (vi < 0 || covered[vi]) return;     /* constant, or binding-tied */
+        warn(p, w->line, w->col,
+             "%s '%s' can fire more than once in one step (bindings differing "
+             "on '%s') and set '%s' to a value that varies with the binding — "
+             "a contested-step error (§5.8); include '%s' in the target's "
+             "arguments (#98)",
+             w->is_ramif ? "ramification" : "action", w->owner,
+             intern_name(p->syms, e->value), an,
+             intern_name(p->syms, e->value));
+    }
+    /* boolean: one template concludes one polarity — never self-conflicts */
+}
+
+static void cp_collect_writer(parser *p, ast_action *a, ast_binder *bnd,
+                              binder_item *item, ast_atom *eff, cp_writer *w)
+{
+    (void)p;
+    w->eff = eff;
+    w->owner = a->name;
+    w->is_ramif = a->is_ramif;
+    w->nvars = 0;
+    for (int k = 0; k < a->nvars; k++) w->vars[w->nvars++] = a->vars[k];
+    if (bnd)
+        for (int k = 0; k < bnd->nvars && w->nvars < 3 * MAX_ARGS; k++)
+            w->vars[w->nvars++] = bnd->vars[k];
+    w->ng = 0;
+    w->conds[w->ng] = a->requires; w->nconds[w->ng++] = a->nreq;
+    if (bnd)  { w->conds[w->ng] = bnd->where;  w->nconds[w->ng++] = bnd->nwhere; }
+    if (item) { w->conds[w->ng] = item->when;  w->nconds[w->ng++] = item->nwhen; }
+    w->line = eff->line;
+    w->col = eff->col;
+}
+
+/* Judgment side: complementary concluding rules (strict/defeasible; kind and
+ * value machinery excluded — the kind stratum solves and errors at build). */
+static bool cp_rule_concludes(parser *p, ast_rule *r)
+{
+    if (r->kind == DL_DEFEATER) return false;
+    if (r->head.is_valuedef || r->head.is_kinddef) return false;
+    if (rule_is_kind(p, r)) return false;
+    if (r->head.value != INTERN_NONE || r->head.is_guard ||
+        r->head.is_expr_guard)
+        return false;
+    return true;
+}
+
+/* Is some rule concluding the same literal as `side` ordered (via p->sups —
+ * hand-written or band-desugared) above `opp`? Team defeat's static shadow. */
+static bool cp_team_covers(parser *p, ast_rule *side, ast_rule *opp)
+{
+    for (int i = 0; i < p->nrules; i++) {
+        ast_rule *t = &p->rules[i];
+        if (!cp_rule_concludes(p, t) || t->kind == DL_STRICT) continue;
+        if (t->head.pred != side->head.pred || t->head.neg != side->head.neg)
+            continue;
+        for (int e = 0; e < p->nsups; e++)
+            if (strcmp(p->sups[e].a, t->label) == 0 &&
+                strcmp(p->sups[e].b, opp->label) == 0)
+                return true;
+    }
+    return false;
+}
+
+static void cp_check_rule_pair(parser *p, ast_rule *ra, ast_rule *rb)
+{
+    if (ra->head.pred != rb->head.pred || ra->head.neg == rb->head.neg)
+        return;
+    cp_subst u = { .n = 0 };
+    if (!cp_unify_args(&u, &ra->head, ra->vars, ra->nvars,
+                           &rb->head, rb->vars, rb->nvars))
+        return;                                /* heads never collide */
+    /* only the BODIES exclude co-firing; `unless` guards defeat, they do
+     * not gate applicability */
+    ast_atom *ba[1] = { ra->body };
+    int      nba[1] = { ra->nbody };
+    ast_atom *bb[1] = { rb->body };
+    int      nbb[1] = { rb->nbody };
+    if (cp_groups_exclusive(p, &u, ba, nba, 1, ra->vars, ra->nvars,
+                            bb, nbb, 1, rb->vars, rb->nvars))
+        return;
+    const char *pn = intern_name(p->syms, ra->head.pred);
+    if (ra->kind == DL_STRICT && rb->kind == DL_STRICT) {
+        warn(p, rb->line, rb->col,
+             "strict rules '%s' and '%s' conclude complementary '%s' — "
+             "superiority never orders the strict layer, so a state where "
+             "both fire proves a definite contradiction; make their bodies "
+             "exclusive, or weaken one to `=>` (#98)",
+             ra->label, rb->label, pn);
+        return;
+    }
+    if (ra->kind == DL_STRICT || rb->kind == DL_STRICT)
+        return;                                /* strict wins: decided */
+    if (cp_team_covers(p, ra, rb) || cp_team_covers(p, rb, ra))
+        return;                                /* ordered (directly or by a
+                                                * teammate / band edge) */
+    warn(p, rb->line, rb->col,
+         "rules '%s' and '%s' conclude complementary '%s' and nothing orders "
+         "them — whenever both apply, team defeat reads BOTH sides REFUTED "
+         "(§13); add '%s > %s' (or the reverse), a band edge, or exclusive "
+         "bodies (#98)",
+         ra->label, rb->label, pn, ra->label, rb->label);
+}
+
+static void check_conflictable_pairs(parser *p)
+{
+    /* step side: collect every effect writer, then all pairs + selfs */
+    int nw = 0;
+    for (int i = 0; i < p->nactions; i++) {
+        ast_action *a = &p->actions[i];
+        nw += a->neff;
+        for (int bi = 0; bi < a->nbind; bi++)
+            nw += p->binders[a->bind_ix[bi]].nitems;
+    }
+    if (nw > 0) {
+        cp_writer *ws = calloc((size_t)nw, sizeof *ws);
+        int n = 0;
+        for (int i = 0; i < p->nactions; i++) {
+            ast_action *a = &p->actions[i];
+            for (int b = 0; b < a->neff; b++)
+                cp_collect_writer(p, a, NULL, NULL, &a->effects[b], &ws[n++]);
+            for (int bi = 0; bi < a->nbind; bi++) {
+                ast_binder *bnd = &p->binders[a->bind_ix[bi]];
+                for (int it = 0; it < bnd->nitems; it++)
+                    cp_collect_writer(p, a, bnd, &bnd->items[it],
+                                      &bnd->items[it].eff, &ws[n++]);
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            cp_check_writer_self(p, &ws[i]);
+            for (int j = i + 1; j < n; j++)
+                cp_check_writer_pair(p, &ws[i], &ws[j]);
+        }
+        free(ws);
+    }
+    /* judgment side */
+    for (int i = 0; i < p->nrules; i++) {
+        if (!cp_rule_concludes(p, &p->rules[i])) continue;
+        for (int j = i + 1; j < p->nrules; j++) {
+            if (!cp_rule_concludes(p, &p->rules[j])) continue;
+            cp_check_rule_pair(p, &p->rules[i], &p->rules[j]);
+        }
+    }
+}
+
 /* Any predicate used in a condition that is neither a declared fluent nor a
  * rule head can never be true — the Osiris typo bug (§6.1). */
 static void check_orphans(parser *p)
@@ -9039,6 +9544,8 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
         semantic_pass(p);
         if (p->nerrors == 0) {
             desugar_bands(p);                     /* band ladders → pairwise `>` (§6.2) */
+            check_conflictable_pairs(p);          /* #98: contested-step + null
+                                                   * conflicts, at compile time */
             if (p->dtype_sort >= 0)               /* #83: size the closed type domain
                                                    * before any response registers */
                 world_set_dtypes(p->w, p->domain_n[p->dtype_sort]);

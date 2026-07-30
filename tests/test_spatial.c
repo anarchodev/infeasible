@@ -100,7 +100,11 @@ int main(void)
     free(src);
     if (!W) { fprintf(stderr, "compile: %s\n", dg.count ? di[0].msg : "?"); return 1; }
     CHECK(dg.nerrors == 0);
-    CHECK(dg.count == 0);                     /* anchored rule: no cardinality warn */
+    /* anchored rule: no cardinality warn; the ONE expected diagnostic is
+     * #98's true positive — east and west both `:=` at(G) and a host stepping
+     * both in one tick is the contested `-1` (pinned below as it happens) */
+    for (int ci = 0; ci < dg.count && ci < dg.cap; ci++)
+        CHECK(strstr(di[ci].msg, "both assign (`:=`) 'at'") != NULL);
 
     STEP = intern_id(SY, "step");
     NEAR = intern_id(SY, "near");
