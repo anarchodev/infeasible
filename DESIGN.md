@@ -1242,6 +1242,104 @@ tick; two ground instances of one rule draw independently; `shared_roll` gives
 two rules the same value; and a full action-log replay from a stored seed
 reproduces every rolled outcome exactly (I4).
 
+### 5.11 Turn phases and reactions (decided)
+
+Combat moves through stages — declare, react, resolve, clean up — and
+reactions (Shield, opportunity attacks) interrupt mid-resolution. Neither gets
+a language construct. The whole area is a **pattern over existing machinery**,
+proven end-to-end by `examples/reaction5e.story` (the #118 probe) and pinned
+by `test_reaction`.
+
+**Terminology ruling.** §5.8 spent *stages* on intra-tick order (strata ×
+stages × classes × layers). These are **inter-tick**: always say *phases*.
+The two never smear — a stage orders rules within one step's fixpoint; a
+phase gates which rules are live across a run of steps.
+
+**The pattern: a phase is a fluent.** `phase : { declare, react, resolve,
+cleanup }` is an ordinary arity-0 multi-valued fluent (§5.7). Action legality
+is a guard (`requires phase = declare & …`); phase **advancement is causal
+rules and ramifications, never a host write** — the host submits actions and
+empty steps, and the clock ticks itself:
+
+```
+rule to_react(A: actor, T: actor):
+    phase = declare & pending(A, T)' & has_shield(T)   causes phase = react
+rule skip_react(A: actor, T: actor):
+    phase = declare & pending(A, T)' & ~has_shield(T)  causes phase = resolve
+```
+
+I2 holds (all mutation flows through steps) and the turn structure replays
+from the action log alone (I4). Precedent: boardgame.io declares phases and
+allowed-moves-per-phase as data with auto-advance conditions, and MTG turn
+engines reify the turn as state; we take the semantics-by-convention half —
+turn order *is* rules — and decline the construct, because guards and
+ramifications already spell it and a construct would only re-state them.
+
+**The reaction protocol (the named idiom).** A round decomposes into many
+steps; the step boundary rule is: **a step is the largest unit nothing can
+legally interject into**. Anything a reaction may interrupt must therefore
+end a step, and the intermediate moments become ordinary fluents — MTG's
+stack, reified one level deep:
+
+1. **Declare** commits a step. The attack-in-flight is stored state
+   (`pending(A,T)`), and the die and attacker's modifier **lock by
+   snapshot** (`atk_die(A) := roll(20) & atk_mod(A) := atk(A)`). Rolls are
+   per-tick lookups (§5.10), so a value that must survive its own multi-step
+   resolution is written to the store *by design* — the locked roll is part
+   of the attack's state, so it saves and replays for free (#129 tracks
+   whether this earns `latch` sugar; the snapshot is the blessed spelling).
+2. **The window is a judgment.** `can_react(T)` derives from the phase, the
+   incoming hit, spell knowledge, and reaction economy. The host *reads* it
+   and asks the player; it never decides it. The trigger judgment re-reads
+   the locked roll against **live** derived values each tick — casting
+   Shield layers +5 onto the `ac` value (#82), and the same locked d20 that
+   hit in `react` misses in `resolve`. Retroactivity is a judgment flipping,
+   not rollback machinery.
+3. **The I4 logging split.** A *declined open window* is a choice and MUST
+   be a logged action (`pass(T)`). A window that *cannot open* is skipped by
+   rule off closed-world base facts (`~has_shield`, above) with **no log
+   entry** — auto-advance is derivable, so logging it would be noise.
+   (Gating window *entry* on the derived hit itself needs a primed judgment
+   read, and closing an entered-but-empty window needs NAF over a derived
+   predicate — both out today, tracked as #131; entry keyed on base
+   capability facts is the workaround the probe ships.)
+4. **Resolve and cleanup** are empty-step ramifications: damage commits
+   where the (re-judged) hit still holds, death cascades in the same step
+   via `hp'` (§5.8 strata), durations tick down and expire by rule.
+
+One die, two tests falls out: the locked `atk_die` is compared against live
+AC (hit) and against 20 (crit), and the crit doubles the damage die
+branch-free with `test(crit(A))` (#86).
+
+**The `split` hint (landed — the N=1 slice).** Knowing only a subset of
+rules is live per phase is a *compiler* fact, and it is static reachability
+— excluded rules are provably dead from declared structure before any state
+is read (stratification's sibling: #87 orders rules within the tick, phases
+stratify them across the turn). It is NOT idle-skipping, so it passes the
+honest-path rule (§8): the bench that gated it (#120) churns every phase.
+The surface is one annotation with **zero semantic content**, same species
+as `merge`:
+
+```
+state phase : { declare, react, resolve, cleanup } split
+```
+
+The engine caches one step schema per value, selected by the **pre-step**
+value: rules guarded on another value are omitted; inertia exists only for
+the value's write-set (what live rules write or read primed); excluded
+fluents commit by copy (dynamic-bounded numerics still re-clamp). Deleting
+`split` changes time, never meaning — `test_split` pins split-on/off
+byte-identical, and the probe story carries the annotation with unchanged
+goldens. It also completes the loud-no-op ladder (#119): an action all of
+whose rules are dead under the current value is a located step error naming
+both ("no live step rule while `phase=declare`"). A primed read of a split
+fluent is rejected (selection is by the pre-step value). Nothing about the
+hint says "phase": any mode fluent qualifies (overworld/combat, day/night).
+Measured headroom at 100k entities: 65% of the full-schema round statically
+dead, 2.89× on the hand-narrowed simulation; the per-value **lane** schemas
+(where an MV-guarded world currently forfeits the lane path entirely) are
+the open half of #121.
+
 ### Invariants (compiler/engine enforced)
 
 - **I1 — No write-back.** Derived conclusions are never stored as base facts.
