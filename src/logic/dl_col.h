@@ -63,6 +63,16 @@ void      dlcol_add_fact(dlcol *f, dl_lit l, int entity);
 void      dlcol_clear_facts(dlcol *f);
 int       dlcol_row_words(const dlcol *f);
 
+/* OPEN literal (#116): the host knows this input literal but cannot decide it
+ * this solve (a guard over a partial derived value with no applicable
+ * definition). A fact-less located literal is normally closed-world — no
+ * rules means -Delta and so -d conclude trivially, REFUTED. Marking it open
+ * blocks -Delta for the marked entities, so the literal (mark BOTH
+ * polarities for a guard) and everything gated on it stays honestly
+ * UNDECIDED. Cleared by dlcol_clear_facts with the facts — openness is
+ * per-assembly state, exactly like a fact. */
+void      dlcol_set_open(dlcol *f, dl_lit l, int entity);
+
 /* Full family recompute from the current fact columns (clears previous
  * statuses first — the branchless sweep is the point; see 5.8). */
 void dlcol_solve(dlcol *f);

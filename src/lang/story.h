@@ -142,15 +142,28 @@
  *                                          -- subject tuple binding its leading
  *                                          -- args (V(A) = roller, V(A,T) adds
  *                                          -- the target); expanded labels `L.value`
- *                                          -- value definition (#82/#94): ONE
- *                                          -- unconditional base per value, plus
- *                                          -- guarded overrides/layers ordered by
- *                                          -- `>`; `prior` in the expr layers on
+ *                                          -- value definition (#82/#94): AT MOST
+ *                                          -- ONE unconditional base per value,
+ *                                          -- plus guarded overrides/layers ordered
+ *                                          -- by `>`; `prior` in the expr layers on
  *                                          -- the chain below (prior+e / max / min
  *                                          -- commute by class; anything else must
  *                                          -- be totally ordered). Bodies ground to
  *                                          -- MARKER judgments `body => label(...)`
  *                                          -- — ordinary defeasible literals.
+ *                                          -- ZERO unconditional bases makes the
+ *                                          -- value PARTIAL (#116, inferred — no
+ *                                          -- keyword): a guard over it with no
+ *                                          -- applicable definition is UNDECIDED
+ *                                          -- (asserts neither fact), `prior` over
+ *                                          -- nothing propagates undefinedness,
+ *                                          -- and an arithmetic read (effect RHS,
+ *                                          -- clamp bound, definition expr) is
+ *                                          -- legal ONLY if the same rule's
+ *                                          -- condition reads the value too (any
+ *                                          -- guard, or `defined`) — the static
+ *                                          -- safety rule: a clean compile never
+ *                                          -- evaluates an undefined value.
  *   action  := 'action' IDENT [ params ] ':' [ 'requires' conj ] 'causes' effects
  *   effects := effitem ( '&' effitem )*                         -- effect body
  *   effitem := eatom | binder                                   -- plain or set-quantified
@@ -171,6 +184,16 @@
  *                                          -- overrides the blanket per member
  *   conj    := eatom ( '&' eatom )*
  *   eatom   := atom [ cmp INT | '=' IDENT | numop expr ] -- guard / MV / effect
+ *            | 'defined' IDENT [ '(' arg (',' arg)* ')' ] -- definedness of a
+ *                                          -- PARTIAL value (#116): a first-class
+ *                                          -- body atom, the disjunction of the
+ *                                          -- value's prior-free layer markers
+ *                                          -- (grounds as `defined(v(args))`,
+ *                                          -- ordinary defeasible rules sharing a
+ *                                          -- head — queryable, why-traceable).
+ *                                          -- Positive, condition-position only;
+ *                                          -- contextual keyword (an atom named
+ *                                          -- `defined` stays legal)
  *            | IDENT ['not'] 'in' '{' IDENT (',' IDENT)* '}'  -- membership (#95):
  *                                          -- a static grounding filter over a var's
  *                                          -- finite domain; never in the fixpoint

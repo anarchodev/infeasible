@@ -193,10 +193,12 @@ static int test_errors(void)
         { "value v : int\nrule d1: => v = 3\nrule d2: => v = 4\n"
           "rule r: v >= 1 => q\n",
           "two unconditional definitions" },
-        /* guarded definitions are legal since #82's layering slice — but a
-         * value that has ONLY guarded definitions is missing its base */
-        { "state p\nvalue v : int\nrule d: p => v = 3\nrule r: v >= 1 => q\n",
-          "unconditional base definition" },
+        /* a value with only guarded definitions is PARTIAL since #116
+         * (inferred, no keyword — pinned in test_partial.c); but one whose
+         * every definition reads `prior` can never be defined at all */
+        { "state p\nvalue v : int\nrule d: p => v = prior + 1\n"
+          "rule r: v >= 1 => q\n",
+          "can never be defined" },
         { "value v : int\nrule d: -> v = 3\nrule r: v >= 1 => q\n",
           "write '=>'" },
         { "value v : int\nrule d: => v = 3\naction a: causes v := 4\n",

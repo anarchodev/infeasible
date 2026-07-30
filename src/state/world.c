@@ -228,10 +228,13 @@ struct world {
      * two-phase — solve without those guards, evaluate them against the
      * settled result into `tval`, reload with them, solve again. Sound because
      * the compiler rejects a tested atom whose cone contains a test-bearing
-     * guard, so pass-A verdicts of tested atoms are final. */
+     * guard, so pass-A verdicts of tested atoms are final. `tval` is
+     * tri-valued (#116): 1 holds, 0 fails, -1 UNDEFINED — the guard read a
+     * partial value with no applicable definition, and asserts NEITHER fact
+     * (the guard atom stays UNDECIDED in the solve). */
     struct { uint32_t guard; const expr_ins *lhs; int nlhs;
              const expr_ins *rhs; int nrhs; world_cmp op;
-             bool has_test, tval; } *eguards;
+             bool has_test; int8_t tval; } *eguards;
     int neguard, capeguard;
     int n_teg;                    /* # test-bearing eguards (two-phase iff > 0) */
     bool teg_ready;               /* pass C: load has_test guards from tval */
@@ -860,7 +863,7 @@ bool world_num_cmp_holds(const world *w, uint32_t num_atom,
     return cmp_ok(world_get_num(w, num_atom), threshold, op);
 }
 
-static long eval_expr(const world *w, const expr_ins *code, int n);
+static long eval_expr(const world *w, const expr_ins *code, int n, bool *undef);
 
 static int eguard_index(const world *w, uint32_t atom)
 {
@@ -886,18 +889,22 @@ void world_add_expr_guard(world *w, uint32_t guard,
     for (int k = 0; k < nlhs && !ht; k++) ht = l[k].op == EXPR_TEST;
     for (int k = 0; k < nrhs && !ht; k++) ht = r[k].op == EXPR_TEST;
     w->eguards[w->neguard].has_test = ht;
-    w->eguards[w->neguard].tval = false;
+    w->eguards[w->neguard].tval = 0;
     if (ht) w->n_teg++;
     w->neguard++;
 }
 
 /* Does expression guard i hold? Evaluates both bytecode sides (roll/fluent/const)
- * and compares. Rolls read the current tick — idempotent within a solve. */
-static bool guard_holds_expr(const world *w, int i)
+ * and compares. Rolls read the current tick — idempotent within a solve.
+ * Tri-valued (#116): 1 holds, 0 fails, -1 UNDEFINED (a side read a partial
+ * value with no applicable definition — the comparison does not apply). */
+static int guard_holds_expr(const world *w, int i)
 {
-    return cmp_ok(eval_expr(w, w->eguards[i].lhs, w->eguards[i].nlhs),
-                  eval_expr(w, w->eguards[i].rhs, w->eguards[i].nrhs),
-                  w->eguards[i].op);
+    bool und = false;
+    long l = eval_expr(w, w->eguards[i].lhs, w->eguards[i].nlhs, &und);
+    long r = eval_expr(w, w->eguards[i].rhs, w->eguards[i].nrhs, &und);
+    if (und) return -1;
+    return cmp_ok(l, r, w->eguards[i].op) ? 1 : 0;
 }
 
 /* Load every ground expression guard as a closed-world fact (like numeric
@@ -911,12 +918,20 @@ static void load_eguards(world *w, dlcol *f, const uint32_t *of, uint32_t cap)
     for (int i = 0; i < w->neguard; i++) {
         uint32_t ga = w->eguards[i].guard;
         if (ga >= cap || of[ga] == LOC_NONE) continue;
-        bool v;
+        int v;
         if (w->eguards[i].has_test) {
             if (!w->teg_ready) continue;           /* pass A: undecided */
             v = w->eguards[i].tval;
         } else {
             v = guard_holds_expr(w, i);
+        }
+        if (v < 0) {           /* #116 partial value undefined: NEITHER fact —
+                                * marked OPEN so the guard atom (a located,
+                                * rule-less literal that would otherwise close
+                                * to REFUTED) stays honestly UNDECIDED */
+            dlcol_set_open(f, (dl_lit){ of[ga], false }, 0);
+            dlcol_set_open(f, (dl_lit){ of[ga], true }, 0);
+            continue;
         }
         dlcol_add_fact(f, (dl_lit){ of[ga], !v }, 0);
     }
@@ -930,7 +945,7 @@ static void eval_test_guards(world *w, dlcol *tf, const uint32_t *of, uint32_t c
     w->tctx_fam = tf; w->tctx_of = of; w->tctx_cap = cap;
     for (int i = 0; i < w->neguard; i++)
         if (w->eguards[i].has_test)
-            w->eguards[i].tval = guard_holds_expr(w, i);
+            w->eguards[i].tval = (int8_t)guard_holds_expr(w, i);
     w->tctx_fam = NULL;
     w->teg_ready = true;
 }
@@ -1268,8 +1283,12 @@ static dl_verdict lazy_judgment_verdict(const world *w, dl_lit q)
     if (p >= 0)
         return q.neg != provider_holds(w, p) ? DL_PROVED : DL_REFUTED;
     int e = eguard_index(w, q.atom);
-    if (e >= 0)
-        return q.neg != guard_holds_expr(w, e) ? DL_PROVED : DL_REFUTED;
+    if (e >= 0) {
+        int v = guard_holds_expr(w, e);
+        if (v < 0) return DL_UNDECIDED;    /* #116: partial value undefined —
+                                            * the comparison does not apply */
+        return q.neg != (v != 0) ? DL_PROVED : DL_REFUTED;
+    }
     return DL_REFUTED;         /* located, rule-less, fact-less: -d both ways */
 }
 
@@ -2542,8 +2561,12 @@ static bool lit_solved_proved(const world *w, uint32_t atom, bool neg);
 /* Stack VM over `long`; integer-only. Reads numeric fluents' *current* values
  * (the store double-buffers, so every effect this step sees the pre-step
  * state). Bytecode is compiler-emitted and well-formed; depth 64 covers any
- * M1 effect expression. */
-static long eval_expr(const world *w, const expr_ins *code, int n)
+ * M1 effect expression. `undef` (may be NULL) is the out-of-band UNDEFINED
+ * channel (#116): set true when an EXPR_REQDEF found a partial value with no
+ * applicable definition — the result long is then meaningless, never an
+ * in-band sentinel. Evaluation continues past it so every roll site is still
+ * visited (§5.10 replay stability). */
+static long eval_expr(const world *w, const expr_ins *code, int n, bool *undef)
 {
     long st[64];
     long pstk[16];                /* layered-value prior stack (#82/#94) */
@@ -2597,6 +2620,9 @@ static long eval_expr(const world *w, const expr_ins *code, int n)
         case EXPR_PPUSH: if (psp < 16) pstk[psp++] = st[--sp]; break;
         case EXPR_P:     st[sp++] = psp > 0 ? pstk[psp-1] : 0; break;
         case EXPR_PPOP:  if (psp > 0) psp--; break;
+        case EXPR_REQDEF:                 /* #116: definedness check, see world.h */
+            if (st[--sp] <= 0 && undef) *undef = true;
+            break;
         }
     }
     return sp ? st[sp-1] : 0;
@@ -2608,9 +2634,13 @@ static long eval_expr(const world *w, const expr_ins *code, int n)
  * store double-buffers and swaps once), consistent with effect reads. */
 static void num_clamp_bounds(const world *w, int idx, long *lo, long *hi)
 {
-    *lo = w->nums[idx].lo_code ? eval_expr(w, w->nums[idx].lo_code, w->nums[idx].n_lo)
+    /* A partial-value read in a clamp bound is a compile error (#116's static
+     * safety rule — a bound has no guarding body), so the undef channel is
+     * dead here by construction; pass NULL and keep the check an assertion
+     * in spirit. */
+    *lo = w->nums[idx].lo_code ? eval_expr(w, w->nums[idx].lo_code, w->nums[idx].n_lo, NULL)
                                : w->nums[idx].min;
-    *hi = w->nums[idx].hi_code ? eval_expr(w, w->nums[idx].hi_code, w->nums[idx].n_hi)
+    *hi = w->nums[idx].hi_code ? eval_expr(w, w->nums[idx].hi_code, w->nums[idx].n_hi, NULL)
                                : w->nums[idx].max;
 }
 
@@ -3110,7 +3140,21 @@ int world_step(world *w, const uint32_t *actions, int nactions,
                 const num_effect *ef = &r->neffs[e];
                 int i = num_index(w, ef->num_atom);
                 if (i < 0 || w->num_stratum[i] != st) continue;
-                long v = eval_expr(w, ef->code, ef->ncode);
+                bool und = false;
+                long v = eval_expr(w, ef->code, ef->ncode, &und);
+                if (und) {
+                    /* Unreachable from a clean compile (#116's static safety
+                     * rule blocks unguarded partial reads in effect RHS) —
+                     * defense in depth against compiler bugs, outside the
+                     * language contract. */
+                    if (err)
+                        snprintf(err, errsz,
+                                 "internal: effect of rule '%s' read an "
+                                 "undefined partial value (compiler bug — "
+                                 "#116 static safety)", r->name);
+                    rc = -1;
+                    break;
+                }
                 if (ef->op == WORLD_OP_ASSIGN) {
                     world_merge mg = w->nums[i].merge;
                     if (!acc[i].have) {
@@ -3139,6 +3183,7 @@ int world_step(world *w, const uint32_t *actions, int nactions,
                     rcpt_push(&w->rcpt[i], r->name, ef->op, d);
                 }
             }
+            if (rc != 0) break;                    /* internal undef trap above */
         }
 
         for (int i = 0; rc == 0 && i < w->nnum; i++) {
