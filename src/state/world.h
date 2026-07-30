@@ -455,7 +455,14 @@ void world_step_why(world *w, dl_lit q, bool next, FILE *out);
 /* Advance one step given occurring action atoms. Returns 0 on success and
  * commits the new state; returns -1 and leaves the state untouched if some
  * fluent's next value is contested/undecided (err gets the fluent name) —
- * for numerics that is two `:=` effects claiming distinct values. */
+ * for numerics that is two `:=` effects claiming distinct values.
+ *
+ * Loud no-op actions (#119): an action atom that triggers ZERO step rules is
+ * also -1-with-err ("matches no step rule"), state untouched — it can never
+ * do anything in this world, so submitting it is a host bug (typo'd atom,
+ * protocol drift), never a legal no-op. An action whose matching rules all
+ * fail their guards is NOT an error: it steps normally and the turn is spent.
+ * A speculative host should pre-check with world_query, not rely on silence. */
 int world_step(world *w, const uint32_t *actions, int nactions,
                char *err, size_t errsz);
 

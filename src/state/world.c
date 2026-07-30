@@ -138,6 +138,8 @@ struct world {
     int *guard_of;  uint32_t guard_of_cap;   /* guard atom  -> guards index  */
     int *prov_of;   uint32_t prov_of_cap;    /* provider atom -> provs index */
     int *eguard_of; uint32_t eguard_of_cap;  /* expr-guard atom -> eguards index */
+    int *trig_of;   uint32_t trig_of_cap;    /* action atom -> 1 iff any step rule
+                                              * triggers on it (loud no-ops, #119) */
     jrule *jrules; int njr, capjr;
     jsup *jsups; int njs, capjs;
     int jr_matched_base;                   /* watermark: static | matched rules (#28) */
@@ -374,6 +376,7 @@ void world_free(world *w)
     free(w->guard_of);
     free(w->prov_of);
     free(w->eguard_of);
+    free(w->trig_of);
     free(w->views);
     free(w->vrows);
     free(w->vseen_of);
@@ -1025,6 +1028,8 @@ int world_add_step_rule(world *w, const char *name, uint32_t action,
     r->name = arena_strdup(&w->a, name);
     r->prov = NULL;
     r->action = action;
+    if (action != INTERN_NONE)     /* the loud-no-op trigger set (#119) */
+        atom_map_set(&w->trig_of, &w->trig_of_cap, action, 1);
     r->nbody = nbody;
     r->body = arena_alloc(&w->a, (size_t)(nbody ? nbody : 1) * sizeof(step_cond));
     if (nbody)
@@ -2413,6 +2418,19 @@ static int world_step_lanes(world *w, const uint32_t *actions, int nactions,
 int world_step(world *w, const uint32_t *actions, int nactions,
                char *err, size_t errsz)
 {
+    /* Loud no-op actions (#119): an action atom that triggers ZERO step rules
+     * can never do anything in this world — that is a host bug (typo'd atom,
+     * wrong intern, protocol drift), not a legal no-op. Report it and leave
+     * the world untouched. An action whose rules all fail their guards is NOT
+     * this case: it matches by trigger and steps normally (the turn is spent). */
+    for (int i = 0; i < nactions; i++)
+        if (actions[i] >= w->trig_of_cap || w->trig_of[actions[i]] < 0) {
+            if (err)
+                snprintf(err, errsz, "action '%s' matches no step rule",
+                         intern_name(w->syms, actions[i]));
+            return -1;
+        }
+
     ensure_fam(w);
 
     /* the hot path: a homogeneous step world lanes its whole transition, so solve

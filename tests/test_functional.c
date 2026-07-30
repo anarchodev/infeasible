@@ -76,8 +76,9 @@ static int test_move_join_inertia(void)
     CHECK(strcmp(pos(w), "k1") == 0);      /* moved */
     CHECK(burning(w));                      /* join fired: on the on_fire cell */
 
-    /* inertia: a step that fires no move leaves position unchanged */
-    CHECK(step(w, "wait") == 0);
+    /* inertia: an empty step (no action; a bare no-rule atom is loud, #119) */
+    char err[128];
+    CHECK(world_step(w, NULL, 0, err, sizeof err) == 0);
     CHECK(strcmp(pos(w), "k1") == 0);
     CHECK(burning(w));
 
