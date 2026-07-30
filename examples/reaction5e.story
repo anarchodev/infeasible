@@ -42,8 +42,11 @@ sort actor
 entity ( grunk, vera : actor )     // a goblin, and a wizard who knows Shield
 
 state (
-    // the turn clock — an ordinary MV fluent (EPIC #117: no construct)
-    phase : { declare, react, resolve, cleanup }
+    // the turn clock — an ordinary MV fluent (EPIC #117: no construct).
+    // `split` (#121) is a compilation hint with zero semantic content: the
+    // step schema specializes per phase value. Deleting it changes time,
+    // never meaning — test_reaction's goldens pin exactly that.
+    phase : { declare, react, resolve, cleanup } split
 
     alive(actor)
     hp(actor)   : int in 0 .. 30

@@ -257,10 +257,31 @@ struct world {
      * between steps; only the fact bits change. Rebuilt lazily when rules
      * or fluents are added; each world_step then just rewrites fact
      * columns and re-solves, paying no theory rebuild or compile. */
-    dlcol *fam;                   /* step family: judgments + inertia + causal  */
+    dlcol *fam;                   /* the ACTIVE step family for this state —
+                                   * borrows fam0 or a split cache slot below   */
+    dlcol *fam0;                  /* the full (unsplit) step family; owned      */
+    uint64_t fam0_ver;
     dlcol *jfam;                  /* judgment family: judgments only (the query
                                    * layer — DESIGN.md §6.3, one columnar engine
                                    * for both "what's true" and "what happens") */
+
+    /* `split` (#121): per-value step-schema specialization on ONE designated
+     * arity-0 finite-domain fluent (its MV erasure — the value atoms). Zero
+     * semantic content: each cached schema omits rules statically dead under
+     * that value and the inertia of fluents no live rule can touch; excluded
+     * fluents commit by copy. Selection is by the PRE-step value; no unique
+     * value true -> the full schema (fam0). nvals == 0 -> split inactive. */
+    struct {
+        uint32_t *vatoms; int nvals;  /* the value atoms, domain order (owned) */
+        dlcol   **fams;               /* per-value schema cache; NULL = unbuilt */
+        uint64_t *vers;               /* struct_ver each slot was built at      */
+        uint8_t **flw;                /* [v][nfl]  write-set at build time      */
+        uint8_t **numw;               /* [v][nnum] numeric write-set            */
+        int *map_of; uint32_t map_cap;      /* value atom -> value index        */
+        int *trig_of; uint32_t trig_cap;    /* action -> live-value bitmask     */
+        uint64_t trig_ver;
+    } sp;
+    const uint8_t *flw_cur, *numw_cur;  /* active narrowing; NULL = all live   */
     /* Structure version (#63): bumped on any structural edit (rule/fluent add,
      * a matcher re-ground). Each family caches the version it was built at, so a
      * query rebuilds ONLY the judgment family and a step ONLY the step family —
@@ -329,8 +350,16 @@ static void invalidate_state_solved(world *w)
 
 void world_free(world *w)
 {
-    if (w->fam)
-        dlcol_free(w->fam);
+    if (w->fam0)
+        dlcol_free(w->fam0);           /* w->fam only borrows (fam0 or a slot) */
+    for (int v = 0; v < w->sp.nvals; v++) {
+        if (w->sp.fams[v]) dlcol_free(w->sp.fams[v]);
+        free(w->sp.flw[v]);
+        free(w->sp.numw[v]);
+    }
+    free(w->sp.vatoms); free(w->sp.fams); free(w->sp.vers);
+    free(w->sp.flw); free(w->sp.numw);
+    free(w->sp.map_of); free(w->sp.trig_of);
     if (w->jfam)
         dlcol_free(w->jfam);
     for (int i = 0; i < w->nlanes; i++) {
@@ -1046,6 +1075,55 @@ int world_add_step_rule(world *w, const char *name, uint32_t action,
     return w->nsr++;
 }
 
+int world_set_split(world *w, const uint32_t *value_atoms, int nvals)
+{
+    if (w->sp.nvals)
+        return -1;                     /* one split fluent per world (#121) */
+    if (nvals < 2 || nvals > 31)
+        return -1;                     /* finite, and the liveness mask is 31 bits
+                                        * — generous, and loud rather than silent */
+    for (int v = 0; v < nvals; v++)
+        if (fluent_index(w, value_atoms[v]) < 0)
+            return -1;                 /* every value atom must be a declared fluent */
+    w->sp.vatoms = malloc((size_t)nvals * sizeof *w->sp.vatoms);
+    memcpy(w->sp.vatoms, value_atoms, (size_t)nvals * sizeof *w->sp.vatoms);
+    w->sp.nvals = nvals;
+    w->sp.fams = calloc((size_t)nvals, sizeof *w->sp.fams);
+    w->sp.vers = calloc((size_t)nvals, sizeof *w->sp.vers);
+    w->sp.flw  = calloc((size_t)nvals, sizeof *w->sp.flw);
+    w->sp.numw = calloc((size_t)nvals, sizeof *w->sp.numw);
+    for (int v = 0; v < nvals; v++)
+        atom_map_set(&w->sp.map_of, &w->sp.map_cap, value_atoms[v], v);
+    w->sp.trig_ver = w->struct_ver - 1;    /* masks not built yet */
+    return 0;
+}
+
+static int srule_split_value(const world *w, const srule *r);
+
+/* Per-action live-value bitmasks for the split loudness check: bit v set iff
+ * some step rule with this trigger is live under value v. Rebuilt lazily on a
+ * structural edit; absent actions read -1 (the #119 check already screens
+ * triggers that match nothing anywhere). */
+static void ensure_split_trig_masks(world *w)
+{
+    if (w->sp.trig_ver == w->struct_ver)
+        return;
+    for (uint32_t k = 0; k < w->sp.trig_cap; k++)
+        w->sp.trig_of[k] = -1;
+    int all = (int)((1u << w->sp.nvals) - 1);
+    for (int s = 0; s < w->nsr; s++) {
+        const srule *r = &w->srules[s];
+        if (r->action == INTERN_NONE)
+            continue;
+        int g = srule_split_value(w, r);
+        int mask = g == -2 ? all : g >= 0 ? (1 << g) : 0;
+        int prev = r->action < w->sp.trig_cap ? w->sp.trig_of[r->action] : -1;
+        atom_map_set(&w->sp.trig_of, &w->sp.trig_cap, r->action,
+                     (prev < 0 ? 0 : prev) | mask);
+    }
+    w->sp.trig_ver = w->struct_ver;
+}
+
 void world_set_rule_prov(world *w, int rule, const char *prov)
 {
     arena *ra = w->in_matched ? &w->matched_a : &w->a;   /* match world_add_rule (#48) */
@@ -1634,6 +1712,20 @@ void world_step_why(world *w, dl_lit q, bool next, FILE *out)
                 fam_stale ? " (no step taken since the last edit)" : "");
         return;
     }
+    /* Split narrowing (#121): a fluent outside the active value's write-set
+     * has no rules in the narrowed family — not even inertia — because the
+     * commit copied it through. Say so, instead of rendering an empty trace. */
+    if (next && w->flw_cur) {
+        int i = fluent_index(w, q.atom);
+        if (i >= 0 && !w->flw_cur[i]) {
+            fprintf(out, "why %s%s'? outside the split write-set this step — "
+                         "no live rule can affect it; committed by copy "
+                         "(inertia), value = %s\n",
+                    q.neg ? "~" : "", intern_name(w->syms, q.atom),
+                    w->vals[i] ? "true" : "false");
+            return;
+        }
+    }
     /* if the last step was answered on the lanes, w->fam does not hold that
      * transition — replay it from the snapshot so the trace is the real one. */
     if (w->last_routed)
@@ -1891,11 +1983,73 @@ static void emit_judgment_family(world *w)
     w->jfam_solved = false;
 }
 
-/* The step family: judgments + generated inertia + causal rules/ramifications. */
-static void emit_step_family(world *w)
+/* The value index of `atom` in the split domain, or -1. */
+static int split_value_index(const world *w, uint32_t atom)
 {
-    if (w->fam)
-        dlcol_free(w->fam);
+    return atom < w->sp.map_cap ? w->sp.map_of[atom] : -1;
+}
+
+/* The split guard of a step rule: the value index its body demands via an
+ * unprimed positive cond on a split value atom; -2 = unguarded (live in every
+ * value), -3 = two distinct values demanded (never fires — dead everywhere).
+ * Detection is syntactic and dumb by design (#121): negated or primed reads
+ * of the split fluent do not filter (the rule stays in every schema). */
+static int srule_split_value(const world *w, const srule *r)
+{
+    int found = -2;
+    for (int i = 0; i < r->nbody; i++) {
+        if (r->body[i].primed || r->body[i].lit.neg)
+            continue;
+        int v = split_value_index(w, r->body[i].lit.atom);
+        if (v < 0)
+            continue;
+        if (found == -2)      found = v;
+        else if (found != v)  found = -3;
+    }
+    return found;
+}
+
+/* The step family: judgments + generated inertia + causal rules/ramifications.
+ * `sv` < 0 builds the full schema; `sv` >= 0 builds the split value's narrowed
+ * schema (#121): rules guarded on another value are omitted, and inertia is
+ * emitted only for the value's write-set — the fluents a live rule writes or
+ * reads primed (a primed read needs the inertia rule so its next-state verdict
+ * settles). The write-set bitmaps are stored into the split cache slot so the
+ * commit can copy excluded fluents through. The location space is shared with
+ * the full schema (append-only, #67) — narrowing removes rules, never atoms. */
+static dlcol *build_step_family(world *w, int sv)
+{
+    uint8_t *live = NULL, *flw = NULL, *numw = NULL;
+    if (sv >= 0) {
+        live = calloc((size_t)(w->nsr ? w->nsr : 1), 1);
+        flw  = calloc((size_t)(w->nfl ? w->nfl : 1), 1);
+        numw = calloc((size_t)(w->nnum ? w->nnum : 1), 1);
+        for (int s = 0; s < w->nsr; s++) {
+            const srule *r = &w->srules[s];
+            int g = srule_split_value(w, r);
+            if (!(g == -2 || g == sv))
+                continue;                              /* dead under sv */
+            live[s] = 1;
+            for (int e = 0; e < r->neffects; e++) {
+                int fi = fluent_index(w, r->effects[e].atom);
+                if (fi >= 0) flw[fi] = 1;
+            }
+            for (int e = 0; e < r->nneff; e++) {
+                int ni = num_index(w, r->neffs[e].num_atom);
+                if (ni >= 0) numw[ni] = 1;
+            }
+            for (int i = 0; i < r->nbody; i++)
+                if (r->body[i].primed) {
+                    int fi = fluent_index(w, r->body[i].lit.atom);
+                    if (fi >= 0) flw[fi] = 1;
+                }
+        }
+        free(w->sp.flw[sv]);
+        free(w->sp.numw[sv]);
+        w->sp.flw[sv] = flw;
+        w->sp.numw[sv] = numw;
+    }
+
     dlcol *f = dlcol_new((int)w->nloc, 1);
     emit_atom_names(f, w);
     emit_judgment_rules(f, w);
@@ -1909,6 +2063,8 @@ static void emit_step_family(world *w)
     int *inertia_pos = malloc((size_t)(w->nfl ? w->nfl : 1) * sizeof *inertia_pos);
     int *inertia_neg = malloc((size_t)(w->nfl ? w->nfl : 1) * sizeof *inertia_neg);
     for (int i = 0; i < w->nfl; i++) {
+        if (flw && !flw[i])
+            continue;                  /* outside the write-set: commit by copy */
         const char *fname = intern_name(w->syms, w->fluents[i]);
         dl_lit now = { w->fl_loc[i], false }, nxt = { w->pr_loc[i], false };
         /* generated inertia reads in source terms (§6.3): a name the author
@@ -1930,6 +2086,8 @@ static void emit_step_family(world *w)
      * the inertia rule it conflicts with */
     for (int s = 0; s < w->nsr; s++) {
         const srule *r = &w->srules[s];
+        if (live && !live[s])
+            continue;                  /* statically dead under this value */
         int nbody = r->nbody + (r->action != INTERN_NONE ? 1 : 0);
         if (nbody > bodycap) {
             if (body != lbuf)
@@ -1971,8 +2129,8 @@ static void emit_step_family(world *w)
         free(body);
     free(inertia_pos);
     free(inertia_neg);
-
-    w->fam = f;
+    free(live);
+    return f;
 }
 
 /* Refresh the matched judgment layer against current facts before (re)building a
@@ -2004,15 +2162,55 @@ static void ensure_jfam(world *w)
     w->jfam_ver = w->struct_ver;
 }
 
-/* Ensure the step family reflects the current structure — the STEP path. */
+/* The current value index of the split fluent (pre-step state), or -1 when
+ * split is inactive or no unique value atom is true (fall back to the full
+ * schema — always safe, the narrowing is pure optimization). */
+static int split_cur_value(const world *w)
+{
+    int found = -1;
+    for (int v = 0; v < w->sp.nvals; v++) {
+        int i = fluent_index(w, w->sp.vatoms[v]);
+        if (i >= 0 && w->vals[i]) {
+            if (found >= 0) return -1;             /* not unique */
+            found = v;
+        }
+    }
+    return found;
+}
+
+/* Ensure the step family reflects the current structure — the STEP path.
+ * With split active (#121), select the cached per-value schema by the
+ * PRE-step value of the split fluent, building it lazily; w->fam borrows the
+ * selected slot and flw_cur/numw_cur carry the value's write-set narrowing
+ * into the commit (NULL = full schema, everything live). */
 static void ensure_fam(world *w)
 {
     refresh_matched(w);
-    if (w->fam && w->fam_ver == w->struct_ver)
-        return;
-    assign_locs(w);
-    emit_step_family(w);
-    w->fam_ver = w->struct_ver;
+    int v = split_cur_value(w);
+    if (v < 0) {
+        if (!w->fam0 || w->fam0_ver != w->struct_ver) {
+            assign_locs(w);
+            if (w->fam0)
+                dlcol_free(w->fam0);
+            w->fam0 = build_step_family(w, -1);
+            w->fam0_ver = w->struct_ver;
+        }
+        w->fam = w->fam0;
+        w->flw_cur = NULL;
+        w->numw_cur = NULL;
+    } else {
+        if (!w->sp.fams[v] || w->sp.vers[v] != w->struct_ver) {
+            assign_locs(w);
+            if (w->sp.fams[v])
+                dlcol_free(w->sp.fams[v]);
+            w->sp.fams[v] = build_step_family(w, v);
+            w->sp.vers[v] = w->struct_ver;
+        }
+        w->fam = w->sp.fams[v];
+        w->flw_cur = w->sp.flw[v];
+        w->numw_cur = w->sp.numw[v];
+    }
+    w->fam_ver = w->struct_ver;        /* the active family is fresh */
 }
 
 /* Load current-state facts (closed-world fluents + numeric guard atoms) into the
@@ -2431,13 +2629,38 @@ int world_step(world *w, const uint32_t *actions, int nactions,
             return -1;
         }
 
+    /* Split loudness (#121, completing #119): an action ALL of whose rules
+     * are statically dead under the current split value can do nothing this
+     * step — that is protocol drift ("cast_shield during declare"), reported
+     * with the action and the value, state untouched. Guard-failure within a
+     * live rule stays a normal step. */
+    if (w->sp.nvals) {
+        int v = split_cur_value(w);
+        if (v >= 0) {
+            ensure_split_trig_masks(w);
+            for (int i = 0; i < nactions; i++) {
+                int m = actions[i] < w->sp.trig_cap ? w->sp.trig_of[actions[i]]
+                                                    : -1;
+                if (m >= 0 && !(m & (1 << v))) {
+                    if (err)
+                        snprintf(err, errsz,
+                                 "action '%s' matches no live step rule while "
+                                 "'%s' (split)",
+                                 intern_name(w->syms, actions[i]),
+                                 intern_name(w->syms, w->sp.vatoms[v]));
+                    return -1;
+                }
+            }
+        }
+    }
+
     ensure_fam(w);
 
     /* the hot path: a homogeneous step world lanes its whole transition, so solve
      * it bit-parallel across entities. Numerics ride when the family covers them
      * (covers_numeric): the boolean firing solves bit-parallel and the numeric
      * columns commit column-parallel. (w->lanes_ok guards post-compile edits.) */
-    if (w->lanes_ok && w->nsteplanes == 1 && w->npg == 0 &&
+    if (w->lanes_ok && w->nsteplanes == 1 && w->npg == 0 && w->sp.nvals == 0 &&
         (w->nnum == 0 || w->steplanes[0].covers_numeric)) {
         int rc = world_step_lanes(w, actions, nactions, err, errsz);
         if (rc == 0) w->tick++;                    /* monotone step counter (§5.10) */
@@ -2542,6 +2765,16 @@ int world_step(world *w, const uint32_t *actions, int nactions,
 
         for (int i = 0; rc == 0 && i < w->nnum; i++) {
             if (w->num_stratum[i] != st) continue;   /* owned by another stratum */
+            if (w->numw_cur && !w->numw_cur[i] &&
+                !w->nums[i].lo_code && !w->nums[i].hi_code) {
+                /* outside the split write-set (#121) with static bounds: no
+                 * live effect can touch it and the stored value is already
+                 * clamped — copy through. Dynamic bounds still re-clamp (a
+                 * bound expression may read fluents that DID change). */
+                nextnum[i] = w->nums[i].value;
+                w->rcpt[i].base = nextnum[i];
+                continue;
+            }
             num_receipt *rcp = &w->rcpt[i];
             if (acc[i].conflict) {
                 if (err)
@@ -2623,6 +2856,11 @@ int world_step(world *w, const uint32_t *actions, int nactions,
     /* boolean next-state + contested check, from the FINAL solve */
     bool *next = malloc((size_t)(w->nfl ? w->nfl : 1) * sizeof *next);
     for (int i = 0; rc == 0 && i < w->nfl; i++) {
+        if (w->flw_cur && !w->flw_cur[i]) {
+            next[i] = w->vals[i];      /* outside the split write-set (#121):
+                                        * no live writer, inertia only — copy */
+            continue;
+        }
         dl_lit p = { w->pr_loc[i], false };
         if (dlcol_defeasible(f, p, 0) == DL_PROVED) {
             next[i] = true;
