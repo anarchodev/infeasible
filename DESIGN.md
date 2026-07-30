@@ -2036,6 +2036,40 @@ lacks. The binding is a **dev-time view** (§12): typed authoring convenience,
 never required to run or remix — the shipped, authoritative host form is
 plain ES modules against `world_*`.
 
+**The binding's totality boundary (decided 2026-07-30 — §5.13's last
+rung, stated now so the artifact is not retrofitted later).** The binding
+is where the host-protocol `-1`s die, and the interface decision that
+makes them die *correctly* is: **action sets are assembled through an
+incremental builder, never passed as raw arrays.** The builder is the
+protocol checks, moved to construction time and made attributable:
+
+- generated **action constructors** — an unknown or misspelled atom is
+  unconstructible (retires #119's row);
+- **per-value liveness** and the `can_act` idiom — an action dead under
+  the current `split` value is refused at `add` (retires #121's row);
+- **#159 `exclusive`-group enforcement per `add`** — a violating order
+  fails *at insertion*, naming the group and the conflicting order already
+  in the set. This is the load-bearing choice: "unconstructible" must not
+  be a static type claim alone, because the aggregated-untrusted-input
+  host — a networked simultaneous-turn game collecting orders from remote
+  clients — receives violating orders with **no local bug**, and needs
+  per-order, per-source rejection (drop that client's order, keep the
+  tick), never a whole-set failure and never a crash a remote player can
+  trigger.
+
+With the builder consuming the whole protocol class, the host-side panic
+policy becomes mechanical: an `internal:` error always asserts; an
+authoring error is unreachable from a compiled story (#160); a protocol
+error is consumed at construction — so **a `world_step -1` reaching a
+bound host is unconditionally assert-worthy**, completing the runtime
+check's demotion to defense in depth. The engine itself never aborts,
+deliberately: it is a library (the rule-editor feeds it half-broken live
+sessions; a WASM `abort()` kills the page), the reject is atomic (no
+soundness pressure), and replay has a legitimate non-bug path to the
+protocol `-1` — an action log replayed against a story whose `exclusive`
+groups have since changed must surface as *save incompatibility*, a
+detectable, reportable condition, not a crash.
+
 **Erasure is a rule, not an accident:** no surface construct may require
 runtime representation beyond engine structures. Bands erase to pairwise
 edges (§6.2), thresholds to guard atoms and entailment rules (§5.8), types
