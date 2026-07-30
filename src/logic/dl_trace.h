@@ -46,6 +46,14 @@ typedef struct {
      * NULL for none. The whole pointer may be NULL if the backing carries no
      * provenance. */
     const char *(*rule_prov)(void *ctx, int r);
+
+    /* #109 cycle rule (§5.2): if literal l was CYCLE-COMPLETED to REFUTED
+     * (the Datalog completion over an unattacked support-SCC), fill
+     * out[0..ret) with the SCC's member literals (clamped to cap) and return
+     * the member count; return 0 when l was not completed. May be NULL. The
+     * renderer prints the loop line ("no support: every derivation re-enters
+     * the cycle (…)") from it. */
+    int (*cycle_members)(void *ctx, dl_lit l, dl_lit *out, int cap);
 } dl_trace_vtbl;
 
 void dl_trace_render(const dl_trace_vtbl *v, void *ctx, dl_lit q, FILE *out);

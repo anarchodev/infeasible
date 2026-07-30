@@ -52,6 +52,27 @@ void dl_trace_render(const dl_trace_vtbl *v, void *ctx, dl_lit q, FILE *out)
             verdict_str(v->defeasible(ctx, q)));
     if (v->is_fact(ctx, q))
         fprintf(out, "  it is a base fact\n");
+    if (v->cycle_members) {                    /* #109: the completion's trace */
+        dl_lit mem[6];
+        int nm = v->cycle_members(ctx, q, mem, 6);
+        if (nm > 0) {
+            fprintf(out, "  no support: every derivation of ");
+            v->put_lit(ctx, q, out);
+            fprintf(out, " re-enters the cycle (");
+            int shown = nm < 6 ? nm : 6;
+            for (int i = 0; i < shown; i++) {
+                if (i) fprintf(out, " <- ");
+                v->put_lit(ctx, mem[i], out);
+            }
+            if (nm > shown)
+                fprintf(out, " <- ...");
+            else if (shown > 1) {
+                fprintf(out, " <- ");
+                v->put_lit(ctx, mem[0], out);
+            }
+            fprintf(out, ")\n");
+        }
+    }
     if (!v->solved(ctx)) {
         fprintf(out, "  (family not solved)\n");
         return;

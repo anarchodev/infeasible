@@ -980,6 +980,123 @@ int world_add_rule(world *w, const char *name, dl_rule_kind kind,
     return w->njr++;
 }
 
+/* #109 cycle rule (§5.2): see world.h. Nodes are literal indices
+ * (atom*2 + neg); support edges body -> head over strict/defeasible jrules;
+ * iterative Tarjan; the first cyclic SCC any rule (defeaters included)
+ * concludes a complement into is reported with its loop and attacker. */
+bool world_attacked_cycle(world *w, char *err, size_t errsz, const char **prov)
+{
+    if (prov) *prov = NULL;
+    if (w->njr == 0) return false;
+    uint32_t maxa = 0;
+    for (int r = 0; r < w->njr; r++) {
+        const jrule *jr = &w->jrules[r];
+        if (jr->head.atom > maxa) maxa = jr->head.atom;
+        for (int b = 0; b < jr->nbody; b++)
+            if (jr->body[b].atom > maxa) maxa = jr->body[b].atom;
+    }
+    int n = ((int)maxa + 1) * 2;
+#define LIDX(l) ((int)(l).atom * 2 + ((l).neg ? 1 : 0))
+    int nedge = 0;
+    for (int r = 0; r < w->njr; r++)
+        if (w->jrules[r].kind != DL_DEFEATER)
+            nedge += w->jrules[r].nbody;
+    int32_t *aoff = calloc((size_t)n + 2, sizeof *aoff);
+    int32_t *ato = malloc((size_t)(nedge ? nedge : 1) * sizeof *ato);
+    for (int r = 0; r < w->njr; r++) {
+        if (w->jrules[r].kind == DL_DEFEATER) continue;
+        for (int b = 0; b < w->jrules[r].nbody; b++)
+            aoff[LIDX(w->jrules[r].body[b]) + 1]++;
+    }
+    for (int i = 0; i < n; i++) aoff[i + 1] += aoff[i];
+    int32_t *fill = malloc((size_t)n * sizeof *fill);
+    memcpy(fill, aoff, (size_t)n * sizeof *fill);
+    for (int r = 0; r < w->njr; r++) {
+        if (w->jrules[r].kind == DL_DEFEATER) continue;
+        for (int b = 0; b < w->jrules[r].nbody; b++)
+            ato[fill[LIDX(w->jrules[r].body[b])]++] = LIDX(w->jrules[r].head);
+    }
+    free(fill);
+
+    int32_t *low = malloc((size_t)n * sizeof *low);
+    int32_t *idx = malloc((size_t)n * sizeof *idx);
+    int32_t *stk = malloc((size_t)n * sizeof *stk);
+    bool    *onstk = calloc((size_t)n, 1);
+    int32_t *fv = malloc((size_t)n * sizeof *fv);
+    int32_t *fe = malloc((size_t)n * sizeof *fe);
+    int32_t *scc = malloc((size_t)n * sizeof *scc);
+    for (int i = 0; i < n; i++) idx[i] = -1;
+    int counter = 0, sp = 0, nscc = 0;
+    for (int root = 0; root < n; root++) {
+        if (idx[root] >= 0) continue;
+        int fp = 0;
+        fv[fp] = root; fe[fp] = aoff[root];
+        idx[root] = low[root] = counter++;
+        stk[sp++] = root; onstk[root] = true;
+        while (fp >= 0) {
+            int v = fv[fp];
+            if (fe[fp] < aoff[v + 1]) {
+                int x = ato[fe[fp]++];
+                if (idx[x] < 0) {
+                    idx[x] = low[x] = counter++;
+                    stk[sp++] = x; onstk[x] = true;
+                    fp++;
+                    fv[fp] = x; fe[fp] = aoff[x];
+                } else if (onstk[x] && idx[x] < low[v]) {
+                    low[v] = idx[x];
+                }
+            } else {
+                if (low[v] == idx[v]) {
+                    int m;
+                    do { m = stk[--sp]; onstk[m] = false; scc[m] = nscc; }
+                    while (m != v);
+                    nscc++;
+                }
+                fp--;
+                if (fp >= 0 && low[v] < low[fv[fp]]) low[fv[fp]] = low[v];
+            }
+        }
+    }
+    free(low); free(idx); free(stk); free(onstk); free(fv); free(fe);
+
+    int *sz = calloc((size_t)(nscc ? nscc : 1), sizeof *sz);
+    bool *cyc = calloc((size_t)(nscc ? nscc : 1), 1);
+    for (int i = 0; i < n; i++) sz[scc[i]]++;
+    for (int c = 0; c < nscc; c++) if (sz[c] > 1) cyc[c] = true;
+    for (int i = 0; i < n; i++)
+        for (int k = aoff[i]; k < aoff[i + 1]; k++)
+            if (ato[k] == i) cyc[scc[i]] = true;
+
+    bool found = false;
+    for (int r = 0; r < w->njr && !found; r++) {
+        int t = LIDX(w->jrules[r].head) ^ 1;   /* the literal r attacks */
+        if (t >= n || !cyc[scc[t]]) continue;
+        found = true;
+        char loop[192];
+        int off = 0, shown = 0;
+        for (int i = 0; i < n && shown < 4; i++) {
+            if (scc[i] != scc[t]) continue;
+            off += snprintf(loop + off, sizeof loop - (size_t)off, "%s%s%s",
+                            shown ? " <- " : "", (i & 1) ? "~" : "",
+                            intern_name(w->syms, (uint32_t)(i >> 1)));
+            if (off >= (int)sizeof loop) { off = (int)sizeof loop - 1; break; }
+            shown++;
+        }
+        if (err)
+            snprintf(err, errsz,
+                     "the rules concluding '%s%s' form a support cycle (%s%s) "
+                     "and rule '%s' attacks it — defeat cannot reach through "
+                     "a cycle (§5.2); break the loop or remove the attack",
+                     (t & 1) ? "~" : "", intern_name(w->syms, (uint32_t)(t >> 1)),
+                     loop, sz[scc[t]] > 4 ? " <- ..." : "",
+                     w->jrules[r].name);
+        if (prov) *prov = w->jrules[r].prov;
+    }
+    free(sz); free(cyc); free(scc); free(aoff); free(ato);
+#undef LIDX
+    return found;
+}
+
 void world_add_sup(world *w, int winner, int loser)
 {
     GROW(w->jsups, w->njs, w->capjs);

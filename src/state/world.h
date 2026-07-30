@@ -50,6 +50,16 @@ void world_set_fluent_struct(world *w, uint32_t atom, uint32_t pred,
 struct factindex;
 const struct factindex *world_fact_index(world *w);
 
+/* #109 cycle rule (§5.2): scan the ground JUDGMENT support graph (body ->
+ * head over strict/defeasible rules) for a cyclic SCC some rule — defeaters
+ * included — attacks (concludes a member's complement into). Returns true
+ * and fills `err` (the loop and the attacker, human-readable) and `*prov`
+ * (the attacker's provenance string, or NULL) when one exists. The .story
+ * compiler turns this into a located compile error; the engine itself leaves
+ * attacked cycles honestly UNDECIDED (the Datalog completion never touches
+ * them), so hand-built worlds keep today's behavior. */
+bool world_attacked_cycle(world *w, char *err, size_t errsz, const char **prov);
+
 /* Numeric fluents (DESIGN.md §5.8): an integer value store, kept separate from
  * the boolean closed-world fluents — scalars never become atoms. Values are
  * read only through comparison *guard atoms* (`hp<=0`). A guard over a STORED
