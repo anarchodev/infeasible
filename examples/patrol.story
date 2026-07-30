@@ -32,6 +32,13 @@ init ( guard(guard1) intruder(intruder1) )
 action east(G: actor): causes at(G) := step(at(G), 0)
 action west(G: actor): causes at(G) := step(at(G), 1)
 
+// Both moves assign at(G), so co-submitting them for ONE guard would be a
+// contested step. `exclusive` (#159, §5.13) makes the one-order-per-guard
+// protocol CHECKED instead of a host promise: world_step rejects a violating
+// action set pre-solve, and the #98 conflictable-pair warning is discharged —
+// this file compiles zero-warning.
+exclusive east(G: actor), west(G: actor)
+
 // A judgment DERIVED from the provider — never stored (I1). `near(G, I)` anchors
 // the two variables, so this is not a cross-product blow-up (§5.2 cardinality).
 rule spot(G: actor, I: actor):

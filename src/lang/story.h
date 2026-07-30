@@ -173,6 +173,24 @@
  *   params  := '(' vbind (',' vbind)* ')'
  *   vbind   := IDENT ':' IDENT                          -- var : sort
  *   OP      := '->' | '=>' | '~>'
+ *   excl    := 'exclusive' eitem (',' eitem)*  -- #159 (§5.13): a CHECKED
+ *   eitem   := IDENT [ '(' earg (',' earg)* ')' ]  -- action-exclusivity
+ *   earg    := '_' | IDENT [ ':' IDENT ]       -- protocol. Named vars form
+ *                                          -- the group KEY (matched by name
+ *                                          -- across members; `_` never
+ *                                          -- constrains; the optional sort
+ *                                          -- annotation is checked): a step
+ *                                          -- admits at most ONE member
+ *                                          -- instance per key tuple —
+ *                                          -- world_step rejects a violating
+ *                                          -- action set pre-solve (host-
+ *                                          -- protocol class; the §6.3 typed
+ *                                          -- binding retires the check for
+ *                                          -- bound hosts) and the #98 pass
+ *                                          -- treats pairs whose collision
+ *                                          -- forces key equality as
+ *                                          -- exclusive. Contextual keyword,
+ *                                          -- like `fact`
  *   sup     := label '>' label ; label := IDENT [ '.' IDENT ]
  *                                          -- rule labels; the dotted form names a
  *                                          -- kind modifier's expansion (#82).

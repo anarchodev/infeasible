@@ -109,6 +109,14 @@ action strike(A: actor, T: actor):
     requires phase = declare & alive(A) & alive(T)
     causes   pending(A, T) & atk_die(A) := roll(20) & atk_mod(A) := atk(A)
 
+// One strike per attacker per tick (#159): atk_die(A)/atk_mod(A) key on the
+// attacker alone, so two same-tick strikes by one A would contest the die.
+// The protocol is now declared and checked, not assumed. (The remaining #98
+// warning on to_react/skip_react is real and stays: two pendings on targets
+// with mixed shield states in ONE tick would contest `phase` — the deeper
+// one-attack-in-flight invariant is #129/#131 territory.)
+exclusive strike(A: actor, _)
+
 action cast_shield(T: actor):
     requires phase = react & can_react(T)
     causes   shielded(T) & reacted(T)

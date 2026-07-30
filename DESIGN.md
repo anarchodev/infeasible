@@ -1557,6 +1557,7 @@ one.
 | arithmetic over a partial derived value | authoring | **the static safety rule (#116)**: an arithmetic read of a partial value is a located error unless the same rule's condition also reads it |
 | solver UNDECIDED from cyclic rule graphs | authoring | **the §5.2 cycle rule (#109)**: unattacked support-SCCs complete to REFUTED via the Datalog fixpoint; attacked cycles are a located error |
 | unknown action atom (#119's loud no-op) | host protocol | the §6.3 artifact's generated action constructors (M2): a bound host cannot spell an unknown atom |
+| co-submission of protocol-exclusive actions | host protocol | **`exclusive` groups (#159)**: the declared, checked form of "the host never co-submits these" — rejected at step entry today, unconstructible through the §6.3 binding (M2) |
 | action dead under the current `split` value (#121) | host protocol | per-value action liveness in the artifact + the `can_act` judgment idiom (M2): a bound host *asks* instead of tripping |
 | internal tripwires (undeclared effect heads, …) | compiler bug | already unreachable from a clean compile by the vocabulary checks; kept as assertions |
 
@@ -1600,6 +1601,25 @@ which team member beats which attacker — is tooling surface (§6.1 hover),
 not a diagnostic. One reading note the warnings rely on: under ambiguity
 blocking a contested literal reads **REFUTED on both polarities** — an
 applicable unbeaten attacker refutes; contested is not undecided.
+
+**Declared exclusivity (#159).** "The host never co-submits these" is not a
+defense — it is a safety argument living in unverifiable host code. The
+`exclusive` declaration moves it into the language:
+`exclusive east(G: actor), west(G: actor)` names a group whose named
+variables form its *key* (`_` positions never constrain), and a step admits
+at most one member instance per key tuple — checked at `world_step` entry,
+pre-solve, state untouched. Taxonomically this *reclassifies* the covered
+conflictable pairs from authoring to host-protocol: the #98 pass treats a
+pair whose collision forces key equality as exclusive (a collision that
+leaves a key free — an arity-0 fluent — is deliberately not covered and
+still warns), and the §6.3 binding retires the runtime check for bound
+hosts by refusing to construct a violating action set. The construct obeys
+this section's own rule — a new `-1` path may enter the language only with
+its static-or-typed-boundary answer attached, and this one arrives with the
+M2 row above. Self-exclusivity (`exclusive strike(A, _)`: one strike per
+attacker per step, whoever the target) covers the self-collision shape the
+same way; an uncovered *binder* variable stays warned — it collides within
+one submitted action, which no protocol can forbid.
 
 **The cycle rule's gate (#109; semantics in §5.2).** The completion runs
 only in cyclic SCCs no rule attacks, and only for entities where every
