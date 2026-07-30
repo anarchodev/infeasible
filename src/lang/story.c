@@ -38,6 +38,8 @@
 #define CARD_WARN      100000      /* cross-product cardinality warning (§5.2) */
 #define MAX_LADDERS    16          /* priority ladders (`bands …`, §6.2) */
 #define MAX_BANDS      16          /* bands per ladder */
+#define MAX_EXCLS      32          /* `exclusive` groups per file (#159) */
+#define MAX_EXCL_MEMBERS 8         /* member actions per group */
 #define INT_SORT       (-3)        /* provider-arg sort sentinel for `int` (§5.6) */
 
 /* ---- AST ------------------------------------------------------------ */
@@ -195,6 +197,27 @@ typedef struct {
     int         nitems;
     int         line, col;
 } ast_binder;
+
+/* An `exclusive` group (#159, §5.13): a checked action-exclusivity PROTOCOL.
+ * Members are action templates; named variables form the group's KEY —
+ * matched by name across members, `_` positions never constrain — and a step
+ * may contain at most one member instance per key tuple. The safety that
+ * used to be an unverifiable host promise ("we never co-submit east and
+ * west for one guard") becomes a declaration the compiler consumes (#98
+ * treats covered pairs as exclusive) and the engine checks (world_step
+ * rejects a violating action set pre-solve, host-protocol class; the §6.3
+ * typed binding retires the check for bound hosts). */
+typedef struct {
+    struct {
+        char     action[MAX_NAME];
+        uint32_t vars[MAX_ARGS];      /* key var name per position, 0 = `_` */
+        uint32_t typenames[MAX_ARGS]; /* optional `: sort` annotation, 0 = none */
+        int      nargs;
+        int      line, col;
+    } mem[MAX_EXCL_MEMBERS];
+    int nmem;
+    int line, col;
+} ast_excl;
 
 typedef struct {
     uint32_t pred;
@@ -409,6 +432,8 @@ typedef struct {
     int nactions;
     ast_binder *binders;          /* heap; MAX_BINDERS — the `for each` pool */
     int nbinders;
+    ast_excl    excls[MAX_EXCLS]; /* `exclusive` groups (#159) */
+    int nexcls;
     enum_dom enums[MAX_ENUMS];    /* named value domains (§13) */
     int nenums;
     ast_sup     sups[MAX_SUPS];
@@ -2315,6 +2340,82 @@ static void parse_bands(parser *p)
              "ladder '%s' has %d band(s); a ladder with fewer than two bands "
              "orders nothing", l->name, l->nbands);
     p->nladders++;
+}
+
+/* excl := 'exclusive' eitem (',' eitem)*                       (#159)
+ * eitem := IDENT [ '(' earg (',' earg)* ')' ]
+ * earg  := '_' | IDENT [ ':' IDENT ]
+ * `exclusive` is contextual (like `fact`): a declaration-position identifier. */
+static void parse_exclusive(parser *p)
+{
+    token kw = p->cur;
+    advance(p);                                    /* 'exclusive' */
+    if (p->nexcls >= MAX_EXCLS) {
+        fail(p, kw.line, kw.col, "too many `exclusive` groups (max %d)",
+             MAX_EXCLS);
+        return;
+    }
+    ast_excl *x = &p->excls[p->nexcls];
+    memset(x, 0, sizeof *x);
+    x->line = kw.line;
+    x->col = kw.col;
+    for (;;) {
+        if (p->cur.kind != TK_IDENT) {
+            char d[64]; tok_desc(p->cur, d, sizeof d);
+            fail(p, p->cur.line, p->cur.col,
+                 "expected an action name in an `exclusive` group, found %s", d);
+            return;
+        }
+        if (x->nmem >= MAX_EXCL_MEMBERS) {
+            fail(p, p->cur.line, p->cur.col,
+                 "too many members in one `exclusive` group (max %d)",
+                 MAX_EXCL_MEMBERS);
+            return;
+        }
+        copy_ident(x->mem[x->nmem].action, MAX_NAME, p->cur);
+        x->mem[x->nmem].line = p->cur.line;
+        x->mem[x->nmem].col = p->cur.col;
+        advance(p);
+        if (p->cur.kind == TK_LPAREN) {
+            advance(p);
+            for (;;) {
+                if (p->cur.kind != TK_IDENT) {
+                    char d[64]; tok_desc(p->cur, d, sizeof d);
+                    fail(p, p->cur.line, p->cur.col,
+                         "expected a key variable or `_` in an `exclusive` "
+                         "member, found %s", d);
+                    return;
+                }
+                if (x->mem[x->nmem].nargs >= MAX_ARGS) {
+                    fail(p, p->cur.line, p->cur.col,
+                         "too many arguments (max %d)", MAX_ARGS);
+                    return;
+                }
+                int k = x->mem[x->nmem].nargs++;
+                x->mem[x->nmem].vars[k] =
+                    ident_is(p->cur, "_") ? 0 : intern_tok(p, p->cur);
+                advance(p);
+                if (x->mem[x->nmem].vars[k] && p->cur.kind == TK_COLON) {
+                    advance(p);
+                    if (p->cur.kind != TK_IDENT) {
+                        char d[64]; tok_desc(p->cur, d, sizeof d);
+                        fail(p, p->cur.line, p->cur.col,
+                             "expected a sort name after ':', found %s", d);
+                        return;
+                    }
+                    x->mem[x->nmem].typenames[k] = intern_tok(p, p->cur);
+                    advance(p);
+                }
+                if (p->cur.kind == TK_COMMA) { advance(p); continue; }
+                break;
+            }
+            if (!expect(p, TK_RPAREN)) return;
+        }
+        x->nmem++;
+        if (p->cur.kind == TK_COMMA) { advance(p); continue; }
+        break;
+    }
+    p->nexcls++;
 }
 
 static void parse_sup(parser *p)
@@ -4306,6 +4407,124 @@ static void check_partial_arith(parser *p)
     }
 }
 
+static ast_action *find_action_named(parser *p, const char *name)
+{
+    for (int i = 0; i < p->nactions; i++)
+        if (strcmp(p->actions[i].name, name) == 0) return &p->actions[i];
+    return NULL;
+}
+
+/* ---- #159 `exclusive` group well-formedness -------------------------
+ *
+ * Members name distinct declared ACTIONS (never ramifications — those fire
+ * from state; their exclusivity is a rules question) at matching arity; a
+ * named variable is a group KEY and must appear in every member at an
+ * agreeing sort (`_` never constrains); an optional `: sort` annotation must
+ * match the action's declared parameter. A single member keying every
+ * position forbids nothing (two distinct instances never share a key) —
+ * warned as a no-op. */
+static void check_exclusives(parser *p)
+{
+    for (int e = 0; e < p->nexcls; e++) {
+        ast_excl *x = &p->excls[e];
+        for (int m = 0; m < x->nmem; m++) {
+            for (int j = 0; j < m; j++)
+                if (strcmp(x->mem[j].action, x->mem[m].action) == 0)
+                    serr(p, x->mem[m].line, x->mem[m].col,
+                         "'%s' appears twice in one `exclusive` group",
+                         x->mem[m].action);
+            ast_action *a = find_action_named(p, x->mem[m].action);
+            if (!a) {
+                serr(p, x->mem[m].line, x->mem[m].col,
+                     "'%s' is not a declared action — `exclusive` groups "
+                     "range over submitted actions (#159)",
+                     x->mem[m].action);
+                continue;
+            }
+            if (a->is_ramif) {
+                serr(p, x->mem[m].line, x->mem[m].col,
+                     "'%s' is a ramification — it fires from state, not from "
+                     "a submitted action; make its conditions exclusive "
+                     "instead (#159)", x->mem[m].action);
+                continue;
+            }
+            if (x->mem[m].nargs != a->nvars) {
+                serr(p, x->mem[m].line, x->mem[m].col,
+                     "'%s' takes %d argument%s but the `exclusive` member "
+                     "lists %d", x->mem[m].action, a->nvars,
+                     a->nvars == 1 ? "" : "s", x->mem[m].nargs);
+                continue;
+            }
+            for (int k = 0; k < x->mem[m].nargs; k++) {
+                uint32_t v = x->mem[m].vars[k];
+                if (!v) continue;
+                for (int k2 = 0; k2 < k; k2++)
+                    if (x->mem[m].vars[k2] == v)
+                        serr(p, x->mem[m].line, x->mem[m].col,
+                             "key variable '%s' repeats within one member — "
+                             "one position per key variable",
+                             intern_name(p->syms, v));
+                if (x->mem[m].typenames[k] && a->vars[k].sort >= 0 &&
+                    strcmp(intern_name(p->syms, x->mem[m].typenames[k]),
+                           p->sorts[a->vars[k].sort].name) != 0)
+                    serr(p, x->mem[m].line, x->mem[m].col,
+                         "'%s' argument %d ranges over '%s' but the group "
+                         "annotates it '%s'", x->mem[m].action, k + 1,
+                         p->sorts[a->vars[k].sort].name,
+                         intern_name(p->syms, x->mem[m].typenames[k]));
+            }
+        }
+        /* every key var in every member, sorts agreeing */
+        for (int m = 0; m < x->nmem; m++)
+            for (int k = 0; k < x->mem[m].nargs; k++) {
+                uint32_t v = x->mem[m].vars[k];
+                if (!v) continue;
+                bool firstm = true;
+                for (int mp = 0; mp < m && firstm; mp++)
+                    for (int kp = 0; kp < x->mem[mp].nargs; kp++)
+                        if (x->mem[mp].vars[kp] == v) { firstm = false; break; }
+                if (!firstm) continue;
+                ast_action *am = find_action_named(p, x->mem[m].action);
+                for (int m2 = 0; m2 < x->nmem; m2++) {
+                    if (m2 == m) continue;
+                    int j = -1;
+                    for (int k2 = 0; k2 < x->mem[m2].nargs; k2++)
+                        if (x->mem[m2].vars[k2] == v) { j = k2; break; }
+                    if (j < 0) {
+                        serr(p, x->mem[m2].line, x->mem[m2].col,
+                             "key variable '%s' is missing from member '%s' — "
+                             "a group key must appear in every member (mark "
+                             "don't-care positions `_`)",
+                             intern_name(p->syms, v), x->mem[m2].action);
+                        continue;
+                    }
+                    ast_action *a2 = find_action_named(p, x->mem[m2].action);
+                    if (am && a2 && am->vars[k].sort >= 0 &&
+                        a2->vars[j].sort >= 0 &&
+                        am->vars[k].sort != a2->vars[j].sort)
+                        serr(p, x->mem[m2].line, x->mem[m2].col,
+                             "key variable '%s' ranges over '%s' in '%s' but "
+                             "'%s' in '%s'", intern_name(p->syms, v),
+                             p->sorts[am->vars[k].sort].name,
+                             x->mem[m].action,
+                             p->sorts[a2->vars[j].sort].name,
+                             x->mem[m2].action);
+                }
+            }
+        if (x->nmem == 1) {
+            bool wild = false;
+            for (int k = 0; k < x->mem[0].nargs; k++)
+                if (!x->mem[0].vars[k]) wild = true;
+            if (!wild)
+                warn(p, x->line, x->col,
+                     "`exclusive %s` keys every argument — two distinct "
+                     "instances never share a key, so the group forbids "
+                     "nothing; mark the positions that may vary `_` (#159)",
+                     x->mem[0].action);
+        }
+    }
+}
+
 /* ---- §5.8 stratification (#87) -------------------------------------
  *
  * A primed numeric guard reads a fluent's NEXT value, so everything that can
@@ -5598,6 +5817,7 @@ static void semantic_pass(parser *p)
     }
 
     check_partial_arith(p);            /* #116 static safety rule */
+    check_exclusives(p);               /* #159 exclusivity groups */
     check_bands(p);
     stratify_steps(p);                 /* §5.8 strata + cycle rejection (#87) */
 }
@@ -7417,6 +7637,84 @@ static void ground_sup(parser *p, ast_sup *s)
     emit_sup_edges(p, ra, rb, s->bline, s->bcol);
 }
 
+/* #159: ground the `exclusive` groups. Per group: the KEY is the named vars
+ * in first-appearance order; per member, every ground action instance
+ * registers under (group, key-odometer-index) — instances sharing a key
+ * conflict at step time (world_step's pre-solve scan), distinct keys are
+ * independent. The label ("east/west") and the declaration span render in
+ * the rejection. */
+static void ground_exclusives(parser *p)
+{
+    for (int e = 0; e < p->nexcls; e++) {
+        ast_excl *x = &p->excls[e];
+        char label[MAX_NAME * 2];
+        int off = 0;
+        for (int m = 0; m < x->nmem && off < (int)sizeof label; m++)
+            off += snprintf(label + off, sizeof label - (size_t)off, "%s%s",
+                            m ? "/" : "", x->mem[m].action);
+        char pbuf[MAX_NAME + 24];
+        int g = world_new_excl_group(p->w, label,
+                                     prov_str(p, x->line, pbuf, sizeof pbuf));
+        uint32_t kv[MAX_ARGS];
+        int ks[MAX_ARGS], nk = 0;
+        for (int m = 0; m < x->nmem; m++) {
+            ast_action *a = find_action_named(p, x->mem[m].action);
+            if (!a) continue;
+            for (int k = 0; k < x->mem[m].nargs && k < a->nvars; k++) {
+                uint32_t v = x->mem[m].vars[k];
+                if (!v) continue;
+                bool have = false;
+                for (int i = 0; i < nk; i++) if (kv[i] == v) have = true;
+                if (!have && nk < MAX_ARGS) {
+                    kv[nk] = v;
+                    ks[nk] = a->vars[k].sort;
+                    nk++;
+                }
+            }
+        }
+        long keyspace = 1;
+        bool of = false;
+        for (int i = 0; i < nk && !of; i++) {
+            int d = domain_size(p, ks[i]);
+            if (d <= 0) of = true;
+            else { keyspace *= d; if (keyspace > MAX_INSTANCES) of = true; }
+        }
+        if (of) {
+            serr(p, x->line, x->col,
+                 "`exclusive` group '%s' keys more than %d instances — "
+                 "narrow the key (#159)", label, MAX_INSTANCES);
+            continue;
+        }
+        for (int m = 0; m < x->nmem; m++) {
+            ast_action *a = find_action_named(p, x->mem[m].action);
+            if (!a || a->is_ramif) continue;
+            bool aof = false;
+            long total = instance_count(p, a->vars, a->nvars, &aof);
+            if (aof) continue;             /* the action's own grounding
+                                            * already reported the blow-up */
+            uint32_t binding[MAX_ARGS];
+            uint32_t nameatom = intern_id(p->syms, a->name);
+            for (long idx = 0; idx < total; idx++) {
+                decode_binding(p, a->vars, a->nvars, idx, binding);
+                uint32_t key = 0;
+                for (int i = 0; i < nk; i++) {
+                    int jpos = -1;
+                    for (int k = 0; k < x->mem[m].nargs; k++)
+                        if (x->mem[m].vars[k] == kv[i]) { jpos = k; break; }
+                    int d = domain_size(p, ks[i]);
+                    int pos = jpos >= 0 ? entity_pos(p, ks[i], binding[jpos])
+                                        : 0;
+                    if (pos < 0) pos = 0;
+                    key = key * (uint32_t)(d > 0 ? d : 1) + (uint32_t)pos;
+                }
+                world_add_excl_member(p->w, g,
+                                      ground_pred(p, nameatom, binding,
+                                                  a->nvars), key);
+            }
+        }
+    }
+}
+
 /* Resolve a band name to its ladder and rank (0 = lowest). Returns false if no
  * declared ladder contains it. */
 static bool find_band(parser *p, const char *name, int *ladder, int *rank)
@@ -7689,6 +7987,7 @@ static bool cp_groups_exclusive(parser *p, cp_subst *u,
 typedef struct {
     ast_atom   *eff;
     const char *owner;                     /* action / ramification name */
+    const ast_action *act;                 /* the owning construct (#159) */
     bool        is_ramif;
     var_bind    vars[3 * MAX_ARGS];
     int         nvars;
@@ -7735,6 +8034,79 @@ static int cp_fluent_merge(parser *p, uint32_t pred)
     for (int i = 0; i < p->nfluents; i++)
         if (p->fluents[i].pred == pred) return p->fluents[i].merge_mode;
     return 0;
+}
+
+/* #159: is the (a, b) collision forbidden by a declared `exclusive` group?
+ * Both owners must be members of one group, and the collision's unifier must
+ * FORCE every key variable equal (the two members' key positions land in one
+ * σ-class through the effect args) — then any pair of instances that could
+ * actually collide shares the key, and the group rejects their co-submission
+ * at step time. A collision that leaves a key free (an arity-0 fluent, say)
+ * is NOT covered: instances with different keys still contest. */
+static bool cp_excl_covers_pair(parser *p, cp_subst *u, const cp_writer *a,
+                                const cp_writer *b)
+{
+    if (a->is_ramif || b->is_ramif || !a->act || !b->act || a->act == b->act)
+        return false;
+    for (int e = 0; e < p->nexcls; e++) {
+        ast_excl *x = &p->excls[e];
+        int ma = -1, mb = -1;
+        for (int m = 0; m < x->nmem; m++) {
+            if (strcmp(x->mem[m].action, a->act->name) == 0) ma = m;
+            if (strcmp(x->mem[m].action, b->act->name) == 0) mb = m;
+        }
+        if (ma < 0 || mb < 0 || ma == mb) continue;
+        if (x->mem[ma].nargs != a->act->nvars ||
+            x->mem[mb].nargs != b->act->nvars)
+            continue;                              /* malformed: errored */
+        bool forced = true;
+        for (int k = 0; k < x->mem[ma].nargs && forced; k++) {
+            uint32_t v = x->mem[ma].vars[k];
+            if (!v) continue;
+            int jb = -1;
+            for (int j = 0; j < x->mem[mb].nargs; j++)
+                if (x->mem[mb].vars[j] == v) { jb = j; break; }
+            if (jb < 0) { forced = false; break; }
+            cp_subst save = *u;
+            if (!cp_args_equal(&save, (var_bind *)a->vars, a->nvars,
+                               a->act->vars[k].name,
+                               (var_bind *)b->vars, b->nvars,
+                               b->act->vars[jb].name))
+                forced = false;
+        }
+        if (forced) return true;
+    }
+    return false;
+}
+
+/* #159, the SELF-collision analog: colliding instances agree on the effect's
+ * target args, so if every key variable's position is among them the two
+ * instances share the key and the group forbids the pair. An uncovered
+ * BINDER variable disqualifies outright — it collides within ONE submitted
+ * action atom, which no protocol group can forbid. */
+static bool cp_excl_covers_self(parser *p, const cp_writer *w2,
+                                const bool *covered)
+{
+    if (w2->is_ramif || !w2->act) return false;
+    for (int i = w2->act->nvars; i < w2->nvars; i++)
+        if (!covered[i]) return false;
+    for (int e = 0; e < p->nexcls; e++) {
+        ast_excl *x = &p->excls[e];
+        for (int m = 0; m < x->nmem; m++) {
+            if (strcmp(x->mem[m].action, w2->act->name) != 0) continue;
+            if (x->mem[m].nargs != w2->act->nvars) continue;
+            bool ok = true;
+            for (int k = 0; k < x->mem[m].nargs && ok; k++) {
+                uint32_t v = x->mem[m].vars[k];
+                if (!v) continue;
+                int vi = var_index((var_bind *)w2->vars, w2->nvars,
+                                   w2->act->vars[k].name);
+                if (vi < 0 || !covered[vi]) ok = false;
+            }
+            if (ok) return true;
+        }
+    }
+    return false;
 }
 
 static void cp_warn_step(parser *p, const cp_writer *a, const cp_writer *b,
@@ -7806,6 +8178,9 @@ static void cp_check_writer_pair(parser *p, const cp_writer *a,
                             b->conds, b->nconds, b->ng,
                             (var_bind *)b->vars, b->nvars))
         return;
+    if (cp_excl_covers_pair(p, &u, a, b))
+        return;                            /* #159: a declared group rejects
+                                            * the co-submission at step time */
     cp_warn_step(p, a, b, assign);
 }
 
@@ -7826,6 +8201,9 @@ static void cp_check_writer_self(parser *p, const cp_writer *w)
         if (!covered[i] && !missing) { missing = true; missing_var = w->vars[i].name; }
     }
     if (!missing) return;
+    if (cp_excl_covers_self(p, w, covered))
+        return;                            /* #159: colliding instances share
+                                            * a declared group key */
     const char *an = intern_name(p->syms, e->pred);
     if (e->is_num_effect) {
         if (e->numop != WORLD_OP_ASSIGN || cp_fluent_merge(p, e->pred)) return;
@@ -7861,6 +8239,7 @@ static void cp_collect_writer(parser *p, ast_action *a, ast_binder *bnd,
     (void)p;
     w->eff = eff;
     w->owner = a->name;
+    w->act = a;
     w->is_ramif = a->is_ramif;
     w->nvars = 0;
     for (int k = 0; k < a->nvars; k++) w->vars[w->nvars++] = a->vars[k];
@@ -9581,8 +9960,9 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
         case TK_ACTION: parse_action(p); break;
         case TK_BANDS:  parse_bands(p);  break;
         case TK_IDENT:
-            if (ident_is(p->cur, "fact")) parse_fact(p);   /* #124 membership */
-            else                          parse_sup(p);
+            if (ident_is(p->cur, "fact"))           parse_fact(p);  /* #124 */
+            else if (ident_is(p->cur, "exclusive")) parse_exclusive(p); /* #159 */
+            else                                    parse_sup(p);
             break;
         default: {
             char d[64]; tok_desc(p->cur, d, sizeof d);
@@ -9639,6 +10019,7 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
             }
             for (int i = 0; i < p->nactions; i++) ground_action(p, &p->actions[i]);
             for (int i = 0; i < p->nsups; i++)    ground_sup(p, &p->sups[i]);
+            ground_exclusives(p);                 /* #159 exclusivity groups */
             {   /* #109 (§5.2): an attacked support cycle is a located error —
                  * the Datalog completion is only sound where defeat cannot
                  * reach, so the compiler refuses the overlap outright */

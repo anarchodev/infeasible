@@ -236,6 +236,14 @@ struct world {
              const expr_ins *rhs; int nrhs; world_cmp op;
              bool has_test; int8_t tval; } *eguards;
     int neguard, capeguard;
+    /* #159 exclusivity groups: per ground action atom, a chain of (group,
+     * key) memberships; groups carry a label + declaration prov for the
+     * rejection message. */
+    struct { int grp; uint32_t key, atom; int32_t next; } *excl_ents;
+    int nexcl, capexcl;
+    int *excl_of; uint32_t excl_of_cap;        /* action atom -> first entry */
+    struct { char *label, *prov; } *excl_grps;
+    int negrp, capegrp;
     int n_teg;                    /* # test-bearing eguards (two-phase iff > 0) */
     bool teg_ready;               /* pass C: load has_test guards from tval */
     dlcol *tctx_fam;              /* EXPR_TEST eval context override for pass-B
@@ -461,6 +469,9 @@ void world_free(world *w)
     free(w->vmark_of);
     free(w->vmat_of);
     free(w->jrules);
+    free(w->excl_ents);
+    free(w->excl_of);
+    free(w->excl_grps);
     free(w->jsups);
     free(w->srules);
     free(w->nums);
@@ -892,6 +903,27 @@ void world_add_expr_guard(world *w, uint32_t guard,
     w->eguards[w->neguard].tval = 0;
     if (ht) w->n_teg++;
     w->neguard++;
+}
+
+int world_new_excl_group(world *w, const char *label, const char *prov)
+{
+    GROW(w->excl_grps, w->negrp, w->capegrp);
+    w->excl_grps[w->negrp].label = arena_strdup(&w->a, label ? label : "?");
+    w->excl_grps[w->negrp].prov = prov ? arena_strdup(&w->a, prov) : NULL;
+    return w->negrp++;
+}
+
+void world_add_excl_member(world *w, int group, uint32_t action_atom,
+                           uint32_t key)
+{
+    GROW(w->excl_ents, w->nexcl, w->capexcl);
+    w->excl_ents[w->nexcl].grp = group;
+    w->excl_ents[w->nexcl].key = key;
+    w->excl_ents[w->nexcl].atom = action_atom;
+    int prev = action_atom < w->excl_of_cap ? w->excl_of[action_atom] : -1;
+    w->excl_ents[w->nexcl].next = prev;
+    atom_map_set(&w->excl_of, &w->excl_of_cap, action_atom, w->nexcl);
+    w->nexcl++;
 }
 
 /* Does expression guard i hold? Evaluates both bytecode sides (roll/fluent/const)
@@ -3106,6 +3138,60 @@ int world_step(world *w, const uint32_t *actions, int nactions,
                 }
             }
         }
+    }
+
+    /* Exclusivity groups (#159): a declared group admits at most one member
+     * action instance per (group, key) this step — the checked form of "the
+     * host must not co-submit these" (§5.13; host-protocol class, retired
+     * for bound hosts by the §6.3 binding). Pre-solve, state untouched. The
+     * seen-scan is linear in group memberships of the SUBMITTED actions —
+     * fine while grouped submissions are few; index if a profile says so. */
+    if (w->nexcl) {
+        struct eseen { int grp; uint32_t key, atom; };
+        struct eseen sbuf[32], *seen = sbuf;
+        int nseen = 0, capseen = 32, rc2 = 0;
+        for (int i = 0; i < nactions && rc2 == 0; i++) {
+            uint32_t a = actions[i];
+            int e = a < w->excl_of_cap ? w->excl_of[a] : -1;
+            for (; e >= 0 && rc2 == 0; e = w->excl_ents[e].next) {
+                int g = w->excl_ents[e].grp;
+                uint32_t k = w->excl_ents[e].key;
+                bool have = false;
+                for (int x = 0; x < nseen; x++) {
+                    if (seen[x].grp != g || seen[x].key != k) continue;
+                    if (seen[x].atom == a) { have = true; break; }   /* the same
+                                                * action twice: one action */
+                    if (err)
+                        snprintf(err, errsz,
+                                 "actions '%s' and '%s' are declared "
+                                 "exclusive (%s%s%s) — a step may contain at "
+                                 "most one of the group; submit them in "
+                                 "separate steps",
+                                 intern_name(w->syms, seen[x].atom),
+                                 intern_name(w->syms, a),
+                                 w->excl_grps[g].label,
+                                 w->excl_grps[g].prov ? "; " : "",
+                                 w->excl_grps[g].prov ? w->excl_grps[g].prov
+                                                      : "");
+                    rc2 = -1;
+                    break;
+                }
+                if (rc2 || have) continue;
+                if (nseen == capseen) {
+                    capseen *= 2;
+                    struct eseen *ns = malloc((size_t)capseen * sizeof *ns);
+                    memcpy(ns, seen, (size_t)nseen * sizeof *ns);
+                    if (seen != sbuf) free(seen);
+                    seen = ns;
+                }
+                seen[nseen].grp = g;
+                seen[nseen].key = k;
+                seen[nseen].atom = a;
+                nseen++;
+            }
+        }
+        if (seen != sbuf) free(seen);
+        if (rc2) return -1;
     }
 
     ensure_fam(w);

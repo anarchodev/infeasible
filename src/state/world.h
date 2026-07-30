@@ -50,6 +50,20 @@ void world_set_fluent_struct(world *w, uint32_t atom, uint32_t pred,
 struct factindex;
 const struct factindex *world_fact_index(world *w);
 
+/* #159 exclusivity groups (§5.13, EPIC #154): a checked action-exclusivity
+ * PROTOCOL. A declared group admits at most one of its member action
+ * instances per (group, key) per step — members registered with the same
+ * key conflict; distinct keys are independent; the same atom submitted
+ * twice is one action, not a violation. Checked at the top of world_step
+ * before any solve, state untouched — the same host-protocol posture as the
+ * #119 unknown-action check, and the row the §6.3 typed binding retires (a
+ * bound host cannot construct a violating action set). `label` names the
+ * group and `prov` its declaration span in the rejection message (both
+ * copied; prov may be NULL). */
+int  world_new_excl_group(world *w, const char *label, const char *prov);
+void world_add_excl_member(world *w, int group, uint32_t action_atom,
+                           uint32_t key);
+
 /* #109 cycle rule (§5.2): scan the ground JUDGMENT support graph (body ->
  * head over strict/defeasible rules) for a cyclic SCC some rule — defeaters
  * included — attacks (concludes a member's complement into). Returns true
