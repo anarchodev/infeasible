@@ -84,8 +84,14 @@
  *                                                        -- the definition, so every
  *                                                        -- reader shares the draw
  *            | IDENT '(' ('value'|IDENT)* ')'           -- KIND PREDICATE (#124): a
- *                                                        -- boolean value with exactly
- *                                                        -- one `value`-sorted argument
+ *                                                        -- boolean value with one or
+ *                                                        -- more `value`-sorted args
+ *                                                        -- (several = a LINK predicate,
+ *                                                        -- #143 — `dmg_of(value,value)`
+ *                                                        -- joins value parameters:
+ *                                                        -- a modifier may bind extra
+ *                                                        -- `W : value` params through
+ *                                                        -- link atoms and head `W(A)`)
  *                                                        -- (the built-in meta-sort
  *                                                        -- whose elements are the
  *                                                        -- declared value symbols);
