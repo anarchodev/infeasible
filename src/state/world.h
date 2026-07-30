@@ -450,6 +450,16 @@ void world_step_lane_set_numeric(world *w, int numsc, const uint32_t *num_atom_c
  * when it occurs — the discrete cast fans out over the target lanes. */
 void world_step_lane_set_bcast(world *w, int ncast, const uint32_t *cast_atom,
                                const int *cast_local);
+/* #121 mixed routing: bind the last-added step lane family to one split value
+ * (the grounder emits one family per value, its split guards erased), and mark
+ * a step rule as covered by those families under the given value bitmask (bit
+ * v set = the value-v family carries this rule, so the residue schema omits
+ * it). world_step then solves the current value's family FIRST and feeds its
+ * fluents' next-state into the N=1 residue solve as strict primed facts — the
+ * lane half is a stratum under the residue — committing those fluents from
+ * the lane result. Unbound values (or a value with no family) step plain N=1. */
+void world_step_lane_bind_value(world *w, int value_index);
+void world_step_rule_set_lane_cover(world *w, int rule, uint32_t value_mask);
 int  world_step_lane_family_count(const world *w);
 /* True iff world_step routes the numeric transition through the lane family. */
 bool world_routes_numeric(const world *w);

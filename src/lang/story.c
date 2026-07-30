@@ -163,6 +163,8 @@ typedef struct {
     int       stratum;            /* §5.8 strata (#87), assigned by stratify_steps */
     int       bind_ix[MAX_ACT_BINDERS];   /* indices into parser.binders (§13) */
     int       nbind;
+    int       srule_lo, srule_hi; /* the contiguous world srule handle range this
+                                   * action's instances ground to (#121 coverage) */
 } ast_action;
 
 /* A `for each T [, U] where <guard> [limit n]: { <eff> [when <cond>] , … }`
@@ -5731,6 +5733,7 @@ static void emit_num_effect(parser *p, int rule, const ast_atom *e,
 
 static void ground_action(parser *p, ast_action *a)
 {
+    a->srule_lo = a->srule_hi = world_step_rule_count(p->w);
     bool of = false;
     long total = instance_count(p, a->vars, a->nvars, &of);
     if (of) {
@@ -5917,6 +5920,7 @@ static void ground_action(parser *p, ast_action *a)
             }
         }
     }
+    a->srule_hi = world_step_rule_count(p->w);      /* coverage range end (#121) */
 }
 
 static ast_rule *find_rule(parser *p, const char *label)
@@ -6956,10 +6960,294 @@ static void emit_step_lanes(parser *p)
     free(kind);
 }
 
+/* #121 slice 2: per-value step lane families for a `split` world, plus the
+ * coverage marks that carve the N=1 residue. Unlike emit_step_lanes this is
+ * PER-RULE, not all-or-nothing: each action/ramification is classified —
+ * lane-eligible (per-actor boolean over one sort, split guards acting as the
+ * value selector), or residue (numerics, binders, MV effects incl. the split
+ * fluent's own writers, multi-var, provider/expr guards — everything the N=1
+ * path already handles). One family is emitted per split value, holding that
+ * value's covered rules with their split guards DROPPED (statically true
+ * there); world_step solves it first and the residue on N=1 (mixed routing).
+ *
+ * Soundness bail: if a residue rule writes an arity-1-over-S boolean fluent,
+ * one fluent's writers would straddle the two halves (the lane solve could
+ * not see the residue's contribution) — no families are built and the world
+ * steps pure N=1, which is always correct. Numerics and binder effects ride
+ * the residue pipeline; another (non-split) MV fluent bails like today. */
+static void emit_step_lanes_split(parser *p)
+{
+    if (p->dtype_sort >= 0 || p->has_pguards)
+        return;
+
+    pred_info *spi = find_pred(p, p->split_pred);
+    if (!spi || spi->nvalues < 2 || spi->nvalues > 31)
+        return;
+
+    /* the lane sort S and its boolean per-actor fluents; anything else is
+     * residue material, not a bail — except a second MV fluent (like today) */
+    int S = -1, fpred[MAX_PREDS], nf = 0;
+    for (int i = 0; i < p->npreds; i++) {
+        pred_info *pi = &p->preds[i];
+        if (!pi->is_fluent || pi->pred == p->split_pred)
+            continue;
+        if (pi->is_mv)
+            return;                                /* a non-split MV: not laned yet */
+        if (pi->arity != 1 || pi->is_num || pi->is_cell)
+            continue;                              /* global / numeric / n-ary: residue */
+        if (S < 0) S = pi->argsort[0];
+        if (pi->argsort[0] != S)
+            continue;                              /* other-sort fluent: residue */
+        fpred[nf++] = i;
+    }
+    if (nf == 0 || S < 0)
+        return;
+    int nent = domain_size(p, S);
+    if (nent == 0)
+        return;
+
+    /* classify: -4 residue, -3 dead (contradictory selectors),
+     * -2 lane in every value, >= 0 lane in that value only */
+    int8_t cls[MAX_ACTIONS];
+    for (int i = 0; i < p->nactions; i++) {
+        ast_action *a = &p->actions[i];
+        int sel = -2;
+        cls[i] = -4;
+        if (a->nbind > 0 || a->nvars != 1 || a->vars[0].sort != S)
+            continue;
+        uint32_t var = a->vars[0].name;
+        bool ok = true;
+        for (int b = 0; b < a->nreq && ok; b++) {
+            ast_atom *at = &a->requires[b];
+            if (at->is_member) { ok = false; break; }
+            if (at->pred == p->split_pred) {
+                if (at->value == INTERN_NONE || at->neg || at->primed) {
+                    ok = false;                    /* odd split read: residue */
+                    break;
+                }
+                int v = -1;
+                for (int k = 0; k < spi->nvalues; k++)
+                    if (spi->values[k] == at->value) { v = k; break; }
+                if (v < 0) { ok = false; break; }
+                if (sel == -2)      sel = v;
+                else if (sel != v)  sel = -3;      /* two values: never fires */
+                continue;
+            }
+            if (!step_atom_ok(p, at, S, var, false))
+                ok = false;
+        }
+        for (int b = 0; b < a->neff && ok; b++) {
+            ast_atom *e = &a->effects[b];
+            if (e->is_num_effect || e->value != INTERN_NONE ||
+                !step_atom_ok(p, e, S, var, true))
+                ok = false;
+        }
+        if (ok)
+            cls[i] = (int8_t)sel;
+    }
+
+    /* soundness: no residue writer of a lane fluent (see header) */
+    int nlane = 0;
+    for (int i = 0; i < p->nactions; i++) {
+        if (cls[i] == -2 || cls[i] >= 0) { nlane++; continue; }
+        if (cls[i] == -3)
+            continue;                              /* never fires anywhere */
+        ast_action *a = &p->actions[i];
+        for (int b = 0; b < a->neff; b++) {
+            ast_atom *e = &a->effects[b];
+            if (e->is_num_effect || e->value != INTERN_NONE)
+                continue;
+            pred_info *pi = find_pred(p, e->pred);
+            if (pi && pi->is_fluent && !pi->is_mv && !pi->is_num &&
+                pi->arity == 1 && pi->argsort[0] == S)
+                return;                            /* straddled writer: pure N=1 */
+        }
+        for (int bi = 0; bi < a->nbind; bi++) {
+            ast_binder *bnd = &p->binders[a->bind_ix[bi]];
+            for (int it = 0; it < bnd->nitems; it++) {
+                ast_atom *e = &bnd->items[it].eff;
+                if (e->is_num_effect || e->value != INTERN_NONE)
+                    continue;
+                pred_info *pi = find_pred(p, e->pred);
+                if (pi && pi->is_fluent && !pi->is_mv && !pi->is_num &&
+                    pi->arity == 1 && pi->argsort[0] == S)
+                    return;
+            }
+        }
+    }
+    if (nlane == 0)
+        return;
+
+    /* one family per split value: covered = selector-matches or unguarded.
+     * Each family carries ONLY the per-actor fluents its covered rules touch
+     * (read, primed-read, or write) — the per-value write-set narrowing on
+     * the lane side; an untouched fluent has no columns, no inertia, and
+     * commits by copy through the residue's flw logic. */
+    char nbuf[MAX_GROUND + 2];
+    for (int v = 0; v < spi->nvalues; v++) {
+        uint32_t apred[MAX_ACTIONS], glob[MAX_PREDS];
+        int fpred_v[MAX_PREDS], nfv = 0;
+        int na = 0, ng = 0, ncov = 0;
+        for (int i = 0; i < p->nactions; i++) {
+            if (!(cls[i] == -2 || cls[i] == v))
+                continue;
+            ncov++;
+            ast_action *a = &p->actions[i];
+            if (!a->is_ramif) {
+                uint32_t tr = intern_id(p->syms, a->name);
+                int found = -1;
+                for (int j = 0; j < na; j++) if (apred[j] == tr) { found = j; break; }
+                if (found < 0) { if (na >= MAX_ACTIONS) return; apred[na++] = tr; }
+            }
+            for (int b = 0; b < a->nreq + a->neff; b++) {
+                ast_atom *at = b < a->nreq ? &a->requires[b]
+                                           : &a->effects[b - a->nreq];
+                if (at->pred == p->split_pred)
+                    continue;                      /* erased: statically true here */
+                pred_info *pi = find_pred(p, at->pred);
+                if (pi->arity == 0) {
+                    int found = -1;
+                    for (int j = 0; j < ng; j++)
+                        if (glob[j] == at->pred) { found = j; break; }
+                    if (found < 0) { if (ng >= MAX_PREDS) return; glob[ng++] = at->pred; }
+                    continue;
+                }
+                int fi = step_fidx(p, fpred, nf, at->pred);
+                int found = -1;
+                for (int j = 0; j < nfv; j++)
+                    if (fpred_v[j] == fpred[fi]) { found = j; break; }
+                if (found < 0) fpred_v[nfv++] = fpred[fi];
+            }
+        }
+        if (ncov == 0)
+            continue;                              /* this value steps pure N=1 */
+
+        int nloc = 2 * nfv + ng + na;
+        dlcol *f = dlcol_new(nloc, nent);
+        int cur_local[MAX_PREDS], pri_local[MAX_PREDS], glob_local[MAX_PREDS];
+        int inertia_pos[MAX_PREDS], inertia_neg[MAX_PREDS], act_local[MAX_ACTIONS];
+        uint8_t *kind = malloc((size_t)nloc * sizeof *kind);
+        int n = 0;
+        for (int i = 0; i < nfv; i++) {
+            uint32_t P = p->preds[fpred_v[i]].pred;
+            cur_local[i] = n; kind[n] = WORLD_STEP_CUR;
+            dlcol_set_atom_name(f, (uint32_t)n, intern_name(p->syms, P));
+            n++;
+            pri_local[i] = n; kind[n] = WORLD_STEP_PRIMED;
+            snprintf(nbuf, sizeof nbuf, "%s'", intern_name(p->syms, P));
+            dlcol_set_atom_name(f, (uint32_t)n, nbuf);
+            n++;
+        }
+        for (int j = 0; j < ng; j++) {
+            glob_local[j] = n; kind[n] = WORLD_STEP_CUR;
+            dlcol_set_atom_name(f, (uint32_t)n, intern_name(p->syms, glob[j]));
+            n++;
+        }
+        for (int j = 0; j < na; j++) {
+            act_local[j] = n; kind[n] = WORLD_STEP_ACTION;
+            dlcol_set_atom_name(f, (uint32_t)n, intern_name(p->syms, apred[j]));
+            n++;
+        }
+
+        char rbuf[MAX_NAME + 16];
+        for (int i = 0; i < nfv; i++) {
+            const char *fname = intern_name(p->syms, p->preds[fpred_v[i]].pred);
+            snprintf(rbuf, sizeof rbuf, "inertia on %s", fname);
+            dl_lit cur = { (uint32_t)cur_local[i], false },
+                   pri = { (uint32_t)pri_local[i], false };
+            inertia_pos[i] = dlcol_add_rule(f, rbuf, DL_DEFEASIBLE, pri, &cur, 1);
+            dl_lit ncur = dl_complement(cur), npri = dl_complement(pri);
+            inertia_neg[i] = dlcol_add_rule(f, rbuf, DL_DEFEASIBLE, npri, &ncur, 1);
+        }
+
+        for (int i = 0; i < p->nactions; i++) {
+            if (!(cls[i] == -2 || cls[i] == v))
+                continue;
+            ast_action *a = &p->actions[i];
+            dl_lit body[MAX_BODY + 1];
+            int bi = 0;
+            for (int b = 0; b < a->nreq; b++) {
+                ast_atom *at = &a->requires[b];
+                if (at->pred == p->split_pred)
+                    continue;                      /* the value selector, erased */
+                int loc;
+                if (find_pred(p, at->pred)->arity == 0) {
+                    int gj = -1;
+                    for (int j = 0; j < ng; j++) if (glob[j] == at->pred) { gj = j; break; }
+                    loc = glob_local[gj];
+                } else {
+                    int fi = step_fidx(p, fpred_v, nfv, at->pred);
+                    loc = at->primed ? pri_local[fi] : cur_local[fi];
+                }
+                body[bi++] = (dl_lit){ (uint32_t)loc, at->neg };
+            }
+            if (!a->is_ramif) {
+                uint32_t tr = intern_id(p->syms, a->name);
+                int aj = -1;
+                for (int j = 0; j < na; j++) if (apred[j] == tr) { aj = j; break; }
+                body[bi++] = (dl_lit){ (uint32_t)act_local[aj], false };
+            }
+            char pbuf[MAX_NAME + 24];
+            prov_str(p, a->line, pbuf, sizeof pbuf);
+            for (int b = 0; b < a->neff; b++) {
+                int fi = step_fidx(p, fpred_v, nfv, a->effects[b].pred);
+                dl_lit head = { (uint32_t)pri_local[fi], a->effects[b].neg };
+                char cname[MAX_NAME + 8];
+                snprintf(cname, sizeof cname, "%s/%s%s", a->name,
+                         a->effects[b].neg ? "~" : "",
+                         intern_name(p->syms, a->effects[b].pred));
+                int rid = dlcol_add_rule(f, cname, DL_DEFEASIBLE, head, body, bi);
+                dlcol_set_prov(f, rid, pbuf);
+                dlcol_add_sup(f, rid, a->effects[b].neg ? inertia_pos[fi]
+                                                        : inertia_neg[fi]);
+            }
+        }
+
+        uint32_t *ground = malloc((size_t)nloc * nent * sizeof *ground);
+        for (int i = 0; i < nfv; i++) {
+            uint32_t P = p->preds[fpred_v[i]].pred;
+            for (int e = 0; e < nent; e++) {
+                uint32_t ent = domain_at(p, S, e);
+                uint32_t base = ground_pred(p, P, &ent, 1);
+                ground[(size_t)cur_local[i] * nent + e] = base;
+                snprintf(nbuf, sizeof nbuf, "%s'", intern_name(p->syms, base));
+                ground[(size_t)pri_local[i] * nent + e] = intern_id(p->syms, nbuf);
+            }
+        }
+        for (int j = 0; j < ng; j++)
+            for (int e = 0; e < nent; e++)
+                ground[(size_t)glob_local[j] * nent + e] = glob[j];
+        for (int j = 0; j < na; j++)
+            for (int e = 0; e < nent; e++) {
+                uint32_t ent = domain_at(p, S, e);
+                ground[(size_t)act_local[j] * nent + e] =
+                    ground_pred(p, apred[j], &ent, 1);
+            }
+
+        world_add_step_lane_family(p->w, f, nloc, nent, ground, kind);
+        world_step_lane_bind_value(p->w, v);
+        free(ground);
+        free(kind);
+    }
+
+    /* coverage marks: the residue schema omits these srules per value */
+    uint32_t all = (1u << spi->nvalues) - 1;
+    for (int i = 0; i < p->nactions; i++) {
+        if (!(cls[i] == -2 || cls[i] >= 0))
+            continue;
+        uint32_t mask = cls[i] == -2 ? all : (1u << cls[i]);
+        for (int h = p->actions[i].srule_lo; h < p->actions[i].srule_hi; h++)
+            world_step_rule_set_lane_cover(p->w, h, mask);
+    }
+}
+
 static void build_lane_families(parser *p)
 {
     if (p->nactions > 0) {         /* a step world: lane the transition (first cut) */
-        emit_step_lanes(p);        /* bails unless nrules==0 + homogeneous over S */
+        if (p->split_pred)
+            emit_step_lanes_split(p);   /* #121: per-value families + N=1 residue */
+        else
+            emit_step_lanes(p);    /* bails unless nrules==0 + homogeneous over S */
         return;
     }
     if (p->nrules == 0)            /* nothing to lane */

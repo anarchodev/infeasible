@@ -23,7 +23,14 @@
  *
  * Rejections: `split` off an MV domain, on an arity>0 fluent, duplicated,
  * and a primed read of the split fluent (schema selection is by the
- * PRE-step value) are located compile errors. */
+ * PRE-step value) are located compile errors.
+ *
+ * Slice 2 (mixed lane/N=1 routing) is pinned by test_mixed_route /
+ * test_mixed_fallback below: a homogeneous split story grounds one lane
+ * family per value; the residue steps on a sparse N=1 schema fed the lane
+ * half's next-state as strict primed facts; a residue writer of a lane
+ * fluent disqualifies the families (pure N=1) — all held to the same
+ * byte-identical equivalence bar. */
 
 #include "lang/story.h"
 #include "state/world.h"
@@ -259,6 +266,130 @@ static int test_loud_dead_in_value(void)
     return 0;
 }
 
+/* --- mixed lane/N=1 routing (#121 slice 2) --------------------------------
+ * A homogeneous split story grounds one lane family per value (its split
+ * guards erased); the residue — here the MV phase writers — steps N=1 with
+ * the lane half's next-state injected as strict primed facts. The `dawn`
+ * ramification is the injection pin: a RESIDUE rule reading a LANE fluent
+ * primed (`~awake(X)'`) must see the lane-side `doze` effect in the SAME
+ * step. Equivalence against the unsplit twin pins all of it. */
+static const char *MIX_FMT =
+    "sort unit\n"
+    "entity ( u0, u1, u2 : unit )\n"
+    "state (\n"
+    "    mode : { day, night }%s\n"
+    "    awake(unit)  fed(unit)  patrol(unit)\n"
+    ")\n"
+    "init ( mode = day  awake(u0) awake(u1) awake(u2) )\n"
+    "action feed(X: unit): requires mode = day & awake(X) causes fed(X)\n"
+    "action doze(X: unit): requires mode = night causes ~awake(X)\n"
+    "rule wakeup(X: unit):       mode = day & ~awake(X)  causes awake(X)\n"
+    "rule night_patrol(X: unit): mode = night & fed(X)   causes patrol(X)\n"
+    "action to_night: requires mode = day causes mode = night\n"
+    "// residue (MV effect) with a PRIMED read of a lane fluent: the injection\n"
+    "rule dawn(X: unit): mode = night & ~awake(X)' & fed(X) causes mode = day\n"
+    "%s";
+
+static world *compile_mix(const char *slot, const char *extra, intern *sy)
+{
+    char src[4096];
+    snprintf(src, sizeof src, MIX_FMT, slot, extra);
+    story_diag di[8];
+    story_diags d = { di, 8, 0, 0 };
+    world *w = story_compile(src, "m.story", sy, &d);
+    if (!w)
+        fprintf(stderr, "  compile failed: %s\n", d.count ? di[0].msg : "?");
+    return w;
+}
+
+static int mix_agree(world *wa, intern *sa, world *wb, intern *sb, int stepno)
+{
+    static const char *FLU[] = {
+        "mode=day", "mode=night",
+        "awake(u0)", "awake(u1)", "awake(u2)",
+        "fed(u0)", "fed(u1)", "fed(u2)",
+        "patrol(u0)", "patrol(u1)", "patrol(u2)",
+    };
+    int bad = 0;
+    for (size_t i = 0; i < sizeof FLU / sizeof *FLU; i++)
+        if (world_get(wa, intern_id(sa, FLU[i])) !=
+            world_get(wb, intern_id(sb, FLU[i]))) {
+            fprintf(stderr, "  step %d MIX DIVERGED on %s: split=%d full=%d\n",
+                    stepno, FLU[i], world_get(wa, intern_id(sa, FLU[i])),
+                    world_get(wb, intern_id(sb, FLU[i])));
+            bad++;
+        }
+    return bad;
+}
+
+static int test_mixed_route(void)
+{
+    intern *sa = intern_new(), *sb = intern_new();
+    world *wa = compile_mix(" split", "", sa);
+    world *wb = compile_mix("", "", sb);
+    CHECK(wa != NULL && wb != NULL);
+
+    /* one lane family per split value; the unsplit twin lanes nothing (the
+     * MV mode fluent bails the classic all-or-nothing builder) */
+    CHECK(world_step_lane_family_count(wa) == 2);
+    CHECK(world_step_lane_family_count(wb) == 0);
+
+    static const char *SCRIPT[][3] = {
+        { "feed(u0)", "feed(u1)" },   /* day: lane effects */
+        { "to_night" },               /* residue advances the mode */
+        { "doze(u0)" },               /* lane ~awake(u0); dawn(u0) reads it
+                                       * PRIMED and flips mode back — the
+                                       * injection, all in one step */
+        { NULL },                     /* empty day step: wakeup(u0) re-arms */
+        { "to_night" },
+        { "doze(u2)" },               /* u2 unfed: dawn stays quiet */
+        { NULL },                     /* empty night step: patrols persist */
+    };
+    for (size_t s = 0; s < sizeof SCRIPT / sizeof *SCRIPT; s++) {
+        int n = 0;
+        while (n < 3 && SCRIPT[s][n]) n++;
+        CHECK(step_both(wa, sa, wb, sb, SCRIPT[s], n) == 0);
+        CHECK(mix_agree(wa, sa, wb, sb, (int)s) == 0);
+    }
+    /* spot-check the injection actually happened: after step 2 the mode came
+     * BACK to day in the same step doze landed */
+    CHECK(q(wa, sa, "mode=night") == DL_PROVED);   /* end state: second night */
+    CHECK(world_get(wa, intern_id(sa, "awake(u2)")) == 0);
+    CHECK(world_get(wa, intern_id(sa, "patrol(u0)")) == 1);
+
+    world_free(wa); world_free(wb);
+    intern_free(sa); intern_free(sb);
+    return 0;
+}
+
+/* A residue rule writing a LANE fluent would straddle one fluent's writers
+ * across the halves — the grounder must refuse to build families (pure N=1),
+ * and the world must still be exactly equivalent. */
+static int test_mixed_fallback(void)
+{
+    static const char *EXTRA =
+        "action tag(A: unit, B: unit): requires mode = day causes patrol(B)\n";
+    intern *sa = intern_new(), *sb = intern_new();
+    world *wa = compile_mix(" split", EXTRA, sa);
+    world *wb = compile_mix("", EXTRA, sb);
+    CHECK(wa != NULL && wb != NULL);
+    CHECK(world_step_lane_family_count(wa) == 0);   /* soundness bail */
+
+    static const char *S1[] = { "feed(u1)", "tag(u0,u2)" };
+    static const char *S2[] = { "to_night" };
+    static const char *S3[] = { "doze(u1)" };
+    CHECK(step_both(wa, sa, wb, sb, S1, 2) == 0);
+    CHECK(mix_agree(wa, sa, wb, sb, 0) == 0);
+    CHECK(step_both(wa, sa, wb, sb, S2, 1) == 0);
+    CHECK(step_both(wa, sa, wb, sb, S3, 1) == 0);
+    CHECK(mix_agree(wa, sa, wb, sb, 2) == 0);
+    CHECK(world_get(wa, intern_id(sa, "patrol(u2)")) == 1);
+
+    world_free(wa); world_free(wb);
+    intern_free(sa); intern_free(sb);
+    return 0;
+}
+
 /* --- rejections: located compile errors ----------------------------------- */
 static int expect_error(const char *src, const char *needle)
 {
@@ -305,6 +436,8 @@ int main(void)
 {
     if (test_equivalence())        return 1;
     if (test_loud_dead_in_value()) return 1;
+    if (test_mixed_route())        return 1;
+    if (test_mixed_fallback())     return 1;
     if (test_rejections())         return 1;
     printf("test_split: all passed\n");
     return 0;
