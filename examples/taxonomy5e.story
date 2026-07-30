@@ -32,10 +32,10 @@
 //     (`prior / 2`) and penalties subtract (`prior - e`); the commuting
 //     class (#94) excludes both even when explicitly ordered, so the ward
 //     below is spelled as a `min` cap instead of a halving.
-//   - #145: kind-level superiority — "Luck applies above Bless, everywhere
-//     they meet" costs TEN dotted sup lines below (one per shared member);
-//     `halfling_luck > bless` should desugar to them. The probe's biggest
-//     authoring-friction finding.
+//   - #145 (found here, then LANDED): "Luck applies above Bless, everywhere
+//     they meet" first cost TEN dotted sup lines — the probe's biggest
+//     friction finding; it is now the four blanket lines below, desugared to
+//     the pairwise dotted sups over each pair's shared members.
 
 sort actor
 enum ability { str, dex, con, wis }
@@ -142,18 +142,13 @@ rule brutal_ward(A: actor, V: value):
     brutal(V) & warded(A) => V(A) = min(prior, 8)
 
 // Luck (a max layer) meets the add layers on six values — mixed classes
-// demand explicit order (#94), and today that is one dotted line PER
-// member pair (#145: `halfling_luck > bless` should say all of this):
-halfling_luck.spell_save   > bless.spell_save
-halfling_luck.con_save     > bless.con_save
-halfling_luck.sword_atk    > bless.sword_atk
-halfling_luck.sword_atk    > rage.sword_atk
-halfling_luck.bow_atk      > bless.bow_atk
-halfling_luck.bow_atk      > bracers_of_archery.bow_atk
-halfling_luck.firebolt_atk > bless.firebolt_atk
-halfling_luck.firebolt_atk > war_caster_wand.firebolt_atk
-halfling_luck.dagger_throw > bless.dagger_throw
-halfling_luck.dagger_throw > bracers_of_archery.dagger_throw
+// demand explicit order (#94). Kind-level superiority (#145) says each
+// sentence ONCE; the grounder desugars to the dotted pairs over the
+// modifiers' shared members (a specific `a.v > b.v` would override):
+halfling_luck > bless
+halfling_luck > rage
+halfling_luck > bracers_of_archery
+halfling_luck > war_caster_wand
 
 // ---- host-facing snapshots -------------------------------------------------
 

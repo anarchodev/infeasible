@@ -161,6 +161,84 @@ static int test_expanded_ordering(void)
     return 0;
 }
 
+/* --- #145: kind-level superiority — order two modifiers once ------------- */
+static int test_blanket_ordering(void)
+{
+    static const char *FMT =
+        "sort actor\n"
+        "entity bran : actor\n"
+        "state ( blessed(actor)  lucky(actor)  av(actor) : int  bv(actor) : int )\n"
+        "value ( save(value)  s1(actor) : int  s2(actor) : int )\n"
+        "fact ( save(s1)  save(s2) )\n"
+        "rule ba1(X: actor): => s1(X) = 10\n"
+        "rule ba2(X: actor): => s2(X) = 10\n"
+        "rule bless_save(A: actor, V: value): save(V) & blessed(A) => V(A) = prior + 4\n"
+        "rule floor_save(A: actor, V: value): save(V) & lucky(A)   => V(A) = max(prior, 13)\n"
+        "floor_save > bless_save\n"                /* ONE line, every member */
+        "%s"
+        "action snap(X: actor): causes av(X) := s1(X) & bv(X) := s2(X)\n"
+        "action b(X: actor): causes blessed(X)\n"
+        "action l(X: actor): causes lucky(X)\n";
+
+    /* the blanket: floor above the add on BOTH members */
+    {
+        char src[2048];
+        snprintf(src, sizeof src, FMT, "");
+        intern *sy = intern_new();
+        world *w = compile_ok(src, sy);
+        CHECK(w != NULL);
+        CHECK(step1(w, sy, "b(bran)") == 0);
+        CHECK(step1(w, sy, "l(bran)") == 0);
+        CHECK(step1(w, sy, "snap(bran)") == 0);
+        CHECK(num(w, sy, "av(bran)") == 14);       /* max(10+4, 13) */
+        CHECK(num(w, sy, "bv(bran)") == 14);
+        world_free(w);
+        intern_free(sy);
+    }
+    /* most-specific wins: an explicit dotted sup flips ONE member */
+    {
+        char src[2048];
+        snprintf(src, sizeof src, FMT, "bless_save.s2 > floor_save.s2\n");
+        intern *sy = intern_new();
+        world *w = compile_ok(src, sy);
+        CHECK(w != NULL);
+        CHECK(step1(w, sy, "b(bran)") == 0);
+        CHECK(step1(w, sy, "l(bran)") == 0);
+        CHECK(step1(w, sy, "snap(bran)") == 0);
+        CHECK(num(w, sy, "av(bran)") == 14);       /* blanket: max(10+4, 13) */
+        CHECK(num(w, sy, "bv(bran)") == 17);       /* explicit: max(10,13)+4 */
+        world_free(w);
+        intern_free(sy);
+    }
+    /* a blanket over modifiers sharing no member warns and does nothing */
+    {
+        const char *src =
+            "sort actor\nentity a : actor\n"
+            "state ( blessed(actor)  q(actor) : int )\n"
+            "value ( save(value)  atkk(value)  s(actor) : int  t(actor) : int )\n"
+            "fact ( save(s)  atkk(t) )\n"
+            "rule bs(X: actor): => s(X) = 10\n"
+            "rule bt(X: actor): => t(X) = 10\n"
+            "rule ms(A: actor, V: value): save(V) & blessed(A) => V(A) = prior + 1\n"
+            "rule mt(A: actor, V: value): atkk(V) & blessed(A) => V(A) = max(prior, 2)\n"
+            "mt > ms\n"
+            "action p(X: actor): causes q(X) := s(X)\n";
+        intern *sy = intern_new();
+        story_diag di[8];
+        story_diags d = { di, 8, 0, 0 };
+        world *w = story_compile(src, "t.story", sy, &d);
+        CHECK(w != NULL && d.nerrors == 0);
+        bool found = false;
+        for (int k = 0; k < d.count && !found; k++)
+            found = d.items[k].sev == STORY_WARNING &&
+                    strstr(d.items[k].msg, "share no member") != NULL;
+        CHECK(found);
+        world_free(w);
+        intern_free(sy);
+    }
+    return 0;
+}
+
 /* --- a rolled modifier: one die per (member, binding), cloned sites --- */
 static int test_cloned_dice(void)
 {
@@ -438,6 +516,7 @@ int main(void)
 {
     if (test_bless_all_saves()) return 1;
     if (test_expanded_ordering()) return 1;
+    if (test_blanket_ordering()) return 1;
     if (test_cloned_dice()) return 1;
     if (test_facets_and_products()) return 1;
     if (test_two_role_binding()) return 1;

@@ -154,7 +154,13 @@
  *   OP      := '->' | '=>' | '~>'
  *   sup     := label '>' label ; label := IDENT [ '.' IDENT ]
  *                                          -- rule labels; the dotted form names a
- *                                          -- kind modifier's expansion (#82)
+ *                                          -- kind modifier's expansion (#82).
+ *                                          -- Between two kind MODIFIERS, the
+ *                                          -- undotted form is kind-level
+ *                                          -- superiority (#145): desugars to the
+ *                                          -- dotted pairs over their shared
+ *                                          -- members; an explicit dotted sup
+ *                                          -- overrides the blanket per member
  *   conj    := eatom ( '&' eatom )*
  *   eatom   := atom [ cmp INT | '=' IDENT | numop expr ] -- guard / MV / effect
  *            | IDENT ['not'] 'in' '{' IDENT (',' IDENT)* '}'  -- membership (#95):
