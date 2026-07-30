@@ -298,10 +298,63 @@ safe:
    Antoniou transformation (TOCL 2001) eliminates defeaters and compiles away
    the superiority relation, reducing the theory to *basic* form (strict +
    defeasible rules only); the compiler condenses the rule-dependency graph into
-   its strongly-connected components and rejects/stratifies cycles (bands and
-   scope-depth priorities have already erased to `>` upstream, §6.2, so the
-   transformation never sees them). This is Maher's own normal form — the
+   its strongly-connected components and applies the decided cycle rule below
+   (bands and scope-depth priorities have already erased to `>` upstream, §6.2,
+   so the transformation never sees them). This is Maher's own normal form — the
    load-bearing half, shared by *any* linear evaluator.
+
+   **Cycle rule (decided): recursion is Datalog; defeat does not recurse.**
+   Boolean cycles cannot oscillate — the proof tags are monotone, so a cyclic
+   support graph converges; it can only *stall* loop-locked literals at
+   UNDECIDED. (This is why the answer here differs from the primed-numeric
+   cycles §5.8 rejects: those genuinely oscillate at runtime; these are an
+   ergonomics decision, not a soundness one.) The stall is a pothole: a
+   failing rule body yields REFUTED on an acyclic graph and UNDECIDED on a
+   cyclic one — the verdict changes with the graph's shape, not the world's
+   meaning, and UNDECIDED elsewhere means "contested". The decided semantics:
+
+   - **A support-SCC may be cyclic iff none of its literals is attacked
+     anywhere in the theory** — no rule concludes a member's complement, no
+     defeater targets a member. Such an SCC is plain Datalog by construction:
+     least fixpoint inside (supported literals already prove through cycles
+     today), then every underived member **completes to REFUTED**. The
+     completion is trivially sound there because no conflict-flavored
+     UNDECIDED can exist in an unattacked SCC; the why-trace for the refuted
+     side is "no support: every derivation re-enters the cycle", rendered
+     with the loop's members. This is what makes rule-authored recursive
+     relations — command chains, contagion, ally-of-ally, crafting trees —
+     first-class. (Spatial reachability stays provider territory, §5.6;
+     the recursion legalized here is exactly the kind a provider would wall
+     off from mods.)
+   - **A cycle containing an attacked or defeater-targeted literal is a
+     located compile error** naming the loop and the attacker — the same
+     diagnostic posture as §5.8's oscillator rejection. Defeasibility and
+     recursion both exist, in disjoint zones, exactly as stratified negation
+     separates recursion from negation in Datalog; the naive completion
+     would otherwise silently resolve a genuine conflict (UNDECIDED has two
+     causes — loop-starvation and tied attack — and only the first may
+     complete). Well-founded defeasible logic (Maher & Governatori) is the
+     documented escalation path if defeat-through-recursion ever earns its
+     way in; nothing currently points that way — conflicts resolve at the
+     definition level (layers, bands), not through recursive entanglement.
+   - **Module interaction.** A `scene` overriding a recursive relation
+     attacks its own *import*, not the source atom (§5.5 private
+     vocabulary), so scene-local overrides of recursive relations stay
+     legal. Only an `extend` attacking a recursive head directly hits the
+     error, and deliberately so: defeat cannot reach through a cycle, and a
+     loud compile error beats a silently wrong completion.
+   - **Conservativity.** Acyclic theories are untouched — the existing
+     golden suite lives entirely in the acyclic zone and pins it. New
+     goldens: transitive closure over base facts (reachable pairs PROVED,
+     unreachable pairs REFUTED with the loop trace); an attacked cycle
+     rejected naming loop and attacker; an acyclic differential asserting
+     the completion pass changes nothing.
+
+   Neither the check nor the completion needs to wait for the M3 evaluator —
+   the SCC analysis runs at grounding time and the completion is one pass
+   over the solved statuses; the matcher's derived-body widening (#44)
+   inherits recursion as ordinary semi-naive iteration on the extension
+   index, a scope item, not a semantics question.
 2. *SCC-ordered sweep (run time).* Rather than Maher's counter-and-worklist
    algorithm (Delores, TPLP 2001), the evaluator is a single
    *weak-topologically ordered* sweep: solve the SCC condensation in topological
