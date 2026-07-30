@@ -1216,6 +1216,10 @@ rule dmg(A,D): ... roll("d6", i)  // 8d6: a tag + index disambiguate intra-rule 
 ```
 
 Two rules writing `roll("d6")` never collide — their rule identities differ.
+(Roll *kinds* — one modifier whose die lands on every roll of a category —
+were first shipped as a bespoke keyword and are now the functor-position
+modifiers of §5.12: the per-(member, binding) site cloning survives
+unchanged underneath; only the selection surface moved.)
 Intentional *correlation* (one environmental d20 several rules must agree on)
 is the explicit exception: `shared_roll("storm")` names a rule-independent
 global site. Safe-because-independent is the zero-boilerplate default;
@@ -1351,6 +1355,101 @@ across the halves, so that world declines the families and steps pure N=1
 baseline (the hand-narrowed ideal's 2.85× minus the measured residue
 orchestration), equivalence pinned byte-for-byte against both the unsplit
 twin and the simulation.
+
+### 5.12 Kinds are rules (decided)
+
+5e modifies by *category*: Bless touches "attack rolls and saving throws,"
+Halfling Luck every d20 roll, Rage melee weapon attacks, Bracers of Archery
+ranged weapon attacks — and the taxonomy those sentences quantify over is
+layered, overlapping, and a **product, not a tree** ("melee weapon attack"
+cross-cuts any nesting you pick). The decided construct
+(`examples/taxonomy5e.story` is the worked probe):
+
+**A kind is the boolean case of `value`, over the built-in meta-sort `value`
+whose elements are the declared value symbols.** Membership is `fact`s;
+hierarchy and unions are derived predicates; the taxonomy is defeasible with
+ordinary superiority; and a modifier written once selects with ordinary body
+atoms, its value variable standing in **functor position** — the single
+genuine novelty, and the HiLog move: `V(A) = prior + roll(4)` looks
+higher-order and grounds first-order, one layer per member, through the same
+expansion machinery (dotted `L.value` labels, per-(member, binding) roll
+sites, the commuting-layer class).
+
+```
+value ( save(value, ability)  attack(value, reach, source)  d20(value) )
+fact  ( save(spell_save, wis)  attack(sword_atk, melee, weapon) )
+
+rule saves_roll_d20(V: value, A: ability): save(V, A)      => d20(V)
+rule attacks_roll_d20(V: value):           attack(V, _, _) => d20(V)
+
+rule halfling_luck(A: actor, V: value): d20(V) & lucky(A) => V(A) = max(prior, 2)
+```
+
+**The slogan: the kind stratum is a world with no step function.** Base facts
+plus judgment rules over a closed domain, sealed at world-build, evaluated by
+the *same* DL engine with the same verdicts and the same `why`
+(`story_compile_kinds_why` renders build-time traces in the runtime format —
+the thrown dagger's `thrown_not_melee > melee_by_weapon` defeat reads exactly
+like any runtime defeat). Its only consumer, the grounder, is two-valued, so
+an undecidable membership is a **located authoring error**: an UNDECIDED
+verdict means cyclic support (§5.2's cycle rule applies verbatim); a
+CONTESTED membership — this logic is ambiguity-blocking, so an unresolved
+conflict refutes *both* polarities — is detected as applicable support on
+both sides with neither proved, and the error names the competing rules and
+the superiority to add. Closed-world negation (`~magical(V)` — the sentence
+that makes "nonmagical bludgeoning, piercing, or slashing" one named
+predicate) is admitted only over facts-only kinds, because only those close
+at build; negating a derived kind is the same located error shape.
+
+**Staging is inferred from sorts, never declared.** A rule concluding a kind
+runs at world-build and may read only the stratum; a rule reading kinds as
+*selectors* while concluding runtime values is the legal direction — #95's
+"static filter, never in the fixpoint" grown up from membership lists to a
+solved theory. The boundary is enforced both ways with located errors ("kind
+rules run at world-build and cannot read fluents — guard the modifier
+instead"), and the LSP's symbol detail says **build-time** out loud.
+
+**The vocabulary rule** that keeps open/closed coherent: *instances arrive at
+load boundaries; vocabulary is sealed at world-build.* A save can introduce a
+new goblin (§5.9's pools already say how), never a new damage type. Program
+union is the composition model — a module contributes facts and rules, sealed
+when the grounder takes the fixpoint; `taxonomy5e.story`'s bottom-of-file
+"initiative is a dex check" (one membership fact, and Luck — written far
+above, knowing nothing of initiative — covers it) is the single-file
+degenerate case of exactly what a module system will do.
+
+**The two-primitives statement** (the answer to construct proliferation):
+sorts and kinds are the **membership** primitive — a named finite set you
+quantify over at ground time, over entities and over value symbols
+respectively; bands and layer chains are the **ordering** primitive; and the
+grounder erases all of them — the engine sees none of this. Enum and MV
+domains are neither: they classify a fluent's *range*, not things rules
+quantify over.
+
+**Retractions** (kept, per house style — each closes a plausible path):
+- *Tag trees* (the GAS shape): a tree forces one decomposition order and the
+  taxonomy is a product; GameplayTags' dotted paths hit exactly this, with
+  wildcard conventions as the workaround. Derived predicates give as many
+  overlapping taxonomies as the material needs.
+- *An ADT surface* (`kind roll = attack(…) | save(…)` + patterns): right
+  semantics, wrong surface — predicate arity, body atoms, and variables
+  already are the sum, the pattern, and the wildcard; the grammar would be
+  imported weight.
+- *`kindset` / `open` / `+=`*: a named union is a derived predicate; module
+  extension is program union — no keywords. Anonymity at the set level, never
+  at the name level (every name still resolves to a declaration).
+- *Membership lists*: became N facts; multi-membership is free.
+- *The `kind` keyword itself* (PR #115's surface, removed): a kind is the
+  boolean case of `value` and the stratum is inferred from sorts; loudness
+  lives in diagnostics and hover, not the grammar.
+
+**Deferred, stated**: cross-value links (`dmg_of(V)` — Rage's +2 belongs on
+the *damage* roll of the selected attack; #143), ordered non-commuting kind
+modifiers (resistance halves, penalties subtract; #144), kind-level
+superiority (`halfling_luck > bless` desugaring to the per-member dotted
+pairs — the probe's biggest friction finding; #145), kind-indexed value
+families, and the module system (single-file program union is the shipped
+degenerate case).
 
 ### Invariants (compiler/engine enforced)
 
