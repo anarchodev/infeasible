@@ -4473,6 +4473,20 @@ static void solve_kind_stratum(parser *p)
             if (ki >= 0) concluded[ki] = true;
         }
 
+    /* orphan kinds (#126): a declared kind predicate with no membership
+     * facts and no deriving rules classifies nothing — a typo or a stub */
+    for (int ki = 0; ki < p->nkindpreds; ki++) {
+        if (concluded[ki]) continue;
+        bool has_fact = false;
+        for (int f = 0; f < p->nkfacts && !has_fact; f++)
+            has_fact = p->kfacts[f].pred == p->kindpreds[ki].pred;
+        if (!has_fact)
+            warn(p, p->kindpreds[ki].line, p->kindpreds[ki].col,
+                 "kind '%s' has no membership facts and no deriving rules — "
+                 "it classifies nothing",
+                 intern_name(p->syms, p->kindpreds[ki].pred));
+    }
+
     /* ---- validate the kind rules ---- */
     for (int i = 0; i < p->nrules; i++) {
         ast_rule *r = &p->rules[i];
@@ -4954,11 +4968,46 @@ static void expand_kind_rules(parser *p)
             r->head.lhs_root = clone_expr(p, k->head.lhs_root);
             p->nrules++;
         }
-        if (matched == 0)
-            warn(p, k->line, k->col,
-                 "modifier '%s' matches no member value — its kind atoms "
-                 "select nothing (missing `fact`s, or no selected value fits "
-                 "the %d-argument subject tuple)", k->label, nsubj);
+        if (matched == 0) {
+            /* #126: name the nearest miss — the member satisfying the most
+             * selector atoms, and the first one it fails (a why-shaped hint) */
+            int best = -1, bestn = 0, bestfail = -1;
+            for (int vi = 0; vi < p->nvaluedecls; vi++) {
+                int n = 0, firstfail = -1;
+                for (int q = 0; q < nksel; q++) {
+                    ast_atom *ka = &k->body[ksel[q]];
+                    pred_info *pi = find_pred(p, ka->pred);
+                    uint32_t args[MAX_ARGS];
+                    bool ok = true;
+                    for (int a = 0; a < pi->arity; a++) {
+                        if (a == pi->kval_pos)
+                            args[a] = p->valuedecls[vi].pred;
+                        else if (ka->args[a].name == wild)
+                            ok = false;            /* skip wild for the hint */
+                        else
+                            args[a] = ka->args[a].name;
+                    }
+                    bool prv = ok && p->kres &&
+                        dl_defeasible(p->kres,
+                            dl_pos(ground_pred(p, ka->pred, args,
+                                               pi->arity))) == DL_PROVED;
+                    if (prv) n++;
+                    else if (firstfail < 0) firstfail = ksel[q];
+                }
+                if (n > bestn) { bestn = n; best = vi; bestfail = firstfail; }
+            }
+            if (best >= 0 && bestfail >= 0)
+                warn(p, k->line, k->col,
+                     "modifier '%s' matches no member value — '%s' comes "
+                     "closest but is not proved '%s'",
+                     k->label, intern_name(p->syms, p->valuedecls[best].pred),
+                     intern_name(p->syms, k->body[bestfail].pred));
+            else
+                warn(p, k->line, k->col,
+                     "modifier '%s' matches no member value — its kind atoms "
+                     "select nothing (missing `fact`s, or no selected value "
+                     "fits the %d-argument subject tuple)", k->label, nsubj);
+        }
     }
 }
 
@@ -8282,6 +8331,18 @@ static story_model *harvest_model(parser *p)
         build_fluent_detail(det, sizeof det, p, &p->providers[i], "provider");
         sm_add_sym(m, nm, STORY_SYM_PROVIDER, p->providers[i].line, p->providers[i].col, det);
         sm_add_ref(m, nm, STORY_OCC_DECL, p->providers[i].line, p->providers[i].col);
+    }
+    for (int i = 0; i < p->nkindpreds; i++) {      /* kind predicates (#124/#126):
+                                                    * the detail says BUILD-TIME
+                                                    * out loud (the LSP hover) */
+        const char *nm = intern_name(p->syms, p->kindpreds[i].pred);
+        build_fluent_detail(det, sizeof det, p, &p->kindpreds[i], "kind");
+        size_t dl_ = strlen(det);
+        snprintf(det + dl_, sizeof det - dl_, " — build-time");
+        sm_add_sym(m, nm, STORY_SYM_VALUE, p->kindpreds[i].line,
+                   p->kindpreds[i].col, det);
+        sm_add_ref(m, nm, STORY_OCC_DECL, p->kindpreds[i].line,
+                   p->kindpreds[i].col);
     }
     for (int i = 0; i < p->nvaluedecls; i++) {     /* derived values (#82) */
         const char *nm = intern_name(p->syms, p->valuedecls[i].pred);
