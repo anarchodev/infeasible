@@ -1443,11 +1443,14 @@ quantify over.
   boolean case of `value` and the stratum is inferred from sorts; loudness
   lives in diagnostics and hover, not the grammar.
 
+**Kind-level superiority** (landed, #145): `halfling_luck > bless` between
+two modifiers desugars to the per-member dotted pairs over their shared
+members — the probe's biggest friction finding, answered as pure sugar; an
+explicit dotted sup overrides the blanket per member (most-specific wins).
+
 **Deferred, stated**: cross-value links (`dmg_of(V)` — Rage's +2 belongs on
 the *damage* roll of the selected attack; #143), ordered non-commuting kind
-modifiers (resistance halves, penalties subtract; #144), kind-level
-superiority (`halfling_luck > bless` desugaring to the per-member dotted
-pairs — the probe's biggest friction finding; #145), kind-indexed value
+modifiers (resistance halves, penalties subtract; #144), kind-indexed value
 families, and the module system (single-file program union is the shipped
 degenerate case).
 
