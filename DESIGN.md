@@ -1443,16 +1443,25 @@ quantify over.
   boolean case of `value` and the stratum is inferred from sorts; loudness
   lives in diagnostics and hover, not the grammar.
 
-**Kind-level superiority** (landed, #145): `halfling_luck > bless` between
-two modifiers desugars to the per-member dotted pairs over their shared
-members — the probe's biggest friction finding, answered as pure sugar; an
-explicit dotted sup overrides the blanket per member (most-specific wins).
+**The probe's three gap findings, all landed.** Kind-level superiority
+(#145): `halfling_luck > bless` between two modifiers desugars to the
+per-member dotted pairs over their shared members; an explicit dotted sup
+overrides the blanket per member (most-specific wins). Cross-value links
+(#143): a kind predicate may carry several `value` positions — a LINK
+predicate — and a modifier binds extra `value` parameters through it, so
+Rage selects over attacks and lands on the linked *damage* roll
+(`attack(V, melee, weapon) & dmg_of(V, W) & raging(A) => W(A) = prior + 2`);
+selection is a build-time join, existential over the linked parameters, one
+expansion per head member, and derived links come free because links are
+ordinary kinds. Non-commuting modifiers (#144): any `prior` shape is
+admitted — resistance *halves* (`prior / 2`), penalties subtract — with
+#94's per-member check demanding total ordering, which one #145 blanket
+usually supplies; only the prior-less override stays out. The probe now
+states Rage, Bless, Luck, the thrown dagger, brutality, and resistance
+PHB-faithfully, with no approximations left.
 
-**Deferred, stated**: cross-value links (`dmg_of(V)` — Rage's +2 belongs on
-the *damage* roll of the selected attack; #143), ordered non-commuting kind
-modifiers (resistance halves, penalties subtract; #144), kind-indexed value
-families, and the module system (single-file program union is the shipped
-degenerate case).
+**Deferred, stated**: kind-indexed value families, and the module system
+(single-file program union is the shipped degenerate case).
 
 ### Invariants (compiler/engine enforced)
 
