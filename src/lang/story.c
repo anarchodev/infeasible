@@ -8279,6 +8279,38 @@ static bool join_atom_ok(parser *p, const ast_atom *a, const var_bind *vars,
     return true;
 }
 
+/* Does predicate `from`'s derivation transitively READ predicate `to`?
+ * Template-level DFS down the judgment dependency graph (rules concluding the
+ * current pred, either polarity, into their body/guard preds). */
+static bool pred_feeds_dfs(parser *p, uint32_t from, uint32_t to, bool *seen)
+{
+    if (from == to) return true;
+    int fi = pred_idx(p, from);
+    if (fi < 0 || seen[fi]) return false;
+    seen[fi] = true;
+    for (int i = 0; i < p->nrules; i++) {
+        ast_rule *r = &p->rules[i];
+        if (r->head.is_valuedef || r->head.is_kinddef || rule_is_kind(p, r))
+            continue;
+        if (r->head.pred != from) continue;
+        for (int b = 0; b < r->nbody; b++)
+            if (!r->body[b].is_member && !r->body[b].is_expr_guard &&
+                pred_feeds_dfs(p, r->body[b].pred, to, seen))
+                return true;
+        for (int g = 0; g < r->nguard; g++)
+            if (!r->guard[g].is_member && !r->guard[g].is_expr_guard &&
+                pred_feeds_dfs(p, r->guard[g].pred, to, seen))
+                return true;
+    }
+    return false;
+}
+
+static bool pred_feeds(parser *p, uint32_t from, uint32_t to)
+{
+    bool seen[MAX_PREDS] = { false };
+    return pred_feeds_dfs(p, from, to, seen);
+}
+
 static void emit_join_family(parser *p, ast_rule *r)
 {
     /* Honor the same cardinality cap the eager path enforces: the lane builder
@@ -8289,6 +8321,34 @@ static void emit_join_family(parser *p, ast_rule *r)
     (void)instance_count(p, r->vars, r->nvars, &of);
     if (of)
         return;
+
+    /* Routing soundness (#109, and a latent bug it exposed): this ONE-RULE
+     * family claims world_query routing for its head atoms, so it must BE the
+     * head pred's whole proof cone — no other rule may conclude or attack the
+     * pred (the rule's own `unless` defeater is in-family), and the rule must
+     * not be recursive: a per-iteration slice cannot see sibling iterations'
+     * conclusions, so a recursive relation would refute its own transitive
+     * pairs. Recursive rules stay on the N=1 family (their lanes/matcher
+     * story is the #44 derived-body widening); multi-rule preds await a
+     * family that carries the full cone. */
+    for (int i = 0; i < p->nrules; i++) {
+        ast_rule *o = &p->rules[i];
+        if (o == r) continue;
+        if (o->head.is_valuedef || o->head.is_kinddef || rule_is_kind(p, o))
+            continue;
+        if (o->head.pred == r->head.pred)
+            return;
+    }
+    for (int b = 0; b < r->nbody; b++)
+        if (!r->body[b].is_member && !r->body[b].is_expr_guard &&
+            find_pred(p, r->body[b].pred) &&
+            pred_feeds(p, r->body[b].pred, r->head.pred))
+            return;
+    for (int g = 0; g < r->nguard; g++)
+        if (!r->guard[g].is_member && !r->guard[g].is_expr_guard &&
+            find_pred(p, r->guard[g].pred) &&
+            pred_feeds(p, r->guard[g].pred, r->head.pred))
+            return;
 
     int Sl = r->vars[0].sort;
     int nent = domain_size(p, Sl);
@@ -9579,6 +9639,19 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
             }
             for (int i = 0; i < p->nactions; i++) ground_action(p, &p->actions[i]);
             for (int i = 0; i < p->nsups; i++)    ground_sup(p, &p->sups[i]);
+            {   /* #109 (§5.2): an attacked support cycle is a located error —
+                 * the Datalog completion is only sound where defeat cannot
+                 * reach, so the compiler refuses the overlap outright */
+                char cerr[512]; const char *cprov = NULL;
+                if (world_attacked_cycle(p->w, cerr, sizeof cerr, &cprov)) {
+                    int cline = 0;
+                    if (cprov) {
+                        const char *cl = strrchr(cprov, ':');
+                        if (cl) cline = atoi(cl + 1);
+                    }
+                    serr(p, cline ? cline : 1, 1, "%s", cerr);
+                }
+            }
             check_orphans(p);
             /* Skip lanes in tick-time matcher mode: matchable rules aren't ground
              * into the world (only captured), so a judgment lane family would

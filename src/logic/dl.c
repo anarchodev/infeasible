@@ -67,6 +67,20 @@ struct dl_result {
      * decision can affect instead of rescanning every literal each sweep. */
     int32_t *dep_off;        /* [nlits+1]      */
     int32_t *dep_to;         /* [2*total_body] */
+
+    /* #109 cycle rule (§5.2): SCC condensation of the SUPPORT graph (body ->
+     * head over strict + defeasible rules; defeaters attack, never support).
+     * scc_cyclic marks size>1 or self-loop; scc_attacked marks an SCC some
+     * rule (any kind, defeaters included) concludes a member's complement
+     * into. `completed` records literals the completion pass refuted, for the
+     * why-trace's loop line. */
+    int32_t *scc;            /* [nlits] SCC id */
+    int32_t *scc_off;        /* [nscc+1] members, grouped */
+    int32_t *scc_lit;        /* [nlits]  member literal indices */
+    bool    *scc_cyclic;     /* [nscc] */
+    bool    *scc_attacked;   /* [nscc] */
+    bool    *completed;      /* [nlits] */
+    int      nscc;
 };
 
 dl_theory *dl_theory_new(intern *syms)
@@ -320,6 +334,161 @@ static bool eval_part(const dl_result *res, int qi)
 }
 
 /* Default driver: rescan to fixpoint. */
+/* ---- #109 cycle rule (§5.2): SCC condensation + Datalog completion ------
+ *
+ * Build the support-graph SCCs once per solve (iterative Tarjan over literal
+ * nodes; edges body -> head for every strict/defeasible rule). A cyclic SCC
+ * whose members are attacked NOWHERE (no rule of any kind concludes a
+ * member's complement) is plain Datalog: after the monotone fixpoint stalls,
+ * every still-UNDECIDED member whose stall is purely in-SCC completes to
+ * REFUTED. The gate that keeps this sound: if any member's rule reads an
+ * OUT-of-SCC literal that is itself UNDECIDED (a tied attack elsewhere, an
+ * open #116 guard), the whole SCC stays undecided — completion only ever
+ * consumes decided inputs, so the two causes of UNDECIDED never blur.
+ * Attacked cycles are untouched here (the language layer rejects them at
+ * compile time; hand-built theories keep today's honest stall). */
+
+static void build_scc(dl_result *res)
+{
+    int n = res->nlits;
+    res->scc = malloc((size_t)(n ? n : 1) * sizeof *res->scc);
+    res->completed = calloc((size_t)(n ? n : 1), 1);
+
+    /* adjacency: body-literal -> head-literal, support rules only */
+    int nedge = 0;
+    for (int r = 0; r < res->nrules; r++)
+        if (res->rkind[r] != DL_DEFEATER)
+            nedge += res->rbody_off[r + 1] - res->rbody_off[r];
+    int32_t *aoff = calloc((size_t)n + 2, sizeof *aoff);
+    int32_t *ato = malloc((size_t)(nedge ? nedge : 1) * sizeof *ato);
+    for (int r = 0; r < res->nrules; r++) {
+        if (res->rkind[r] == DL_DEFEATER) continue;
+        for (int b = res->rbody_off[r]; b < res->rbody_off[r + 1]; b++)
+            aoff[res->body[b] + 1]++;
+    }
+    for (int i = 0; i < n; i++) aoff[i + 1] += aoff[i];
+    int32_t *fill = malloc((size_t)(n ? n : 1) * sizeof *fill);
+    memcpy(fill, aoff, (size_t)n * sizeof *fill);
+    for (int r = 0; r < res->nrules; r++) {
+        if (res->rkind[r] == DL_DEFEATER) continue;
+        for (int b = res->rbody_off[r]; b < res->rbody_off[r + 1]; b++)
+            ato[fill[res->body[b]]++] = res->rhead[r];
+    }
+    free(fill);
+
+    /* iterative Tarjan */
+    int32_t *low = malloc((size_t)(n ? n : 1) * sizeof *low);
+    int32_t *idx = malloc((size_t)(n ? n : 1) * sizeof *idx);
+    int32_t *stk = malloc((size_t)(n ? n : 1) * sizeof *stk);
+    bool    *onstk = calloc((size_t)(n ? n : 1), 1);
+    int32_t *frame_v = malloc((size_t)(n ? n : 1) * sizeof *frame_v);
+    int32_t *frame_e = malloc((size_t)(n ? n : 1) * sizeof *frame_e);
+    for (int i = 0; i < n; i++) idx[i] = -1;
+    int counter = 0, sp = 0, nscc = 0;
+    for (int root = 0; root < n; root++) {
+        if (idx[root] >= 0) continue;
+        int fp = 0;
+        frame_v[fp] = root; frame_e[fp] = aoff[root];
+        idx[root] = low[root] = counter++;
+        stk[sp++] = root; onstk[root] = true;
+        while (fp >= 0) {
+            int v = frame_v[fp];
+            if (frame_e[fp] < aoff[v + 1]) {
+                int w = ato[frame_e[fp]++];
+                if (idx[w] < 0) {
+                    idx[w] = low[w] = counter++;
+                    stk[sp++] = w; onstk[w] = true;
+                    fp++;
+                    frame_v[fp] = w; frame_e[fp] = aoff[w];
+                } else if (onstk[w] && idx[w] < low[v]) {
+                    low[v] = idx[w];
+                }
+            } else {
+                if (low[v] == idx[v]) {
+                    int m;
+                    do {
+                        m = stk[--sp];
+                        onstk[m] = false;
+                        res->scc[m] = nscc;
+                    } while (m != v);
+                    nscc++;
+                }
+                fp--;
+                if (fp >= 0 && low[v] < low[frame_v[fp]])
+                    low[frame_v[fp]] = low[v];
+            }
+        }
+    }
+    res->nscc = nscc;
+    free(low); free(idx); free(stk); free(onstk);
+    free(frame_v); free(frame_e);
+
+    /* members grouped by SCC (counting sort) */
+    res->scc_off = calloc((size_t)nscc + 2, sizeof *res->scc_off);
+    res->scc_lit = malloc((size_t)(n ? n : 1) * sizeof *res->scc_lit);
+    for (int i = 0; i < n; i++) res->scc_off[res->scc[i] + 1]++;
+    for (int c = 0; c < nscc; c++) res->scc_off[c + 1] += res->scc_off[c];
+    int32_t *f2 = malloc((size_t)(nscc ? nscc : 1) * sizeof *f2);
+    memcpy(f2, res->scc_off, (size_t)nscc * sizeof *f2);
+    for (int i = 0; i < n; i++) res->scc_lit[f2[res->scc[i]]++] = i;
+    free(f2);
+
+    /* cyclic: size > 1, or a self-loop edge */
+    res->scc_cyclic = calloc((size_t)(nscc ? nscc : 1), 1);
+    for (int c = 0; c < nscc; c++)
+        if (res->scc_off[c + 1] - res->scc_off[c] > 1)
+            res->scc_cyclic[c] = true;
+    for (int i = 0; i < n && nedge; i++)
+        for (int k = aoff[i]; k < aoff[i + 1]; k++)
+            if (ato[k] == i) res->scc_cyclic[res->scc[i]] = true;
+
+    /* attacked: some rule (defeaters included) concludes a member's complement */
+    res->scc_attacked = calloc((size_t)(nscc ? nscc : 1), 1);
+    for (int r = 0; r < res->nrules; r++) {
+        int comp = res->rhead[r] ^ 1;
+        res->scc_attacked[res->scc[comp]] = true;
+    }
+    free(aoff); free(ato);
+}
+
+/* One completion pass over `status` (delta or part). `strict_only` marks the
+ * delta layer, where only strict rules support (a defeasible rule's stalled
+ * body must not block a -Delta completion it cannot influence). Returns true
+ * if any literal was refuted — the caller re-runs the sweep so the new
+ * decisions propagate (which can in turn unlock further SCCs). */
+static bool complete_pass(dl_result *res, signed char *status, bool strict_only)
+{
+    bool any = false;
+    for (int c = 0; c < res->nscc; c++) {
+        if (!res->scc_cyclic[c] || res->scc_attacked[c]) continue;
+        bool stalled = false, blocked = false;
+        for (int k = res->scc_off[c]; k < res->scc_off[c + 1] && !blocked; k++) {
+            int m = res->scc_lit[k], ri;
+            if (status[m] == DL_UNDECIDED) stalled = true;
+            FOR_HEAD_RULES(res, m, ri) {
+                if (res->rkind[ri] == DL_DEFEATER) continue;
+                if (strict_only && res->rkind[ri] != DL_STRICT) continue;
+                for (int b = res->rbody_off[ri]; b < res->rbody_off[ri + 1]; b++) {
+                    int bl = res->body[b];
+                    if (res->scc[bl] != c && status[bl] == DL_UNDECIDED)
+                        { blocked = true; break; }   /* undecided INPUT: honest
+                                                      * stall, never complete */
+                }
+            }
+        }
+        if (blocked || !stalled) continue;
+        for (int k = res->scc_off[c]; k < res->scc_off[c + 1]; k++) {
+            int m = res->scc_lit[k];
+            if (status[m] == DL_UNDECIDED) {
+                status[m] = DL_REFUTED;
+                res->completed[m] = true;
+                any = true;
+            }
+        }
+    }
+    return any;
+}
+
 static void sweep(const dl_result *res, signed char *status,
                   bool (*eval)(const dl_result *, int))
 {
@@ -480,8 +649,11 @@ static dl_result *result_new(dl_theory *t)
 dl_result *dl_solve(dl_theory *t)
 {
     dl_result *res = result_new(t);
-    sweep(res, res->delta, eval_delta);  /* delta first: it is constant during part */
-    sweep(res, res->part,  eval_part);
+    build_scc(res);                      /* #109: cycle rule support */
+    do sweep(res, res->delta, eval_delta);  /* delta first: constant during part */
+    while (complete_pass(res, res->delta, true));
+    do sweep(res, res->part, eval_part);
+    while (complete_pass(res, res->part, false));
     return res;
 }
 
@@ -492,11 +664,14 @@ dl_result *dl_solve(dl_theory *t)
 dl_result *dl_solve_wl(dl_theory *t)
 {
     dl_result *res = result_new(t);
+    build_scc(res);                      /* #109: cycle rule support */
     build_dep(res);
     int  *stack = malloc((size_t)(res->nlits ? res->nlits : 1) * sizeof *stack);
     bool *inq   = calloc((size_t)(res->nlits ? res->nlits : 1), sizeof *inq);
-    run_worklist(res, res->delta, eval_delta, stack, inq);
-    run_worklist(res, res->part,  eval_part,  stack, inq);
+    do run_worklist(res, res->delta, eval_delta, stack, inq);
+    while (complete_pass(res, res->delta, true));
+    do run_worklist(res, res->part, eval_part, stack, inq);
+    while (complete_pass(res, res->part, false));
     free(stack);
     free(inq);
     return res;
@@ -518,6 +693,12 @@ void dl_result_free(dl_result *r)
     free(r->beat_by);
     free(r->dep_off);
     free(r->dep_to);
+    free(r->scc);
+    free(r->scc_off);
+    free(r->scc_lit);
+    free(r->scc_cyclic);
+    free(r->scc_attacked);
+    free(r->completed);
     free(r);
 }
 
@@ -594,6 +775,19 @@ static bool sc_beats(void *ctx, int w, int l)
 { return beats_c(((const scalar_trace *)ctx)->res, w, l); }
 static const char *sc_rule_prov(void *ctx, int r)
 { return ((const scalar_trace *)ctx)->res->rprov[r]; }
+static int sc_cycle_members(void *ctx, dl_lit l, dl_lit *out, int cap)
+{
+    const dl_result *res = ((const scalar_trace *)ctx)->res;
+    int qi = lit_idx(l);
+    if (!res->completed || qi >= res->nlits || !res->completed[qi])
+        return 0;
+    int c = res->scc[qi], n = 0;
+    for (int k = res->scc_off[c]; k < res->scc_off[c + 1]; k++) {
+        if (n < cap) out[n] = lit_from_idx(res->scc_lit[k]);
+        n++;
+    }
+    return n;
+}
 
 static const dl_trace_vtbl scalar_vtbl = {
     .put_lit = sc_put_lit, .put_rule = sc_put_rule,
@@ -603,6 +797,7 @@ static const dl_trace_vtbl scalar_vtbl = {
     .rule_kind = sc_rule_kind, .nbody = sc_nbody, .body_at = sc_body_at,
     .applicable = sc_applicable, .beats = sc_beats,
     .rule_prov = sc_rule_prov,
+    .cycle_members = sc_cycle_members,
 };
 
 void dl_why(const dl_theory *t, const dl_result *res, dl_lit q, FILE *out)

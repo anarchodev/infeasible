@@ -2,7 +2,6 @@
 #include "logic/dl_trace.h"
 #include "core/grow.h"
 
-#include <stdlib.h>
 #include <string.h>
 
 /* Columnar family solver (see dl_col.h). This is dl.c's tri-valued fixpoint
@@ -51,6 +50,16 @@ struct dlcol {
     /* Per-rule applicability rows recomputed each sweep, plus scratch. */
     uint64_t *app_t, *app_f;                   /* [nrules][W] */
     uint64_t *scratch;                         /* 8 rows */
+
+    /* #109 cycle rule (§5.2): SCC condensation of the support graph (body ->
+     * head over strict + defeasible rules; defeaters attack, never support),
+     * rebuilt with the compiled indices. `completed` is a status-shaped
+     * column recording cycle-completed refutations for dlcol_why. */
+    int32_t *scc_of;                           /* [nlits] */
+    int32_t *scc_off, *scc_lit;                /* members grouped by SCC */
+    bool    *scc_cyclic, *scc_attacked;        /* [nscc] */
+    int      nscc;
+    uint64_t *completed;                       /* [nlits][W] */
 };
 
 static int lit_idx(dl_lit l) { return (int)l.atom * 2 + (l.neg ? 1 : 0); }
@@ -81,6 +90,7 @@ dlcol *dlcol_new(int natoms, int nentities)
     size_t nm = f->nlits ? (size_t)f->nlits * f->W : 1;   /* natoms==0 ok */
     f->fact = calloc(nm, sizeof *f->fact);
     f->open = calloc(nm, sizeof *f->open);
+    f->completed = calloc(nm, sizeof *f->completed);
     f->delta_t = calloc(nm, sizeof *f->delta_t);
     f->delta_f = calloc(nm, sizeof *f->delta_f);
     f->part_t  = calloc(nm, sizeof *f->part_t);
@@ -105,6 +115,9 @@ void dlcol_free(dlcol *f)
     free(f->beat_off); free(f->beat_by);
     free(f->fact);
     free(f->open);
+    free(f->completed);
+    free(f->scc_of); free(f->scc_off); free(f->scc_lit);
+    free(f->scc_cyclic); free(f->scc_attacked);
     free(f->delta_t); free(f->delta_f);
     free(f->part_t); free(f->part_f);
     free(f->app_t); free(f->app_f);
@@ -120,7 +133,7 @@ size_t dlcol_footprint(const dlcol *f)
 {
     size_t nm = (size_t)f->nlits * f->W;
     size_t b = sizeof *f;
-    b += 6 * nm * sizeof(uint64_t);          /* fact, open, delta_t/f, part_t/f */
+    b += 7 * nm * sizeof(uint64_t);   /* fact, open, completed, delta/part t+f */
     b += (size_t)8 * f->W * sizeof(uint64_t);             /* scratch */
     if (f->app_t) b += 2 * (size_t)f->nrules * f->W * sizeof(uint64_t);
     b += (size_t)f->caprules * sizeof *f->rules;
@@ -201,7 +214,7 @@ void dlcol_ensure_atoms(dlcol *f, int natoms)
         f->col = realloc(f->col, newnm * sizeof *f->col); \
         memset(f->col + oldnm, 0, (newnm - oldnm) * sizeof *f->col); \
     } while (0)
-    REGROW(fact); REGROW(open);
+    REGROW(fact); REGROW(open); REGROW(completed);
     REGROW(delta_t); REGROW(delta_f); REGROW(part_t); REGROW(part_f);
 #undef REGROW
     f->aname = realloc(f->aname, (size_t)natoms * sizeof *f->aname);
@@ -252,6 +265,160 @@ static int body_end_c(const dlcol *f, int r)
     return r + 1 < f->nrules ? f->rules[r + 1].body_off : f->nbody;
 }
 
+/* ---- #109 cycle rule (§5.2): SCC condensation + Datalog completion ------
+ *
+ * Schema-level (shared by every entity): iterative Tarjan over literal nodes
+ * with body -> head edges from strict/defeasible rules. A cyclic SCC no rule
+ * (defeaters included) attacks is plain Datalog: after the monotone fixpoint
+ * stalls, still-UNDECIDED members complete to REFUTED — per entity, and only
+ * for entities where every OUT-of-SCC input the SCC reads is decided (a tied
+ * attack elsewhere or a #116 open guard keeps the honest stall). Semantics
+ * identical to dl.c's completion; tests/test_col.c pins the differential. */
+
+static void build_scc_c(dlcol *f)
+{
+    int n = f->nlits;
+    free(f->scc_of); free(f->scc_off); free(f->scc_lit);
+    free(f->scc_cyclic); free(f->scc_attacked);
+    f->scc_of = malloc((size_t)(n ? n : 1) * sizeof *f->scc_of);
+
+    int nedge = 0;
+    for (int r = 0; r < f->nrules; r++)
+        if (f->rules[r].kind != DL_DEFEATER)
+            nedge += body_end_c(f, r) - f->rules[r].body_off;
+    int32_t *aoff = calloc((size_t)n + 2, sizeof *aoff);
+    int32_t *ato = malloc((size_t)(nedge ? nedge : 1) * sizeof *ato);
+    for (int r = 0; r < f->nrules; r++) {
+        if (f->rules[r].kind == DL_DEFEATER) continue;
+        for (int b = f->rules[r].body_off; b < body_end_c(f, r); b++)
+            aoff[f->body[b] + 1]++;
+    }
+    for (int i = 0; i < n; i++) aoff[i + 1] += aoff[i];
+    int32_t *fill = malloc((size_t)(n ? n : 1) * sizeof *fill);
+    memcpy(fill, aoff, (size_t)n * sizeof *fill);
+    for (int r = 0; r < f->nrules; r++) {
+        if (f->rules[r].kind == DL_DEFEATER) continue;
+        for (int b = f->rules[r].body_off; b < body_end_c(f, r); b++)
+            ato[fill[f->body[b]]++] = f->rules[r].head;
+    }
+    free(fill);
+
+    int32_t *low = malloc((size_t)(n ? n : 1) * sizeof *low);
+    int32_t *idx = malloc((size_t)(n ? n : 1) * sizeof *idx);
+    int32_t *stk = malloc((size_t)(n ? n : 1) * sizeof *stk);
+    bool    *onstk = calloc((size_t)(n ? n : 1), 1);
+    int32_t *frame_v = malloc((size_t)(n ? n : 1) * sizeof *frame_v);
+    int32_t *frame_e = malloc((size_t)(n ? n : 1) * sizeof *frame_e);
+    for (int i = 0; i < n; i++) idx[i] = -1;
+    int counter = 0, sp = 0, nscc = 0;
+    for (int root = 0; root < n; root++) {
+        if (idx[root] >= 0) continue;
+        int fp = 0;
+        frame_v[fp] = root; frame_e[fp] = aoff[root];
+        idx[root] = low[root] = counter++;
+        stk[sp++] = root; onstk[root] = true;
+        while (fp >= 0) {
+            int v = frame_v[fp];
+            if (frame_e[fp] < aoff[v + 1]) {
+                int w = ato[frame_e[fp]++];
+                if (idx[w] < 0) {
+                    idx[w] = low[w] = counter++;
+                    stk[sp++] = w; onstk[w] = true;
+                    fp++;
+                    frame_v[fp] = w; frame_e[fp] = aoff[w];
+                } else if (onstk[w] && idx[w] < low[v]) {
+                    low[v] = idx[w];
+                }
+            } else {
+                if (low[v] == idx[v]) {
+                    int m;
+                    do {
+                        m = stk[--sp];
+                        onstk[m] = false;
+                        f->scc_of[m] = nscc;
+                    } while (m != v);
+                    nscc++;
+                }
+                fp--;
+                if (fp >= 0 && low[v] < low[frame_v[fp]])
+                    low[frame_v[fp]] = low[v];
+            }
+        }
+    }
+    f->nscc = nscc;
+    free(low); free(idx); free(stk); free(onstk);
+    free(frame_v); free(frame_e);
+
+    f->scc_off = calloc((size_t)nscc + 2, sizeof *f->scc_off);
+    f->scc_lit = malloc((size_t)(n ? n : 1) * sizeof *f->scc_lit);
+    for (int i = 0; i < n; i++) f->scc_off[f->scc_of[i] + 1]++;
+    for (int c = 0; c < nscc; c++) f->scc_off[c + 1] += f->scc_off[c];
+    int32_t *f2 = malloc((size_t)(nscc ? nscc : 1) * sizeof *f2);
+    memcpy(f2, f->scc_off, (size_t)nscc * sizeof *f2);
+    for (int i = 0; i < n; i++) f->scc_lit[f2[f->scc_of[i]]++] = i;
+    free(f2);
+
+    f->scc_cyclic = calloc((size_t)(nscc ? nscc : 1), 1);
+    for (int c = 0; c < nscc; c++)
+        if (f->scc_off[c + 1] - f->scc_off[c] > 1)
+            f->scc_cyclic[c] = true;
+    for (int i = 0; i < n && nedge; i++)
+        for (int k = aoff[i]; k < aoff[i + 1]; k++)
+            if (ato[k] == i) f->scc_cyclic[f->scc_of[i]] = true;
+
+    f->scc_attacked = calloc((size_t)(nscc ? nscc : 1), 1);
+    for (int r = 0; r < f->nrules; r++)
+        f->scc_attacked[f->scc_of[f->rules[r].head ^ 1]] = true;
+    free(aoff); free(ato);
+}
+
+/* One columnar completion pass over a status layer (delta or part).
+ * `strict_only` marks the delta layer, where only strict rules support.
+ * Returns true if any bit flipped — the caller re-runs the layer's solve so
+ * the new decisions propagate (which can unlock further SCCs). */
+static bool complete_cols(dlcol *f, uint64_t *t, uint64_t *fl, bool strict_only)
+{
+    const int W = f->W;
+    uint64_t *bad = f->scratch + 0 * W;        /* runs between solves */
+    bool any = false;
+    for (int c = 0; c < f->nscc; c++) {
+        if (!f->scc_cyclic[c] || f->scc_attacked[c]) continue;
+        memset(bad, 0, (size_t)W * sizeof *bad);
+        for (int k = f->scc_off[c]; k < f->scc_off[c + 1]; k++) {
+            int m = f->scc_lit[k];
+            for (int h = f->head_off[m]; h < f->head_off[m + 1]; h++) {
+                int r = f->head_rule[h];
+                if (f->rules[r].kind == DL_DEFEATER) continue;
+                if (strict_only && f->rules[r].kind != DL_STRICT) continue;
+                for (int b = f->rules[r].body_off; b < body_end_c(f, r); b++) {
+                    int bl = f->body[b];
+                    if (f->scc_of[bl] == c) continue;
+                    const uint64_t *bt = row(t, f, bl), *bf = row(fl, f, bl);
+                    for (int w = 0; w < W; w++)
+                        bad[w] |= ~(bt[w] | bf[w]);   /* undecided INPUT at e:
+                                                       * honest stall, never
+                                                       * complete there */
+                }
+            }
+        }
+        for (int k = f->scc_off[c]; k < f->scc_off[c + 1]; k++) {
+            int m = f->scc_lit[k];
+            uint64_t *mt = row(t, f, m), *mf = row(fl, f, m);
+            uint64_t *mc = row(f->completed, f, m);
+            for (int w = 0; w < W; w++) {
+                uint64_t msk = (w == W - 1) ? f->tail : ~0ull;
+                uint64_t nf = ~mt[w] & ~mf[w] & ~bad[w] & msk;
+                if (nf) {
+                    mf[w] |= nf;
+                    mc[w] |= nf;
+                    any = true;
+                }
+            }
+        }
+    }
+    return any;
+}
+
 static void compile_indices(dlcol *f)
 {
     free(f->head_off); free(f->head_rule);
@@ -286,6 +453,7 @@ static void compile_indices(dlcol *f)
 
     f->app_t = calloc((size_t)(f->nrules ? f->nrules : 1) * f->W, sizeof *f->app_t);
     f->app_f = calloc((size_t)(f->nrules ? f->nrules : 1) * f->W, sizeof *f->app_f);
+    build_scc_c(f);                            /* #109: cycle-rule condensation */
     f->dirty = false;
 }
 
@@ -492,8 +660,13 @@ void dlcol_solve(dlcol *f)
     size_t rbytes = (size_t)(f->nrules ? f->nrules : 1) * f->W * sizeof(uint64_t);
     memset(f->app_t, 0, rbytes);
     memset(f->app_f, 0, rbytes);
+    memset(f->completed, 0, bytes);            /* #109: per-solve state */
     solve_delta(f);
+    while (complete_cols(f, f->delta_t, f->delta_f, true))
+        solve_delta(f);
     solve_part(f);
+    while (complete_cols(f, f->part_t, f->part_f, false))
+        solve_part(f);
 }
 
 static dl_verdict verdict_at(const dlcol *f, const uint64_t *t,
@@ -632,6 +805,23 @@ static bool cc_beats(void *ctx, int w, int l)
 { return col_beats(((const col_trace *)ctx)->f, w, l); }
 static const char *cc_rule_prov(void *ctx, int r)
 { return ((const col_trace *)ctx)->f->rules[r].prov; }
+static int cc_cycle_members(void *ctx, dl_lit l, dl_lit *out, int cap)
+{
+    const col_trace *c = ctx;
+    const dlcol *f = c->f;
+    int qi = lit_idx(l);
+    if (qi >= f->nlits || c->entity < 0 || c->entity >= f->nents)
+        return 0;
+    const uint64_t *mc = row((uint64_t *)f->completed, f, qi);
+    if (!((mc[c->entity / 64] >> (c->entity % 64)) & 1))
+        return 0;
+    int sc = f->scc_of[qi], n = 0;
+    for (int k = f->scc_off[sc]; k < f->scc_off[sc + 1]; k++) {
+        if (n < cap) out[n] = lit_from_idx(f->scc_lit[k]);
+        n++;
+    }
+    return n;
+}
 
 static const dl_trace_vtbl col_vtbl = {
     .put_lit = cc_put_lit, .put_rule = cc_put_rule,
@@ -641,6 +831,7 @@ static const dl_trace_vtbl col_vtbl = {
     .rule_kind = cc_rule_kind, .nbody = cc_nbody, .body_at = cc_body_at,
     .applicable = cc_applicable, .beats = cc_beats,
     .rule_prov = cc_rule_prov,
+    .cycle_members = cc_cycle_members,
 };
 
 void dlcol_why(const dlcol *f, dl_lit q, int entity, FILE *out)
