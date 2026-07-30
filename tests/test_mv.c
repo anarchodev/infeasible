@@ -57,9 +57,13 @@ static int test_mv_door(void)
         free(src); intern_free(sy);
         return 1;
     }
-    if (diags.count)
-        fprintf(stderr, "unexpected diagnostic: %s\n", diags.items[0].msg);
-    CHECK(diags.count == 0);
+    /* the jam_* writers exist to PIN the contested step below — #98 now
+     * surfaces that pair at compile time as warnings (never errors); every
+     * diagnostic must be that conflict, and nothing else */
+    CHECK(diags.nerrors == 0);
+    CHECK(diags.count > 0);
+    for (int i = 0; i < diags.count && i < diags.cap; i++)
+        CHECK(strstr(diags.items[i].msg, "conflicting effects on 'door'") != NULL);
 
     /* value-atoms intern as "door=<v>" — the erasure the compiler emits */
     uint32_t locked   = intern_id(sy, "door=locked"),

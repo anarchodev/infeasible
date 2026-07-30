@@ -233,7 +233,12 @@
  * parser recovers at declaration boundaries (panic mode, §10) so one bad
  * declaration does not mask the rest of the file. Returns the compiled world
  * when no error-severity diagnostic was produced, or NULL if any error was —
- * warnings (e.g. orphan/typo detection, §6.1) never fail the compile.
+ * warnings never fail the compile. Warning classes: orphan/typo detection
+ * (§6.1), grounding-cardinality blow-ups (§5.2), and CONFLICTABLE PAIRS
+ * (#98, EPIC #154): step-effect pairs that could contest a step (the runtime
+ * `-1`) and complementary judgment pairs nothing orders (team defeat's
+ * silent double-REFUTED) — a zero-warning story cannot take the contested
+ * step paths.
  *
  * `items`/`cap` are caller-owned; `count` is the total number of diagnostics
  * produced (may exceed `cap`, in which case only the first `cap` are stored)
