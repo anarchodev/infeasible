@@ -25,7 +25,9 @@
 #define MAX_INITS      (1 << 24)   /* runaway ceiling only — the list grows to fit */
 #define MAX_GROUND     256     /* ground atom name buffer */
 #define MAX_EXPRS      4096    /* effect-expression AST node pool */
-#define MAX_CODE       64      /* VM bytecode per ground effect */
+#define MAX_CODE       128     /* VM bytecode per ground effect (partial-value
+ * chains + the #116 definedness epilogue emit ~11-15 ins per layer; overflow
+ * is a located error via parser.code_of — never silent truncation) */
 #define MAX_ENUMS      16      /* named value domains (`enum school { … }`, §13) */
 #define MAX_WHEN       8       /* conjuncts in a binder `where` / item `when` */
 #define MAX_ITEMS      8       /* effect items in one `for each` block */
@@ -75,6 +77,10 @@ typedef struct {
                                 * mempool, `neg` = `not in`. A static grounding
                                 * filter — never emitted, never in the fixpoint. */
     int         mem_ix, mem_n;
+    bool        is_defined;    /* `defined v(args)` (#116): the value's
+                                * definedness as a first-class body atom — the
+                                * disjunction of its prior-free layer markers.
+                                * pred/args name the VALUE; body position only. */
     uint32_t    as_value;      /* `-= e as fire` (#83): the damage-type enum value
                                 * this contribution accumulates under; 0 = untyped */
     int       line, col;
@@ -383,6 +389,19 @@ typedef struct {
     bool in_valuedef_expr;                /* `prior` legality context */
     bool in_ramif_eff;                    /* primed-read legality context (#84) */
     int vdepth;                           /* value-inline recursion depth (cycle backstop) */
+    bool value_partial[MAX_FLUENTS];      /* #116: no unconditional base — partiality
+                                           * is INFERRED (decided 2026-07-30); guards
+                                           * over it are tri-valued, arithmetic reads
+                                           * need the static safety rule */
+    int *vdefd_of; uint32_t vdefd_cap;    /* `defined(v(…))` atom -> grounded (dedup) */
+    long encl_marks[2 * MAX_ARGS];        /* enclosing layer-marker EXPR_TEST args
+                                           * during nested value inlining (#116): a
+                                           * nested partial read's REQDEF is waived
+                                           * when any enclosing layer did not fire */
+    int nencl;
+    bool code_of;                         /* bytecode emission overflowed MAX_CODE —
+                                           * checked (and reset) where code is
+                                           * consumed; a located error, never silent */
     ast_rule   *rules;            /* heap; MAX_RULES */
     int nrules;
     ast_action *actions;          /* heap; MAX_ACTIONS */
@@ -1045,10 +1064,18 @@ static bool parse_atom(parser *p, ast_atom *out)
     out->line = id.line;
     out->col = id.col;
     advance(p);
+    /* `defined v(args)` (#116): a partial value's definedness as a body atom —
+     * contextual (like `prior`/`test`), so `defined` stays a legal atom name
+     * when no identifier follows. */
+    if (ident_is(id, "defined") && p->cur.kind == TK_IDENT) {
+        out->is_defined = true;
+        out->pred = intern_tok(p, p->cur);
+        advance(p);
+    }
     /* set membership: `T in P` / `T not in P` over a `set of` param — the
      * leading id is the element var, P the set (a host-answered provider
      * relation, §5.6/§13). Lowers to a read of P(T): `not in` negates it. */
-    if (p->cur.kind == TK_IN || ident_is(p->cur, "not")) {
+    if (!out->is_defined && (p->cur.kind == TK_IN || ident_is(p->cur, "not"))) {
         bool notin = false;
         if (ident_is(p->cur, "not")) {
             token nt = p->cur; advance(p);
@@ -3171,6 +3198,56 @@ static void check_guard_test_nodes(parser *p, int e, int depth)
     }
 }
 
+/* `defined v(args)` (#116): validate a definedness read — the pred must be a
+ * declared derived value, read positively, in a condition position. Over a
+ * value with an unconditional base it always holds (warn, keep — a generic
+ * rule may mix total and partial subjects later). */
+static void check_defined_read(parser *p, ast_atom *at, var_bind *vars,
+                               int nvars, bool note, bool in_effect,
+                               const char *ctx)
+{
+    const char *nm = intern_name(p->syms, at->pred);
+    if (note) note_ref(p, at->pred, at->line, at->col);
+    if (in_effect || at->is_num_effect) {
+        serr(p, at->line, at->col,
+             "`defined %s(…)` is a condition, not an effect — it cannot "
+             "appear in a `causes` clause", nm);
+        return;
+    }
+    if (at->neg) {
+        serr(p, at->line, at->col,
+             "negated `defined` is not supported yet — no rule concludes its "
+             "negation, so `~defined %s(…)` could never fire; guard the "
+             "fallback with its own condition instead", nm);
+        return;
+    }
+    if (at->primed || at->is_guard || at->is_expr_guard ||
+        at->value != INTERN_NONE) {
+        serr(p, at->line, at->col,
+             "`defined %s(…)` is itself the condition — it takes no "
+             "comparison, prime, or value", nm);
+        return;
+    }
+    int vi = find_value(p, at->pred);
+    pred_info *pi = find_pred(p, at->pred);
+    if (vi < 0 || !pi || !pi->is_value) {
+        serr(p, at->line, at->col,
+             "'%s' is not a declared value — `defined` reads a derived "
+             "value's definedness (#116)", nm);
+        return;
+    }
+    check_pred_args(p, at->pred, pi, at->args, at->nargs, vars, nvars, ctx);
+    for (int d = 0; d < p->nvdefs[vi]; d++) {
+        ast_rule *r = &p->rules[p->vdefs[vi][d]];
+        if (r->nbody == 0 && !r->has_guard) {
+            warn(p, at->line, at->col,
+                 "'%s' is total (definition '%s' is its unconditional base) — "
+                 "`defined %s(…)` always holds", nm, r->label, nm);
+            break;
+        }
+    }
+}
+
 /* Validate one atom against the schema: predicate known, arity matches, and
  * every argument is a bound variable or a declared entity (with a sort check
  * for fluent atoms). `note` records condition refs for orphan analysis;
@@ -3193,6 +3270,10 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
                  intern_name(p->syms, at->pred));
             return;
         }
+    }
+    if (at->is_defined) {                           /* `defined v(args)` (#116) */
+        check_defined_read(p, at, vars, nvars, note, in_effect, ctx);
+        return;
     }
     if (at->is_expr_guard) {                        /* `expr <op> expr` guard */
         if (in_effect) {
@@ -3990,11 +4071,23 @@ static void order_value_layers(parser *p)
             }
         }
         if (base < 0) {
-            serr(p, p->valuedecls[vi].line, p->valuedecls[vi].col,
-                 "'%s' needs an unconditional base definition — every guarded "
-                 "definition layers on or overrides the value the base "
-                 "provides (#94: a base must exist)", vn);
-            return;
+            /* #116: partiality is INFERRED — zero unconditional bases makes
+             * the value PARTIAL (no keyword; the static safety rule keeps a
+             * forgotten base loud at the first arithmetic consumer). At least
+             * one prior-free definition must exist, or no layer can ever
+             * ground the chain and the value could never be defined. */
+            p->value_partial[vi] = true;
+            bool grounding = false;
+            for (int i = 0; i < ngl && !grounding; i++)
+                if (!expr_has_prior(p, p->rules[gl[i]].head.lhs_root))
+                    grounding = true;
+            if (!grounding) {
+                serr(p, p->valuedecls[vi].line, p->valuedecls[vi].col,
+                     "'%s' can never be defined — every definition reads "
+                     "`prior`, which layers on the value beneath; add a "
+                     "definition that does not read `prior` (#116)", vn);
+                return;
+            }
         }
         p->value_def[vi] = base;
 
@@ -4053,6 +4146,162 @@ static void order_value_layers(parser *p)
             p->value_layers[vi][nplaced++] = gl[pick];
         }
         p->value_nlayers[vi] = ngl;
+    }
+}
+
+/* ---- #116 static safety rule ----------------------------------------
+ *
+ * An ARITHMETIC position (an effect RHS, a clamp bound, a value definition's
+ * expression) may read a PARTIAL value only if the same rule's condition also
+ * reads it — through any guard over it, or the explicit `defined` atom.
+ * Soundness is syntactic, no entailment needed: when the value is undefined,
+ * a condition reading it is UNDECIDED, the rule cannot fire, and the RHS
+ * never evaluates. An unguarded read is a located compile error; the runtime
+ * EXPR_REQDEF trap survives only as defense in depth (world.c). Clamp bounds
+ * have no guarding condition, so a partial read there is always an error.
+ * The check is per-atom TEXTUAL (same pred, same written args): grounding
+ * substitutes uniformly across a rule, so a textual match is a ground match
+ * for every binding — and a false positive (definedness implied indirectly,
+ * e.g. via `caster(A)`) costs one self-documenting conjunct, the Elm trade. */
+
+static bool expr_tree_reads_value(parser *p, int e, uint32_t pred,
+                                  const ast_arg *args, int nargs, int depth)
+{
+    if (e < 0 || depth > 2 * MAX_ARGS) return false;
+    ex_node *n = &p->exprs[e];
+    switch (n->kind) {
+    case EX_LOAD:
+        if (n->pred == pred && n->nargs == nargs) {
+            bool same = true;
+            for (int k = 0; k < nargs && same; k++)
+                same = n->args[k].name == args[k].name;
+            if (same) return true;
+        }
+        return false;
+    case EX_CALL:
+        for (int k = 0; k < n->nargs; k++)
+            if (expr_tree_reads_value(p, n->cargs[k], pred, args, nargs,
+                                      depth + 1))
+                return true;
+        return false;
+    case EX_CONST: case EX_ROLL: case EX_TEST: case EX_PRIOR:
+        return false;
+    case EX_NEG:
+        return expr_tree_reads_value(p, n->lhs, pred, args, nargs, depth + 1);
+    default:
+        return expr_tree_reads_value(p, n->lhs, pred, args, nargs, depth + 1) ||
+               expr_tree_reads_value(p, n->rhs, pred, args, nargs, depth + 1);
+    }
+}
+
+/* Does one condition atom read value (pred, args)? A `defined` atom names it
+ * directly; a comparison / body-equality guard was canonicalized into an
+ * expression guard whose sides may inline it. */
+static bool cond_reads_value(parser *p, const ast_atom *at, uint32_t pred,
+                             const ast_arg *args, int nargs)
+{
+    if (at->is_defined && at->pred == pred && at->nargs == nargs) {
+        bool same = true;
+        for (int k = 0; k < nargs && same; k++)
+            same = at->args[k].name == args[k].name;
+        if (same) return true;
+    }
+    if (at->is_expr_guard)
+        return expr_tree_reads_value(p, at->lhs_root, pred, args, nargs, 0) ||
+               expr_tree_reads_value(p, at->rhs_root, pred, args, nargs, 0);
+    return false;
+}
+
+typedef struct {
+    const ast_atom *conds[3]; int nconds[3]; int ngroups;
+    const char *what, *rulename;       /* diagnostic shape; NULL for clamps */
+} psafe_ctx;
+
+static void check_partial_expr(parser *p, int e, const psafe_ctx *cx, int depth)
+{
+    if (e < 0 || depth > 2 * MAX_ARGS) return;
+    ex_node *n = &p->exprs[e];
+    switch (n->kind) {
+    case EX_LOAD: {
+        int vi = find_value(p, n->pred);
+        if (vi >= 0 && p->value_partial[vi]) {
+            bool covered = false;
+            for (int g = 0; g < cx->ngroups && !covered; g++)
+                for (int b = 0; b < cx->nconds[g] && !covered; b++)
+                    covered = cond_reads_value(p, &cx->conds[g][b], n->pred,
+                                               n->args, n->nargs);
+            if (!covered) {
+                const char *nm = intern_name(p->syms, n->pred);
+                if (!cx->what)
+                    serr(p, n->line, n->col,
+                         "a clamp bound reads '%s', which is partial (no "
+                         "unconditional base) — bounds have no guarding "
+                         "condition; give '%s' a base or clamp with a total "
+                         "value (#116)", nm, nm);
+                else
+                    serr(p, n->line, n->col,
+                         "%s '%s' reads '%s', which is partial (no "
+                         "unconditional base), without its condition reading "
+                         "it — add `defined %s(…)` (or a comparison over it) "
+                         "so the rule cannot fire while '%s' is undefined "
+                         "(#116)", cx->what, cx->rulename, nm, nm, nm);
+            }
+        }
+        return;          /* nested definitions are checked at their own rule */
+    }
+    case EX_CALL:
+        for (int k = 0; k < n->nargs; k++)
+            check_partial_expr(p, n->cargs[k], cx, depth + 1);
+        return;
+    case EX_CONST: case EX_ROLL: case EX_TEST: case EX_PRIOR:
+        return;
+    case EX_NEG: check_partial_expr(p, n->lhs, cx, depth + 1); return;
+    default:
+        check_partial_expr(p, n->lhs, cx, depth + 1);
+        check_partial_expr(p, n->rhs, cx, depth + 1);
+        return;
+    }
+}
+
+static void check_partial_arith(parser *p)
+{
+    bool any = false;
+    for (int v = 0; v < p->nvaluedecls && !any; v++)
+        any = p->value_partial[v];
+    if (!any) return;
+    /* value definitions: the expr vs the definition's own body + guard */
+    for (int i = 0; i < p->nrules; i++) {
+        ast_rule *r = &p->rules[i];
+        if (!r->head.is_valuedef) continue;
+        psafe_ctx cx = { { r->body, r->guard }, { r->nbody, r->nguard }, 2,
+                         "definition", r->label };
+        check_partial_expr(p, r->head.lhs_root, &cx, 0);
+    }
+    for (int i = 0; i < p->nactions; i++) {
+        ast_action *a = &p->actions[i];
+        const char *what = a->is_ramif ? "ramification" : "effect of action";
+        for (int b = 0; b < a->neff; b++) {
+            if (!a->effects[b].is_num_effect) continue;
+            psafe_ctx cx = { { a->requires }, { a->nreq }, 1, what, a->name };
+            check_partial_expr(p, a->effects[b].expr_root, &cx, 0);
+        }
+        for (int bi = 0; bi < a->nbind; bi++) {
+            ast_binder *bnd = &p->binders[a->bind_ix[bi]];
+            for (int it = 0; it < bnd->nitems; it++) {
+                if (!bnd->items[it].eff.is_num_effect) continue;
+                psafe_ctx cx = { { a->requires, bnd->where,
+                                   bnd->items[it].when },
+                                 { a->nreq, bnd->nwhere,
+                                   bnd->items[it].nwhen }, 3, what, a->name };
+                check_partial_expr(p, bnd->items[it].eff.expr_root, &cx, 0);
+            }
+        }
+    }
+    for (int i = 0; i < p->nfluents; i++) {        /* clamp bounds */
+        ast_fluent *fl = &p->fluents[i];
+        psafe_ctx cx = { { NULL }, { 0 }, 0, NULL, NULL };
+        if (fl->rmin_expr >= 0) check_partial_expr(p, fl->rmin_expr, &cx, 0);
+        if (fl->rmax_expr >= 0) check_partial_expr(p, fl->rmax_expr, &cx, 0);
     }
 }
 
@@ -5347,6 +5596,7 @@ static void semantic_pass(parser *p)
                      intern_name(p->syms, a->args[k].name));
     }
 
+    check_partial_arith(p);            /* #116 static safety rule */
     check_bands(p);
     stratify_steps(p);                 /* §5.8 strata + cycle rejection (#87) */
 }
@@ -5507,7 +5757,7 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
 {
     long cv;
     if (expr_fold(p, e, &cv)) {
-        if (*pos < MAX_CODE) { code[*pos].op = EXPR_CONST; code[(*pos)++].arg = cv; }
+        if (*pos < MAX_CODE) { code[*pos].op = EXPR_CONST; code[(*pos)++].arg = cv; } else p->code_of = true;
         return;
     }
     ex_node *n = &p->exprs[e];
@@ -5524,7 +5774,7 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
         if (*pos < MAX_CODE) {
             code[*pos].op = n->nprimed ? EXPR_LOADN : EXPR_LOAD;   /* #84 */
             code[(*pos)++].arg = (long)g;
-        }
+        } else p->code_of = true;
         return;
     }
     if (n->kind == EX_ROLL) {
@@ -5535,7 +5785,7 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
         for (int k = 0; k < nvars; k++)
             site = site * 0x100000001B3ull ^ binding[k];
         int idx = world_add_roll_site(p->w, (int)n->konst, site);
-        if (*pos < MAX_CODE) { code[*pos].op = EXPR_ROLL; code[(*pos)++].arg = (long)idx; }
+        if (*pos < MAX_CODE) { code[*pos].op = EXPR_ROLL; code[(*pos)++].arg = (long)idx; } else p->code_of = true;
         return;
     }
     if (n->kind == EX_CALL) {
@@ -5546,11 +5796,11 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
         if (*pos < MAX_CODE) {
             code[*pos].op = EXPR_CALL;
             code[(*pos)++].arg = ((long)n->pred << 8) | (long)(n->nargs & 0xff);
-        }
+        } else p->code_of = true;
         return;
     }
     if (n->kind == EX_PRIOR) {                 /* the chain's running value (#82) */
-        if (*pos < MAX_CODE) { code[*pos].op = EXPR_P; code[(*pos)++].arg = 0; }
+        if (*pos < MAX_CODE) { code[*pos].op = EXPR_P; code[(*pos)++].arg = 0; } else p->code_of = true;
         return;
     }
     if (n->kind == EX_TEST) {
@@ -5568,12 +5818,12 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
         if (*pos < MAX_CODE) {
             code[*pos].op = EXPR_TEST;
             code[(*pos)++].arg = ((long)g << 1) | (n->konst ? 1 : 0);
-        }
+        } else p->code_of = true;
         return;
     }
     if (n->kind == EX_NEG) {
         emit_expr(p, n->lhs, vars, nvars, binding, code, pos);
-        if (*pos < MAX_CODE) { code[*pos].op = EXPR_NEG; code[(*pos)++].arg = 0; }
+        if (*pos < MAX_CODE) { code[*pos].op = EXPR_NEG; code[(*pos)++].arg = 0; } else p->code_of = true;
         return;
     }
     emit_expr(p, n->lhs, vars, nvars, binding, code, pos);
@@ -5581,7 +5831,7 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
     expr_op op = n->kind == EX_ADD ? EXPR_ADD : n->kind == EX_SUB ? EXPR_SUB
                : n->kind == EX_MUL ? EXPR_MUL : n->kind == EX_DIV ? EXPR_DIV
                : n->kind == EX_MIN ? EXPR_MIN                     : EXPR_MAX;
-    if (*pos < MAX_CODE) { code[*pos].op = op; code[(*pos)++].arg = 0; }
+    if (*pos < MAX_CODE) { code[*pos].op = op; code[(*pos)++].arg = 0; } else p->code_of = true;
 }
 
 /* Inline a value read (#82): emit the definition's expression under the read's
@@ -5647,6 +5897,47 @@ static uint32_t ensure_marker_grounded(parser *p, int ri, const uint32_t *rargs)
     return m;
 }
 
+/* Ground the `defined(v(args))` judgment for one binding (#116): one
+ * defeasible rule per prior-free definition — `marker => defined(v(…))`, the
+ * disjunction via shared heads — deduped by the defined atom. A prior-bearing
+ * definition contributes nothing (it propagates undefinedness, never grounds
+ * it). Over a value with an unconditional base the atom is trivially true
+ * (one bodyless rule); the check pass already warned. An ordinary literal:
+ * queryable, `why?`-traceable, usable in any body or step condition. */
+static uint32_t ensure_defined_grounded(parser *p, uint32_t pred,
+                                        const uint32_t *args, int nargs)
+{
+    int vi = find_value(p, pred);
+    uint32_t vg = ground_pred(p, pred, args, nargs);
+    char nm[MAX_GROUND + 12];
+    snprintf(nm, sizeof nm, "defined(%s)", intern_name(p->syms, vg));
+    uint32_t g = intern_id(p->syms, nm);
+    if (g < p->vdefd_cap && p->vdefd_of[g] >= 0) return g;
+    atom_map_set(&p->vdefd_of, &p->vdefd_cap, g, 1);
+    if (vi < 0) return g;
+    char pbuf[MAX_NAME + 24];
+    if (!p->value_partial[vi]) {
+        dl_lit none = dl_pos(g);                   /* unused at nbody = 0 */
+        int h = world_add_rule(p->w, nm, DL_DEFEASIBLE, dl_pos(g), &none, 0);
+        world_set_rule_prov(p->w, h,
+            prov_str(p, p->valuedecls[vi].line, pbuf, sizeof pbuf));
+        return g;
+    }
+    for (int d = 0; d < p->nvdefs[vi]; d++) {
+        int ri = p->vdefs[vi][d];
+        if (expr_has_prior(p, p->rules[ri].head.lhs_root))
+            continue;                              /* propagates, never grounds */
+        uint32_t m = ensure_marker_grounded(p, ri, args);
+        dl_lit b = dl_pos(m);
+        char rn[MAX_GROUND + 12];
+        snprintf(rn, sizeof rn, "%s.defines", intern_name(p->syms, m));
+        int h = world_add_rule(p->w, rn, DL_DEFEASIBLE, dl_pos(g), &b, 1);
+        world_set_rule_prov(p->w, h,
+            prov_str(p, p->rules[ri].line, pbuf, sizeof pbuf));
+    }
+    return g;
+}
+
 /* Inline a value read (#82/#94): the chain program. Base expression first,
  * then per layer (chain order, bottom to top) the branch-free blend
  *     v' = v + test(marker)·(f(v) − v)
@@ -5659,24 +5950,38 @@ static void emit_value_inline(parser *p, uint32_t pred, const uint32_t *rargs,
                               expr_ins *code, int *pos)
 {
     int vi = find_value(p, pred);
-    int base = vi >= 0 ? p->value_def[vi] : -1;
-    if (base < 0) return;                      /* reported in the check pass */
+    if (vi < 0 || p->nvdefs[vi] == 0) return;  /* no defs: reported in check pass */
+    int base = p->value_def[vi];
+    bool partial = p->value_partial[vi];
+    if (base < 0 && !partial) return;          /* reported in the check pass */
     if (++p->vdepth > MAX_ARGS * 2) { p->vdepth--; return; }   /* cycle backstop */
-    ast_rule *bd = &p->rules[base];
-    uint32_t sub[MAX_ARGS] = { 0 };
-    emit_valuedef_sub(p, bd, rargs, sub);
-    emit_expr(p, bd->head.lhs_root, bd->vars, bd->nvars, sub, code, pos);
+#define VEMIT(o, a) do { if (*pos < MAX_CODE) {         code[*pos].op = (o); code[(*pos)++].arg = (a); } else p->code_of = true; } while (0)
+    if (base >= 0) {
+        ast_rule *bd = &p->rules[base];
+        uint32_t sub[MAX_ARGS] = { 0 };
+        emit_valuedef_sub(p, bd, rargs, sub);
+        emit_expr(p, bd->head.lhs_root, bd->vars, bd->nvars, sub, code, pos);
+    } else {
+        /* partial (#116): no base — a masked placeholder; the REQDEF epilogue
+         * below refuses to let an undefined chain deliver it */
+        VEMIT(EXPR_CONST, 0);
+    }
     for (int L = 0; L < p->value_nlayers[vi]; L++) {
         int ri = p->value_layers[vi][L];
         ast_rule *ld = &p->rules[ri];
         uint32_t lsub[MAX_ARGS] = { 0 };
         emit_valuedef_sub(p, ld, rargs, lsub);
         long targ = (long)ensure_marker_grounded(p, ri, rargs) << 1;
-#define VEMIT(o, a) do { if (*pos < MAX_CODE) {         code[*pos].op = (o); code[(*pos)++].arg = (a); } } while (0)
         VEMIT(EXPR_PPUSH, 0);                  /* v -> prior slot   */
         VEMIT(EXPR_P, 0);                      /* [v]               */
         VEMIT(EXPR_TEST, targ);                /* [v, t]            */
-        emit_expr(p, ld->head.lhs_root, ld->vars, ld->nvars, lsub, code, pos);
+        {   /* #116: a nested partial read inside f only demands definedness
+             * when THIS layer fired — record the marker for its epilogue */
+            bool pushed = p->nencl < 2 * MAX_ARGS;
+            if (pushed) p->encl_marks[p->nencl++] = targ;
+            emit_expr(p, ld->head.lhs_root, ld->vars, ld->nvars, lsub, code, pos);
+            if (pushed) p->nencl--;
+        }
         VEMIT(EXPR_MUL, 0);                    /* [v, t*f]          */
         VEMIT(EXPR_ADD, 0);                    /* [v + t*f]         */
         VEMIT(EXPR_TEST, targ);
@@ -5684,8 +5989,39 @@ static void emit_value_inline(parser *p, uint32_t pred, const uint32_t *rargs,
         VEMIT(EXPR_MUL, 0);                    /* [.., t*v]         */
         VEMIT(EXPR_SUB, 0);                    /* [v + t*(f - v)]   */
         VEMIT(EXPR_PPOP, 0);
-#undef VEMIT
     }
+    if (partial) {
+        /* Every read site of a partial value also grounds its `defined(…)`
+         * judgment (#116): the atom is part of the value's observable
+         * surface — hosts and `why?` can always ask it, and the M2 boundary
+         * reads a partial value as the option pair (defined, value). */
+        ensure_defined_grounded(p, pred, rargs, p->valuedecls[vi].nargs);
+        /* Definedness epilogue (#116): push
+         *     x = OR(prior-free layer markers) + Σ(1 − test(enclosing marker))
+         * then EXPR_REQDEF pops x and flags the evaluation UNDEFINED iff
+         * x <= 0 — no grounding layer fired AND every enclosing layer did
+         * (the evaluate-all-and-mask shape must not poison masked-off
+         * branches). A prior-bearing layer never grounds the chain: `prior`
+         * over nothing PROPAGATES undefinedness (Bless on a save that does
+         * not exist — still does not exist). */
+        int nd = 0;
+        for (int L = 0; L < p->value_nlayers[vi]; L++) {
+            int ri = p->value_layers[vi][L];
+            if (expr_has_prior(p, p->rules[ri].head.lhs_root))
+                continue;
+            long targ = (long)ensure_marker_grounded(p, ri, rargs) << 1;
+            VEMIT(EXPR_TEST, targ);
+            if (nd++) VEMIT(EXPR_MAX, 0);
+        }
+        for (int k = 0; k < p->nencl; k++) {
+            VEMIT(EXPR_CONST, 1);
+            VEMIT(EXPR_TEST, p->encl_marks[k]);
+            VEMIT(EXPR_SUB, 0);
+            VEMIT(EXPR_ADD, 0);
+        }
+        VEMIT(EXPR_REQDEF, 0);
+    }
+#undef VEMIT
     p->vdepth--;
 }
 
@@ -5722,11 +6058,26 @@ static void touch_ground_fluent(parser *p, uint32_t atom, uint32_t pred,
 static dl_lit ground_lit(parser *p, ast_atom *at, var_bind *vars, int nvars,
                          const uint32_t *binding)
 {
+    if (at->is_defined) {                          /* `defined v(args)` (#116) */
+        uint32_t dargs[MAX_ARGS];
+        for (int k = 0; k < at->nargs; k++)
+            dargs[k] = resolve_arg(vars, nvars, binding, at->args[k]);
+        uint32_t g = ensure_defined_grounded(p, at->pred, dargs, at->nargs);
+        return at->neg ? dl_neg(g) : dl_pos(g);    /* neg rejected in checks */
+    }
     if (at->is_expr_guard) {                       /* `expr <op> expr` — e.g. the d20 */
         expr_ins lcode[MAX_CODE], rcode[MAX_CODE];
         int nl = 0, nr = 0;
+        p->code_of = false;
         emit_expr(p, at->lhs_root, vars, nvars, binding, lcode, &nl);
         emit_expr(p, at->rhs_root, vars, nvars, binding, rcode, &nr);
+        if (p->code_of) {
+            serr(p, at->line, at->col,
+                 "guard expression too long — its compiled form (including "
+                 "inlined value chains) exceeds %d VM instructions; simplify "
+                 "the expression or the value's layers", MAX_CODE);
+            p->code_of = false;
+        }
         char label[24], nm[MAX_GROUND];
         snprintf(label, sizeof label, "eg%d", at->lhs_root);   /* per guard occurrence */
         inst_name(p, nm, sizeof nm, label, vars, nvars, binding);
@@ -5873,10 +6224,17 @@ static void declare_ground_fluents(parser *p)
                     }
                     expr_ins lo[MAX_CODE], hi[MAX_CODE];
                     int nlo = 0, nhi = 0;
+                    p->code_of = false;
                     if (f->rmin_expr >= 0)
                         emit_expr(p, f->rmin_expr, kv, f->nargs, binding, lo, &nlo);
                     if (f->rmax_expr >= 0)
                         emit_expr(p, f->rmax_expr, kv, f->nargs, binding, hi, &nhi);
+                    if (p->code_of) {
+                        serr(p, f->line, f->col,
+                             "clamp bound expression too long — its compiled "
+                             "form exceeds %d VM instructions", MAX_CODE);
+                        p->code_of = false;
+                    }
                     world_set_num_clamp(p->w, atom,
                                         f->rmin_expr >= 0 ? lo : NULL, nlo,
                                         f->rmax_expr >= 0 ? hi : NULL, nhi);
@@ -6822,7 +7180,16 @@ static void ground_action(parser *p, ast_action *a)
             uint32_t num = ground_pred(p, e->pred, nargs, e->nargs);
             expr_ins code[MAX_CODE];
             int nc = 0;
+            p->code_of = false;
             emit_expr(p, e->expr_root, a->vars, a->nvars, binding, code, &nc);
+            if (p->code_of) {
+                serr(p, e->line, e->col,
+                     "effect expression too long — its compiled form "
+                     "(including inlined value chains) exceeds %d VM "
+                     "instructions; simplify the expression or the value's "
+                     "layers", MAX_CODE);
+                p->code_of = false;
+            }
             emit_num_effect(p, h, e, num, nargs[0], code, nc);
         }
 
@@ -6916,7 +7283,16 @@ static void ground_action(parser *p, ast_action *a)
                         uint32_t num = ground_pred(p, e->pred, narg, e->nargs);
                         expr_ins code[MAX_CODE];
                         int nc = 0;
+                        p->code_of = false;
                         emit_expr(p, e->expr_root, cv, ncv, cb, code, &nc);
+                        if (p->code_of) {
+                            serr(p, e->line, e->col,
+                                 "effect expression too long — its compiled "
+                                 "form (including inlined value chains) "
+                                 "exceeds %d VM instructions; simplify the "
+                                 "expression or the value's layers", MAX_CODE);
+                            p->code_of = false;
+                        }
                         emit_num_effect(p, h2, e, num, narg[0], code, nc);
                     }
                 }
@@ -7164,6 +7540,10 @@ static bool lane_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var,
 {
     if (a->value != INTERN_NONE || a->is_guard || a->is_num_effect || a->is_expr_guard)
         return false;                              /* MV / numeric / expr guard: out */
+    if (a->is_defined)
+        return false;                              /* `defined v(…)` (#116): its
+                                                    * marker-disjunction rules
+                                                    * live in the N=1 family */
     pred_info *pi = find_pred(p, a->pred);
     if (!pi || pi->is_mv || pi->is_num || pi->is_provider)
         return false;                              /* providers are host-answered, not laned */
@@ -8721,6 +9101,8 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
     free(p->ents);
     free(p->ent_of);
     free(p->ent_pos);
+    free(p->vmark_of);
+    free(p->vdefd_of);
     for (int s = 0; s < p->nsorts; s++) free(p->domain_ents[s]);
     if (p->fidx) factindex_free(p->fidx);
     free(p);

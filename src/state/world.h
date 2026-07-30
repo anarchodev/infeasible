@@ -52,11 +52,16 @@ const struct factindex *world_fact_index(world *w);
 
 /* Numeric fluents (DESIGN.md §5.8): an integer value store, kept separate from
  * the boolean closed-world fluents — scalars never become atoms. Values are
- * read only through comparison *guard atoms* (`hp<=0`), which the world asserts
- * closed-world from the stored value on every evaluation (strict inputs, never
- * UNDECIDED, never concluded by a rule). `min`/`max` are the declared clamp
- * range (`state hp : int in 0..20`), the outermost stage of the commit
- * pipeline below. */
+ * read only through comparison *guard atoms* (`hp<=0`). A guard over a STORED
+ * numeric is asserted closed-world from the stored value on every evaluation
+ * (a strict input, never UNDECIDED, never concluded by a rule). A guard over
+ * a DERIVED value (an expression guard whose bytecode inlines a value chain)
+ * is only closed-world while the value is total: over a PARTIAL value (#116 —
+ * one with no unconditional base definition) it is genuinely tri-valued, and
+ * when no definition applies the guard asserts NEITHER fact, leaving it
+ * UNDECIDED — the honest "the question does not apply". `min`/`max` are the
+ * declared clamp range (`state hp : int in 0..20`), the outermost stage of
+ * the commit pipeline below. */
 typedef enum {
     WORLD_CMP_LE, WORLD_CMP_LT, WORLD_CMP_GE, WORLD_CMP_GT, WORLD_CMP_EQ
 } world_cmp;
@@ -202,7 +207,7 @@ typedef enum {
     EXPR_PPUSH,   /* pop the running value onto the prior stack (enter a layer) */
     EXPR_P,       /* push the top of the prior stack (`prior` reads) */
     EXPR_PPOP,    /* drop the top prior slot (leave a layer) */
-    EXPR_LOADN    /* primed numeric READ (#87 extension, for #84's modeled
+    EXPR_LOADN,   /* primed numeric READ (#87 extension, for #84's modeled
                    * pipeline): push the NEXT value of the numeric fluent whose
                    * atom = arg — the value a lower stratum already committed
                    * this tick. Legal only in ramification effect expressions
@@ -210,6 +215,21 @@ typedef enum {
                    * fluent; a fluent with no writers reads its current value
                    * (inertia: next == current). The .story front end rejects
                    * it everywhere else. */
+    EXPR_REQDEF   /* partial-value definedness check (#116): pop x; if x <= 0,
+                   * flag the evaluation UNDEFINED (out-of-band, never an
+                   * in-band sentinel; evaluation continues, so every roll
+                   * site is still visited — §5.10 replay stability). Emitted
+                   * at the end of a partial value's inlined chain with
+                   * x = OR(prior-free layer markers) + Σ(1 − test(enclosing
+                   * layer marker)): a nested read only demands definedness
+                   * when every enclosing layer actually fired, so the
+                   * evaluate-all-and-mask shape never poisons a masked-off
+                   * branch. An undefined GUARD is UNDECIDED (asserts neither
+                   * fact — genuinely tri-valued, see the numeric-fluent note
+                   * above); an undefined effect RHS or clamp bound is
+                   * unreachable from a clean compile (#116's static safety
+                   * rule) and reports an internal step error — defense in
+                   * depth, outside the language contract. */
 } expr_op;
 typedef struct { expr_op op; long arg; } expr_ins;
 

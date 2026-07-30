@@ -41,6 +41,10 @@ struct dlcol {
 
     /* Columns: [nlits][W], row r at masks + r*W. */
     uint64_t *fact;
+    uint64_t *open;                            /* #116 open literals: no fact,
+                                                * but NOT closed-world — block
+                                                * -Delta (and so -d), leaving
+                                                * the literal UNDECIDED */
     uint64_t *delta_t, *delta_f;               /* +Delta / -Delta */
     uint64_t *part_t,  *part_f;                /* +d / -d */
 
@@ -76,6 +80,7 @@ dlcol *dlcol_new(int natoms, int nentities)
     f->tail = (nentities > 0 && r != 0) ? (~0ull >> (64 - r)) : ~0ull;
     size_t nm = f->nlits ? (size_t)f->nlits * f->W : 1;   /* natoms==0 ok */
     f->fact = calloc(nm, sizeof *f->fact);
+    f->open = calloc(nm, sizeof *f->open);
     f->delta_t = calloc(nm, sizeof *f->delta_t);
     f->delta_f = calloc(nm, sizeof *f->delta_f);
     f->part_t  = calloc(nm, sizeof *f->part_t);
@@ -99,6 +104,7 @@ void dlcol_free(dlcol *f)
     free(f->head_off); free(f->head_rule);
     free(f->beat_off); free(f->beat_by);
     free(f->fact);
+    free(f->open);
     free(f->delta_t); free(f->delta_f);
     free(f->part_t); free(f->part_f);
     free(f->app_t); free(f->app_f);
@@ -114,7 +120,7 @@ size_t dlcol_footprint(const dlcol *f)
 {
     size_t nm = (size_t)f->nlits * f->W;
     size_t b = sizeof *f;
-    b += 5 * nm * sizeof(uint64_t);                       /* fact, delta_t/f, part_t/f */
+    b += 6 * nm * sizeof(uint64_t);          /* fact, open, delta_t/f, part_t/f */
     b += (size_t)8 * f->W * sizeof(uint64_t);             /* scratch */
     if (f->app_t) b += 2 * (size_t)f->nrules * f->W * sizeof(uint64_t);
     b += (size_t)f->caprules * sizeof *f->rules;
@@ -195,7 +201,8 @@ void dlcol_ensure_atoms(dlcol *f, int natoms)
         f->col = realloc(f->col, newnm * sizeof *f->col); \
         memset(f->col + oldnm, 0, (newnm - oldnm) * sizeof *f->col); \
     } while (0)
-    REGROW(fact); REGROW(delta_t); REGROW(delta_f); REGROW(part_t); REGROW(part_f);
+    REGROW(fact); REGROW(open);
+    REGROW(delta_t); REGROW(delta_f); REGROW(part_t); REGROW(part_f);
 #undef REGROW
     f->aname = realloc(f->aname, (size_t)natoms * sizeof *f->aname);
     for (int a = f->natoms; a < natoms; a++) f->aname[a] = NULL;
@@ -229,6 +236,12 @@ void dlcol_add_fact(dlcol *f, dl_lit l, int entity)
 void dlcol_clear_facts(dlcol *f)
 {
     memset(f->fact, 0, (size_t)f->nlits * f->W * sizeof(uint64_t));
+    memset(f->open, 0, (size_t)f->nlits * f->W * sizeof(uint64_t));
+}
+
+void dlcol_set_open(dlcol *f, dl_lit l, int entity)
+{
+    row(f->open, f, lit_idx(l))[entity / 64] |= 1ull << (entity % 64);
 }
 
 int dlcol_row_words(const dlcol *f) { return f->W; }
@@ -327,6 +340,8 @@ static void solve_delta(dlcol *f)
                 uint64_t nt = (prove[w] & ~df[w] & ~dt[w]) & m;
                 dt[w] |= nt;
                 uint64_t nf = (alldead[w] & ~row(f->fact, f, q)[w]
+                               & ~row(f->open, f, q)[w]    /* #116: open stays
+                                                            * undecided */
                                & ~dt[w] & ~df[w]) & m;
                 df[w] |= nf;
                 any |= nt | nf;
