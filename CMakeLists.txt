@@ -97,3 +97,9 @@ target_compile_options(bench_matcher PRIVATE -O2)
 add_executable(bench_dtype tests/bench_dtype.c)
 target_link_libraries(bench_dtype PRIVATE infeasible_core)
 target_compile_options(bench_dtype PRIVATE -O2)
+
+# #121 adoption gate (EPIC #117): full phase-guarded schema vs hand-narrowed
+# per-phase worlds — `split` is built only if narrowing wins >= 1.3x at 100k.
+add_executable(bench_phase tests/bench_phase.c)
+target_link_libraries(bench_phase PRIVATE infeasible_core)
+target_compile_options(bench_phase PRIVATE -O2)
