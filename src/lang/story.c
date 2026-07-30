@@ -5011,6 +5011,64 @@ static void expand_kind_rules(parser *p)
     }
 }
 
+/* #145: kind-level superiority. `halfling_luck > bless` between two functor
+ * modifiers is the sentence "Luck applies above Bless, everywhere they meet"
+ * — it desugars to the pairwise dotted sups over the INTERSECTION of their
+ * member sets (recovered from the expansion's own `A.member` labels), the
+ * same erasure story as bands: the engine never learns. An explicit dotted
+ * sup between a specific pair — either direction — suppresses the blanket
+ * for that member (most-specific wins, as everywhere in the language). A
+ * blanket over modifiers that share no member is an orphan-style warning. */
+static void desugar_kind_sups(parser *p)
+{
+    int n0 = p->nsups;
+    for (int i = 0; i < n0; i++) {
+        ast_sup *s = &p->sups[i];
+        ast_rule *ra = find_rule(p, s->a);
+        ast_rule *rb = find_rule(p, s->b);
+        if (!ra || !rb || !ra->head.is_kinddef || !rb->head.is_kinddef)
+            continue;                  /* ground_sup owns every other shape */
+        int shared = 0;
+        for (int vi = 0; vi < p->nvaluedecls; vi++) {
+            const char *vn = intern_name(p->syms, p->valuedecls[vi].pred);
+            char la[MAX_NAME], lb[MAX_NAME];
+            if (snprintf(la, sizeof la, "%s.%s", s->a, vn) >= MAX_NAME ||
+                snprintf(lb, sizeof lb, "%s.%s", s->b, vn) >= MAX_NAME)
+                continue;              /* expansion already errored the label */
+            if (!find_rule(p, la) || !find_rule(p, lb))
+                continue;              /* not a shared member */
+            shared++;
+            bool explicit_ = false;
+            for (int j = 0; j < n0 && !explicit_; j++) {
+                if (j == i) continue;
+                explicit_ =
+                    (strcmp(p->sups[j].a, la) == 0 &&
+                     strcmp(p->sups[j].b, lb) == 0) ||
+                    (strcmp(p->sups[j].a, lb) == 0 &&
+                     strcmp(p->sups[j].b, la) == 0);
+            }
+            if (explicit_)
+                continue;              /* most-specific wins */
+            if (p->nsups >= MAX_SUPS) {
+                serr(p, s->aline, s->acol,
+                     "too many superiority edges (max %d) desugaring "
+                     "'%s > %s' — raise MAX_SUPS", MAX_SUPS, s->a, s->b);
+                return;
+            }
+            ast_sup *d = &p->sups[p->nsups++];
+            memset(d, 0, sizeof *d);
+            snprintf(d->a, MAX_NAME, "%s", la);
+            snprintf(d->b, MAX_NAME, "%s", lb);
+            d->aline = s->aline; d->acol = s->acol;
+            d->bline = s->bline; d->bcol = s->bcol;
+        }
+        if (shared == 0)
+            warn(p, s->aline, s->acol,
+                 "'%s > %s' orders kind modifiers that share no member value "
+                 "— it does nothing", s->a, s->b);
+    }
+}
+
 static void semantic_pass(parser *p)
 {
     synthesize_enum_sorts(p);          /* #96: before entities resolve */
@@ -5024,6 +5082,7 @@ static void semantic_pass(parser *p)
     check_kfacts(p);                   /* #124: membership vocabulary first */
     solve_kind_stratum(p);             /* #125: the taxonomy solves at build */
     expand_kind_rules(p);              /* #124 kinds-are-facts: before defs register */
+    desugar_kind_sups(p);              /* #145: blanket modifier ordering */
 
     /* #124 staging boundary: a `value`-sorted binder exists only to feed a
      * functor-modifier head this slice — anywhere else (a rule concluding a
@@ -6870,10 +6929,13 @@ static void ground_sup(parser *p, ast_sup *s)
     if (rule_is_kind(p, ra) || rule_is_kind(p, rb))
         return;                        /* #125: applied inside the kind stratum
                                         * (mixed pairs already errored there) */
+    if (ra->head.is_kinddef && rb->head.is_kinddef)
+        return;                        /* #145: desugared to the dotted pairs */
     if (ra->head.is_kinddef || rb->head.is_kinddef) {
         serr(p, s->aline, s->acol,
              "'%s' > '%s': a kind modifier's expansions are the orderable "
-             "rules — target the expanded label (`<modifier>.<value>`)",
+             "rules — target the expanded label (`<modifier>.<value>`), or "
+             "order two kind modifiers wholesale (`A > B`, #145)",
              s->a, s->b);
         return;
     }
