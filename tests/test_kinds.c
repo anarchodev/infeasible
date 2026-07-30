@@ -392,7 +392,7 @@ static int test_errors(void)
           "value ( save(value)  s(actor) : int )\n"
           "rule bs(X: actor): => s(X) = 10\n"
           "rule j(V: value): blessed(a) => q(a)\n",
-          "land with #125" },
+          "this rule is neither" },
         /* fact vocabulary */
         { "value s : int\nrule d: => s = 3\nfact zap(s)\n",
           "not a declared kind predicate" },

@@ -91,6 +91,22 @@
  *                                                        -- declared value symbols);
  *                                                        -- build-time-only vocabulary,
  *                                                        -- populated by `fact`s
+ *                                                        -- KIND RULES (#125): a rule
+ *                                                        -- concluding a kind pred
+ *                                                        -- (`rule L(V: value):
+ *                                                        --  k(V,…) & D in {…} &
+ *                                                        --  ~facts_only(V) => k2(V,c)`)
+ *                                                        -- is BUILD-TIME: the stratum
+ *                                                        -- (facts + kind rules +
+ *                                                        -- superiority, defeasible)
+ *                                                        -- solves at grounding via the
+ *                                                        -- scalar DL engine; UNDECIDED
+ *                                                        -- (cycle) or CONTESTED
+ *                                                        -- (unordered conflict)
+ *                                                        -- membership is a located
+ *                                                        -- error; reading runtime
+ *                                                        -- state under a kind head is
+ *                                                        -- a located error
  *   fact    := 'fact' ( katom | '(' katom* ')' )        -- kind membership (#124);
  *   katom   := IDENT '(' IDENT (',' IDENT)* ')'         -- args are bare symbols,
  *                                                        -- vocabulary-checked (the
@@ -209,6 +225,17 @@ typedef struct {
  * returned world (provenance strings copy from it at compile time). */
 world *story_compile(const char *src, const char *srcname, intern *syms,
                      story_diags *diags);
+
+/* #125: same compile, but also render the BUILD-TIME why-trace for one ground
+ * kind atom (`query`, e.g. "d20(dagger_throw)") into `out` — the kind stratum
+ * ("a world with no step function") is solved by the same scalar DL engine at
+ * grounding, and its trace uses the ordinary dl_trace renderer, so the output
+ * is byte-identical in format to a runtime `why`. A query atom the stratum
+ * never touched renders the usual not-in-theory shape. Tooling entry point
+ * (the §6.1 why-debugger reaching compile-time decisions). */
+world *story_compile_kinds_why(const char *src, const char *srcname,
+                               intern *syms, story_diags *diags,
+                               const char *query, FILE *out);
 
 /* Same result as story_compile, but grounds eligible rules via the semi-naïve
  * join matcher over the fact-store extension index (§5.2 item 4, #28) instead

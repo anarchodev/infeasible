@@ -348,6 +348,12 @@ typedef struct {
     int nkindpreds;
     ast_kfact   kfacts[MAX_KFACTS];       /* #124 membership facts */
     int nkfacts;
+    dl_theory  *kth;                      /* #125: the kind-stratum theory,   */
+    dl_result  *kres;                     /* solved at build; NULL = no kinds */
+    uint32_t   *katoms; int *katom_rule;  /* ground kind atoms (sweep list) + */
+    int nkatoms, capkatoms;               /* first concluding rule ix or -1   */
+    const char *kwhy_query;               /* #125 build-time why: query atom  */
+    FILE       *kwhy_out;                 /* name + sink, or NULL             */
     uint32_t    metaval;                  /* the interned "value" meta-sort name —
                                            * LAZY (metaval()): interning it eagerly
                                            * would shift every later atom id and so
@@ -4330,6 +4336,393 @@ static void check_kfacts(parser *p)
     }
 }
 
+/* ---- #125: the kind stratum is rules ----------------------------------
+ * "A world with no step function": membership facts + kind rules over the
+ * sealed value domain, evaluated at grounding by the SAME scalar DL engine
+ * (dl_solve — build-time, small), with the same verdicts and the same
+ * dl_why. The grounder is a two-valued consumer: any UNDECIDED kind atom is
+ * a located authoring error. Modifier selection queries these verdicts, so
+ * a derived kind expands identically to the equivalent fact-only spelling. */
+
+static uint32_t ground_pred(parser *p, uint32_t pred, const uint32_t *args, int n);
+static const char *prov_str(parser *p, int line, char *buf, size_t n);
+static void inst_name(parser *p, char *buf, size_t n, const char *label,
+                      var_bind *vars, int nvars, const uint32_t *binding);
+static bool members_ok(parser *p, ast_atom *body, int n, var_bind *vars,
+                       int nvars, const uint32_t *binding);
+static ast_rule *find_rule(parser *p, const char *label);
+
+/* A rule concluding a kind predicate — a build-time taxonomy rule. */
+static bool rule_is_kind(parser *p, ast_rule *r)
+{
+    if (r->head.is_valuedef || r->head.is_kinddef) return false;
+    pred_info *pi = find_pred(p, r->head.pred);
+    return pi && pi->is_kindpred;
+}
+
+static int kindpred_index(parser *p, uint32_t pred)
+{
+    for (int i = 0; i < p->nkindpreds; i++)
+        if (p->kindpreds[i].pred == pred) return i;
+    return -1;
+}
+
+/* Domain of one kind-stratum dimension: the value symbols for the meta-sort,
+ * a sort's members (entities or enum values) otherwise. */
+static long kdim_size(parser *p, int sort)
+{
+    return sort == SORT_METAVALUE ? p->nvaluedecls : domain_size(p, sort);
+}
+static uint32_t kdim_at(parser *p, int sort, long i)
+{
+    return sort == SORT_METAVALUE ? p->valuedecls[i].pred : domain_at(p, sort, i);
+}
+
+/* Append a ground kind atom to the sweep list (deduped; the list is small). */
+static void kadd_atom(parser *p, uint32_t atom, int rule_ix)
+{
+    for (int i = 0; i < p->nkatoms; i++)
+        if (p->katoms[i] == atom) {
+            if (p->katom_rule[i] < 0) p->katom_rule[i] = rule_ix;
+            return;
+        }
+    if (p->nkatoms == p->capkatoms) {
+        p->capkatoms = p->capkatoms ? p->capkatoms * 2 : 64;
+        p->katoms = realloc(p->katoms, (size_t)p->capkatoms * sizeof *p->katoms);
+        p->katom_rule = realloc(p->katom_rule,
+                                (size_t)p->capkatoms * sizeof *p->katom_rule);
+    }
+    p->katoms[p->nkatoms] = atom;
+    p->katom_rule[p->nkatoms] = rule_ix;
+    p->nkatoms++;
+}
+
+/* One kind-rule atom's ground literal under a binding. `dims` is the rule's
+ * variables extended with one synthetic dimension per `_` occurrence
+ * (wdim[b][a] maps atom b, arg a to its dimension, -1 = not a wildcard). */
+static dl_lit kind_ground_lit(parser *p, ast_atom *at, int b, var_bind *dims,
+                              int ndims, const uint32_t *bind,
+                              int wdim[][MAX_ARGS])
+{
+    uint32_t args[MAX_ARGS];
+    for (int a = 0; a < at->nargs; a++) {
+        int vi = var_index(dims, ndims, at->args[a].name);
+        if (wdim[b][a] >= 0)      args[a] = bind[wdim[b][a]];
+        else if (vi >= 0)         args[a] = bind[vi];
+        else                      args[a] = at->args[a].name;   /* a symbol */
+    }
+    dl_lit l = { ground_pred(p, at->pred, args, at->nargs), at->neg };
+    return l;
+}
+
+/* Validate one kind-atom argument list against its predicate: variables must
+ * carry the position's sort (the meta-sort at kval_pos), symbols must be
+ * members of the position's domain; `_` is legal only where allowed. */
+static void kind_check_args(parser *p, ast_atom *at, pred_info *pi,
+                            var_bind *vars, int nvars, uint32_t wild,
+                            bool allow_wild)
+{
+    for (int a = 0; a < at->nargs; a++) {
+        uint32_t nm = at->args[a].name;
+        if (nm == wild) {
+            if (!allow_wild)
+                serr(p, at->args[a].line, at->args[a].col,
+                     "a head names what it concludes — no `_` wildcards");
+            continue;
+        }
+        int vi = var_index(vars, nvars, nm);
+        if (vi >= 0) {
+            int want = a == pi->kval_pos ? SORT_METAVALUE : pi->argsort[a];
+            if (want != -2 && vars[vi].sort != want &&
+                !(a == pi->kval_pos && vars[vi].sort == SORT_METAVALUE))
+                serr(p, at->args[a].line, at->args[a].col,
+                     "'%s' has the wrong sort for this position of '%s'",
+                     intern_name(p->syms, nm), intern_name(p->syms, at->pred));
+            continue;
+        }
+        if (a == pi->kval_pos) {
+            if (find_value(p, nm) < 0)
+                serr(p, at->args[a].line, at->args[a].col,
+                     "'%s' is not a declared value", intern_name(p->syms, nm));
+            continue;
+        }
+        int s = pi->argsort[a];
+        if (s < 0) continue;
+        bool in = false;
+        for (long e = 0; e < domain_size(p, s) && !in; e++)
+            in = domain_at(p, s, e) == nm;
+        if (!in)
+            serr(p, at->args[a].line, at->args[a].col,
+                 "'%s' is not a member of sort '%s'",
+                 intern_name(p->syms, nm), p->sorts[s].name);
+    }
+}
+
+static void solve_kind_stratum(parser *p)
+{
+    if (p->nkindpreds == 0)
+        return;
+    uint32_t wild = intern_id(p->syms, "_");
+
+    /* which kind preds have concluding rules (any polarity) — those are
+     * DERIVED: never closed-world, never negatable in a body */
+    bool concluded[MAX_FLUENTS] = { false }, negated[MAX_FLUENTS] = { false };
+    for (int i = 0; i < p->nrules; i++)
+        if (rule_is_kind(p, &p->rules[i])) {
+            int ki = kindpred_index(p, p->rules[i].head.pred);
+            if (ki >= 0) concluded[ki] = true;
+        }
+
+    /* ---- validate the kind rules ---- */
+    for (int i = 0; i < p->nrules; i++) {
+        ast_rule *r = &p->rules[i];
+        if (!rule_is_kind(p, r)) continue;
+        resolve_vars(p, r->vars, r->nvars, "a kind rule");
+        if (r->has_guard || r->nguard)
+            serr(p, r->line, r->col,
+                 "`unless` on a kind rule is not supported in this slice — "
+                 "use a defeater (`~>`) or superiority");
+        pred_info *hp = find_pred(p, r->head.pred);
+        if (r->head.nargs != hp->arity) {
+            serr(p, r->head.line, r->head.col, "'%s' takes %d arguments, not %d",
+                 intern_name(p->syms, r->head.pred), hp->arity, r->head.nargs);
+            continue;
+        }
+        kind_check_args(p, &r->head, hp, r->vars, r->nvars, wild, false);
+        for (int b = 0; b < r->nbody; b++) {
+            ast_atom *at = &r->body[b];
+            if (at->is_member) continue;           /* #95 static filter */
+            pred_info *bp = find_pred(p, at->pred);
+            if (!bp || !bp->is_kindpred) {
+                serr(p, at->line, at->col,
+                     "kind rules run at world-build and cannot read '%s' — "
+                     "fluents, providers, rolls and judgments are runtime; "
+                     "guard the modifier instead",
+                     intern_name(p->syms, at->pred));
+                continue;
+            }
+            if (at->primed || at->value != INTERN_NONE || at->is_guard ||
+                at->is_expr_guard || at->is_num_effect) {
+                serr(p, at->line, at->col,
+                     "a kind atom is a plain (possibly negated) literal");
+                continue;
+            }
+            if (at->nargs != bp->arity) {
+                serr(p, at->line, at->col, "'%s' takes %d arguments, not %d",
+                     intern_name(p->syms, at->pred), bp->arity, at->nargs);
+                continue;
+            }
+            if (at->neg) {
+                int ki = kindpred_index(p, at->pred);
+                if (ki >= 0 && concluded[ki])
+                    serr(p, at->line, at->col,
+                         "negation over the DERIVED kind '%s' is not "
+                         "closed-world — only facts-only kinds close at "
+                         "world-build; conclude the complement with a rule",
+                         intern_name(p->syms, at->pred));
+                else if (ki >= 0)
+                    negated[ki] = true;
+            }
+            kind_check_args(p, at, bp, r->vars, r->nvars, wild, true);
+        }
+    }
+    if (p->nerrors)
+        return;
+
+    /* ---- assemble the theory ---- */
+    p->kth = dl_theory_new(p->syms);
+    for (int i = 0; i < p->nkfacts; i++) {
+        ast_kfact *kf = &p->kfacts[i];
+        uint32_t a = ground_pred(p, kf->pred, kf->args, kf->nargs);
+        dl_add_fact(p->kth, dl_pos(a));
+        kadd_atom(p, a, -1);
+    }
+    /* closed-world negatives, only where a body actually negates a
+     * facts-only kind: every unasserted combination of its argument domains */
+    for (int ki = 0; ki < p->nkindpreds; ki++) {
+        if (!negated[ki] || concluded[ki]) continue;
+        pred_info *pi = find_pred(p, p->kindpreds[ki].pred);
+        long total = 1;
+        for (int a = 0; a < pi->arity; a++)
+            total *= kdim_size(p, a == pi->kval_pos ? SORT_METAVALUE
+                                                    : pi->argsort[a]);
+        for (long ix = 0; ix < total; ix++) {
+            uint32_t args[MAX_ARGS];
+            long rem = ix;
+            for (int a = 0; a < pi->arity; a++) {
+                int s = a == pi->kval_pos ? SORT_METAVALUE : pi->argsort[a];
+                long d = kdim_size(p, s);
+                args[a] = kdim_at(p, s, rem % d);
+                rem /= d;
+            }
+            bool asserted = false;
+            for (int f = 0; f < p->nkfacts && !asserted; f++) {
+                ast_kfact *kf = &p->kfacts[f];
+                if (kf->pred != pi->pred || kf->nargs != pi->arity) continue;
+                asserted = true;
+                for (int a = 0; a < pi->arity && asserted; a++)
+                    asserted = kf->args[a] == args[a];
+            }
+            if (!asserted)
+                dl_add_fact(p->kth, dl_neg(ground_pred(p, pi->pred, args,
+                                                       pi->arity)));
+        }
+    }
+
+    /* ground the kind rules: variables plus one dimension per `_`. Each
+     * ground instance is recorded with its literals so the contested sweep
+     * below can re-derive applicability from the solved result. */
+    struct kinst { int rule, id; dl_lit head; dl_lit body[MAX_BODY]; int nb; };
+    struct kinst *kmap = NULL;
+    int nkmap = 0, capkmap = 0;
+    for (int i = 0; i < p->nrules; i++) {
+        ast_rule *r = &p->rules[i];
+        if (!rule_is_kind(p, r)) continue;
+        var_bind dims[MAX_BODY * MAX_ARGS];
+        int ndims = r->nvars;
+        for (int v = 0; v < r->nvars; v++) dims[v] = r->vars[v];
+        int wdim[MAX_BODY][MAX_ARGS];
+        for (int b = 0; b < r->nbody; b++) {
+            ast_atom *at = &r->body[b];
+            pred_info *bp = find_pred(p, at->pred);
+            for (int a = 0; a < at->nargs; a++) {
+                wdim[b][a] = -1;
+                if (at->is_member || !bp || !bp->is_kindpred) continue;
+                if (at->args[a].name != wild) continue;
+                dims[ndims].name = wild;
+                dims[ndims].sort = a == bp->kval_pos ? SORT_METAVALUE
+                                                     : bp->argsort[a];
+                dims[ndims].line = at->line;
+                dims[ndims].col = at->col;
+                wdim[b][a] = ndims++;
+            }
+        }
+        long total = 1;
+        for (int d = 0; d < ndims; d++) {
+            long sz = kdim_size(p, dims[d].sort);
+            if (sz <= 0) { total = 0; break; }
+            total *= sz;
+        }
+        for (long ix = 0; ix < total; ix++) {
+            uint32_t bind[MAX_BODY * MAX_ARGS];
+            long rem = ix;
+            for (int d = 0; d < ndims; d++) {
+                long sz = kdim_size(p, dims[d].sort);
+                bind[d] = kdim_at(p, dims[d].sort, rem % sz);
+                rem /= sz;
+            }
+            if (!members_ok(p, r->body, r->nbody, dims, ndims, bind))
+                continue;
+            dl_lit body[MAX_BODY];
+            int nb = 0;
+            for (int b = 0; b < r->nbody; b++) {
+                if (r->body[b].is_member) continue;
+                body[nb] = kind_ground_lit(p, &r->body[b], b, dims, ndims,
+                                           bind, wdim);
+                kadd_atom(p, body[nb].atom, -1);
+                nb++;
+            }
+            int hw[MAX_BODY][MAX_ARGS] = { { -1 } };
+            for (int a = 0; a < MAX_ARGS; a++) hw[0][a] = -1;
+            dl_lit head = kind_ground_lit(p, &r->head, 0, dims, ndims, bind, hw);
+            kadd_atom(p, head.atom, i);
+            char nm[MAX_GROUND];
+            inst_name(p, nm, sizeof nm, r->label, r->vars, r->nvars, bind);
+            int id = dl_add_rule(p->kth, nm, r->kind, head, body, nb);
+            char pb[MAX_NAME + 24];
+            dl_set_prov(p->kth, id, prov_str(p, r->line, pb, sizeof pb));
+            if (nkmap == capkmap) {
+                capkmap = capkmap ? capkmap * 2 : 64;
+                kmap = realloc(kmap, (size_t)capkmap * sizeof *kmap);
+            }
+            kmap[nkmap].rule = i;
+            kmap[nkmap].id = id;
+            kmap[nkmap].head = head;
+            kmap[nkmap].nb = nb;
+            for (int b = 0; b < nb; b++) kmap[nkmap].body[b] = body[b];
+            nkmap++;
+        }
+    }
+
+    /* superiority between kind rules: every ground-instance pair (dl consults
+     * a sup edge only when the two heads actually conflict) */
+    for (int s = 0; s < p->nsups; s++) {
+        ast_rule *ra = find_rule(p, p->sups[s].a);
+        ast_rule *rb = find_rule(p, p->sups[s].b);
+        bool ka = ra && rule_is_kind(p, ra), kb = rb && rule_is_kind(p, rb);
+        if (!ka && !kb) continue;
+        if (ka != kb) {
+            serr(p, p->sups[s].aline, p->sups[s].acol,
+                 "'%s' > '%s': a kind rule orders only against kind rules — "
+                 "the strata never conflict", p->sups[s].a, p->sups[s].b);
+            continue;
+        }
+        for (int x = 0; x < nkmap; x++) {
+            if (&p->rules[kmap[x].rule] != ra) continue;
+            for (int y = 0; y < nkmap; y++)
+                if (&p->rules[kmap[y].rule] == rb)
+                    dl_add_sup(p->kth, kmap[x].id, kmap[y].id);
+        }
+    }
+
+    p->kres = dl_solve(p->kth);
+
+    /* ---- the two-valued consumer's sweep. Two failure shapes:
+     *  - a CYCLE leaves a verdict UNDECIDED (the scaffold engine; §5.2's
+     *    cycle rule is #109) — located error;
+     *  - a CONTESTED membership: this engine is ambiguity-BLOCKING, so an
+     *    unresolved conflict REFUTES both polarities — detected as
+     *    "applicable support on both sides, neither proved", re-derived
+     *    from our own ground records against the solved result. ---- */
+    for (int i = 0; i < p->nkatoms; i++) {
+        uint32_t a = p->katoms[i];
+        dl_verdict pv = dl_defeasible(p->kres, dl_pos(a));
+        dl_verdict nv = dl_defeasible(p->kres, dl_neg(a));
+        if (pv == DL_UNDECIDED || nv == DL_UNDECIDED) {
+            int ri = p->katom_rule[i];
+            serr(p, ri >= 0 ? p->rules[ri].line : 1,
+                 ri >= 0 ? p->rules[ri].col : 1,
+                 "kind membership '%s' is UNDECIDED at world-build — its "
+                 "support is cyclic (§5.2, #109); break the cycle",
+                 intern_name(p->syms, a));
+            continue;
+        }
+        if (pv == DL_PROVED || nv == DL_PROVED)
+            continue;                              /* decided, either way */
+        const char *pl = NULL, *nl = NULL;
+        int line = 0, col = 0;
+        for (int x = 0; x < nkmap && !(pl && nl); x++) {
+            if (kmap[x].head.atom != a) continue;
+            bool app = true;
+            for (int b = 0; b < kmap[x].nb && app; b++)
+                app = dl_defeasible(p->kres, kmap[x].body[b]) == DL_PROVED;
+            if (!app) continue;
+            ast_rule *r = &p->rules[kmap[x].rule];
+            if (!kmap[x].head.neg && !pl) {
+                pl = r->label;
+                line = r->line; col = r->col;
+            } else if (kmap[x].head.neg && !nl) {
+                nl = r->label;
+            }
+        }
+        if (pl && nl)
+            serr(p, line, col,
+                 "kind membership '%s' is CONTESTED at world-build — '%s' "
+                 "and '%s' both fire with neither superior; add "
+                 "`%s > %s` (or the reverse), or a fact",
+                 intern_name(p->syms, a), pl, nl, nl, pl);
+    }
+    free(kmap);
+
+    /* build-time why (#125): render the trace for one queried kind atom with
+     * the ordinary dl_trace renderer — byte-identical to the runtime format */
+    if (p->kwhy_query && p->kwhy_out) {
+        uint32_t qa = intern_id(p->syms, p->kwhy_query);
+        dl_why(p->kth, p->kres, dl_pos(qa), p->kwhy_out);
+    }
+}
+
+
 /* #124 kinds-are-facts: expand each functor-position modifier
  *
  *     rule L(A: actor, V: value): k(V, …) & body => V(A[, T]) = expr
@@ -4468,21 +4861,34 @@ static void expand_kind_rules(parser *p)
             pred_info *vpi = find_pred(p, v->pred);
             bool sel = true;
             for (int s = 0; s < nksel && sel; s++) {
+                /* #125: selection queries the solved kind stratum — a fact
+                 * and a derived membership answer identically. Wildcard
+                 * facets are existential: any member of the position's
+                 * domain proved. */
                 ast_atom *ka = &k->body[ksel[s]];
                 pred_info *pi = find_pred(p, ka->pred);
+                uint32_t args[MAX_ARGS];
+                int wpos[MAX_ARGS], nw = 0;
+                for (int a = 0; a < pi->arity; a++) {
+                    if (a == pi->kval_pos)             args[a] = v->pred;
+                    else if (ka->args[a].name == wild) wpos[nw++] = a;
+                    else                               args[a] = ka->args[a].name;
+                }
+                long total = 1;
+                for (int wq = 0; wq < nw; wq++)
+                    total *= domain_size(p, pi->argsort[wpos[wq]]);
                 bool any = false;
-                for (int f = 0; f < p->nkfacts && !any; f++) {
-                    ast_kfact *kf = &p->kfacts[f];
-                    if (kf->pred != ka->pred || kf->nargs != pi->arity ||
-                        kf->args[pi->kval_pos] != v->pred)
-                        continue;
-                    bool m = true;
-                    for (int a = 0; a < ka->nargs && m; a++) {
-                        if (a == pi->kval_pos) continue;
-                        uint32_t nm = ka->args[a].name;
-                        if (nm != wild && nm != kf->args[a]) m = false;
+                for (long ix = 0; ix < total && !any; ix++) {
+                    long rem = ix;
+                    for (int wq = 0; wq < nw; wq++) {
+                        long d = domain_size(p, pi->argsort[wpos[wq]]);
+                        args[wpos[wq]] = domain_at(p, pi->argsort[wpos[wq]],
+                                                   rem % d);
+                        rem /= d;
                     }
-                    any = m;
+                    uint32_t ga = ground_pred(p, ka->pred, args, pi->arity);
+                    any = p->kres &&
+                          dl_defeasible(p->kres, dl_pos(ga)) == DL_PROVED;
                 }
                 sel = any;
             }
@@ -4567,6 +4973,7 @@ static void semantic_pass(parser *p)
     check_functions(p);
 
     check_kfacts(p);                   /* #124: membership vocabulary first */
+    solve_kind_stratum(p);             /* #125: the taxonomy solves at build */
     expand_kind_rules(p);              /* #124 kinds-are-facts: before defs register */
 
     /* #124 staging boundary: a `value`-sorted binder exists only to feed a
@@ -4574,14 +4981,14 @@ static void semantic_pass(parser *p)
      * kind, an action over values) is the derived-kind stratum, #125 */
     for (int i = 0; i < p->nrules; i++) {
         ast_rule *r = &p->rules[i];
-        if (r->head.is_kinddef) continue;
+        if (r->head.is_kinddef || rule_is_kind(p, r)) continue;
         for (int v = 0; v < r->nvars; v++)
             if (r->vars[v].sort == SORT_METAVALUE ||
                 r->vars[v].sort == -(int)p->metaval - 2)
                 serr(p, r->vars[v].line, r->vars[v].col,
-                     "a `value`-sorted parameter outside a functor-modifier "
-                     "head — derived kind rules (`… => k(V)`) land with #125; "
-                     "this slice's `V : value` only feeds a `V(A) = …` head");
+                     "a `value`-sorted parameter belongs to a kind rule "
+                     "(`… => k(V)`) or a functor-modifier head (`V(A) = …`) — "
+                     "this rule is neither");
     }
     for (int i = 0; i < p->nactions; i++)
         for (int v = 0; v < p->actions[i].nvars; v++)
@@ -4608,6 +5015,13 @@ static void semantic_pass(parser *p)
         }
         if (r->head.is_valuedef) {
             check_valuedef(p, i);
+            for (int j = i + 1; j < p->nrules; j++)
+                if (strcmp(r->label, p->rules[j].label) == 0)
+                    serr(p, p->rules[j].line, p->rules[j].col,
+                         "duplicate rule label '%s'", r->label);
+            continue;
+        }
+        if (rule_is_kind(p, r)) {      /* #125: validated in solve_kind_stratum */
             for (int j = i + 1; j < p->nrules; j++)
                 if (strcmp(r->label, p->rules[j].label) == 0)
                     serr(p, p->rules[j].line, p->rules[j].col,
@@ -5351,6 +5765,7 @@ static bool members_ok(parser *p, ast_atom *body, int n, var_bind *vars,
 static void ground_rule(parser *p, ast_rule *r)
 {
     if (r->head.is_valuedef || r->head.is_kinddef) return;   /* #82: never dl rules */
+    if (rule_is_kind(p, r)) return;    /* #125: solved at build, never runtime */
     bool of = false;
     long total = instance_count(p, r->vars, r->nvars, &of);
     if (of) {
@@ -5446,6 +5861,7 @@ static bool rule_in_sup(parser *p, ast_rule *r)
 static bool rule_matchable(parser *p, ast_rule *r)
 {
     if (r->head.is_valuedef || r->head.is_kinddef) return false;   /* #82 */
+    if (rule_is_kind(p, r)) return false;              /* #125: build-time */
     if (r->nvars < 1 || r->nbody < 1) return false;
     if (r->has_guard) return false;                /* `unless` defeater — later */
     if (r->head.is_num_effect) return false;
@@ -6402,6 +6818,9 @@ static void ground_sup(parser *p, ast_sup *s)
         serr(p, s->bline, s->bcol, "unknown rule label '%s' in superiority", s->b);
         return;
     }
+    if (rule_is_kind(p, ra) || rule_is_kind(p, rb))
+        return;                        /* #125: applied inside the kind stratum
+                                        * (mixed pairs already errored there) */
     if (ra->head.is_kinddef || rb->head.is_kinddef) {
         serr(p, s->aline, s->acol,
              "'%s' > '%s': a kind modifier's expansions are the orderable "
@@ -6608,6 +7027,7 @@ static void compute_taint(parser *p, bool *taint)
         for (int i = 0; i < p->nrules; i++) {
             ast_rule *r = &p->rules[i];
             if (r->head.is_valuedef || r->head.is_kinddef) continue;   /* #82 */
+            if (rule_is_kind(p, r)) continue;                          /* #125 */
             int hp = pred_idx(p, r->head.pred);
             if (hp < 0 || taint[hp]) continue;
             bool bad = !rule_eligible(p, r);
@@ -6648,6 +7068,7 @@ static void emit_sort_lanes(parser *p, int S, const bool *taint)
     for (int i = 0; i < p->nrules; i++) {
         ast_rule *r = &p->rules[i];
         if (r->head.is_valuedef || r->head.is_kinddef) continue;       /* #82 */
+        if (rule_is_kind(p, r)) continue;                              /* #125 */
         int hp = pred_idx(p, r->head.pred);
         if (hp < 0 || taint[hp] || r->nvars != 1 || r->vars[0].sort != S)
             continue;
@@ -7966,9 +8387,12 @@ void story_model_free(story_model *m)
  * for the caller's first story_matcher_reground; implies matched grounding. */
 static world *compile_impl(const char *src, const char *srcname, intern *syms,
                            story_diags *diags, bool matched,
-                           story_model **out, story_matcher **mret)
+                           story_model **out, story_matcher **mret,
+                           const char *kwhy_query, FILE *kwhy_out)
 {
     parser *p = calloc(1, sizeof *p);
+    p->kwhy_query = kwhy_query;        /* #125 build-time why hook */
+    p->kwhy_out = kwhy_out;
     p->dtype_sort = -1;           /* #83: no damage-type enum until an `as` is seen */
     p->ground_matched = matched || mret != NULL;
     p->sparse = mret != NULL;     /* #92: dense universe only for eager +
@@ -8079,6 +8503,10 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
      * best-effort, so navigation works even on a file that failed to compile. */
     if (out) *out = harvest_model(p);
 
+    if (p->kres) dl_result_free(p->kres);              /* #125 kind stratum */
+    if (p->kth)  dl_theory_free(p->kth);
+    free(p->katoms);
+    free(p->katom_rule);
     for (int i = 0; i < p->nrules; i++) free(p->rules[i].insts);
     free(p->rules);
     free(p->actions);
@@ -8097,13 +8525,21 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
 world *story_compile(const char *src, const char *srcname, intern *syms,
                      story_diags *diags)
 {
-    return compile_impl(src, srcname, syms, diags, false, NULL, NULL);
+    return compile_impl(src, srcname, syms, diags, false, NULL, NULL, NULL, NULL);
+}
+
+world *story_compile_kinds_why(const char *src, const char *srcname,
+                               intern *syms, story_diags *diags,
+                               const char *query, FILE *out)
+{
+    return compile_impl(src, srcname, syms, diags, false, NULL, NULL,
+                        query, out);
 }
 
 world *story_compile_model(const char *src, const char *srcname, intern *syms,
                            story_diags *diags, story_model **out)
 {
-    return compile_impl(src, srcname, syms, diags, false, out, NULL);
+    return compile_impl(src, srcname, syms, diags, false, out, NULL, NULL, NULL);
 }
 
 /* Same grammar and world, but ground rules in the join-matcher kernel via the
@@ -8112,7 +8548,7 @@ world *story_compile_model(const char *src, const char *srcname, intern *syms,
 world *story_compile_matched(const char *src, const char *srcname, intern *syms,
                              story_diags *diags)
 {
-    return compile_impl(src, srcname, syms, diags, true, NULL, NULL);
+    return compile_impl(src, srcname, syms, diags, true, NULL, NULL, NULL, NULL);
 }
 
 /* Tick-time matcher: compile, retain the matchable-rule plan, and materialize the
@@ -8130,7 +8566,7 @@ story_matcher *story_compile_matcher(const char *src, const char *srcname,
                                      intern *syms, story_diags *diags, world **out)
 {
     story_matcher *m = NULL;
-    world *w = compile_impl(src, srcname, syms, diags, true, NULL, &m);
+    world *w = compile_impl(src, srcname, syms, diags, true, NULL, &m, NULL, NULL);
     if (out) *out = w;
     if (!w) return NULL;                 /* compile failed; m already NULL/freed */
     /* Auto re-ground: the world refreshes the matched layer itself before each
