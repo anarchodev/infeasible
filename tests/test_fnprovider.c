@@ -90,9 +90,8 @@ static int test_directional_move(void)
     CHECK(world_step(w, &west, 1, err, sizeof err) == 0);
     CHECK(at(w, "hero") == 104);             /* neighbor(105, -1) */
 
-    /* inertia: a step with no move leaves position unchanged */
-    uint32_t noop = intern_id(SY, "wait");
-    CHECK(world_step(w, &noop, 1, err, sizeof err) == 0);
+    /* inertia: an empty step (no action; a bare no-rule atom is loud, #119) */
+    CHECK(world_step(w, NULL, 0, err, sizeof err) == 0);
     CHECK(at(w, "hero") == 104);
 
     world_free(w);

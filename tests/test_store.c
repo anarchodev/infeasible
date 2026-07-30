@@ -85,9 +85,8 @@ static int test_copy_move(void)
     CHECK(at(w, "ally") == 1001);
     CHECK(grouped(w));                        /* now co-located (via the provider) */
 
-    /* inertia: a step with no move leaves position unchanged */
-    uint32_t noop = intern_id(SY, "wait");
-    CHECK(world_step(w, &noop, 1, err, sizeof err) == 0);
+    /* inertia: an empty step (no action; a bare no-rule atom is loud, #119) */
+    CHECK(world_step(w, NULL, 0, err, sizeof err) == 0);
     CHECK(at(w, "aria") == 1001);
 
     world_free(w);

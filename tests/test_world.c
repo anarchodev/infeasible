@@ -5,6 +5,7 @@
 #include "core/intern.h"
 
 #include <stdio.h>
+#include <string.h>
 
 #define CHECK(c) \
     do { \
@@ -30,6 +31,9 @@ static int test_yale_shooting(void)
 
     dl_lit e_loaded = dl_pos(loaded);
     world_add_step_rule(w, "load", a_load, NULL, 0, &e_loaded, 1);
+    /* `wait` is a real action that changes nothing: an effectless trigger
+     * rule. (A bare atom with no rule is a loud error since #119.) */
+    world_add_step_rule(w, "wait", a_wait, NULL, 0, NULL, 0);
     step_cond gun_loaded = { { loaded, false }, false };
     dl_lit e_dead[] = { dl_neg(alive), dl_neg(loaded) };
     world_add_step_rule(w, "shoot", a_shoot, &gun_loaded, 1, e_dead, 2);
@@ -113,6 +117,58 @@ static int test_conflict_detection(void)
     return 0;
 }
 
+/* Loud no-op actions (#119): an action atom that triggers ZERO step rules is
+ * an error (-1, err names it, state untouched) — a typo'd atom must never
+ * read as "the game ignored me". An action whose rules exist but fail their
+ * guards is NOT this case: it steps normally and the turn is spent. */
+static int test_loud_noop_action(void)
+{
+    intern *sy = intern_new();
+    uint32_t open = intern_id(sy, "door_open"),
+             unlocked = intern_id(sy, "unlocked");
+    uint32_t a_push = intern_id(sy, "act_push"),
+             a_typo = intern_id(sy, "act_pussh");
+
+    world *w = world_new(sy);
+    world_declare_fluent(w, open);
+    world_declare_fluent(w, unlocked);
+
+    step_cond is_unlocked = { { unlocked, false }, false };
+    dl_lit e_open = dl_pos(open);
+    world_add_step_rule(w, "push", a_push, &is_unlocked, 1, &e_open, 1);
+
+    /* unknown atom: loud, named, unmutated */
+    char err[256] = "";
+    CHECK(world_step(w, &a_typo, 1, err, sizeof err) == -1);
+    CHECK(strstr(err, "act_pussh") != NULL);
+    CHECK(strstr(err, "matches no step rule") != NULL);
+    CHECK(!world_get(w, open));
+
+    /* a batch containing one unknown atom is rejected whole — the valid
+     * action's effect must not land either (steps are atomic) */
+    world_set(w, unlocked, true);
+    uint32_t batch[2] = { a_push, a_typo };
+    err[0] = '\0';
+    CHECK(world_step(w, batch, 2, err, sizeof err) == -1);
+    CHECK(strstr(err, "act_pussh") != NULL);
+    CHECK(!world_get(w, open));
+
+    /* guard-failed is NOT an error: locked door, push matches by trigger,
+     * the guard fails, the step commits with nothing fired */
+    world_set(w, unlocked, false);
+    CHECK(world_step(w, &a_push, 1, err, sizeof err) == 0);
+    CHECK(!world_get(w, open));
+
+    /* and the world is still live after the rejections */
+    world_set(w, unlocked, true);
+    CHECK(world_step(w, &a_push, 1, err, sizeof err) == 0);
+    CHECK(world_get(w, open));
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
 /* The cellar: judgments (weakened / can_force) with defeater + superiority,
  * gating an action whose condition is itself a derived judgment. */
 static int test_cellar(void)
@@ -181,7 +237,8 @@ static int test_cellar(void)
 /* The cached step schema must rebuild when the world grows mid-game: step,
  * then add a new fluent and step rule, step again — the new rule fires, the
  * old fluent's state and inertia survive the rebuild, and an action atom
- * interned after the schema was built is safely inert. */
+ * interned after the schema was built is loudly rejected (#119) without
+ * corrupting the pending rebuild. */
 static int test_grow_mid_game(void)
 {
     intern *sy = intern_new();
@@ -207,9 +264,17 @@ static int test_grow_mid_game(void)
     effs[0] = dl_pos(door);
     world_add_step_rule(w, "open_door", a_open, NULL, 0, effs, 1);
 
+    /* an action atom no rule mentions is a LOUD reject since #119 (it used
+     * to be silently inert) — and the rejection must not corrupt the
+     * about-to-rebuild schema */
     acts[0] = a_open;
     acts[1] = a_noop;
-    CHECK(world_step(w, acts, 2, NULL, 0) == 0);
+    char err[128] = "";
+    CHECK(world_step(w, acts, 2, err, sizeof err) == -1);
+    CHECK(strstr(err, "act_dance") != NULL);
+    CHECK(!world_get(w, door));
+
+    CHECK(world_step(w, acts, 1, NULL, 0) == 0);
     CHECK(world_get(w, door));
     CHECK(world_get(w, lamp));      /* inertia across the rebuild */
 
@@ -226,6 +291,7 @@ int main(void)
     if (test_yale_shooting()) return 1;
     if (test_ramification()) return 1;
     if (test_conflict_detection()) return 1;
+    if (test_loud_noop_action()) return 1;
     if (test_cellar()) return 1;
     if (test_grow_mid_game()) return 1;
     printf("test_world: all passed\n");
