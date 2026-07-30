@@ -29,10 +29,9 @@
 //     roll of melee weapon attacks — `dmg_of(value, value)` is a LINK
 //     predicate and the modifier binds a second value parameter through
 //     it; the Rage below is now the faithful spelling.
-//   - #144: ordered non-commuting kind modifiers — resistance halves
-//     (`prior / 2`) and penalties subtract (`prior - e`); the commuting
-//     class (#94) excludes both even when explicitly ordered, so the ward
-//     below is spelled as a `min` cap instead of a halving.
+//   - #144 (found here, then LANDED): resistance HALVES — the ward below
+//     is the faithful `prior / 2`, a non-commuting shape admitted because
+//     it is totally ordered against its neighbors (one #145 blanket line).
 //   - #145 (found here, then LANDED): "Luck applies above Bless, everywhere
 //     they meet" first cost TEN dotted sup lines — the probe's biggest
 //     friction finding; it is now the four blanket lines below, desugared to
@@ -141,10 +140,10 @@ rule bracers_of_archery(A: actor, V: value):
 rule war_caster_wand(A: actor, V: value):
     attack(V, _, spell) & warcaster(A)    => V(A) = prior + 1
 
-// a brutal-damage ward: caps nonmagical physical damage (see gap #144 —
-// a real resistance HALVES, which needs the ordered non-commuting class)
+// a brutal-damage ward: RESISTANCE, the faithful halving (#144 — a
+// non-commuting shape, legal because the blanket below orders it)
 rule brutal_ward(A: actor, V: value):
-    brutal(V) & warded(A) => V(A) = min(prior, 8)
+    brutal(V) & warded(A) => V(A) = prior / 2
 
 // Luck (a max layer) meets the add layers on six values — mixed classes
 // demand explicit order (#94). Kind-level superiority (#145) says each
@@ -154,7 +153,8 @@ halfling_luck > bless
 halfling_luck > bracers_of_archery
 halfling_luck > war_caster_wand
 // Rage now lands on damage values (no member shared with Luck); it meets
-// the ward's min cap on sword_dmg — one blanket line orders them:
+// the ward's halving on sword_dmg — one blanket line orders them
+// (resistance applies after all other modifiers, PHB order):
 brutal_ward > rage
 
 // ---- host-facing snapshots -------------------------------------------------

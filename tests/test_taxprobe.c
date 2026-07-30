@@ -114,8 +114,8 @@ int main(void)
     /* the thrown dagger: ranged-weapon BY DEFEAT — Bracers yes, Rage NO */
     CHECK(num(w, sy, "dta(bran)") == 14);  /* 10 + d4(2) + 2, and not +2 more */
     /* damage: Rage's +2 lands on the LINKED sword_dmg (#143), and the
-     * brutal ward's cap applies above it (blanket-ordered): min(10+2, 8) */
-    CHECK(num(w, sy, "swd(bran)") == 8);
+     * ward RESISTS above it (#144, blanket-ordered): (10+2)/2, floored */
+    CHECK(num(w, sy, "swd(bran)") == 6);
     CHECK(num(w, sy, "fbd(bran)") == 10);
     /* initiative: a check — Bless ignores it, Luck floors it (1 -> 2) */
     CHECK(num(w, sy, "ini(bran)") == 2);
