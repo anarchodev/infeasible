@@ -414,7 +414,9 @@ Defeasible logic defines consequence, not time. Time lives in the fact store:
 - **Conflict = authoring error**: if neither `f'` nor `~f'` is provable
   (two applicable causal rules with no superiority), the step function rejects
   the step and reports the fluent and the fighting rules. Detected at run
-  time now; the compiler will detect conflictable pairs statically.
+  time, and now statically: the conflictable-pair pass (#98, §5.13) warns on
+  any effect pair that could contest — a zero-warning story cannot take this
+  path.
 - Sanity anchor: the **Yale shooting problem** behaves correctly by
   construction — inertia on `loaded` is only defeated by a rule that actually
   fires against it; nothing fires during `wait`. This is a golden test.
@@ -810,7 +812,9 @@ lookup where the solver would be:
   nothing to discover — and mints one guard atom per threshold per ground
   instance. To the solver these are strict inputs: asserted closed-world each
   evaluation (never UNDECIDED), usable as antecedents, never concluded by any
-  rule. On a value change the provider re-buckets (one binary search over the
+  rule. (This closed-world promise is scoped to guards over *stored*
+  numerics: a guard over a partial derived value is genuinely tri-valued —
+  when no definition applies it asserts neither fact, §5.13/#116.) On a value change the provider re-buckets (one binary search over the
   fluent's sorted thresholds) and only the atoms that actually flipped root
   invalidation cones (I3) — chip damage that crosses no threshold wakes no
   rules.
@@ -882,8 +886,8 @@ inside each class:
 - **Absolute effects (`:=`) are value conclusions.** "Set hp to 10" claims a
   value exactly as `door=open` does, so `:=` effects compete under §5.7:
   strict-team defeat, bands, superiority; two unresolved `:=`s on one fluent
-  = contested step, statically detectable as a conflictable pair. No new
-  semantics.
+  = contested step, statically detected by the conflictable-pair pass (#98,
+  §5.13). No new semantics.
 - **Relative effects (`+=`, `-=`) combine by summation** (additive fluents:
   Lee & Lifschitz 2003) — the genuinely new class, possible only because
   numeric domains have group structure. Addition commutes, so contributions
@@ -1172,7 +1176,8 @@ full pipeline (base, deltas, clamp exercised in one step); two unresolved
 `:=`s reject naming both rules; `combine min` resolves two speed-setters to
 the most restrictive; and the trace test asserts the itemized receipt.
 *Status*: the guard-boundary half (threshold entailment chains; guard atoms
-as closed-world strict inputs, never UNDECIDED) is pinned in
+over stored numerics as closed-world strict inputs, never UNDECIDED — the
+partial-derived-value exception is §5.13's) is pinned in
 `tests/test_landmark.c`; the pipeline, dying-trigger, and oscillator tests
 await the M1 value store and are listed in that file's header so the gap
 stays visible.
@@ -1515,6 +1520,110 @@ PHB-faithfully, with no approximations left.
 
 **Deferred, stated**: kind-indexed value families, and the module system
 (single-file program union is the shipped degenerate case).
+
+### 5.13 Regaining totality (decided)
+
+The bar is Elm's: **a program that compiles does not fail at runtime** —
+here, a clean compile plus a typed host never observes a `world_step` error.
+The engine was close enough to this bar to claim it deliberately: the logic
+layer is tri-valued (undecidedness is a *verdict*, never an in-band datum),
+division is total by decided semantics (`x/0 = 0`, floored — the precedent:
+totalize where a sensible answer exists), and the compiler already refused
+programs it could not evaluate soundly (nested test guards, primed-judgment
+reads, the kind stratum's build-time sweep, §5.8's oscillators). What
+remained was a finite, enumerable list of `world_step` `-1` paths, each of
+exactly one of two kinds, with one principled answer each:
+
+1. **an authoring error a stronger compiler can catch** — moved to a located
+   compile diagnostic;
+2. **a host-protocol error a typed boundary can make unconstructible** —
+   moved behind the §6.3 interface artifact (M2).
+
+The runtime checks stay in the code as *assertions* (defense in depth
+against compiler bugs) but leave the language contract. The loud-failures
+rule is strengthened, not weakened: the loudest possible failure is the one
+at compile time. And totality does **not** retire tri-valuedness — an
+UNDECIDED verdict on a *judgment* is an honest answer ("the question does
+not apply") and stays; totality is the guarantee that the **two-valued
+consumers** — arithmetic, the step commit, the grounder — are never handed
+one.
+
+**The inventory, and where each row landed.**
+
+| runtime failure | kind | static answer |
+|---|---|---|
+| contested boolean / multi-valued fluent | authoring | **conflictable pairs (#98)**: complementary-effect writers that could co-fire warn at compile unless their conditions provably exclude it |
+| conflicting merge-less `:=` on one numeric | authoring | same pass, numeric side — including a writer colliding with *itself* when a scope variable is missing from the target and the value varies with the binding |
+| arithmetic over a partial derived value | authoring | **the static safety rule (#116)**: an arithmetic read of a partial value is a located error unless the same rule's condition also reads it |
+| solver UNDECIDED from cyclic rule graphs | authoring | **the §5.2 cycle rule (#109)**: unattacked support-SCCs complete to REFUTED via the Datalog fixpoint; attacked cycles are a located error |
+| unknown action atom (#119's loud no-op) | host protocol | the §6.3 artifact's generated action constructors (M2): a bound host cannot spell an unknown atom |
+| action dead under the current `split` value (#121) | host protocol | per-value action liveness in the artifact + the `can_act` judgment idiom (M2): a bound host *asks* instead of tripping |
+| internal tripwires (undeclared effect heads, …) | compiler bug | already unreachable from a clean compile by the vocabulary checks; kept as assertions |
+
+**Partiality is inferred (#116).** A derived value with zero unconditional,
+`prior`-free base definitions is *partial* — no keyword. The decision was
+argued both ways (`split` set a make-the-weight-visible precedent for an
+explicit marker); inferred won because the safety rule is the loudness
+backstop: a forgotten base changes the value's contract, and the first
+unguarded arithmetic consumer errors at compile, which is where the author
+is actually looking. The machinery: `defined v(X)` is a first-class body
+atom — the disjunction of the value's *prior-free* layer markers, ordinary
+defeasible rules sharing a head, grounded at every partial read site so
+hosts and `why?` can always ask it; a guard over an undefined value asserts
+**neither fact** (an *open literal* in the family — a fact-less located
+literal would otherwise close to REFUTED, since −∂ is vacuous with no
+rules); `prior` over nothing *propagates* undefinedness (Bless on a save
+that does not exist — still does not exist) rather than trapping. The
+safety rule's soundness is syntactic, no entailment needed: an absent value
+makes the guarding condition UNDECIDED, the rule cannot fire, and the RHS
+never evaluates. False positives (definedness implied indirectly) cost one
+self-documenting conjunct — the Elm trade, the same one #98's exclusivity
+conditions ask for below. On the M2 boundary a partial value reads as the
+option pair `(defined, value)`, never an exception.
+
+**The conflictable-pair contract (#98).** Warning severity, never an error,
+and — decided against the issue's first sketch — **resolved pairs stay
+quiet**: the zero-warning state must be *reachable*, or the contract below
+is vacuous. What warns is exactly what can go wrong: step-effect pairs
+(complementary booleans, different multi-valued values, merge-less `:=`)
+whose conditions do not provably exclude co-firing, judgment pairs nothing
+orders (no covering `>` — a *teammate's* edge counts, team defeat's static
+shadow; band edges count, having desugared to `>`), and strict-vs-strict
+conflicts, which superiority can never order. Exclusivity is judged under
+the collision's unifier — complementary literal, distinct multi-valued
+constants, disjoint comparison intervals, disjoint membership lists — and
+is conservative in the direction a warning needs: exclusivity the compiler
+cannot see warns, and one more condition is the fix. Resolving every flag
+is the author's totality proof, exactly Elm's "handle the case you know is
+impossible". The *report* on resolved pairs — band edge / explicit `>` /
+which team member beats which attacker — is tooling surface (§6.1 hover),
+not a diagnostic. One reading note the warnings rely on: under ambiguity
+blocking a contested literal reads **REFUTED on both polarities** — an
+applicable unbeaten attacker refutes; contested is not undecided.
+
+**The cycle rule's gate (#109; semantics in §5.2).** The completion runs
+only in cyclic SCCs no rule attacks, and only for entities where every
+*out-of-SCC* input the SCC reads is decided — a tied attack elsewhere, or a
+#116 open guard, keeps the honest stall. Loop-starvation and conflict never
+blur; that gate is what lets #116's tri-valuedness and #109's completion
+coexist in one solve.
+
+**The contract.** A story that compiles with **zero errors and zero
+warnings** cannot take the contested or undefined step paths, and — with
+#109 — cannot be handed a solver UNDECIDED by a two-valued consumer. The
+remaining `-1`s are host-protocol, and the M2 typed binding retires those
+for bound hosts: *a clean, zero-warning compile plus a bound host never
+observes `world_step -1`*. Honest boundaries, stated: a host that bypasses
+the binding with raw atoms keeps today's loud `-1`s (deliberately — the
+check is the protocol); provider callbacks are a trust boundary (host-
+answered facts are inputs, not proofs) and sit outside the claim; and the
+claim is per-story, carried by the author's zero-warning obligation, not a
+global theorem about the language.
+
+*Status*: the three compile-side rows are landed and pinned
+(`test_partial`, `test_conflict`, `test_cycle`; #116/#98/#109); the
+host-protocol rows wait on the §6.3 artifact (M2), and the contract's full
+sentence should be re-stated there when the binding ships.
 
 ### Invariants (compiler/engine enforced)
 
@@ -2729,9 +2838,11 @@ semantics. Names are working names.
   (an emergent team win is unpredictable without global knowledge) is
   epistemic and is answered by visibility, not semantics: the `why?` trace
   already renders which team member beat which attacker, and the
-  conflictable-pair compile check (a planned lint surfacing every
-  complementary-head pair and how it resolves, team wins loudly) moves that
-  knowledge to build time. Pinned by the criss-cross golden in `test_dl`
+  conflictable-pair compile check has landed (#98, §5.13) — unordered
+  complementary pairs warn at build time (a teammate's `>` edge counts as
+  team defeat's static shadow); the per-pair *resolution report* for
+  resolved pairs (band edge / `>` / which member beats which attacker) is
+  the remaining tooling surface (§6.1 hover). Pinned by the criss-cross golden in `test_dl`
   (verdict-level, not just the dl↔dl_col differential). Still needs
   author-facing docs.
 - **Cross-scope entity identity** (§5.5, §6.4): scope-qualified atoms give a

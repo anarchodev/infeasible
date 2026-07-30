@@ -55,7 +55,7 @@ API shape: `dl_theory_new` → `dl_add_rule`/`dl_add_sup`/`dl_add_fact` → `dl_
 
 The why-trace format lives once in `dl_trace.c/h` as a vtable over an opaque ctx; the scalar (`dl_result`) and columnar (`dlcol`) backings each supply accessors, so `dl_why` and `dlcol_why` render **byte-for-byte identical** traces by construction (pinned by `test_col`). Change trace formatting in one place.
 
-Scaffold caveat: this is the correct-but-not-yet-linear implementation. The committed M3 linear path (behind the same API) is the Antoniou transformation + a stratifying/SCC-condensing compiler, then an **SCC-ordered ("weak-topological") sweep** as the evaluator — *not* Maher's counter/worklist route (rationale + literature in DESIGN.md §5.2). The golden tests pin the semantics so the swap stays safe. Cyclic rule graphs may leave literals `DL_UNDECIDED` (the future compiler rejects/stratifies cycles).
+Scaffold caveat: this is the correct-but-not-yet-linear implementation. The committed M3 linear path (behind the same API) is the Antoniou transformation + a stratifying/SCC-condensing compiler, then an **SCC-ordered ("weak-topological") sweep** as the evaluator — *not* Maher's counter/worklist route (rationale + literature in DESIGN.md §5.2). The golden tests pin the semantics so the swap stays safe. Cycles follow the §5.2 cycle rule (#109, implemented in both engines): an unattacked support cycle is Datalog — least fixpoint, then unsupported members complete to REFUTED (`dl_why` renders the loop); a cycle any rule attacks stays honestly `DL_UNDECIDED` in the engine and is a located compile error in the `.story` layer ("defeat cannot reach through a cycle").
 
 ### State & the step function (`src/state/world.h`)
 
