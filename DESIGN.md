@@ -1336,9 +1336,21 @@ both ("no live step rule while `phase=declare`"). A primed read of a split
 fluent is rejected (selection is by the pre-step value). Nothing about the
 hint says "phase": any mode fluent qualifies (overworld/combat, day/night).
 Measured headroom at 100k entities: 65% of the full-schema round statically
-dead, 2.89× on the hand-narrowed simulation; the per-value **lane** schemas
-(where an MV-guarded world currently forfeits the lane path entirely) are
-the open half of #121.
+dead, 2.89× on the hand-narrowed simulation. The per-value **lane** schemas
+landed with the mixed lane/N=1 route (#121, both slices): under each value
+the erased split guard makes the per-actor residue lane-eligible, so one
+lane family per value (holding only the fluents its live rules touch)
+solves bit-parallel, while the leftover — the phase's own advance rules,
+numerics, binders — steps on a *sparse* N=1 residue schema fed the lane
+half's next-state as strict primed facts (the lane half is a stratum under
+the residue, the same mechanism as §5.8's primed-guard mints). A residue
+rule writing a per-actor lane fluent would straddle one fluent's writers
+across the halves, so that world declines the families and steps pure N=1
+— always sound, never silently wrong. Through the real path, the same
+100k workload runs the full round at **2.11×** over the single-schema lane
+baseline (the hand-narrowed ideal's 2.85× minus the measured residue
+orchestration), equivalence pinned byte-for-byte against both the unsplit
+twin and the simulation.
 
 ### Invariants (compiler/engine enforced)
 
