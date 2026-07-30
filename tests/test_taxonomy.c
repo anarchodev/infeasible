@@ -280,6 +280,83 @@ static int test_errors(void)
     return 0;
 }
 
+/* --- #126 coverage diagnostics ------------------------------------------- */
+static int test_coverage_diags(void)
+{
+    /* orphan kind: declared, never populated, never derived — a warning */
+    {
+        const char *src =
+            "value ( save(value)  ghost(value)  s : int )\n"
+            "fact save(s)\n"
+            "rule bs: => s = 3\n";
+        intern *sy = intern_new();
+        story_diag di[8];
+        story_diags d = { di, 8, 0, 0 };
+        world *w = story_compile(src, "t.story", sy, &d);
+        CHECK(w != NULL && d.nerrors == 0);
+        bool found = false;
+        for (int k = 0; k < d.count && !found; k++)
+            found = d.items[k].sev == STORY_WARNING &&
+                    strstr(d.items[k].msg, "'ghost'") != NULL &&
+                    strstr(d.items[k].msg, "classifies nothing") != NULL;
+        CHECK(found);
+        world_free(w);
+        intern_free(sy);
+    }
+    /* nearest miss: the empty-selector warning names the closest member and
+     * the atom it fails (the why-shaped hint) */
+    {
+        const char *src =
+            "sort actor\nentity a : actor\n"
+            "state ( blessed(actor)  q(actor) : int )\n"
+            "value ( save(value)  ranged(value)  s(actor) : int )\n"
+            "fact save(s)\n"
+            "rule bs(X: actor): => s(X) = 10\n"
+            "rule m(A: actor, V: value):\n"
+            "    save(V) & ranged(V) & blessed(A) => V(A) = prior + 1\n"
+            "action p(X: actor): causes q(X) := s(X)\n";
+        intern *sy = intern_new();
+        story_diag di[8];
+        story_diags d = { di, 8, 0, 0 };
+        world *w = story_compile(src, "t.story", sy, &d);
+        CHECK(w != NULL && d.nerrors == 0);
+        bool found = false;
+        for (int k = 0; k < d.count && !found; k++)
+            found = d.items[k].sev == STORY_WARNING &&
+                    strstr(d.items[k].msg, "'s' comes closest") != NULL &&
+                    strstr(d.items[k].msg, "not proved 'ranged'") != NULL;
+        CHECK(found);
+        world_free(w);
+        intern_free(sy);
+    }
+    /* the span model says "build-time" out loud on a kind predicate (the
+     * LSP hover detail, deferred from #125) */
+    {
+        const char *src =
+            "value ( save(value)  s : int )\n"
+            "fact save(s)\n"
+            "rule bs: => s = 3\n";
+        intern *sy = intern_new();
+        story_diag di[8];
+        story_diags d = { di, 8, 0, 0 };
+        story_model *m = NULL;
+        world *w = story_compile_model(src, "t.story", sy, &d, &m);
+        CHECK(w != NULL && m != NULL);
+        int nsym = 0;
+        const story_symbol *syms = story_model_symbols(m, &nsym);
+        bool found = false;
+        for (int k = 0; k < nsym && !found; k++)
+            found = strcmp(syms[k].name, "save") == 0 && syms[k].detail &&
+                    strstr(syms[k].detail, "kind") != NULL &&
+                    strstr(syms[k].detail, "build-time") != NULL;
+        CHECK(found);
+        story_model_free(m);
+        world_free(w);
+        intern_free(sy);
+    }
+    return 0;
+}
+
 int main(void)
 {
     if (test_derived_hierarchy())    return 1;
@@ -288,6 +365,7 @@ int main(void)
     if (test_undecided_error())      return 1;
     if (test_derived_equals_facts()) return 1;
     if (test_errors())               return 1;
+    if (test_coverage_diags())       return 1;
     printf("test_taxonomy: all passed\n");
     return 0;
 }
