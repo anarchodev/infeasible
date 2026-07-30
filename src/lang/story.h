@@ -79,11 +79,24 @@
  *   function:= 'function' IDENT '(' vtype (',' vtype)* ')' ':' vtype
  *                                          -- spelling alias for a typed provider
  *   value   := 'value' ( vdecl | '(' vdecl* ')' )       -- engine-derived value (#82)
- *   vdecl   := IDENT [ '(' IDENT* ')' ] ':' 'int' [ 'kind' IDENT ]
- *                                                        -- defined by a rule, inlined
+ *   vdecl   := IDENT [ '(' IDENT* ')' ] ':' 'int'       -- defined by a rule, inlined
  *                                                        -- at reads; roll sites key on
  *                                                        -- the definition, so every
  *                                                        -- reader shares the draw
+ *            | IDENT '(' ('value'|IDENT)* ')'           -- KIND PREDICATE (#124): a
+ *                                                        -- boolean value with exactly
+ *                                                        -- one `value`-sorted argument
+ *                                                        -- (the built-in meta-sort
+ *                                                        -- whose elements are the
+ *                                                        -- declared value symbols);
+ *                                                        -- build-time-only vocabulary,
+ *                                                        -- populated by `fact`s
+ *   fact    := 'fact' ( katom | '(' katom* ')' )        -- kind membership (#124);
+ *   katom   := IDENT '(' IDENT (',' IDENT)* ')'         -- args are bare symbols,
+ *                                                        -- vocabulary-checked (the
+ *                                                        -- value position names a
+ *                                                        -- declared value; others name
+ *                                                        -- sort/enum members)
  *   vtype   := IDENT | 'int'                            -- a sort/domain, or int
  *   init    := 'init'   ( iatom | '(' iatom* ')' )      -- ground
  *   iatom   := atom | IDENT '=' (IDENT | INT)           -- MV / numeric init
@@ -91,12 +104,20 @@
  *                ( OP atom [ 'unless' conj ]
  *                | 'causes' effects )                           -- ramification
  *            | 'rule' IDENT [ params ] ':' [ conj ] '=>' IDENT '(' args ')' '=' expr
- *            | 'rule' IDENT '(' vbind ')' ':' [ conj ] '=>'
- *                  'kind' IDENT '(' IDENT ')' '=' expr
- *                                          -- kind modifier (#82): expands into a
- *                                          -- layer (`prior`-shaped, commuting
- *                                          -- class) on EVERY value declaring the
- *                                          -- kind; expanded labels `L.value`
+ *            | 'rule' IDENT params ':' conj '=>'
+ *                  IDENT '(' IDENT (',' IDENT)* ')' '=' expr
+ *                                          -- FUNCTOR modifier (#124): the head
+ *                                          -- IDENT is a `V : value` parameter
+ *                                          -- (HiLog move — looks higher-order,
+ *                                          -- grounds first-order); the body's
+ *                                          -- kind atoms (`k(V, …)`, constants
+ *                                          -- and `_` facets) select the member
+ *                                          -- set against the `fact`s; expands
+ *                                          -- into a layer (`prior`-shaped,
+ *                                          -- commuting class) per member, the
+ *                                          -- subject tuple binding its leading
+ *                                          -- args (V(A) = roller, V(A,T) adds
+ *                                          -- the target); expanded labels `L.value`
  *                                          -- value definition (#82/#94): ONE
  *                                          -- unconditional base per value, plus
  *                                          -- guarded overrides/layers ordered by
