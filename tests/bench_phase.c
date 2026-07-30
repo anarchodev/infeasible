@@ -43,14 +43,24 @@
  *     B's timed region, which is CONSERVATIVE (the real split shares one
  *     fact store and copies nothing).
  *
- * Equivalence: A and the B-owner worlds must agree on every family after
- * every round of a seeded run — the narrowing is only interesting if it is
- * provably semantics-free.
+ * S — THE REAL THING (#121 slice 2): the same workload authored as a
+ *     genuine split story — `phase : { … } split`, guards on the MV values,
+ *     advancement by phase-guarded RULES (I2's spelling, no host clock) —
+ *     stepped through the shipped mixed lane/N=1 route: one per-value lane
+ *     family (split guards erased, only the value's touched fluents) solved
+ *     bit-parallel, the residue (the phase writers) on a SPARSE N=1 schema
+ *     with the lane half's next-state injected as strict primed facts.
  *
- * Reported per N: ms/step per phase and full-round total (A vs B, median
- * over rounds), % of A statically dead (1 - B/A), build time (A's one
- * compile vs B's K compiles — the split design pays K schema compiles),
- * arena bytes (A vs sum of B), and the GATE verdict against 1.3x. */
+ * Equivalence: A, the B-owner worlds, and S must agree on every family
+ * after every round of a seeded run — the narrowing is only interesting if
+ * it is provably semantics-free, and S's mixed route is held to the same
+ * bar.
+ *
+ * Reported per N: ms/step per phase and full-round total (A vs B vs S,
+ * median over rounds), build time, arena bytes, and the GATE verdict:
+ * `split` earns its keep iff the REAL path (S) beats A by >= 1.3x at 100k.
+ * B remains in the report as the floor-cost ideal the residue orchestration
+ * is measured against. */
 
 #include "lang/story.h"
 #include "state/world.h"
@@ -128,8 +138,13 @@ static int emit_phase(char *s, size_t cap, int off, const phase_cfg *p,
 }
 
 /* Build a world source. `phase` = -1 for the full A world (all phases,
- * guarded); 0..3 for a B world (that phase only, unguarded, its own
- * families + the gate family). */
+ * guarded on boolean-erasure globals, clock driven by world_set); -2 for
+ * the REAL SPLIT world S (`phase : { … } split`, guards on the MV values,
+ * advancement by phase-guarded RULES — I2's spelling — stepped through the
+ * #121 mixed lane/N=1 route); 0..3 for a B world (that phase only,
+ * unguarded, its own families + the gate family). */
+static const char *SPLIT_VAL[NPHASE] = { "declare", "react", "resolve", "cleanup" };
+
 static char *gen_source(int n, int phase)
 {
     size_t cap = (size_t)n * 12 + 8192;
@@ -138,6 +153,22 @@ static char *gen_source(int n, int phase)
     for (int e = 0; e < n; e++)
         off += snprintf(s + off, cap - off, "%su%d", e ? ", " : "", e);
     off += snprintf(s + off, cap - off, " : actor)\nstate (");
+    if (phase == -2) {
+        off += snprintf(s + off, cap - off,
+                        " phase : { declare, react, resolve, cleanup } split");
+        for (int f = 0; f < NFAM; f++)
+            off += snprintf(s + off, cap - off, " f%d(actor)", f);
+        off += snprintf(s + off, cap - off, " )\ninit ( phase = declare )\n");
+        char guard[48];
+        for (int p = 0; p < NPHASE; p++) {
+            snprintf(guard, sizeof guard, "phase = %s", SPLIT_VAL[p]);
+            off = emit_phase(s, cap, off, &PH[p], guard);
+            off += snprintf(s + off, cap - off,
+                "action adv_%s: requires phase = %s causes phase = %s\n",
+                SPLIT_VAL[p], SPLIT_VAL[p], SPLIT_VAL[(p + 1) % NPHASE]);
+        }
+        return s;
+    }
     if (phase < 0) {
         for (int p = 0; p < NPHASE; p++)
             off += snprintf(s + off, cap - off, " %s", PH[p].name);
@@ -232,8 +263,21 @@ static int bench_one(int n)
     }
     double build_b = now_ms() - t0;
 
+    /* S — the real thing: `split` + rule-driven advancement, mixed-routed */
+    t0 = now_ms();
+    src = gen_source(n, -2);
+    world *ws = compile_or_die(src, sy, "S");
+    free(src);
+    double build_s = now_ms() - t0;
+
     if (world_step_lane_family_count(wa) != 1) {
         fprintf(stderr, "bench_phase: A did not lane its transition at N=%d\n", n);
+        return 1;
+    }
+    if (world_step_lane_family_count(ws) != NPHASE) {
+        fprintf(stderr, "bench_phase: S built %d per-value lane families at "
+                "N=%d (want %d) — mixed routing off\n",
+                world_step_lane_family_count(ws), n, NPHASE);
         return 1;
     }
     for (int p = 0; p < NPHASE; p++)
@@ -252,6 +296,7 @@ static int bench_one(int n)
         for (int e = 0; e < n; e++)
             if (xrand() & 1) {
                 world_set(wa, at.fl[f][e], true);
+                world_set(ws, at.fl[f][e], true);
                 for (int p = 0; p < NPHASE; p++) {
                     const phase_cfg *pc = &PH[p];
                     bool holds = (f == pc->ram || f == pc->gate);
@@ -268,12 +313,18 @@ static int bench_one(int n)
         owner[PH[p].ram] = p;
     }
 
-    /* ---- the seeded rounds: identical action stream through A and B ---- */
-    uint32_t *acts = malloc((size_t)n * 8 * sizeof *acts + 1);
-    double ta[NPHASE][ROUNDS], tb[NPHASE][ROUNDS];
+    /* ---- the seeded rounds: identical action stream through A, B, S ---- */
+    uint32_t *acts = malloc(((size_t)n * 8 + 1) * sizeof *acts);
+    uint32_t adv[NPHASE];
+    for (int p = 0; p < NPHASE; p++) {
+        char b[32];
+        snprintf(b, sizeof b, "adv_%s", SPLIT_VAL[p]);
+        adv[p] = intern_id(sy, b);
+    }
+    double ta[NPHASE][ROUNDS], tb[NPHASE][ROUNDS], ts[NPHASE][ROUNDS];
     char err[128];
-    int first_solve_a = 1, first_solve_b = 1;
-    double schema_a = 0, schema_b = 0;
+    int first_solve_a = 1, first_solve_b = 1, first_solve_s = 1;
+    double schema_a = 0, schema_b = 0, schema_s = 0;
 
     for (int r = 0; r < ROUNDS; r++) {
         for (int p = 0; p < NPHASE; p++) {
@@ -320,12 +371,31 @@ static int bench_one(int n)
             double b1 = now_ms();
             tb[p][r] = b1 - b0;
             if (first_solve_b) { schema_b = tb[p][r]; first_solve_b = 0; }
+
+            /* S: the same churn plus the phase-guarded advance action — the
+             * clock is a RULE, the step runs the mixed lane/N=1 route */
+            acts[nacts] = adv[p];
+            double s0 = now_ms();
+            if (world_step(ws, acts, nacts + 1, err, sizeof err) != 0) {
+                fprintf(stderr, "bench_phase: S step failed (%s)\n", err);
+                return 1;
+            }
+            double s1 = now_ms();
+            ts[p][r] = s1 - s0;
+            if (first_solve_s) { schema_s = ts[p][r]; first_solve_s = 0; }
         }
 
-        /* ---- equivalence: A vs the owner world, every family ---- */
+        /* ---- equivalence: A vs the owner world AND the real split world,
+         * every family — the mixed route must be semantics-free too ---- */
         int stride = n <= 10000 ? 1 : 101, bad = 0;
         for (int f = 0; f < NFAM && bad < 5; f++)
-            for (int e = 0; e < n && bad < 5; e += stride)
+            for (int e = 0; e < n && bad < 5; e += stride) {
+                if (world_get(wa, at.fl[f][e]) != world_get(ws, at.fl[f][e])) {
+                    fprintf(stderr, "  MISMATCH round %d f%d(u%d): A=%d S=%d\n",
+                            r, f, e, world_get(wa, at.fl[f][e]),
+                            world_get(ws, at.fl[f][e]));
+                    bad++;
+                }
                 if (world_get(wa, at.fl[f][e]) !=
                     world_get(wb[owner[f]], at.fl[f][e])) {
                     fprintf(stderr, "  MISMATCH round %d f%d(u%d): A=%d B=%d\n",
@@ -333,6 +403,7 @@ static int bench_one(int n)
                             world_get(wb[owner[f]], at.fl[f][e]));
                     bad++;
                 }
+            }
         if (bad) {
             fprintf(stderr, "bench_phase: NOT semantics-free at N=%d — "
                     "narrowing is disqualified\n", n);
@@ -341,30 +412,33 @@ static int bench_one(int n)
     }
 
     /* ---- report (medians skip the round-0 schema build by construction) -- */
-    double atot = 0, btot = 0;
-    printf("N=%d  (%d rounds; first A/B step includes schema build: "
-           "%.0f / %.0f ms)\n", n, ROUNDS, schema_a, schema_b);
+    double atot = 0, btot = 0, stot = 0;
+    printf("N=%d  (%d rounds; first A/B/S step includes schema build: "
+           "%.0f / %.0f / %.0f ms)\n", n, ROUNDS, schema_a, schema_b, schema_s);
     for (int p = 0; p < NPHASE; p++) {
-        double ma = median(ta[p], ROUNDS), mb = median(tb[p], ROUNDS);
-        atot += ma; btot += mb;
-        printf("  %-10s  A %9.3f ms   B %9.3f ms   %5.2fx\n",
-               PH[p].name + 3, ma, mb, ma / mb);
+        double ma = median(ta[p], ROUNDS), mb = median(tb[p], ROUNDS),
+               ms = median(ts[p], ROUNDS);
+        atot += ma; btot += mb; stot += ms;
+        printf("  %-10s  A %9.3f ms   B %9.3f ms  %5.2fx   S %9.3f ms  %5.2fx\n",
+               PH[p].name + 3, ma, mb, ma / mb, ms, ma / ms);
     }
-    printf("  %-10s  A %9.3f ms   B %9.3f ms   %5.2fx   "
-           "statically dead: %.0f%% of A\n",
-           "ROUND", atot, btot, atot / btot, 100.0 * (1.0 - btot / atot));
-    printf("  build: A %.0f ms (1 compile)   B %.0f ms (%d compiles)   "
-           "arena: A %.1f MB   B %.1f MB\n",
-           build_a, build_b, NPHASE,
+    printf("  %-10s  A %9.3f ms   B %9.3f ms  %5.2fx   S %9.3f ms  %5.2fx   "
+           "(B = hand-narrowed ideal, S = real `split`, mixed-routed)\n",
+           "ROUND", atot, btot, atot / btot, stot, atot / stot);
+    printf("  build: A %.0f ms   B %.0f ms (%d compiles)   S %.0f ms   "
+           "arena: A %.1f MB   B %.1f MB   S %.1f MB\n",
+           build_a, build_b, NPHASE, build_s,
            (double)world_arena_bytes(wa) / 1e6,
            (double)(world_arena_bytes(wb[0]) + world_arena_bytes(wb[1]) +
-                    world_arena_bytes(wb[2]) + world_arena_bytes(wb[3])) / 1e6);
-    printf("  GATE (#121 builds only if >= 1.30x at 100k): %.2fx — %s\n",
-           atot / btot, atot / btot >= 1.30 ? "PASS" : "FAIL");
+                    world_arena_bytes(wb[2]) + world_arena_bytes(wb[3])) / 1e6,
+           (double)world_arena_bytes(ws) / 1e6);
+    printf("  GATE (real path >= 1.30x at 100k): %.2fx — %s\n",
+           atot / stot, atot / stot >= 1.30 ? "PASS" : "FAIL");
 
     free(acts);
     free_atoms(&at);
     world_free(wa);
+    world_free(ws);
     for (int p = 0; p < NPHASE; p++) world_free(wb[p]);
     intern_free(sy);
     return 0;
@@ -372,8 +446,9 @@ static int bench_one(int n)
 
 int main(int argc, char **argv)
 {
-    printf("bench_phase (#120): full phase-guarded schema (A) vs hand-narrowed "
-           "per-phase worlds (B)\n"
+    printf("bench_phase (#120/#121): full phase-guarded schema (A) vs "
+           "hand-narrowed per-phase worlds (B) vs real `split`, mixed-routed "
+           "(S)\n"
            "%d families, write-sets declare:2 react:3 resolve:9 cleanup:3; "
            "churn every phase\n", NFAM);
     if (argc > 1)

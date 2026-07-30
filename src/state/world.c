@@ -42,6 +42,9 @@ typedef struct {
     num_effect *neffs;    /* numeric effects (§5.8 write side) */
     int nneff, capneff;
     int stratum;          /* §5.8 strata (#87): 0 = settles in the first solve */
+    uint32_t lane_cover;  /* #121 mixed routing: bit v set = a per-value lane
+                           * family handles this rule under split value v, so
+                           * the residue schema omits it. 0 = never covered. */
 } srule;
 
 /* Per-numeric-fluent commit receipt, rebuilt each successful step. */
@@ -117,6 +120,10 @@ typedef struct {
      * is set (the cast fans out over the target lanes). -1 = not a cast atom. */
     int     *bcast_of;
     uint32_t bcast_of_cap;
+
+    int split_value;              /* #121 mixed routing: the split value index
+                                   * this per-value family serves, or -1 (the
+                                   * classic whole-transition family). */
 } step_lane_family;
 
 struct world {
@@ -198,6 +205,15 @@ struct world {
     int npg, cappg;
     struct { uint32_t atom; bool val; } *pg_cur;
     int npg_cur, cappg_cur;
+    /* Structure-derived step scaffolding, cached per struct_ver so a step
+     * never re-sweeps the O(nsr) rule table (#121 made the sweep the hot
+     * spot once everything else was narrowed): the stratum count, the
+     * per-numeric writer strata, and the srules that carry numeric effects. */
+    uint64_t scaffold_ver;
+    int scaffold_nsr, scaffold_nnum;    /* nums/rules can grow without a
+                                         * struct_ver bump (world_declare_num) */
+    int nstrata_cache;
+    int *neff_rules; int n_neff_rules, cap_neff_rules;
     int *num_stratum;                   /* per nums[i]: max writer stratum;
                                          * recomputed per stratified step */
     int num_stratum_cap;
@@ -277,11 +293,38 @@ struct world {
         uint64_t *vers;               /* struct_ver each slot was built at      */
         uint8_t **flw;                /* [v][nfl]  write-set at build time      */
         uint8_t **numw;               /* [v][nnum] numeric write-set            */
+        uint8_t *mixed;               /* [v] 1 = this value's schema omits its
+                                       * lane-covered rules, so the step MUST
+                                       * run the mixed lane/N=1 route          */
+        /* The SPARSE residue space (#121 mixed, the #77 trick on the step
+         * side): one compact loc space shared by every mixed value's residue
+         * schema, holding only the atoms the residue can touch — judgment
+         * rules, uncovered srules, their fluents' cur/primed twins. A mixed
+         * step then pays O(residue), not O(all ground atoms). */
+        uint32_t *smap; uint32_t smap_cap;    /* atom -> sparse loc (LOC_NONE) */
+        uint32_t *satoms; int nsloc, capsloc; /* reverse: sparse loc -> atom   */
+        uint32_t *sfl_loc, *spr_loc;          /* [nfl] fluent cur/primed locs  */
+        uint32_t *sfl_list; int nsfl, capsfl; /* fluent indices present        */
+        uint64_t space_ver;
         int *map_of; uint32_t map_cap;      /* value atom -> value index        */
         int *trig_of; uint32_t trig_cap;    /* action -> live-value bitmask     */
         uint64_t trig_ver;
     } sp;
     const uint8_t *flw_cur, *numw_cur;  /* active narrowing; NULL = all live   */
+    /* Mixed lane/N=1 step in flight (#121): the lane half solved first; its
+     * per-fluent next-state is injected into the residue solve as STRICT
+     * facts on the primed locs (strict beats defeasible inertia, so residue
+     * rules reading a lane fluent primed see the true next value), and the
+     * commit takes lane-managed fluents from here instead of the family. */
+    const uint8_t *mix_managed;         /* [nfl] 1 = fluent owned by the lane half */
+    const bool    *mix_next;            /* [nfl] its lane-computed next value      */
+    /* The ACTIVE step-family maps: how the solve/commit/why path finds the
+     * current w->fam's locations. The dense path points these at loc_of /
+     * fl_loc / pr_loc; a mixed split value points them at the sparse residue
+     * space above. afl_list non-NULL = load facts for just those fluents. */
+    const uint32_t *aloc_of; uint32_t aloc_cap;
+    const uint32_t *afl_loc, *apr_loc;
+    const uint32_t *afl_list; int nafl;
     /* Structure version (#63): bumped on any structural edit (rule/fluent add,
      * a matcher re-ground). Each family caches the version it was built at, so a
      * query rebuilds ONLY the judgment family and a step ONLY the step family —
@@ -358,7 +401,10 @@ void world_free(world *w)
         free(w->sp.numw[v]);
     }
     free(w->sp.vatoms); free(w->sp.fams); free(w->sp.vers);
-    free(w->sp.flw); free(w->sp.numw);
+    free(w->sp.flw); free(w->sp.numw); free(w->sp.mixed);
+    free(w->sp.smap); free(w->sp.satoms);
+    free(w->sp.sfl_loc); free(w->sp.spr_loc); free(w->sp.sfl_list);
+    free(w->neff_rules);
     free(w->sp.map_of); free(w->sp.trig_of);
     if (w->jfam)
         dlcol_free(w->jfam);
@@ -1070,6 +1116,7 @@ int world_add_step_rule(world *w, const char *name, uint32_t action,
     r->neffs = NULL;
     r->nneff = r->capneff = 0;
     r->stratum = 0;
+    r->lane_cover = 0;
     w->struct_ver++;             /* structural edit (#63) */
     w->lanes_ok = false;          /* a structural edit stales the lane families */
     return w->nsr++;
@@ -1092,6 +1139,7 @@ int world_set_split(world *w, const uint32_t *value_atoms, int nvals)
     w->sp.vers = calloc((size_t)nvals, sizeof *w->sp.vers);
     w->sp.flw  = calloc((size_t)nvals, sizeof *w->sp.flw);
     w->sp.numw = calloc((size_t)nvals, sizeof *w->sp.numw);
+    w->sp.mixed = calloc((size_t)nvals, 1);
     for (int v = 0; v < nvals; v++)
         atom_map_set(&w->sp.map_of, &w->sp.map_cap, value_atoms[v], v);
     w->sp.trig_ver = w->struct_ver - 1;    /* masks not built yet */
@@ -1499,6 +1547,7 @@ void world_add_step_lane_family(world *w, dlcol *fam, int nloc, int nent,
     sf->nnumeff = 0; sf->numeff = NULL;            /* world_step_lane_set_numeric */
     sf->covers_numeric = false;
     sf->bcast_of = NULL; sf->bcast_of_cap = 0;     /* broadcast triggers: off unless set */
+    sf->split_value = -1;                          /* whole-transition family (#121) */
     size_t g = (size_t)nloc * (size_t)nent;
     sf->ground = malloc((g ? g : 1) * sizeof *sf->ground);
     memcpy(sf->ground, ground, (g ? g : 1) * sizeof *sf->ground);
@@ -1591,6 +1640,18 @@ void world_step_lane_set_bcast(world *w, int ncast, const uint32_t *cast_atom,
     sf->bcast_of = malloc((size_t)sf->bcast_of_cap * sizeof *sf->bcast_of);
     for (uint32_t k = 0; k < sf->bcast_of_cap; k++) sf->bcast_of[k] = -1;
     for (int i = 0; i < ncast; i++) sf->bcast_of[cast_atom[i]] = cast_local[i];
+}
+
+void world_step_lane_bind_value(world *w, int value_index)
+{
+    if (w->nsteplanes == 0) return;
+    w->steplanes[w->nsteplanes - 1].split_value = value_index;
+}
+
+void world_step_rule_set_lane_cover(world *w, int rule, uint32_t value_mask)
+{
+    if (rule >= 0 && rule < w->nsr)
+        w->srules[rule].lane_cover = value_mask;
 }
 
 int world_step_lane_family_count(const world *w) { return w->nsteplanes; }
@@ -1706,7 +1767,19 @@ void world_step_why(world *w, dl_lit q, bool next, FILE *out)
     }
     bool fam_stale = w->fam_ver != w->struct_ver;
     if (!w->fam || fam_stale ||
-        atom >= w->loc_cap || w->loc_of[atom] == LOC_NONE) {
+        atom >= w->aloc_cap || w->aloc_of[atom] == LOC_NONE) {
+        /* a lane-managed fluent in a mixed step (#121) has no residue rules —
+         * it was solved bit-parallel on the per-value lane family */
+        if (!fam_stale && w->fam && w->sp.nvals) {
+            int i = fluent_index(w, q.atom);
+            if (i >= 0) {
+                fprintf(out, "why %s%s%s? solved on the split value's lane "
+                             "family this step (bit-parallel); value = %s\n",
+                        q.neg ? "~" : "", intern_name(w->syms, q.atom),
+                        next ? "'" : "", w->vals[i] ? "true" : "false");
+                return;
+            }
+        }
         fprintf(out, "why %s%s? not in the step theory%s\n",
                 q.neg ? "~" : "", intern_name(w->syms, atom),
                 fam_stale ? " (no step taken since the last edit)" : "");
@@ -1730,7 +1803,7 @@ void world_step_why(world *w, dl_lit q, bool next, FILE *out)
      * transition — replay it from the snapshot so the trace is the real one. */
     if (w->last_routed)
         solve_step_family_vals(w, w->step_snap, w->last_actions, w->last_nactions);
-    dl_lit loc = { w->loc_of[atom], q.neg };
+    dl_lit loc = { w->aloc_of[atom], q.neg };
     dlcol_why(w->fam, loc, 0, out);
 }
 
@@ -2017,7 +2090,7 @@ static int srule_split_value(const world *w, const srule *r)
  * settles). The write-set bitmaps are stored into the split cache slot so the
  * commit can copy excluded fluents through. The location space is shared with
  * the full schema (append-only, #67) — narrowing removes rules, never atoms. */
-static dlcol *build_step_family(world *w, int sv)
+static dlcol *build_step_family(world *w, int sv, bool mix)
 {
     uint8_t *live = NULL, *flw = NULL, *numw = NULL;
     if (sv >= 0) {
@@ -2029,6 +2102,9 @@ static dlcol *build_step_family(world *w, int sv)
             int g = srule_split_value(w, r);
             if (!(g == -2 || g == sv))
                 continue;                              /* dead under sv */
+            if (mix && ((r->lane_cover >> sv) & 1))
+                continue;                              /* the per-value lane family
+                                                        * owns it — residue omits it */
             live[s] = 1;
             for (int e = 0; e < r->neffects; e++) {
                 int fi = fluent_index(w, r->effects[e].atom);
@@ -2162,6 +2238,193 @@ static void ensure_jfam(world *w)
     w->jfam_ver = w->struct_ver;
 }
 
+/* Sparse loc for `atom` in the split residue space, assigning one if new. */
+static uint32_t sadd(world *w, uint32_t atom)
+{
+    if (atom < w->sp.smap_cap && w->sp.smap[atom] != LOC_NONE)
+        return w->sp.smap[atom];
+    if (atom >= w->sp.smap_cap) {
+        uint32_t nc = w->sp.smap_cap ? w->sp.smap_cap : 64;
+        while (nc <= atom) nc *= 2;
+        w->sp.smap = realloc(w->sp.smap, (size_t)nc * sizeof *w->sp.smap);
+        for (uint32_t k = w->sp.smap_cap; k < nc; k++) w->sp.smap[k] = LOC_NONE;
+        w->sp.smap_cap = nc;
+    }
+    if (w->sp.nsloc == w->sp.capsloc) {
+        w->sp.capsloc = w->sp.capsloc ? w->sp.capsloc * 2 : 64;
+        w->sp.satoms = realloc(w->sp.satoms,
+                               (size_t)w->sp.capsloc * sizeof *w->sp.satoms);
+    }
+    w->sp.smap[atom] = (uint32_t)w->sp.nsloc;
+    w->sp.satoms[w->sp.nsloc] = atom;
+    return (uint32_t)w->sp.nsloc++;
+}
+
+/* Pull fluent `i` into the space: cur + primed locs, and the fact list. */
+static void sadd_fluent(world *w, int i)
+{
+    if (i < 0 || w->sp.sfl_loc[i] != LOC_NONE)
+        return;
+    w->sp.sfl_loc[i] = sadd(w, w->fluents[i]);
+    w->sp.spr_loc[i] = sadd(w, w->primed[i]);
+    if (w->sp.nsfl == w->sp.capsfl) {
+        w->sp.capsfl = w->sp.capsfl ? w->sp.capsfl * 2 : 64;
+        w->sp.sfl_list = realloc(w->sp.sfl_list,
+                                 (size_t)w->sp.capsfl * sizeof *w->sp.sfl_list);
+    }
+    w->sp.sfl_list[w->sp.nsfl++] = (uint32_t)i;
+}
+
+/* (Re)build the shared sparse residue space: every atom a mixed value's
+ * residue schema can touch — all judgment rules, plus every srule that is
+ * live-and-uncovered under at least one value. Anything else (the lane
+ * half's per-actor churn) never enters, which is the whole point. */
+static void ensure_split_space(world *w)
+{
+    if (w->sp.space_ver == w->struct_ver && w->sp.satoms)
+        return;
+    for (uint32_t k = 0; k < w->sp.smap_cap; k++) w->sp.smap[k] = LOC_NONE;
+    w->sp.nsloc = 0;
+    w->sp.nsfl = 0;
+    w->sp.sfl_loc = realloc(w->sp.sfl_loc,
+                            (size_t)(w->nfl ? w->nfl : 1) * sizeof *w->sp.sfl_loc);
+    w->sp.spr_loc = realloc(w->sp.spr_loc,
+                            (size_t)(w->nfl ? w->nfl : 1) * sizeof *w->sp.spr_loc);
+    for (int i = 0; i < w->nfl; i++)
+        w->sp.sfl_loc[i] = w->sp.spr_loc[i] = LOC_NONE;
+
+    for (int j = 0; j < w->njr; j++) {
+        sadd_fluent(w, fluent_index(w, w->jrules[j].head.atom));
+        sadd(w, w->jrules[j].head.atom);
+        for (int b = 0; b < w->jrules[j].nbody; b++) {
+            sadd_fluent(w, fluent_index(w, w->jrules[j].body[b].atom));
+            sadd(w, w->jrules[j].body[b].atom);
+        }
+    }
+    uint32_t all = (1u << w->sp.nvals) - 1;
+    for (int s = 0; s < w->nsr; s++) {
+        const srule *r = &w->srules[s];
+        int g = srule_split_value(w, r);
+        uint32_t lv = g == -3 ? 0 : g == -2 ? all : (1u << g);
+        if (!(lv & ~r->lane_cover))
+            continue;                  /* lane-covered wherever it is live */
+        if (r->action != INTERN_NONE)
+            sadd(w, r->action);
+        for (int b = 0; b < r->nbody; b++) {
+            int fi = fluent_index(w, r->body[b].lit.atom);
+            if (fi >= 0)
+                sadd_fluent(w, fi);    /* cur + primed (a primed read needs both) */
+            else
+                sadd(w, r->body[b].lit.atom);   /* guard / judgment / marker */
+        }
+        for (int e = 0; e < r->neffects; e++)
+            sadd_fluent(w, fluent_index(w, r->effects[e].atom));
+    }
+    w->sp.space_ver = w->struct_ver;
+}
+
+/* The residue schema for one MIXED split value, over the sparse space:
+ * judgments + inertia for the value's write-set + the live uncovered rules.
+ * Same semantics as build_step_family(v, mix=true), a fraction of the size. */
+static dlcol *build_step_family_sparse(world *w, int sv)
+{
+    uint8_t *live = calloc((size_t)(w->nsr ? w->nsr : 1), 1);
+    uint8_t *flw  = calloc((size_t)(w->nfl ? w->nfl : 1), 1);
+    uint8_t *numw = calloc((size_t)(w->nnum ? w->nnum : 1), 1);
+    for (int s = 0; s < w->nsr; s++) {
+        const srule *r = &w->srules[s];
+        int g = srule_split_value(w, r);
+        if (!(g == -2 || g == sv) || ((r->lane_cover >> sv) & 1))
+            continue;
+        live[s] = 1;
+        for (int e = 0; e < r->neffects; e++) {
+            int fi = fluent_index(w, r->effects[e].atom);
+            if (fi >= 0) flw[fi] = 1;
+        }
+        for (int e = 0; e < r->nneff; e++) {
+            int ni = num_index(w, r->neffs[e].num_atom);
+            if (ni >= 0) numw[ni] = 1;
+        }
+        for (int i = 0; i < r->nbody; i++)
+            if (r->body[i].primed) {
+                int fi = fluent_index(w, r->body[i].lit.atom);
+                if (fi >= 0) flw[fi] = 1;
+            }
+    }
+    free(w->sp.flw[sv]);
+    free(w->sp.numw[sv]);
+    w->sp.flw[sv] = flw;
+    w->sp.numw[sv] = numw;
+
+    dlcol *f = dlcol_new(w->sp.nsloc, 1);
+    emit_atom_names_range(f, w, w->sp.satoms, 0, w->sp.nsloc);
+    emit_judgment_rule_range(f, w, w->sp.smap, 0, w->njr);
+    for (int j = 0; j < w->njs; j++)
+        dlcol_add_sup(f, w->jsups[j].winner, w->jsups[j].loser);
+
+    char buf[300];
+    int *inertia_pos = malloc((size_t)(w->nfl ? w->nfl : 1) * sizeof *inertia_pos);
+    int *inertia_neg = malloc((size_t)(w->nfl ? w->nfl : 1) * sizeof *inertia_neg);
+    for (int i = 0; i < w->nfl; i++) {
+        if (!flw[i])
+            continue;
+        const char *fname = intern_name(w->syms, w->fluents[i]);
+        dl_lit now = { w->sp.sfl_loc[i], false }, nxt = { w->sp.spr_loc[i], false };
+        char prov[320];
+        if (w->fl_prov[i])
+            snprintf(prov, sizeof prov, "generated; declared %s", w->fl_prov[i]);
+        else
+            snprintf(prov, sizeof prov, "generated");
+        snprintf(buf, sizeof buf, "inertia on %s", fname);
+        inertia_pos[i] = dlcol_add_rule(f, buf, DL_DEFEASIBLE, nxt, &now, 1);
+        dlcol_set_prov(f, inertia_pos[i], prov);
+        dl_lit nnow = dl_complement(now), nnxt = dl_complement(nxt);
+        inertia_neg[i] = dlcol_add_rule(f, buf, DL_DEFEASIBLE, nnxt, &nnow, 1);
+        dlcol_set_prov(f, inertia_neg[i], prov);
+    }
+
+    dl_lit lbuf[64];
+    dl_lit *body = lbuf;
+    int bodycap = 64;
+    for (int s = 0; s < w->nsr; s++) {
+        const srule *r = &w->srules[s];
+        if (!live[s])
+            continue;
+        int nbody = r->nbody + (r->action != INTERN_NONE ? 1 : 0);
+        if (nbody > bodycap) {
+            if (body != lbuf) free(body);
+            body = malloc((size_t)nbody * sizeof *body);
+            bodycap = nbody;
+        }
+        int bi = 0;
+        for (int i = 0; i < r->nbody; i++)
+            body[bi++] = map_lit(w->sp.smap, r->body[i].primed
+                                        ? primed_lit(w, r->body[i].lit)
+                                        : r->body[i].lit);
+        if (r->action != INTERN_NONE) {
+            dl_lit act = { r->action, false };
+            body[bi++] = map_lit(w->sp.smap, act);
+        }
+        for (int e = 0; e < r->neffects; e++) {
+            dl_lit eff = r->effects[e];
+            int fi = fluent_index(w, eff.atom);
+            dl_lit head = { w->sp.spr_loc[fi], eff.neg };
+            snprintf(buf, sizeof buf, "%s/%s%s", r->name,
+                     eff.neg ? "~" : "", intern_name(w->syms, eff.atom));
+            int rid = dlcol_add_rule(f, buf, DL_DEFEASIBLE, head, body, nbody);
+            if (r->prov)
+                dlcol_set_prov(f, rid, r->prov);
+            dlcol_add_sup(f, rid, eff.neg ? inertia_pos[fi] : inertia_neg[fi]);
+        }
+    }
+    if (body != lbuf)
+        free(body);
+    free(inertia_pos);
+    free(inertia_neg);
+    free(live);
+    return f;
+}
+
 /* The current value index of the split fluent (pre-step state), or -1 when
  * split is inactive or no unique value atom is true (fall back to the full
  * schema — always safe, the narrowing is pure optimization). */
@@ -2192,24 +2455,50 @@ static void ensure_fam(world *w)
             assign_locs(w);
             if (w->fam0)
                 dlcol_free(w->fam0);
-            w->fam0 = build_step_family(w, -1);
+            w->fam0 = build_step_family(w, -1, false);
             w->fam0_ver = w->struct_ver;
         }
         w->fam = w->fam0;
         w->flw_cur = NULL;
         w->numw_cur = NULL;
     } else {
-        if (!w->sp.fams[v] || w->sp.vers[v] != w->struct_ver) {
-            assign_locs(w);
+        /* mixed routing (#121): the residue schema omits lane-covered rules
+         * ONLY when the step will actually run the lane half — decided here,
+         * stored with the cache slot, so the two can never disagree. A mixed
+         * residue builds on the SPARSE space (O(residue) per step, the #77
+         * trick); a value with no lane family stays on the dense schema. */
+        bool mix = false;
+        if (w->npg == 0 && w->lanes_ok)
+            for (int k = 0; k < w->nsteplanes; k++)
+                if (w->steplanes[k].split_value == v) { mix = true; break; }
+        if (!w->sp.fams[v] || w->sp.vers[v] != w->struct_ver ||
+            (w->sp.mixed[v] != 0) != mix) {
             if (w->sp.fams[v])
                 dlcol_free(w->sp.fams[v]);
-            w->sp.fams[v] = build_step_family(w, v);
+            if (mix) {
+                ensure_split_space(w);
+                w->sp.fams[v] = build_step_family_sparse(w, v);
+            } else {
+                assign_locs(w);
+                w->sp.fams[v] = build_step_family(w, v, false);
+            }
             w->sp.vers[v] = w->struct_ver;
+            w->sp.mixed[v] = mix;
         }
         w->fam = w->sp.fams[v];
         w->flw_cur = w->sp.flw[v];
         w->numw_cur = w->sp.numw[v];
+        if (mix) {
+            w->aloc_of = w->sp.smap;   w->aloc_cap = w->sp.smap_cap;
+            w->afl_loc = w->sp.sfl_loc; w->apr_loc = w->sp.spr_loc;
+            w->afl_list = w->sp.sfl_list; w->nafl = w->sp.nsfl;
+            w->fam_ver = w->struct_ver;
+            return;
+        }
     }
+    w->aloc_of = w->loc_of;  w->aloc_cap = w->loc_cap;    /* dense actives */
+    w->afl_loc = w->fl_loc;  w->apr_loc = w->pr_loc;
+    w->afl_list = NULL;      w->nafl = 0;
     w->fam_ver = w->struct_ver;        /* the active family is fresh */
 }
 
@@ -2342,9 +2631,9 @@ static bool srule_fired(const world *w, const srule *r,
     for (int i = 0; i < r->nbody; i++) {
         dl_lit l = r->body[i].primed ? primed_lit(w, r->body[i].lit)
                                      : r->body[i].lit;
-        if (l.atom >= w->loc_cap || w->loc_of[l.atom] == LOC_NONE)
+        if (l.atom >= w->aloc_cap || w->aloc_of[l.atom] == LOC_NONE)
             return false;
-        dl_lit loc = { w->loc_of[l.atom], l.neg };
+        dl_lit loc = { w->aloc_of[l.atom], l.neg };
         if (dlcol_defeasible(w->fam, loc, 0) != DL_PROVED)
             return false;
     }
@@ -2375,8 +2664,8 @@ static bool lit_solved_proved(const world *w, uint32_t atom, bool neg)
      * (#86) may point EXPR_TEST at a non-step family (the query-layer jfam);
      * everything else (effects, the #84 response) reads the step family */
     dlcol *f = w->tctx_fam ? w->tctx_fam : w->fam;
-    const uint32_t *of = w->tctx_fam ? w->tctx_of : w->loc_of;
-    uint32_t cap = w->tctx_fam ? w->tctx_cap : w->loc_cap;
+    const uint32_t *of = w->tctx_fam ? w->tctx_of : w->aloc_of;
+    uint32_t cap = w->tctx_fam ? w->tctx_cap : w->aloc_cap;
     if (atom >= cap || of[atom] == LOC_NONE)
         return false;
     dl_lit loc = { of[atom], neg };
@@ -2437,28 +2726,46 @@ static void solve_step_family_vals(world *w, const bool *vals,
     w->teg_ready = false;
     for (int phase = 0; ; phase++) {               /* two-phase iff test-guards (#86) */
         dlcol_clear_facts(f);
-        for (int i = 0; i < w->nfl; i++) {
-            dl_lit l = { w->fl_loc[i], !vals[i] };
-            dlcol_add_fact(f, l, 0);
+        if (w->afl_list) {                         /* sparse residue: its fluents only */
+            for (int k = 0; k < w->nafl; k++) {
+                int i = (int)w->afl_list[k];
+                dl_lit l = { w->afl_loc[i], !vals[i] };
+                dlcol_add_fact(f, l, 0);
+            }
+        } else {
+            for (int i = 0; i < w->nfl; i++) {
+                dl_lit l = { w->afl_loc[i], !vals[i] };
+                dlcol_add_fact(f, l, 0);
+            }
         }
         for (int i = 0; i < nactions; i++) {
             uint32_t a = actions[i];
-            if (a < w->loc_cap && w->loc_of[a] != LOC_NONE) {
-                dl_lit l = { w->loc_of[a], false };
+            if (a < w->aloc_cap && w->aloc_of[a] != LOC_NONE) {
+                dl_lit l = { w->aloc_of[a], false };
                 dlcol_add_fact(f, l, 0);
             }
         }
         /* numeric guard atoms feed judgment rules inside the step theory too */
-        load_guards(w, f, w->loc_of, w->loc_cap);
-        load_providers(w, f, w->loc_of, w->loc_cap);
-        load_eguards(w, f, w->loc_of, w->loc_cap);
+        load_guards(w, f, w->aloc_of, w->aloc_cap);
+        load_providers(w, f, w->aloc_of, w->aloc_cap);
+        load_eguards(w, f, w->aloc_of, w->aloc_cap);
         /* primed-guard facts minted by settled lower strata (§5.8 #87): strict
          * inputs about the NEXT value; empty until the stratum loop mints them */
         for (int i = 0; i < w->npg_cur; i++) {
             uint32_t a = w->pg_cur[i].atom;
-            if (a < w->loc_cap && w->loc_of[a] != LOC_NONE)
-                dlcol_add_fact(f, (dl_lit){ w->loc_of[a], !w->pg_cur[i].val }, 0);
+            if (a < w->aloc_cap && w->aloc_of[a] != LOC_NONE)
+                dlcol_add_fact(f, (dl_lit){ w->aloc_of[a], !w->pg_cur[i].val }, 0);
         }
+        /* mixed routing (#121): the lane half already settled these fluents'
+         * next state — inject it as strict primed facts (the lane half is a
+         * stratum below the residue, same mechanism as the #87 mints above).
+         * Only fluents in the residue's write-set matter: flw is exactly the
+         * set whose primed locs any residue rule reads (the commit takes
+         * lane-managed fluents straight from mix_next, never from here). */
+        if (w->mix_managed)
+            for (int i = 0; i < w->nfl; i++)
+                if (w->mix_managed[i] && (!w->flw_cur || w->flw_cur[i]))
+                    dlcol_add_fact(f, (dl_lit){ w->apr_loc[i], !w->mix_next[i] }, 0);
         dlcol_solve(f);
         if (phase == 1 || w->n_teg == 0) break;
         eval_test_guards(w, f, w->loc_of, w->loc_cap);
@@ -2667,6 +2974,55 @@ int world_step(world *w, const uint32_t *actions, int nactions,
         return rc;
     }
 
+    /* Mixed lane/N=1 routing (#121): with split active, the grounder may have
+     * built a per-value lane family for the current value's homogeneous
+     * residue (its split guards erased — statically true here). Solve it
+     * FIRST, bit-parallel; its fluents' next-state then enters the N=1
+     * residue solve below as strict primed facts (the lane half is a stratum
+     * under the residue), and the commit takes those fluents from the lane
+     * result. Falls through to plain N=1 when no family matches the value. */
+    bool *mix_next = NULL;
+    uint8_t *mix_managed = NULL;
+    if (w->sp.nvals) {
+        int v = split_cur_value(w);
+        step_lane_family *sf = NULL;
+        if (v >= 0 && w->sp.mixed[v])      /* the residue fam omits covered
+                                            * rules — the lane half MUST run */
+            for (int k = 0; k < w->nsteplanes; k++)
+                if (w->steplanes[k].split_value == v) { sf = &w->steplanes[k]; break; }
+        if (sf) {
+            solve_step_lane_family(w, sf, actions, nactions);
+            mix_next    = malloc((size_t)(w->nfl ? w->nfl : 1) * sizeof *mix_next);
+            mix_managed = calloc((size_t)(w->nfl ? w->nfl : 1), 1);
+            for (int a = 0; a < sf->nloc; a++) {
+                if (sf->kind[a] != WORLD_STEP_PRIMED) continue;
+                for (int e = 0; e < sf->nent; e++) {
+                    int i = sf->fl_of[(size_t)a * sf->nent + e];
+                    if (i < 0) continue;           /* marker / non-fluent readout */
+                    dl_lit p = { (uint32_t)a, false };
+                    if (dlcol_defeasible(sf->fam, p, e) == DL_PROVED) {
+                        mix_next[i] = true;
+                    } else if (dlcol_defeasible(sf->fam, dl_complement(p), e)
+                               == DL_PROVED) {
+                        mix_next[i] = false;
+                    } else {
+                        if (err)
+                            snprintf(err, errsz,
+                                     "conflicting or undecided effects on "
+                                     "fluent '%s'",
+                                     intern_name(w->syms, w->fluents[i]));
+                        free(mix_next);
+                        free(mix_managed);
+                        return -1;
+                    }
+                    mix_managed[i] = 1;
+                }
+            }
+            w->mix_next = mix_next;
+            w->mix_managed = mix_managed;
+        }
+    }
+
     dlcol *f = w->fam;
 
     /* §5.8 strata (#87): with primed guards, the tick runs one solve per
@@ -2676,21 +3032,43 @@ int world_step(world *w, const uint32_t *actions, int nactions,
      * the state write stays atomic at the very end, so the action log records
      * ONE step (I4 — replay never sees a half-tick). Zero primed guards is
      * the degenerate one-stratum case: exactly one solve, today's tick. */
-    int nstrata = 1;
-    for (int s = 0; s < w->nsr; s++)
-        if (w->srules[s].stratum + 1 > nstrata) nstrata = w->srules[s].stratum + 1;
-    if (w->num_stratum_cap < w->nnum) {
-        w->num_stratum = realloc(w->num_stratum,
-                                 (size_t)w->nnum * sizeof *w->num_stratum);
-        w->num_stratum_cap = w->nnum;
-    }
-    for (int i = 0; i < w->nnum; i++) w->num_stratum[i] = 0;
-    for (int s = 0; s < w->nsr; s++)               /* fluent stratum = max writer */
-        for (int e = 0; e < w->srules[s].nneff; e++) {
-            int i = num_index(w, w->srules[s].neffs[e].num_atom);
-            if (i >= 0 && w->srules[s].stratum > w->num_stratum[i])
-                w->num_stratum[i] = w->srules[s].stratum;
+    /* structure-only scaffolding, cached per struct_ver (stored as ver+1 so a
+     * fresh world at ver 0 still computes once): the O(nsr) sweeps here were
+     * the mixed route's hot spot once the solves themselves were narrowed */
+    if (w->scaffold_ver != w->struct_ver + 1 ||
+        w->scaffold_nsr != w->nsr || w->scaffold_nnum != w->nnum) {
+        int nst = 1;
+        for (int s = 0; s < w->nsr; s++)
+            if (w->srules[s].stratum + 1 > nst) nst = w->srules[s].stratum + 1;
+        w->nstrata_cache = nst;
+        if (w->num_stratum_cap < w->nnum) {
+            w->num_stratum = realloc(w->num_stratum,
+                                     (size_t)w->nnum * sizeof *w->num_stratum);
+            w->num_stratum_cap = w->nnum;
         }
+        for (int i = 0; i < w->nnum; i++) w->num_stratum[i] = 0;
+        w->n_neff_rules = 0;
+        for (int s = 0; s < w->nsr; s++) {         /* fluent stratum = max writer */
+            if (w->srules[s].nneff == 0)
+                continue;
+            for (int e = 0; e < w->srules[s].nneff; e++) {
+                int i = num_index(w, w->srules[s].neffs[e].num_atom);
+                if (i >= 0 && w->srules[s].stratum > w->num_stratum[i])
+                    w->num_stratum[i] = w->srules[s].stratum;
+            }
+            if (w->n_neff_rules == w->cap_neff_rules) {
+                w->cap_neff_rules = w->cap_neff_rules ? w->cap_neff_rules * 2 : 16;
+                w->neff_rules = realloc(w->neff_rules,
+                                        (size_t)w->cap_neff_rules
+                                            * sizeof *w->neff_rules);
+            }
+            w->neff_rules[w->n_neff_rules++] = s;
+        }
+        w->scaffold_ver = w->struct_ver + 1;
+        w->scaffold_nsr = w->nsr;
+        w->scaffold_nnum = w->nnum;
+    }
+    int nstrata = w->nstrata_cache;
     w->npg_cur = 0;
 
     int rc = 0;
@@ -2724,9 +3102,9 @@ int world_step(world *w, const uint32_t *actions, int nactions,
         w->cur_stratum = st;
         solve_step_family(w, actions, nactions);   /* injects pg_cur facts */
 
-        for (int s = 0; s < w->nsr; s++) {
-            const srule *r = &w->srules[s];
-            if (r->nneff == 0 || !srule_fired(w, r, actions, nactions))
+        for (int k = 0; k < w->n_neff_rules; k++) {
+            const srule *r = &w->srules[w->neff_rules[k]];
+            if (!srule_fired(w, r, actions, nactions))
                 continue;
             for (int e = 0; e < r->nneff; e++) {
                 const num_effect *ef = &r->neffs[e];
@@ -2856,12 +3234,16 @@ int world_step(world *w, const uint32_t *actions, int nactions,
     /* boolean next-state + contested check, from the FINAL solve */
     bool *next = malloc((size_t)(w->nfl ? w->nfl : 1) * sizeof *next);
     for (int i = 0; rc == 0 && i < w->nfl; i++) {
+        if (w->mix_managed && w->mix_managed[i]) {
+            next[i] = w->mix_next[i];  /* the lane half owns it (#121 mixed) */
+            continue;
+        }
         if (w->flw_cur && !w->flw_cur[i]) {
             next[i] = w->vals[i];      /* outside the split write-set (#121):
                                         * no live writer, inertia only — copy */
             continue;
         }
-        dl_lit p = { w->pr_loc[i], false };
+        dl_lit p = { w->apr_loc[i], false };
         if (dlcol_defeasible(f, p, 0) == DL_PROVED) {
             next[i] = true;
         } else if (dlcol_defeasible(f, dl_complement(p), 0) == DL_PROVED) {
@@ -2887,6 +3269,10 @@ int world_step(world *w, const uint32_t *actions, int nactions,
     }
 
     if (rc == 0) w->tick++;                        /* monotone step counter (§5.10) */
+    w->mix_managed = NULL;                         /* mixed context down (#121) */
+    w->mix_next = NULL;
+    free(mix_managed);
+    free(mix_next);
     free(next);
     free(nextnum);
     return rc;
