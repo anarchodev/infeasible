@@ -945,20 +945,28 @@ so the hatches are shaped for strangers:
    the trace reads "fire 8 → 4 (`tiefling_resistance` beats
    `base_fire_damage`)" — richer than the tooltip it imitates, and each
    roll is §5.10-site-keyed, so the receipt can show the dice.
-   *Status*: the first shipped form is configured, not modeled — #83/#84's
-   per-type commit stage hardcodes the 5e response algebra (immune → 0,
-   resistant XOR vulnerable → floored halve / double, both cancel, PHB
-   p.197) in engine code, because the modeled form is generate-then-apply
-   inside one tick and waits on stratification (#87). Treat it as a
-   scaffold in the `dl.c` sense: golden tests pin its semantics, the
-   modeled form stays the committed endpoint, and equivalence gets
-   validated before the C stage is kept (as a compiler-picked fast path,
-   §6.1's invisible-backing rule) or removed. One caution for the modeled
-   port: floored halving and doubling do not commute (7 → 3 → 6 one way,
-   7 → 14 → 7 the other), so resistance and vulnerability are *not* two
-   stackable multiplicative layers — 5e's both-cancel is a third rule
-   defeating the other two, authored and traced; #94's commutation check
-   will rightly refuse the two-undefeated-layers encoding.
+   *Status (decided, 2026-07-30)*: the modeled form is the ONLY form. The
+   first shipped form was configured — #83/#84's per-type commit stage
+   hardcoded the 5e response algebra (immune → 0, resistant XOR vulnerable
+   → floored halve / double, both cancel, PHB p.197) in engine code while
+   the modeled form waited on stratification (#87). Once strata, `test()`
+   guards, and primed reads landed, the equivalence gate ran (modeled ≡
+   configured pinned golden; 1.88–1.96× at 2k/10k/100k N=1, the gap being
+   the second stratum's extra solve) and the #84 decision REMOVED the
+   configured stage and its `as <type>` surface: the measured 2× lives
+   only in the N=1 regime the M3 SCC sweep is built to change, the lane
+   cost model below prices the modeled form at near-parity, and keeping
+   the stage would have required the §6.1 invisible-backing promotion
+   (shape recognizer + byte-identical trace unification) — compiler work
+   needed by nothing else, to preserve a non-durable win. The modeled
+   trajectories are pinned as absolute goldens (`test_modeled`, values
+   carried verbatim from the retired stage); re-run `bench_dtype` when
+   the M3 sweep lands. One caution the port confirmed: floored halving
+   and doubling do not commute (7 → 3 → 6 one way, 7 → 14 → 7 the
+   other), so resistance and vulnerability are *not* two stackable
+   multiplicative layers — 5e's both-cancel is a third rule defeating
+   the other two, authored and traced; #94's commutation check rightly
+   refuses the two-undefeated-layers encoding.
 
 **The receipt is structured data, not only a rendering.** BG3-style floating
 combat text — every hit displaying its source and damage type — is a *view of
@@ -986,8 +994,9 @@ the timestamps, not the fixedness).
 **One tick, in order — strata, stages, classes, layers (decided).** The
 numeric tier now carries four ordering mechanisms, each introduced for its
 own reason: strata across values (the primed-guard layering above), the
-fixed commit pipeline within one fluent (base → Σ per type → per-type
-response → clamp), operator classes within one accumulator (set before
+fixed commit pipeline within one fluent (base → Σ deltas → clamp; the
+per-type response stage is modeled content, not a pipeline stage, per the
+#84 decision above), operator classes within one accumulator (set before
 add; admissible merges), and layered `prior` definitions within one
 derived value (#82/#94). They compose because their jurisdictions are
 disjoint, and the composition is the decided semantics of a tick:
@@ -1011,11 +1020,11 @@ disjoint, and the composition is the decided semantics of a tick:
    the top of this passage holds at every level.
 
 One corollary is decided with it — **commit-time visibility**: a judgment
-consulted from the commit (a per-type response atom, a verdict tested in
-an effect expression) reads the fixpoint as settled at its own stratum —
-the latest settled state, never a partially-propagated one. The shipped
-#84 behaviour (responses solved over the pre-step state) is exactly this
-rule in the degenerate one-stratum world, so landing strata changes no
+consulted from the commit (a verdict tested in an effect expression)
+reads the fixpoint as settled at its own stratum — the latest settled
+state, never a partially-propagated one. The retired #84 stage's
+behaviour (responses solved over the pre-step state) was exactly this
+rule in the degenerate one-stratum world, so landing strata changed no
 existing world's replay; golden tests pin each side (pre-step in a
 one-stratum world; a resistance concluded in a lower stratum of the same
 tick applies to damage committed above it).
@@ -1043,20 +1052,21 @@ tick applies to damage committed above it).
   evaluation is a short chain walk; on lanes it is evaluate-all-and-mask:
   per layer the guard is an already-solved bit column and the update is
   `v = select(mask, f(v), v)` — branch-free, 64-wide masks, vectorizable
-  arithmetic. This is the same loop shape as the configured response
-  stage (three mask reads and a scale), generalized from a hardcoded 3 to
-  a static K, with K ≈ 2–5 in 5e material — a bounded constant factor,
-  not a new asymptotic.
-- **Anchors and the adoption gate.** `bench_slice` steps a 100k-unit
-  battle in 2.5 ms/tick (judge+step ≈ 1.2 ms of it); the numeric commit
-  is a fraction of the step share, so even 5× on commit arithmetic
-  leaves order-of-magnitude headroom against a 16 ms frame. The gate is
-  the prototype-before-adopt playbook: extend the 5e bench with a
-  typed-damage tick, require the modeled pipeline within ~2× of the
-  configured stage at 100k and both inside budget. If modeled misses,
-  the configured stage survives as the compiler-picked fast path for the
-  response shapes it matches, and the modeled form remains the semantics
-  it must agree with.
+  arithmetic. This is the same loop shape as the retired configured
+  response stage (three mask reads and a scale), generalized from a
+  hardcoded 3 to a static K, with K ≈ 2–5 in 5e material — a bounded
+  constant factor, not a new asymptotic.
+- **Anchors and the adoption gate (ran; decided).** `bench_slice` steps a
+  100k-unit battle in 2.5 ms/tick (judge+step ≈ 1.2 ms of it); the
+  numeric commit is a fraction of the step share, so even 5× on commit
+  arithmetic leaves order-of-magnitude headroom against a 16 ms frame.
+  The gate was the prototype-before-adopt playbook: `bench_dtype`
+  measured the modeled pipeline at 1.88–1.96× of the configured stage
+  (2k/10k/100k, both N=1), inside the ~2× bound — and the #84 decision
+  removed the stage rather than keeping it as a fast path (see the
+  *Status* note under escape hatch 4 above). The modeled form is both
+  the semantics and the implementation; the surviving lane work targets
+  it alone.
 - **Space is unchanged.** Layer programs mint no atoms (numbers never
   become atoms); guard atoms exist only for authored comparisons;
   accumulators and layer scratch die at commit. The save gains nothing.

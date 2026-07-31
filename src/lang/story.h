@@ -217,12 +217,11 @@
  *                                          -- finite domain; never in the fixpoint
  *   cmp     := '<=' | '<' | '>=' | '>' | '='
  *   numop   := ':=' | '+=' | '-='                        -- numeric effect (§5.8);
- *                                          -- a `+=`/`-=` RHS may end `'as' IDENT`
- *                                          -- (#83): the delta accumulates in that
- *                                          -- enum value's damage-type bucket and the
- *                                          -- commit consults resistant/vulnerable/
- *                                          -- immune(<subject>, <type>) judgments
- *                                          -- after summation, before the clamp (#84)
+ *                                          -- `as` after a RHS is a located error:
+ *                                          -- the #83 typed-contribution surface was
+ *                                          -- removed with the #84 stage (typed
+ *                                          -- damage is authored in the modeled
+ *                                          -- form, DESIGN.md §5.8)
  *   expr    := term (('+'|'-') term)*                    -- effect RHS, int-only
  *   term    := factor (('*'|'/') factor)*   -- '/' floors (rounds toward -inf, §5.8)
  *   factor  := '-' factor | INT

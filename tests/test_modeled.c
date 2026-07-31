@@ -1,19 +1,22 @@
-/* Golden test for primed numeric READS (#84's modeled pipeline / #87
- * extension) and the modeled ≡ configured typed-damage equivalence.
+/* Golden test for primed numeric READS (the modeled typed-damage pipeline /
+ * #87 extension).
  *
  * `f(X)'` inside a RAMIFICATION's effect expression reads the next value a
  * lower stratum committed this tick (EXPR_LOADN). With it, the MODELED
- * typed-damage pipeline (DESIGN §5.8 escape hatch 4) is expressible in
- * `.story`: actions accumulate `inc_fire(X) +=` at stratum 0 — a per-tick
- * TRANSIENT accumulator built from the ordinary operator-class pipeline (an
+ * typed-damage pipeline (DESIGN §5.8) is expressible in `.story`: actions
+ * accumulate `inc_fire(X) +=` at stratum 0 — a per-tick TRANSIENT
+ * accumulator built from the ordinary operator-class pipeline (an
  * always-firing `:= 0` ramification is the base, the deltas sum on top, so
  * every tick starts from zero with no reset machinery) — and a stratum-1
  * ramification applies the 5e response as branch-free test() arithmetic over
- * `inc_fire(X)'` and subtracts from hp. The equivalence pin drives the SAME
- * scripted history through this and through the CONFIGURED engine stage
- * (`as fire`, PR #103) and requires identical hp trajectories — including
- * the sum-then-halve case (two 3s resisted are floor(6/2)=3, not 1+1) that
- * distinguishes per-type summation from per-attack response. */
+ * `inc_fire(X)'` and subtracts from hp.
+ *
+ * The hp trajectories below are ABSOLUTE goldens, preserved verbatim from
+ * the configured engine stage at the moment of its removal (#84 decision):
+ * this file was the modeled ≡ configured equivalence pin while both forms
+ * existed, and the expected values are the configured stage's last word —
+ * including the sum-then-halve case (two 3s resisted are floor(6/2)=3, not
+ * 1+1) that distinguishes per-type summation from per-attack response. */
 
 #include "lang/story.h"
 #include "state/world.h"
@@ -69,28 +72,12 @@ static int test_mirror(void)
     return 0;
 }
 
-/* --- modeled ≡ configured, over one scripted history --- */
+/* --- the modeled pipeline, over one scripted history --- */
 
 static const char *JUDGE =
     "rule r_f(X: unit): raging(X) => resistant(X, fire)\n"
     "rule v_f(X: unit): soaked(X) => vulnerable(X, fire)\n"
     "rule i_f(X: unit): stoned(X) => immune(X, fire)\n";
-
-static const char *CONFIGURED =
-    "sort unit\n"
-    "entity ( u0, u1, u2, u3 : unit )\n"
-    "enum damage_type { fire, cold }\n"
-    "state (\n"
-    "    raging(unit)  soaked(unit)  stoned(unit)\n"
-    "    hp(unit) : int in 0 .. 400\n"
-    ")\n"
-    "init ( hp(u0)=400 hp(u1)=400 hp(u2)=400 hp(u3)=400\n"
-    "       raging(u1)  soaked(u2)  stoned(u3) )\n"
-    "%JUDGE%"
-    "action burn(T: unit):   causes hp(T) -= 3 as fire\n"
-    "action burn2(T: unit):  causes hp(T) -= 3 as fire\n"
-    "action chill(T: unit):  causes hp(T) -= 5 as cold\n"
-    "action douse(X: unit):  causes soaked(X)\n";
 
 static const char *MODELED =
     "sort unit\n"
@@ -133,54 +120,45 @@ static char *subst_judge(const char *tmpl)
     return buf;
 }
 
-static int test_equivalence(void)
+static int test_trajectory(void)
 {
-    intern *sc = intern_new(), *sm = intern_new();
-    world *C = compile_ok(subst_judge(CONFIGURED), sc);
-    CHECK(C != NULL);
+    intern *sm = intern_new();
     world *M = compile_ok(subst_judge(MODELED), sm);
     CHECK(M != NULL);
 
-    /* one scripted history; step both worlds with the same action sets */
-    static const char *SCRIPT[][2] = {
-        { "burn(u0)", NULL },                  /* no response: 3        */
-        { "burn(u1)", "burn2(u1)" },           /* resist: floor(6/2)=3  */
-        { "burn(u2)", NULL },                  /* vulnerable: 6         */
-        { "burn(u3)", "burn2(u3)" },           /* immune: 0             */
-        { "chill(u1)", NULL },                 /* untyped-response cold: 5 */
-        { "douse(u1)", NULL },                 /* u1 now raging AND soaked */
-        { "burn(u1)", NULL },                  /* cancel: raw 3         */
-        { "burn(u0)", "chill(u0)" },           /* two types, one tick   */
+    /* one scripted history; per-step hp goldens are the configured stage's
+     * last output before its removal (see the header comment) */
+    static const struct { const char *a, *b; long hp[4]; } SCRIPT[] = {
+        { "burn(u0)", NULL,        { 397, 400, 400, 400 } },  /* no response: 3 */
+        { "burn(u1)", "burn2(u1)", { 397, 397, 400, 400 } },  /* resist: floor(6/2)=3 */
+        { "burn(u2)", NULL,        { 397, 397, 394, 400 } },  /* vulnerable: 6 */
+        { "burn(u3)", "burn2(u3)", { 397, 397, 394, 400 } },  /* immune: 0 */
+        { "chill(u1)", NULL,       { 397, 392, 394, 400 } },  /* no cold response: 5 */
+        { "douse(u1)", NULL,       { 397, 392, 394, 400 } },  /* u1 raging AND soaked */
+        { "burn(u1)", NULL,        { 397, 389, 394, 400 } },  /* cancel: raw 3 */
+        { "burn(u0)", "chill(u0)", { 389, 389, 394, 400 } },  /* two types, one tick */
     };
     static const char *UNITS[] = { "u0", "u1", "u2", "u3" };
     for (size_t s = 0; s < sizeof SCRIPT / sizeof SCRIPT[0]; s++) {
-        uint32_t ac[2], am[2];
-        int n = SCRIPT[s][1] ? 2 : 1;
-        for (int i = 0; i < n; i++) {
-            ac[i] = intern_id(sc, SCRIPT[s][i]);
-            am[i] = intern_id(sm, SCRIPT[s][i]);
-        }
+        uint32_t am[2];
+        int n = SCRIPT[s].b ? 2 : 1;
+        am[0] = intern_id(sm, SCRIPT[s].a);
+        if (n == 2) am[1] = intern_id(sm, SCRIPT[s].b);
         char err[128];
-        CHECK(world_step(C, ac, n, err, sizeof err) == 0);
         CHECK(world_step(M, am, n, err, sizeof err) == 0);
         for (int u = 0; u < 4; u++) {
             char b[32];
             snprintf(b, sizeof b, "hp(%s)", UNITS[u]);
-            long hc = num(C, sc, b), hm = num(M, sm, b);
-            if (hc != hm) {
-                fprintf(stderr, "MISMATCH step %zu: %s configured=%ld modeled=%ld\n",
-                        s, b, hc, hm);
+            long hm = num(M, sm, b);
+            if (hm != SCRIPT[s].hp[u]) {
+                fprintf(stderr, "MISMATCH step %zu: %s expected=%ld got=%ld\n",
+                        s, b, SCRIPT[s].hp[u], hm);
                 return 1;
             }
         }
     }
-    /* and the aggregate trajectory is the interesting one, not degenerate */
-    CHECK(num(C, sc, "hp(u1)") == 400 - 3 - 5 - 3);   /* halved-sum, cold, cancel */
-    CHECK(num(C, sc, "hp(u2)") == 394);               /* vulnerable: 6 */
-    CHECK(num(C, sc, "hp(u3)") == 400);               /* immune */
-
-    world_free(C); world_free(M);
-    intern_free(sc); intern_free(sm);
+    world_free(M);
+    intern_free(sm);
     return 0;
 }
 
@@ -206,6 +184,12 @@ static int test_errors(void)
           "value v(unit) : int\nrule d(X: unit): => v(X) = 3\n"
           "rule t(X: unit): on causes m(X) := v(X)'\n",
           "no primed form" },
+        /* the removed `as <type>` surface refuses with a pointer at the
+         * modeled idiom (#84) */
+        { "sort unit\nentity u : unit\nenum damage_type { fire }\n"
+          "state hp(unit) : int\n"
+          "action burn(T: unit): causes hp(T) -= 3 as fire\n",
+          "typed contributions were removed" },
     };
     for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {
         intern *sy = intern_new();
@@ -235,7 +219,7 @@ static int test_errors(void)
 int main(void)
 {
     if (test_mirror()) return 1;
-    if (test_equivalence()) return 1;
+    if (test_trajectory()) return 1;
     if (test_errors()) return 1;
     printf("test_modeled: all passed\n");
     return 0;

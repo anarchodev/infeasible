@@ -24,12 +24,7 @@ typedef struct {
     world_numop op;
     const expr_ins *code; /* RHS bytecode (arena-copied) */
     int ncode;
-    int dtype;            /* damage-type bucket (#83/#84); -1 = untyped */
 } num_effect;
-
-/* Per-(fluent, type) response atoms (#84): boolean judgments the commit
- * pipeline consults after summation, before the clamp. INTERN_NONE = absent. */
-typedef struct { uint32_t resist, vuln, immune; } num_resp;
 
 typedef struct {
     const char *name;
@@ -191,10 +186,8 @@ struct world {
     struct { uint32_t atom; long value, min, max; bool has_range;
              const expr_ins *lo_code; int n_lo;
              const expr_ins *hi_code; int n_hi;
-             num_resp *resp;            /* per-type response atoms, NULL = untyped (#84) */
              world_merge merge; } *nums;   /* ASSIGN-class algebra (#85) */
     int nnum, capnum;
-    int ndtypes;                        /* size of the closed damage-type enum (#83) */
     struct { uint32_t guard, num; world_cmp op; long threshold; } *guards;
     int ng, capg;
     /* Primed guards (§5.8 #87): over the NEXT value, minted as strict facts by
@@ -656,7 +649,6 @@ void world_declare_num(world *w, uint32_t atom, long min, long max, bool has_ran
     w->nums[w->nnum].has_range = has_range;
     w->nums[w->nnum].lo_code = NULL; w->nums[w->nnum].n_lo = 0;
     w->nums[w->nnum].hi_code = NULL; w->nums[w->nnum].n_hi = 0;
-    w->nums[w->nnum].resp = NULL;
     w->nums[w->nnum].merge = WORLD_MERGE_REGISTER;
     atom_map_set(&w->num_of, &w->num_of_cap, atom, w->nnum);
     w->nnum++;
@@ -666,26 +658,6 @@ void world_set_num_merge(world *w, uint32_t atom, world_merge m)
 {
     int i = num_index(w, atom);
     if (i >= 0) w->nums[i].merge = m;
-}
-
-void world_set_dtypes(world *w, int ndtypes)
-{
-    if (ndtypes > w->ndtypes) w->ndtypes = ndtypes;
-}
-
-void world_set_num_response(world *w, uint32_t num_atom, int dtype,
-                            uint32_t resist, uint32_t vuln, uint32_t immune)
-{
-    int i = num_index(w, num_atom);
-    if (i < 0 || dtype < 0 || dtype >= w->ndtypes) return;
-    if (!w->nums[i].resp) {
-        num_resp *r = arena_alloc(&w->a, (size_t)w->ndtypes * sizeof *r);
-        memset(r, 0, (size_t)w->ndtypes * sizeof *r);   /* INTERN_NONE = absent */
-        w->nums[i].resp = r;
-    }
-    w->nums[i].resp[dtype].resist = resist;
-    w->nums[i].resp[dtype].vuln   = vuln;
-    w->nums[i].resp[dtype].immune = immune;
 }
 
 /* Attach dynamic clamp bounds to an already-declared numeric fluent (§5.8):
@@ -1355,13 +1327,6 @@ void world_set_step_prov(world *w, int rule, const char *prov)
 void world_add_num_effect(world *w, int rule, uint32_t num_atom,
                           world_numop op, const expr_ins *code, int ncode)
 {
-    world_add_num_effect_typed(w, rule, num_atom, op, code, ncode, -1);
-}
-
-void world_add_num_effect_typed(world *w, int rule, uint32_t num_atom,
-                                world_numop op, const expr_ins *code, int ncode,
-                                int dtype)
-{
     srule *r = &w->srules[rule];
     /* grow the effect list; it lives in the arena, so double by re-copying */
     if (r->nneff == r->capneff) {
@@ -1380,7 +1345,6 @@ void world_add_num_effect_typed(world *w, int rule, uint32_t num_atom,
     e->op = op;
     e->code = owncode;
     e->ncode = ncode;
-    e->dtype = dtype;
     /* numeric effects run in the commit phase, not the fixpoint — the cached
      * boolean family is unaffected, so no fam_dirty here. */
 }
@@ -2820,9 +2784,8 @@ static bool srule_fired(const world *w, const srule *r,
 }
 
 /* Is a literal defeasibly proved in the solved step theory? An atom no rule
- * mentions has no location — absent (0), never an error. Shared by the typed
- * response (#84) and EXPR_TEST (#86); both run commit-side, strictly after
- * the fixpoint settles. */
+ * mentions has no location — absent (0), never an error. Serves EXPR_TEST
+ * (#86), which runs commit-side, strictly after the fixpoint settles. */
 static bool lit_solved_proved(const world *w, uint32_t atom, bool neg)
 {
     if (atom == INTERN_NONE) return false;
@@ -2841,7 +2804,7 @@ static bool lit_solved_proved(const world *w, uint32_t atom, bool neg)
     }
     /* derived judgments read the solved family — pass-B guard evaluation
      * (#86) may point EXPR_TEST at a non-step family (the query-layer jfam);
-     * everything else (effects, the #84 response) reads the step family */
+     * everything else (effects) reads the step family */
     dlcol *f = w->tctx_fam ? w->tctx_fam : w->fam;
     const uint32_t *of = w->tctx_fam ? w->tctx_of : w->aloc_of;
     uint32_t cap = w->tctx_fam ? w->tctx_cap : w->aloc_cap;
@@ -2849,36 +2812,6 @@ static bool lit_solved_proved(const world *w, uint32_t atom, bool neg)
         return false;
     dl_lit loc = { of[atom], neg };
     return dlcol_defeasible(f, loc, 0) == DL_PROVED;
-}
-
-static bool resp_proved(const world *w, uint32_t atom)
-{
-    return lit_solved_proved(w, atom, false);
-}
-
-/* The per-type response (#84): scale one type's summed delta by the solved
- * response judgments. Immunity dominates; resistance and vulnerability
- * COEXIST AND CANCEL (PHB p.197) — they are independent flags, not points on
- * an ordered domain. Halving floors the MAGNITUDE (5e "round down": 7 damage
- * resisted is 3, whichever direction the delta runs). Sets *why to the atom
- * that decided the scaling (INTERN_NONE if untouched) for the receipt. */
-static long typed_response(const world *w, int i, int t, long d, uint32_t *why)
-{
-    *why = INTERN_NONE;
-    if (!w->nums[i].resp) return d;
-    const num_resp *r = &w->nums[i].resp[t];
-    if (resp_proved(w, r->immune)) { *why = r->immune; return 0; }
-    bool res = resp_proved(w, r->resist);
-    bool vul = resp_proved(w, r->vuln);
-    if (res == vul) return d;                      /* neither, or both cancel */
-    if (res) {
-        long m = d < 0 ? -d : d;
-        m /= 2;
-        *why = r->resist;
-        return d < 0 ? -m : m;
-    }
-    *why = r->vuln;
-    return d * 2;
 }
 
 static void rcpt_push(num_receipt *rc, const char *rule, world_numop op, long amt)
@@ -3324,10 +3257,6 @@ int world_step(world *w, const uint32_t *actions, int nactions,
     struct nacc { long delta, assign_val; const char *rule;
                   bool have, conflict; } *acc =
         calloc((size_t)(w->nnum ? w->nnum : 1), sizeof *acc);
-    /* per-type buckets (#84): commit-time scratch, fixed-width because the
-     * type domain is a closed declared enum; absent entirely when untyped */
-    long *tacc = (w->ndtypes > 0 && w->nnum > 0)
-        ? calloc((size_t)w->nnum * (size_t)w->ndtypes, sizeof *tacc) : NULL;
     for (int i = 0; i < w->nnum; i++) w->rcpt[i].n = 0;
 
     for (int st = 0; st < nstrata && rc == 0; st++) {
@@ -3379,10 +3308,7 @@ int world_step(world *w, const uint32_t *actions, int nactions,
                     }
                 } else {
                     long d = (ef->op == WORLD_OP_ADD) ? v : -v;
-                    if (tacc && ef->dtype >= 0 && ef->dtype < w->ndtypes)
-                        tacc[(size_t)i * w->ndtypes + ef->dtype] += d;
-                    else
-                        acc[i].delta += d;
+                    acc[i].delta += d;
                     rcpt_push(&w->rcpt[i], r->name, ef->op, d);
                 }
             }
@@ -3422,24 +3348,6 @@ int world_step(world *w, const uint32_t *actions, int nactions,
             long base = acc[i].have ? acc[i].assign_val : w->nums[i].value;
             rcp->base = base;
             long total = acc[i].delta;
-            if (tacc) {
-                /* the typed stage (#84): Σ per type happened in the scan; now
-                 * the per-type response, strictly after summation and strictly
-                 * before the clamp — 5e's observable ordering. The scaling adds
-                 * a receipt row named after the deciding response atom, so
-                 * base + Σ items still equals the committed value. */
-                for (int t = 0; t < w->ndtypes; t++) {
-                    long d = tacc[(size_t)i * w->ndtypes + t];
-                    if (!d) continue;
-                    uint32_t why;
-                    long rd = typed_response(w, i, t, d, &why);
-                    if (rd != d)
-                        rcpt_push(rcp, intern_name(w->syms, why),
-                                  rd - d >= 0 ? WORLD_OP_ADD : WORLD_OP_SUB,
-                                  rd - d);
-                    total += rd;
-                }
-            }
             long val = base + total;
             if (w->nums[i].has_range) {
                 long lo, hi; num_clamp_bounds(w, i, &lo, &hi);
@@ -3476,7 +3384,6 @@ int world_step(world *w, const uint32_t *actions, int nactions,
         }
     }
     free(acc);
-    free(tacc);
     w->nn_cur = NULL;                              /* commit-loop context down */
 
     /* boolean next-state + contested check, from the FINAL solve */
