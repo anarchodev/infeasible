@@ -84,8 +84,6 @@ typedef struct {
                                 * definedness as a first-class body atom — the
                                 * disjunction of its prior-free layer markers.
                                 * pred/args name the VALUE; body position only. */
-    uint32_t    as_value;      /* `-= e as fire` (#83): the damage-type enum value
-                                * this contribution accumulates under; 0 = untyped */
     int       line, col;
 } ast_atom;
 
@@ -398,8 +396,6 @@ typedef struct {
                                            * interned; compares false against any
                                            * real atom (INTERN_NONE is 0). */
     int nvaluedecls;
-    int dtype_sort;               /* #83: the ONE enum-sort damage types come from
-                                   * (-1 until an `as` typed contribution is seen) */
     bool has_pguards;             /* #87: any primed numeric guard — strata exist,
                                    * step lanes bail, world steps N=1 */
     uint32_t split_pred;          /* the ONE `split` fluent (#121), 0 = none */
@@ -1228,16 +1224,16 @@ static bool parse_atom(parser *p, ast_atom *out)
         if (e < 0) return false;
         out->is_num_effect = true;
         out->expr_root = e;
-        if (p->cur.kind == TK_AS) {            /* typed contribution (#83) */
-            advance(p);
-            if (p->cur.kind != TK_IDENT) {
-                char d[64]; tok_desc(p->cur, d, sizeof d);
-                fail(p, p->cur.line, p->cur.col,
-                     "expected a damage-type value after `as`, found %s", d);
-                return false;
-            }
-            out->as_value = intern_tok(p, p->cur);
-            advance(p);
+        if (p->cur.kind == TK_AS) {
+            /* the `as <type>` typed-contribution surface went with the
+             * configured response stage (#84) — keep the refusal located
+             * and pointed at the modeled idiom */
+            fail(p, p->cur.line, p->cur.col,
+                 "`as` typed contributions were removed (#84) — author typed "
+                 "damage in the modeled form: accumulate into a per-type "
+                 "transient (`incoming_fire(T)' += …`), write the response as "
+                 "ordinary rules, and commit with one effect (DESIGN.md §5.8)");
+            return false;
         }
     }
     return true;
@@ -3503,44 +3499,6 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
         }
         check_pred_args(p, at->pred, pi, at->args, at->nargs, vars, nvars, ctx);
         check_expr(p, at->expr_root, vars, nvars);
-        if (at->as_value != INTERN_NONE) {          /* typed contribution (#83) */
-            if (at->numop == WORLD_OP_ASSIGN) {
-                serr(p, at->line, at->col,
-                     "`as` types a contribution (`+=`/`-=`), not a `:=` "
-                     "assignment — an assigned value has no damage type");
-                return;
-            }
-            int ei = find_entity(p, at->as_value);
-            int es = ei >= 0 ? p->ents[ei].sort : -1;
-            if (es < 0 || !p->sorts[es].is_enum) {
-                serr(p, at->line, at->col,
-                     "'%s' after `as` is not a declared enum value — damage "
-                     "types are a closed `enum` (#83)",
-                     intern_name(p->syms, at->as_value));
-                return;
-            }
-            if (p->dtype_sort >= 0 && p->dtype_sort != es) {
-                serr(p, at->line, at->col,
-                     "typed contributions must draw from ONE enum per world — "
-                     "'%s' is from '%s' but damage types were already '%s'",
-                     intern_name(p->syms, at->as_value), p->sorts[es].name,
-                     p->sorts[p->dtype_sort].name);
-                return;
-            }
-            p->dtype_sort = es;
-            /* the response is per SUBJECT (resistant(subject, type)): the
-             * target fluent's first argument must be an entity */
-            if (pi->arity < 1 || pi->argsort[0] < 0 ||
-                p->sorts[pi->argsort[0]].is_enum) {
-                serr(p, at->line, at->col,
-                     "a typed contribution needs a subject — '%s' must be "
-                     "keyed by an entity first argument (e.g. `hp(actor)`) so "
-                     "`resistant(<subject>, %s)` has someone to be about",
-                     intern_name(p->syms, at->pred),
-                     intern_name(p->syms, at->as_value));
-                return;
-            }
-        }
         return;
     }
     if (pi && pi->is_cell) {   /* read side: cells are read through providers only */
@@ -7289,28 +7247,13 @@ void story_matcher_free(story_matcher *m)
     free(m);
 }
 
-/* Emit one grounded numeric effect. A typed contribution (#83, `as fire`)
- * routes to its enum bucket and registers the response atoms for this target
- * instance — resistant/vulnerable/immune(<subject>, <type>), the fixed
- * response vocabulary — which the commit pipeline consults after summation and
- * before the clamp (#84). Registration is per (instance, type) and idempotent;
- * types never mentioned by an effect need no response. */
+/* Emit one grounded numeric effect. */
 static void emit_num_effect(parser *p, int rule, const ast_atom *e,
                             uint32_t num, uint32_t subject,
                             const expr_ins *code, int nc)
 {
-    if (e->as_value == INTERN_NONE) {
-        world_add_num_effect(p->w, rule, num, e->numop, code, nc);
-        return;
-    }
-    int ei = find_entity(p, e->as_value);
-    int dt = ei >= 0 ? p->ent_pos[ei] : -1;        /* position within the enum sort */
-    world_add_num_effect_typed(p->w, rule, num, e->numop, code, nc, dt);
-    uint32_t rargs[2] = { subject, e->as_value };
-    world_set_num_response(p->w, num, dt,
-        ground_pred(p, intern_id(p->syms, "resistant"),  rargs, 2),
-        ground_pred(p, intern_id(p->syms, "vulnerable"), rargs, 2),
-        ground_pred(p, intern_id(p->syms, "immune"),     rargs, 2));
+    (void)subject;
+    world_add_num_effect(p->w, rule, num, e->numop, code, nc);
 }
 
 static void ground_action(parser *p, ast_action *a)
@@ -8914,11 +8857,6 @@ static bool num_eff_ok(parser *p, const ast_atom *e, int S, uint32_t var, long *
 
 static void emit_step_lanes(parser *p)
 {
-    /* #83/#84: the routed lane numerics don't run the per-type response stage
-     * yet — a typed world stays on the N=1 step path (correctness first; the
-     * lane-side response is #84's remaining slice). */
-    if (p->dtype_sort >= 0)
-        return;
     /* #87: a stratified world steps one solve per stratum — N=1 only */
     if (p->has_pguards)
         return;
@@ -9320,7 +9258,7 @@ static void emit_step_lanes(parser *p)
  * the residue pipeline; another (non-split) MV fluent bails like today. */
 static void emit_step_lanes_split(parser *p)
 {
-    if (p->dtype_sort >= 0 || p->has_pguards)
+    if (p->has_pguards)
         return;
 
     pred_info *spi = find_pred(p, p->split_pred);
@@ -9930,7 +9868,6 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
     parser *p = calloc(1, sizeof *p);
     p->kwhy_query = kwhy_query;        /* #125 build-time why hook */
     p->kwhy_out = kwhy_out;
-    p->dtype_sort = -1;           /* #83: no damage-type enum until an `as` is seen */
     p->ground_matched = matched || mret != NULL;
     p->sparse = mret != NULL;     /* #92: dense universe only for eager +
                                    * compile-time-matched modes */
@@ -9994,9 +9931,6 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
             desugar_bands(p);                     /* band ladders → pairwise `>` (§6.2) */
             check_conflictable_pairs(p);          /* #98: contested-step + null
                                                    * conflicts, at compile time */
-            if (p->dtype_sort >= 0)               /* #83: size the closed type domain
-                                                   * before any response registers */
-                world_set_dtypes(p->w, p->domain_n[p->dtype_sort]);
             declare_ground_fluents(p);
             ground_inits(p);
             if (p->ground_matched && !mret) build_fact_index(p);

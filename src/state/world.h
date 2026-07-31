@@ -108,7 +108,7 @@ void world_add_guard(world *w, uint32_t guard, uint32_t num,
  * owns, mints their primed-guard atoms as strict facts, and re-solves for the
  * strata above. The state write stays atomic at the end and the action log
  * records ONE step (I4 — replay never sees a half-tick). Commit-time verdict
- * reads (the #84 response, EXPR_TEST) see the solve of their own stratum —
+ * reads (EXPR_TEST) see the solve of their own stratum —
  * the latest settled state, never a partially-propagated one; with no primed
  * guards the world is the degenerate one-stratum case, byte-identical to
  * today's tick. Primed-numeric CYCLES (a writer of `hp` gated on `hp'`)
@@ -395,33 +395,12 @@ int  world_set_split(world *w, const uint32_t *value_atoms, int nvals);
 void world_add_num_effect(world *w, int rule, uint32_t num_atom,
                           world_numop op, const expr_ins *code, int ncode);
 
-/* Typed contributions + the per-type response (#83/#84, DESIGN.md §5.8).
- *
- * The commit pipeline gains one stage:
- *     base → Σ deltas PER TYPE → per-type response → clamp
- * That ordering is 5e's: the response applies after all other modifiers and
- * before the floor. A typed delta (`hp(T) -= roll(6)+3 as fire`) accumulates
- * in its type's bucket; per fluent and type the pipeline consults three
- * boolean judgments — the response atoms registered below, solved in the same
- * step theory over the PRE-step state — and scales the summed bucket:
- * immune → 0; resistant XOR vulnerable → magnitude halved (floored, 5e round
- * down) / doubled; both → they cancel (×1, PHB p.197). Multiple rules
- * concluding one response atom is just `proved` — non-stacking by construction.
- * The scaling lands in the receipt as an extra contribution named after the
- * response atom, so base + Σ items still equals the committed value.
- *
- * Cost discipline (#84): buckets are commit-time scratch, never stored state —
- * they exist only because `ndtypes` was declared (a CLOSED enum, which is what
- * keeps the accumulator a fixed-width cell). `dtype` indexes that enum;
- * `dtype < 0` is an untyped delta (today's behaviour, no response). An
- * unregistered response leaves a typed delta unscaled. NOT yet on the routed
- * lane path — the compiler keeps typed-effect worlds on the N=1 step. */
-void world_set_dtypes(world *w, int ndtypes);
-void world_add_num_effect_typed(world *w, int rule, uint32_t num_atom,
-                                world_numop op, const expr_ins *code, int ncode,
-                                int dtype);
-void world_set_num_response(world *w, uint32_t num_atom, int dtype,
-                            uint32_t resist, uint32_t vuln, uint32_t immune);
+/* Typed damage (#83/#84) has NO engine stage. The configured per-type
+ * response pipeline (base → Σ per type → response → clamp, PHB p.197 algebra
+ * in C) was removed by the #84 decision once the modeled form was pinned
+ * equivalent: per-type transient accumulators, response rules as ordinary
+ * defeasible layers, one committing effect (DESIGN.md §5.8). Typed damage is
+ * content, not engine. */
 
 /* Query the current state (facts + judgment rules). */
 dl_verdict world_query(world *w, dl_lit q);
