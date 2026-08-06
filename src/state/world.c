@@ -154,6 +154,12 @@ struct world {
      * matched_stale, to refresh the matched layer against current facts before a
      * solve. `regrounding` guards the callback against re-entering a rebuild. */
     world_reground_fn reground_fn; void *reground_ctx; bool matched_stale, regrounding;
+    /* Optional: the world OWNS the re-ground context and disposes it at
+     * world_free. Set when the compiler routes an over-cap rule to the matcher
+     * on its own (#59) — the caller asked for a plain world and never learns a
+     * matcher exists, so it cannot be the one to free it. Left NULL when a
+     * caller builds the matcher explicitly and keeps ownership. */
+    void (*reground_free)(void *);
     /* Predicates some matchable rule READS (#45). A base-fact edit only stales
      * the matched layer when it touches one of these — editing a fluent no
      * matchable rule mentions cannot change the match set, so re-deriving it
@@ -427,6 +433,11 @@ static void invalidate_state_solved_of(world *w, uint32_t pred)
 
 void world_free(world *w)
 {
+    if (w->reground_free && w->reground_ctx) {     /* #59: compiler-owned matcher */
+        w->reground_free(w->reground_ctx);
+        w->reground_ctx = NULL;
+        w->reground_fn = NULL;
+    }
     if (w->fam0)
         dlcol_free(w->fam0);           /* w->fam only borrows (fam0 or a slot) */
     for (int v = 0; v < w->sp.nvals; v++) {
@@ -1188,6 +1199,11 @@ void world_set_reground_fn(world *w, world_reground_fn fn, void *ctx)
     w->reground_fn = fn;
     w->reground_ctx = ctx;
     w->matched_stale = true;        /* the first solve re-grounds the initial layer */
+}
+
+void world_own_reground_ctx(world *w, void (*free_fn)(void *))
+{
+    w->reground_free = free_fn;
 }
 
 /* ---- matched views (#80): island judgments as sets, not rules ---- */
