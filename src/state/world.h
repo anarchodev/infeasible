@@ -296,6 +296,11 @@ void world_matched_reset(world *w);
  * Registering marks the layer stale so the first solve re-grounds. */
 typedef void (*world_reground_fn)(void *ctx, world *w);
 void world_set_reground_fn(world *w, world_reground_fn fn, void *ctx);
+/* Hand the re-ground context's lifetime to the world: `free_fn(ctx)` runs at
+ * world_free. Used when the COMPILER installs a matcher the caller never asked
+ * for and cannot see (#59 over-cap routing) — a caller that builds a matcher
+ * explicitly keeps ownership and must not call this. */
+void world_own_reground_ctx(world *w, void (*free_fn)(void *));
 
 /* Fluent schema hook (#92, the sparse fluent universe): under tick-time
  * compilation the grounder no longer declares the sort cross-product of every

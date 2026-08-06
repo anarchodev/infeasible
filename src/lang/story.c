@@ -6513,6 +6513,17 @@ static bool members_ok(parser *p, ast_atom *body, int n, var_bind *vars,
     return true;
 }
 
+/* Would eager grounding of this rule blow the cardinality ceiling? Split out of
+ * ground_rule so the router (#59) can ask BEFORE committing to the eager path. */
+static bool rule_over_cap(parser *p, ast_rule *r)
+{
+    if (r->head.is_valuedef || r->head.is_kinddef) return false;
+    if (rule_is_kind(p, r)) return false;
+    bool of = false;
+    (void)instance_count(p, r->vars, r->nvars, &of);
+    return of;
+}
+
 static void ground_rule(parser *p, ast_rule *r)
 {
     if (r->head.is_valuedef || r->head.is_kinddef) return;   /* #82: never dl rules */
@@ -6527,8 +6538,10 @@ static void ground_rule(parser *p, ast_rule *r)
          * must add a sparser anchor rather than ship a dropped rule. When the
          * matcher/router lands this cap becomes a routing threshold, not a stop. */
         serr(p, r->line, r->col,
-             "rule '%s' grounds to more than %d instances — add a sparser "
-             "anchor or split the sorts (§5.2 cardinality cap)",
+             "rule '%s' grounds to more than %d instances and cannot be matched "
+             "at tick time — every variable must be bound by a positive base-fluent "
+             "atom for that; add a sparser anchor or split the sorts "
+             "(§5.2 cardinality cap)",
              r->label, MAX_INSTANCES);
         return;
     }
@@ -9893,6 +9906,14 @@ void story_model_free(story_model *m)
  * `mret` (when non-NULL) retains a tick-time matcher plan (#28): matched rules
  * are captured (not eagerly ground) into `*mret`, and the judgment layer is left
  * for the caller's first story_matcher_reground; implies matched grounding. */
+/* Defined beside story_compile_matcher, below; forward-declared so the #59
+ * auto-routing tail can install it. The materialize/schema thunks are already
+ * defined above. */
+static void matcher_reground_thunk(void *ctx, world *w);
+
+/* #59: the world disposes a compiler-installed matcher at world_free. */
+static void matcher_free_thunk(void *ctx) { story_matcher_free((story_matcher *)ctx); }
+
 static world *compile_impl(const char *src, const char *srcname, intern *syms,
                            story_diags *diags, bool matched,
                            story_model **out, story_matcher **mret,
@@ -9985,11 +10006,40 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
                 world_matched_checkpoint(p->w);       /* boundary: static | matched */
                 matcher_capture_schema(m, p);         /* #92: outlive the parser */
             } else {
+                /* #59: the cardinality ceiling is a ROUTING threshold, not a
+                 * stop. A rule whose cross product blows the cap but whose every
+                 * variable is generator-bound is exactly the shape the tick-time
+                 * matcher exists for — its instances are Nᵏ only on paper, while
+                 * the live extension is sparse. Route it there instead of
+                 * refusing the program; an over-cap rule the matcher CANNOT take
+                 * still errors in ground_rule, and says why.
+                 *
+                 * The matcher is created on demand, so a story that never trips
+                 * the cap pays nothing and behaves exactly as before. */
                 for (int i = 0; i < p->nrules; i++) {
-                    if (p->ground_matched && rule_matchable(p, &p->rules[i]))
-                        ground_rule_matched(p, &p->rules[i]);
-                    else
-                        ground_rule(p, &p->rules[i]);
+                    ast_rule *r = &p->rules[i];
+                    if (p->ground_matched && rule_matchable(p, r)) {
+                        ground_rule_matched(p, r);
+                    } else if (rule_over_cap(p, r) && rule_matchable(p, r)) {
+                        if (!m) {
+                            m = calloc(1, sizeof *m);
+                            m->syms = syms;
+                            m->w = p->w;
+                        }
+                        matcher_capture(m, p, r, rule_island(p, r));
+                        warn(p, r->line, r->col,
+                             "rule '%s' exceeds %d eager instances; grounding it "
+                             "at tick time against the live facts instead "
+                             "(§8.1 routing) — its cost now tracks matches, not "
+                             "the sort cross product",
+                             r->label, MAX_INSTANCES);
+                    } else {
+                        ground_rule(p, r);
+                    }
+                }
+                if (m) {                       /* the matched region starts here */
+                    world_matched_checkpoint(p->w);
+                    matcher_capture_schema(m, p);
                 }
             }
             for (int i = 0; i < p->nactions; i++) ground_action(p, &p->actions[i]);
@@ -10013,11 +10063,27 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
              * into the world (only captured), so a judgment lane family would
              * shadow the re-materialized layer with stale, un-re-ground results.
              * lane↔matcher routing is a later slice (#28 router). */
-            if (p->nerrors == 0 && !mret) build_lane_families(p);   /* the DoD thesis, 2a */
+            /* `m` covers the #59 auto-routed case too: either way the matched
+             * rules are captured, not in the world, so a judgment lane family
+             * would shadow the re-materialized layer with stale results. */
+            if (p->nerrors == 0 && !mret && !m) build_lane_families(p);   /* the DoD thesis, 2a */
         }
     }
 
-    if (p->nerrors == 0) { result = p->w; if (mret) *mret = m; }
+    if (p->nerrors == 0) {
+        result = p->w;
+        if (mret) {
+            *mret = m;                     /* caller asked for it, caller frees it */
+        } else if (m) {
+            /* #59: the compiler installed this matcher on its own. The caller
+             * asked for a plain world and never learns it exists, so the world
+             * takes the hooks AND the lifetime. */
+            world_set_reground_fn(p->w, matcher_reground_thunk, m);
+            world_set_materialize_fn(p->w, matcher_materialize_thunk, m);
+            world_set_schema_fn(p->w, matcher_schema_thunk, m);
+            world_own_reground_ctx(p->w, matcher_free_thunk);
+        }
+    }
     else { world_free(p->w); story_matcher_free(m); if (mret) *mret = NULL; }
 
     /* Harvest the span model before the parser tables are torn down —
