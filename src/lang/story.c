@@ -7132,6 +7132,15 @@ static void matcher_capture(story_matcher *m, parser *p, ast_rule *r, bool islan
     d->nbody = r->nbody;
     for (int b = 0; b < r->nbody && b < MAX_BODY; b++)
         m_capture_atom(p, &d->body[b], &r->body[b]);
+    /* #45: tell the world which predicates this rule READS, so a base-fact edit
+     * that cannot change the match set does not force a re-ground. Every body
+     * atom is registered regardless of kind — negated bodies decide a match just
+     * as positive ones do, and a guard's numeric fluent is read the same way.
+     * The head goes in too: a matchable rule may read another's conclusion once
+     * derived bodies land (#44), and over-registering only costs a re-ground. */
+    world_matcher_watch(p->w, r->head.pred);
+    for (int b = 0; b < r->nbody && b < MAX_BODY; b++)
+        world_matcher_watch(p->w, r->body[b].pred);
     d->island = island;
     d->view = island ? world_view_new(p->w, r->head.pred, r->head.neg, r->kind)
                      : -1;

@@ -349,6 +349,16 @@ int  world_view_new(world *w, uint32_t head_pred, bool head_neg,
 void world_views_reset(world *w);
 void world_view_add(world *w, int view, uint32_t atom,
                     const uint32_t *bind, int nvars);
+/* Register a predicate some matchable rule READS (#45), so a base-fact edit
+ * that cannot change the match set does not force a re-ground. The first call
+ * switches the world from staling the matched layer on EVERY edit to staling it
+ * only for registered predicates — so a caller that registers must register
+ * every predicate its matchable rules read (body atoms of any kind, negated
+ * ones and guards included). Failing to register costs a missed re-ground and
+ * therefore stale matches: register conservatively. Registering nothing keeps
+ * the always-stale behaviour. */
+void world_matcher_watch(world *w, uint32_t pred);
+
 void world_set_materialize_fn(world *w, world_materialize_fn fn, void *ctx);
 /* Introspection (bench/tests): rows currently present; bytes held by the view
  * store (rows + maps) — the space the matched layer occupies instead of rules. */

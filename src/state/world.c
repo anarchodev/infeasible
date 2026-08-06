@@ -154,6 +154,15 @@ struct world {
      * matched_stale, to refresh the matched layer against current facts before a
      * solve. `regrounding` guards the callback against re-entering a rebuild. */
     world_reground_fn reground_fn; void *reground_ctx; bool matched_stale, regrounding;
+    /* Predicates some matchable rule READS (#45). A base-fact edit only stales
+     * the matched layer when it touches one of these — editing a fluent no
+     * matchable rule mentions cannot change the match set, so re-deriving it
+     * would be pure waste. Registered by the lang layer at rule capture.
+     * Default-open: with nothing registered (`watch_set` false) every edit
+     * stales, so a caller that never registers keeps the conservative
+     * behaviour, and forgetting to register can only cost time, never
+     * correctness. */
+    int *watch_of; uint32_t watch_cap; bool watch_set;
 
     /* Matched views (#80): island judgments as sets instead of matched rules.
      * Rows are the per-tick match set (cleared by world_views_reset, caps
@@ -386,11 +395,32 @@ world *world_new(intern *syms)
     return w;
 }
 
+/* Does any matchable rule read `pred`? Conservative before registration. */
+static bool matcher_watches(const world *w, uint32_t pred)
+{
+    if (!w->watch_set || pred == INTERN_NONE)
+        return true;
+    return pred < w->watch_cap && w->watch_of[pred] >= 0;
+}
+
 /* A base-fact edit: the judgment family and every lane family must re-solve. */
 static void invalidate_state_solved(world *w)
 {
     w->jfam_solved = false;
     w->matched_stale = true;           /* the matched layer must be re-ground (#45) */
+    for (int i = 0; i < w->nlanes; i++)
+        w->lanes[i].solved = false;
+}
+
+/* As above, for an edit whose predicate is known: the matched layer is staled
+ * only if some matchable rule reads that predicate. The judgment family and the
+ * lanes still re-solve unconditionally — they hold every rule, not just the
+ * matchable ones. */
+static void invalidate_state_solved_of(world *w, uint32_t pred)
+{
+    w->jfam_solved = false;
+    if (matcher_watches(w, pred))
+        w->matched_stale = true;
     for (int i = 0; i < w->nlanes; i++)
         w->lanes[i].solved = false;
 }
@@ -451,6 +481,7 @@ void world_free(world *w)
     free(w->fl_nargs);
     free(w->fl_args);
     free(w->fluent_of);
+    free(w->watch_of);
     free(w->num_of);
     free(w->guard_of);
     free(w->prov_of);
@@ -501,6 +532,17 @@ static void atom_map_set(int **map, uint32_t *cap, uint32_t key, int val)
 static int fluent_index(const world *w, uint32_t atom)
 {
     return atom < w->fluent_of_cap ? w->fluent_of[atom] : -1;
+}
+
+/* Register a predicate some matchable rule reads (#45). The first call flips
+ * the world from watch-everything to watch-this-set, so the lang layer must
+ * register EVERY predicate its matchable rules read — body atoms of any kind,
+ * including negated ones and guards — before the first edit. */
+void world_matcher_watch(world *w, uint32_t pred)
+{
+    if (pred == INTERN_NONE) return;
+    atom_map_set(&w->watch_of, &w->watch_cap, pred, 1);
+    w->watch_set = true;
 }
 
 void world_declare_fluent(world *w, uint32_t atom)
@@ -592,7 +634,9 @@ void world_set(world *w, uint32_t atom, bool value)
     if (i >= 0) {
         if (w->vals[i] != value) fidx_update(w, i, value);   /* index tracks the change */
         w->vals[i] = value;
-        invalidate_state_solved(w);                /* judgments now stale */
+        /* pred-scoped: an edit to a fluent no matchable rule reads leaves the
+         * match set provably unchanged, so it must not force a re-ground */
+        invalidate_state_solved_of(w, w->fl_pred[i]);
     }
 }
 
