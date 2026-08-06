@@ -22,7 +22,10 @@ emcc -O2 -I"$root/src" \
     "$root/src/core/intern.c" \
     "$root/src/logic/dl.c" \
     "$root/src/logic/dl_col.c" \
+    "$root/src/logic/dl_graph.c" \
+    "$root/src/logic/dl_trace.c" \
     "$root/src/state/world.c" \
+    "$root/src/state/factindex.c" \
     "$root/src/lang/lexer.c" \
     "$root/src/lang/story.c" \
     "$root/web/exports.c" \

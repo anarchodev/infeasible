@@ -174,7 +174,7 @@ static int test_strict_wins(void)
     return 0;
 }
 
-/* The two solve drivers must agree on every literal, on a theory that
+/* Every solve driver must agree on every literal, on a theory that
  * exercises facts, chains, a defeater, and superiority (team defeat). */
 static int test_drivers_agree(void)
 {
@@ -208,15 +208,82 @@ static int test_drivers_agree(void)
 
     dl_result *s = dl_solve(t);
     dl_result *w = dl_solve_wl(t);
+    dl_result *c = dl_solve_scc(t);
     for (uint32_t id = 0; id < intern_count(sy); id++) {
         for (int neg = 0; neg < 2; neg++) {
             dl_lit q = neg ? dl_neg(id) : dl_pos(id);
             CHECK(dl_definite(s, q) == dl_definite(w, q));
             CHECK(dl_defeasible(s, q) == dl_defeasible(w, q));
+            CHECK(dl_definite(s, q) == dl_definite(c, q));
+            CHECK(dl_defeasible(s, q) == dl_defeasible(c, q));
         }
     }
     dl_result_free(s);
     dl_result_free(w);
+    dl_result_free(c);
+    dl_theory_free(t);
+    intern_free(sy);
+    return 0;
+}
+
+/* The schedule's reason to exist: a chain whose dependencies run AGAINST
+ * literal-index order, which is the plain sweep's worst case (one pass per
+ * link). Every driver must still decide the whole chain, and the SCC-ordered
+ * one must do it in a single ordered pass. Atoms are interned back-to-front so
+ * the chain's head gets the LOWEST literal index — the sweep meets each link
+ * before the link it reads.
+ *
+ * The cycle in the middle is deliberate: it forces a real multi-member
+ * component into the schedule, so the intra-component iteration is exercised
+ * rather than the all-singletons happy path. Being unattacked, it is a #109
+ * Datalog SCC — its members complete to REFUTED, which the chain below it must
+ * survive. */
+static int test_deep_chain(void)
+{
+    intern *sy = intern_new();
+    enum { N = 200 };
+    uint32_t a[N];
+    char buf[16];
+    for (int i = N - 1; i >= 0; i--) {           /* reverse intern order */
+        snprintf(buf, sizeof buf, "c%d", i);
+        a[i] = intern_id(sy, buf);
+    }
+
+    dl_theory *t = dl_theory_new(sy);
+    dl_add_fact(t, dl_pos(a[0]));
+    for (int i = 1; i < N; i++) {
+        dl_lit body = dl_pos(a[i - 1]);
+        snprintf(buf, sizeof buf, "link%d", i);
+        dl_add_rule(t, buf, DL_DEFEASIBLE, dl_pos(a[i]), &body, 1);
+    }
+    /* an unattacked 3-literal support cycle hanging off the chain, reachable
+     * from nothing: loop-starved, so #109 completes it to REFUTED */
+    uint32_t p = intern_id(sy, "p"), q = intern_id(sy, "q"), r = intern_id(sy, "r");
+    dl_lit bp = dl_pos(p), bq = dl_pos(q), br = dl_pos(r);
+    dl_add_rule(t, "pq", DL_DEFEASIBLE, dl_pos(q), &bp, 1);
+    dl_add_rule(t, "qr", DL_DEFEASIBLE, dl_pos(r), &bq, 1);
+    dl_add_rule(t, "rp", DL_DEFEASIBLE, dl_pos(p), &br, 1);
+
+    dl_result *s = dl_solve(t);
+    dl_result *w = dl_solve_wl(t);
+    dl_result *c = dl_solve_scc(t);
+
+    /* the chain proves end to end, and the starved cycle refutes */
+    CHECK(dl_defeasible(c, dl_pos(a[N - 1])) == DL_PROVED);
+    CHECK(dl_defeasible(c, dl_pos(p)) == DL_REFUTED);
+
+    for (uint32_t id = 0; id < intern_count(sy); id++) {
+        for (int neg = 0; neg < 2; neg++) {
+            dl_lit l = neg ? dl_neg(id) : dl_pos(id);
+            CHECK(dl_definite(s, l) == dl_definite(c, l));
+            CHECK(dl_defeasible(s, l) == dl_defeasible(c, l));
+            CHECK(dl_definite(w, l) == dl_definite(c, l));
+            CHECK(dl_defeasible(w, l) == dl_defeasible(c, l));
+        }
+    }
+    dl_result_free(s);
+    dl_result_free(w);
+    dl_result_free(c);
     dl_theory_free(t);
     intern_free(sy);
     return 0;
@@ -230,6 +297,7 @@ int main(void)
     if (test_team_defeat()) return 1;
     if (test_strict_wins()) return 1;
     if (test_drivers_agree()) return 1;
+    if (test_deep_chain()) return 1;
     printf("test_dl: all passed\n");
     return 0;
 }

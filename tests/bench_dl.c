@@ -1,12 +1,23 @@
 /* Micro-benchmark for the defeasible solver. Deterministic synthetic theory
  * (no rand/wallclock in construction); reports median solve time.
  *
- *   ./bench_dl [natoms] [fanin] [iters] [driver]   driver: sweep (default) | wl
+ *   ./bench_dl [natoms] [fanin] [iters] [driver] [order]
+ *       driver: sweep (default) | scc | wl
+ *       order:  fwd (default)   | rev
  *
  * The theory is a wide layered graph: each atom in layer L is concluded by
  * `fanin` defeasible rules whose bodies draw from layer L-1, plus a competing
  * rule for its negation and a superiority edge — exercising supported /
- * countered / team-defeat paths, and the by-head + superiority indices. */
+ * countered / team-defeat paths, and the by-head + superiority indices.
+ *
+ * `order` picks how atoms are interned, which is what sets literal-index order
+ * and so the plain sweep's scan order. `fwd` interns them in dependency order —
+ * the sweep's best case, one pass decides everything. `rev` interns them
+ * back-to-front, so every rule reads a literal the scan has not reached yet and
+ * the plain sweep needs one pass per layer: the O(passes * nlits) scan-order
+ * cliff DESIGN.md §5.2 says the SCC schedule removes. The theory is the SAME
+ * either way — only the numbering moves — so the gap between the two is pure
+ * scheduling, not a different problem. */
 
 #include "logic/dl.h"
 #include "core/intern.h"
@@ -32,14 +43,18 @@ int main(int argc, char **argv)
     int natoms = argc > 1 ? atoi(argv[1]) : 4000;
     int fanin  = argc > 2 ? atoi(argv[2]) : 4;
     int iters  = argc > 3 ? atoi(argv[3]) : 200;
-    bool use_wl = argc > 4 && strcmp(argv[4], "wl") == 0;
-    dl_result *(*solve)(dl_theory *) = use_wl ? dl_solve_wl : dl_solve;
+    const char *drv = argc > 4 ? argv[4] : "sweep";
+    bool rev = argc > 5 && strcmp(argv[5], "rev") == 0;
+    dl_result *(*solve)(dl_theory *) =
+        strcmp(drv, "wl") == 0  ? dl_solve_wl :
+        strcmp(drv, "scc") == 0 ? dl_solve_scc : dl_solve;
     int layer  = natoms / 20 > 1 ? natoms / 20 : 1;  /* atoms per layer */
 
     intern *sy = intern_new();
     char buf[32];
     uint32_t *atom = malloc((size_t)natoms * sizeof *atom);
-    for (int i = 0; i < natoms; i++) {
+    for (int k = 0; k < natoms; k++) {
+        int i = rev ? natoms - 1 - k : k;
         snprintf(buf, sizeof buf, "a%d", i);
         atom[i] = intern_id(sy, buf);
     }
@@ -83,7 +98,8 @@ int main(int argc, char **argv)
     qsort(ms, (size_t)iters, sizeof *ms, cmp_double);
     double total = 0; for (int i = 0; i < iters; i++) total += ms[i];
 
-    printf("bench_dl[%s]: atoms=%d fanin=%d rules=%d sups=%d iters=%d\n", use_wl?"wl":"sweep",
+    printf("bench_dl[%s/%s]: atoms=%d fanin=%d rules=%d sups=%d iters=%d\n",
+           drv, rev ? "rev" : "fwd",
            natoms, fanin, 2 * (natoms - layer), natoms - layer, iters);
     printf("  median %.3f ms   min %.3f ms   mean %.3f ms\n",
            ms[iters / 2], ms[0], total / iters);

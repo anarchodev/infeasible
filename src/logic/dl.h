@@ -65,6 +65,11 @@ void dl_add_fact(dl_theory *t, dl_lit fact);
  * intern table at call time). */
 dl_result *dl_solve(dl_theory *t);
 
+/* Same result as dl_solve via the SCC-ordered ("weak-topological") sweep of
+ * DESIGN.md 5.2 item 2: the dependency condensation walked in topological
+ * order, iterating only inside a genuine component. No scan-order cliff. */
+dl_result *dl_solve_scc(dl_theory *t);
+
 /* Experimental: same result as dl_solve via an order-independent worklist
  * driver (no O(n^2) scan-order cliff; substrate for incremental global-tier
  * re-solve). Currently regresses the dense scene-tier workload, so it is not

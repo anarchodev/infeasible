@@ -285,14 +285,21 @@ propagation sweep.
   5. Cardinality warnings: any rule ranging over a large cross product with no
      sparse anchor is a compile-time warning with the estimated count.
 
-**Scaffold status.** The current C engine implements the standard semantics
-with a straightforward tri-valued fixpoint (correct, O(n·rules) worst case)
-over pre-ground rules, evaluated by a sequential *sweep* (the default
-`dl_solve`; an order-independent worklist `dl_solve_wl` exists as a differential
-oracle — `test_drivers_agree` — and a cliff-free fallback). The linear-time path
-(M3) is deliberately factored into a build-time half and a run-time half, both
-behind the same API, with the golden tests pinning the semantics so the swap is
-safe:
+**Status.** The engine implements the standard semantics with a tri-valued
+fixpoint over pre-ground rules. The linear-time path (M3) is factored into a
+build-time half and a run-time half, both behind the same API, with the golden
+tests pinning the semantics so each swap is safe. **The run-time half has
+landed** (item 2 below): the columnar engine — the one that actually runs a
+tick, `dlcol_solve` under every `world_step`, judgment family and lane —
+evaluates in SCC-scheduled order, and the schedule is compiled once with the
+rest of the schema, so a tick pays only the walk. The scalar reference
+(`dl.c`, the `.story` kind stratum's build-time solver) keeps the plain sweep
+as its default and carries the ordered driver as `dl_solve_scc` alongside the
+order-independent worklist `dl_solve_wl`; both are differential oracles
+(`test_drivers_agree`), and neither wins there because that path recompiles
+per solve, so a schedule it cannot amortize costs more than the rescans it
+saves. **The build-time half — the Antoniou transformation and the
+stratifying compiler of item 1 — is what remains.**
 
 1. *Transformation + stratification (build time).* The size-preserving
    Antoniou transformation (TOCL 2001) eliminates defeaters and compiles away
@@ -355,8 +362,8 @@ safe:
    over the solved statuses; the matcher's derived-body widening (#44)
    inherits recursion as ordinary semi-naive iteration on the extension
    index, a scope item, not a semantics question.
-2. *SCC-ordered sweep (run time).* Rather than Maher's counter-and-worklist
-   algorithm (Delores, TPLP 2001), the evaluator is a single
+2. *SCC-ordered sweep (run time; landed).* Rather than Maher's
+   counter-and-worklist algorithm (Delores, TPLP 2001), the evaluator is a single
    *weak-topologically ordered* sweep: solve the SCC condensation in topological
    order, iterating only within a genuine component to a local fixpoint. On a
    transformed, near-acyclic theory the components collapse toward singletons and
@@ -366,9 +373,24 @@ safe:
    already wins the dense/shallow scene-tier workload and the entity-indexed
    bitvector lift of the columnar backing (both §8), pays none of the worklist's
    random-access dependency-chasing, and confines residual iteration to the SCCs
-   where cycles actually remain. (A robustness-only variant — SCC scan order over
-   the *untransformed* theory — already removes the sweep's sole weakness, an
-   O(n²) scan-order cliff on adversarial deep chains, without the transformation.)
+   where cycles actually remain. It runs over the *untransformed* theory today —
+   which is already enough to remove the sweep's sole weakness, an O(n²)
+   scan-order cliff on adversarial deep chains — and the transformation above
+   will only shrink the components it walks.
+
+   **The schedule is condensed from the dependency graph, not the support
+   graph** the cycle rule uses. The distinction is load-bearing and easy to get
+   wrong: deciding a literal reads the bodies of the rules that *attack* it as
+   well as those that support it, so the edge set is `body → head` **and**
+   `body → head^1`, defeaters included. A schedule condensed from support edges
+   alone would evaluate a literal before the attackers that refute it. That
+   double edge also buys the columnar engine its per-rule applicability refresh:
+   a rule's bodies are predecessors of both its head and its head's complement,
+   so whichever is visited first, they have already settled — the evaluator
+   refreshes the rules it is about to read instead of every rule once per pass.
+   The two condensations coexist because they answer different questions; the
+   cycle rule's is about *meaning* (which loops may complete to REFUTED, §5.2
+   above), the schedule's is about *order*.
 
 **Precedent and honest status.** SCC-decomposed evaluation of a monotone
 fixpoint is a standard, independently-rediscovered technique in the fields
@@ -382,11 +404,35 @@ condensation). The DL-specific *linear* implementations of record (Maher's
 Delores; SPINdle) instead take the counter route, so wiring the SCC schedule to
 defeasible logic's proof conditions is our synthesis, not a published DL
 result — it is validated by the differential golden tests, not by an external
-theorem, and it must be *measured* to earn the swap (Delores is the cautionary
+theorem, and it had to be *measured* to earn the swap (Delores is the cautionary
 case: its transformation, linear in theory, did not behave linearly in the
-shipped system). Consistent with §8 this is a conditional optimization — the
-sweep already clears frame budget at scale, the counter form's real prize is
-incremental cone re-solve (M4), and the compiler is free to pick per workload.
+shipped system).
+
+**What the measurement said.** Columnar solve is **1.7–1.9× faster** across the
+scale range — `bench_col` 0.30 → 0.18 ms at N=100k, `bench_5e` 0.42 → 0.22 ms
+at N=100k, `bench_slice`'s judgment phase 0.030 → 0.017 ms mean — with the
+replay hash unchanged, which is the differential stated in the units that
+matter. Two results carry more weight than the ratio. First, the win is *not*
+the cliff: these are the dense, shallow, forward-ordered theories the plain
+sweep was already best at, and the schedule beats it there anyway, because
+visiting a literal once with settled inputs beats rescanning it, and because
+refreshing only the rules about to be read beats refreshing every rule once per
+pass. Second, the cliff goes too — `bench_dl`'s `rev` mode reverses the atom
+numbering of an otherwise identical theory, and the plain sweep runs 0.43 → 2.74
+ms across that relabelling while the ordered one holds at 0.52. Scan order stops
+being a performance variable, which is the robustness half of the claim:
+reordering declarations in a `.story` file cannot silently cost 5×.
+
+The scalar reference is the honest exception. There the schedule build (~0.59 ms
+of a 0.74 ms solve at 4000 atoms) is paid per call, because that path recompiles
+the theory on every solve, so it does not pay for itself on forward-ordered
+theories even though the ordered *evaluation* alone is ~3× cheaper. The columnar
+engine has the opposite shape — schema and schedule compile once per rule-set
+change (§4.1's two-tier split; the incremental surface of `dlcol_truncate_rules`)
+and are reused every tick — which is why the swap lands there and stays a driver
+choice here. Consistent with §8 this remains a conditional optimization: the
+counter form's real prize is incremental cone re-solve (M4), and the compiler
+stays free to pick per workload.
 
 ### 5.3 State and time: defeasible inertia
 
