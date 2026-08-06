@@ -82,6 +82,18 @@ add_executable(bench_5e tests/bench_5e.c)
 target_link_libraries(bench_5e PRIVATE infeasible_core)
 target_compile_options(bench_5e PRIVATE -O2)
 
+# Rule-complexity benchmark (DESIGN.md 8): columnar solve across schema depth x
+# width, the axis bench_col/bench_5e hold fixed. Build Release for real numbers.
+add_executable(bench_complexity tests/bench_complexity.c)
+target_link_libraries(bench_complexity PRIVATE infeasible_core)
+target_compile_options(bench_complexity PRIVATE -O2)
+
+# Step-lane frontier benchmark (#75/#165, 5.8/8.1): which authoring shapes reach
+# the lanes, and what each bail costs. Doubles as a marker when a bail retires.
+add_executable(bench_lanes tests/bench_lanes.c)
+target_link_libraries(bench_lanes PRIVATE infeasible_core)
+target_compile_options(bench_lanes PRIVATE -O2)
+
 # Grounding-cost benchmark (§5.2/§8, EPIC #26): eager grounder over a synthetic
 # nᵏ cross product — compile time, ground atoms, peak memory, MAX_INSTANCES cliff.
 add_executable(bench_ground tests/bench_ground.c)
