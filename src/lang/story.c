@@ -5786,16 +5786,40 @@ static void semantic_pass(parser *p)
 /* Takes the intern table directly (not the parser) so the tick-time matcher
  * (#28) can reuse the EXACT ground-atom spelling post-compile — byte-identical
  * atoms and why-traces by construction. */
+/* snprintf-compatible append: copies what fits (always NUL-terminating) and
+ * returns the length it WANTED to write, so a caller accumulates an offset
+ * exactly as it did with snprintf. Unlike the snprintf chain it replaces, this
+ * stays safe once the offset passes `cap` — that chain computed `cap - off` as
+ * a size_t, which underflowed. */
+static int append_term(char *buf, size_t cap, int off, const char *s)
+{
+    size_t l = strlen(s);
+    if (off >= 0 && (size_t)off < cap) {
+        size_t room = cap - (size_t)off - 1;
+        size_t c = l < room ? l : room;
+        memcpy(buf + off, s, c);
+        buf[(size_t)off + c] = '\0';
+    }
+    return (int)l;
+}
+
+/* Spell a ground atom "pred(e1,e2)" into buf. HOT: once per instance in the
+ * eager grounder, and once per match per tick in the tick-time matcher, where
+ * it plus intern_id is ~85% of a re-ground. Hand-written rather than a chain of
+ * snprintf calls, each of which re-parses a format string to copy one string.
+ * Output is byte-identical, which is load-bearing: ground atom spellings are
+ * the ABI a host interning the same name relies on (§6.3). */
 static int build_term(intern *syms, uint32_t pred, const uint32_t *args, int n,
                       char *buf, size_t cap)
 {
-    int off = snprintf(buf, cap, "%s", intern_name(syms, pred));
+    int off = append_term(buf, cap, 0, intern_name(syms, pred));
     if (n == 0) return off;
-    off += snprintf(buf + off, cap - (size_t)off, "(");
-    for (int i = 0; i < n && off < (int)cap; i++)
-        off += snprintf(buf + off, cap - (size_t)off, "%s%s",
-                        i ? "," : "", intern_name(syms, args[i]));
-    if (off < (int)cap) off += snprintf(buf + off, cap - (size_t)off, ")");
+    off += append_term(buf, cap, off, "(");
+    for (int i = 0; i < n && off < (int)cap; i++) {
+        if (i) off += append_term(buf, cap, off, ",");
+        off += append_term(buf, cap, off, intern_name(syms, args[i]));
+    }
+    if (off < (int)cap) off += append_term(buf, cap, off, ")");
     return off;
 }
 
@@ -7108,6 +7132,15 @@ static void matcher_capture(story_matcher *m, parser *p, ast_rule *r, bool islan
     d->nbody = r->nbody;
     for (int b = 0; b < r->nbody && b < MAX_BODY; b++)
         m_capture_atom(p, &d->body[b], &r->body[b]);
+    /* #45: tell the world which predicates this rule READS, so a base-fact edit
+     * that cannot change the match set does not force a re-ground. Every body
+     * atom is registered regardless of kind — negated bodies decide a match just
+     * as positive ones do, and a guard's numeric fluent is read the same way.
+     * The head goes in too: a matchable rule may read another's conclusion once
+     * derived bodies land (#44), and over-registering only costs a re-ground. */
+    world_matcher_watch(p->w, r->head.pred);
+    for (int b = 0; b < r->nbody && b < MAX_BODY; b++)
+        world_matcher_watch(p->w, r->body[b].pred);
     d->island = island;
     d->view = island ? world_view_new(p->w, r->head.pred, r->head.neg, r->kind)
                      : -1;
