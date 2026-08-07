@@ -425,8 +425,9 @@ void       world_why(world *w, dl_lit q, FILE *out);
  * atoms). A per-sort N-lane dl_col family for the homogeneous single-variable
  * judgment rules over that sort — the same rules run once across 64 entities per
  * word instead of grounded per entity into distinct atoms. The grounder emits
- * them; they are validated against the N=1 query path but not yet routed to (the
- * dl_col-was-prototyped-before-adopted playbook). `ground` is a flat
+ * them; world_query answers from the family when the queried atom is a lane
+ * cell, with world_lanes_check the differential pin against the N=1 query
+ * path. `ground` is a flat
  * natoms*nent array of the equivalent named ground atom for each
  * (predicate-local-id, lane); `is_fluent` flags which locals take base facts.
  * `is_import` (may be NULL = none) flags locals that are DERIVED elsewhere and
@@ -466,8 +467,9 @@ int  world_lanes_check(world *w, bool *ok);
  * causal/ramification rules. `kind[loc]` classifies each local; `ground[loc*nent
  * + e]` is the named ground atom for that (local, lane) — the primed local's
  * ground atom is the fluent's `f'` twin. The world copies both and owns `fam`.
- * Prototype-before-adopt: built and validated (world_step_lanes_check) but not
- * yet routed through world_step, mirroring how the judgment lanes landed. */
+ * world_step routes the transition here when one family covers the whole step
+ * world — no primed guards, no value split, numerics only if covers_numeric;
+ * world_step_lanes_check is the differential pin against the N=1 path. */
 /* WORLD_STEP_BCAST: a broadcast cast trigger (a `for each` binder's action) —
  * one signal ANDed into every target-lane, true when any of the action's ground
  * cast atoms occurred this step (see world_step_lane_set_bcast). */
