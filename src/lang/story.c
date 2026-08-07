@@ -3361,11 +3361,11 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
          * this checker; its selection is consumed at expansion) */
         pred_info *kpi = find_pred(p, at->pred);
         if (kpi && kpi->is_kindpred) {
+            const char *kn = intern_name(p->syms, at->pred);
             serr(p, at->line, at->col,
                  "'%s' is a kind predicate — build-time only, readable in a "
-                 "functor modifier's body (`%s(V, …)` with `V : value`); "
-                 "derived kinds at runtime land with #125",
-                 intern_name(p->syms, at->pred));
+                 "functor modifier's body (`%s(V, …)` with `V : value`)",
+                 kn, kn);
             return;
         }
     }
@@ -5287,8 +5287,9 @@ static void expand_kind_rules(parser *p)
                     continue;                      /* wildcard facet */
                 if (vi >= 0) {
                     serr(p, ka->args[a].line, ka->args[a].col,
-                         "a variable facet ('%s') needs the derived-kind "
-                         "stratum (#125) — this slice takes a constant or `_`",
+                         "a variable facet ('%s') needs selector expansion over "
+                         "the solved stratum (#179) — this slice takes a "
+                         "constant or `_`",
                          intern_name(p->syms, nm));
                     bad = true;
                     continue;
