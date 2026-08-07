@@ -2326,7 +2326,9 @@ programmer's. So the tradeoff is made *local, explicit, and visible*.
 
 - **The same axis recurs at every layer,** controllable at the granularity it
   lives at: *grounding* — materialize (flat nᵏ) vs matcher (∝ matches), per
-  rule; *recompute scope* — scene-tier full recompute vs demand-cone wake-up
+  rule; *state density* — every instance of a fluent declared up front vs
+  declared on touch, per fluent (below); *recompute scope* — scene-tier full
+  recompute vs demand-cone wake-up
   (M4), per scope/fluent; *family evaluation* — lanes (pay the full width each
   tick) vs scalar sparse wake, per family; *plan stability* — pinned vs adaptive
   re-plan, per rule. Scenes (§5.5/§6.4) scope the policy to the state it governs
@@ -2355,6 +2357,38 @@ programmer's. So the tradeoff is made *local, explicit, and visible*.
   number, so the tooling obligation follows (§9): surface, per rule/family, the
   static worst case (free, from declared domains) *and* the measured per-tick
   distribution. Exposing a lever without its cost only relocates the guessing.
+
+- **State density is a policy, never a consequence of size (decided).** A
+  plain boolean fluent's ground universe is **sparse by default** — instances
+  exist when touched (by an init, a rule, an action, or a host write), and
+  everything else answers closed-world through the schema hook. **Dense is the
+  override**: an author who needs the flat tail asks for it, and gets the
+  guarantee this section is about — every slot allocated before the first
+  tick, so no declaration, no atom-map growth and no family rebuild can land
+  inside a frame. Both directions are principled, and which is the default is
+  decided by what each costs when the author is wrong.
+
+  Sparse-by-default, because dense is not merely N^k of *store*: the step
+  theory generates inertia **per declared fluent**, two rules each, so a dense
+  binary fluent is 2N² rules re-solved every tick. That is the term the
+  grounding analysis found dominant — closed-world negative inertia over n-ary
+  fluents was 79% of a measured 5e-shaped ground set, and eliding it cut a
+  1000-actor world from 541k ground rules to 43k. An author who never thinks
+  about density should not be paying that.
+
+  Dense-as-override rather than dense-on-overflow, because a predicate that
+  silently changes its tail behaviour when someone adds the 1025th entity is
+  the *opposite* of a provable worst case. Spilling into a different cost
+  model at a size threshold would make density an accident of content, and
+  content is exactly what a mod changes. The cardinality ceiling stays what
+  §5.2 makes it — a memory backstop, and for rules a routing threshold — not a
+  silent switch between tail guarantees.
+
+  Two kinds are dense **by nature, not by policy**, and carry no lever:
+  *multi-valued* fluents (an effect setting one value negates every sibling,
+  so all sibling atoms must exist) and *numeric* fluents (value-store slots,
+  which are O(instances) because that is what the author declared). The lever
+  exists only where the choice is real.
 
 - **Default auto; the lever is a scalpel.** The measured cost model carries the
   common case. Overrides are for the parts the author has reasoned about, where
