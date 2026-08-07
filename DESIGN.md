@@ -1065,6 +1065,34 @@ disjoint, and the composition is the decided semantics of a tick:
    orders by declaration, commit time, or timestamp — the prohibition at
    the top of this passage holds at every level.
 
+**The two accumulator kinds, and why the response stage reads primed
+(decided).** The additive-fluent literature separates exactly the two shapes
+this tier uses. *Additive-inertial* — new value = old value + Σ contributions
+— is an ordinary numeric fluent under `+=`/`-=`, carried across ticks by
+inertia. *Additive-default-zero* — new value = Σ contributions, and 0 when no
+action contributes — is the per-tick transient accumulator, spelled here as a
+`:= 0` base plus `+=` deltas so that the reset is an ordinary operator-class
+commit rather than a second lifetime rule.
+
+The consequence worth pinning is a *lower bound*, not a technique: an effect
+that depends on the **total** of concurrent contributions must read that total
+after the contributions land. C+ reaches the same place from planning — a
+constraint on a total is written over an auxiliary additive-default-zero
+fluent, read in the resulting state (`caused false if departed(G,L) eq M after
+num(G,L) eq N && M > N`). So the response stage's primed read is inherent to
+aggregate-then-respond and no remodeling removes it: a formulation that
+mitigates each contribution as it lands is a *different semantics*
+(per-contribution rather than per-total), not the same one written better. The
+lane frontier's answer is therefore to widen the evaluator, never to rewrite
+the pipeline.
+
+One difference from that prior art is ours to close: there the kind is
+**declared**, here it is **inferred** from the presence of a primed guard.
+Inference is why a single accumulator anywhere puts a whole world on the
+general stratified path — a compiler told that a fluent is default-zero knows
+it owes no inertia on it and that the shape is a fixed two-phase commit, which
+is a pattern to lane rather than a hazard to retreat from.
+
 One corollary is decided with it — **commit-time visibility**: a judgment
 consulted from the commit (a verdict tested in an effect expression)
 reads the fixpoint as settled at its own stratum — the latest settled
@@ -3063,7 +3091,13 @@ semantics. Names are working names.
 - M. Shanahan, *Solving the Frame Problem*, MIT Press 1997.
 - E. Mueller, *Commonsense Reasoning*, 2nd ed., 2014.
 - J. Lee, V. Lifschitz, *Describing Additive Fluents in Action Language C+*,
-  IJCAI 2003. (concurrent numeric effects that combine)
+  IJCAI 2003, pp. 1079–1084; earlier as *Additive Fluents*, AAAI Spring
+  Symposium 2001. (concurrent numeric effects that combine — and the source of
+  §5.8's two accumulator kinds. Also the independent confirmation that a law
+  over a *total* of concurrent contributions must read that total in the
+  resulting state: `caused false if departed(G,L) eq M after num(G,L) eq N &&
+  M > N`, where the auxiliary `departed` is additive-default-zero and the `if`
+  part is evaluated after the contributions land)
 - M. Bartholomew, J. Lee, *Stable Models of Formulas with Intensional
   Functions*, KR 2012. (functional stable models / ASPMT)
 - J. Lee, Y. Meng, *Answer Set Programming Modulo Theories and Reasoning
