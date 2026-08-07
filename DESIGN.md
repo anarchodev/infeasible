@@ -1014,6 +1014,49 @@ so the hatches are shaped for strangers:
    the other two, authored and traced; #94's commutation check rightly
    refuses the two-undefeated-layers encoding.
 
+   **Two forms, and the choice is the author's (decided).** The paragraph
+   above describes the pipeline as layered derived values; `test_modeled`
+   pins it as transient accumulators with a response over the total. Both are
+   real, both are authorable today, and they are not the same semantics —
+   so the surface offers both and the author picks by what a *step* means in
+   their game.
+
+   - **Per instance** — `value fire_dmg(unit) : int` with a `prior /2` layer
+     for resistance, ordered against vulnerability and immunity, and each
+     attack committing `hp(T) -= fire_dmg(T)`. Mitigation happens per
+     contribution and the deltas sum order-free. No accumulator, no primed
+     read, no stratum.
+   - **Per total** — a transient accumulator (`inc_fire`) summing the tick's
+     contributions, and a response reading `inc_fire(X)'` and subtracting
+     once. This is what a *simultaneous batch* means: several contributions
+     that resolve as one instance.
+
+   They differ in exactly one place: floored division does not distribute
+   over addition. Two 3s against resistance are `floor(6/2) = 3` per total
+   and `1 + 1 = 2` per instance; doubling agrees either way (it distributes),
+   immunity agrees, and unmitigated damage agrees. So the divergence is a
+   rounding boundary, not a different model of damage.
+
+   Which is right depends on what a step is, which is the *host's* choice of
+   tick granularity and therefore not the engine's to make. A step that
+   resolves one attack never distinguishes them. A step that batches
+   simultaneous effects does, and then per-total is the claim that the batch
+   is one instance.
+
+   **Per instance is the recommended default**: it is the cheaper shape — no
+   accumulator to reset, no primed read, hence no stratum, and every stage is
+   a marker judgment the trace can interrogate rather than arithmetic inside
+   one effect expression. Reach for the accumulator when a step really is a
+   batch, or when a rule needs the aggregate itself (*"if total damage this
+   round exceeds 50, stagger"*), which per-instance cannot express at all —
+   that is the shape §5.8's primed read exists for, and no reformulation
+   removes it (the additive-fluent result below).
+
+   The cost of the per-instance form is the ordering #94 demands: resistance,
+   vulnerability, immunity and both-cancel are mutually applicable and
+   non-commuting, so they need a total order — a `bands` ladder (§6.2) rather
+   than the pairwise edges, which is what bands are for.
+
 **The receipt is structured data, not only a rendering.** BG3-style floating
 combat text — every hit displaying its source and damage type — is a *view of
 the commit receipt*. The commit already computes the multiset of undefeated
