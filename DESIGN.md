@@ -1090,8 +1090,13 @@ One difference from that prior art is ours to close: there the kind is
 **declared**, here it is **inferred** from the presence of a primed guard.
 Inference is why a single accumulator anywhere puts a whole world on the
 general stratified path — a compiler told that a fluent is default-zero knows
-it owes no inertia on it and that the shape is a fixed two-phase commit, which
-is a pattern to lane rather than a hazard to retreat from.
+its commit pipeline's **base stage is 0 rather than the carried value**, and
+that the shape is a fixed two-phase commit, which is a pattern to lane rather
+than a hazard to retreat from. (Stated as the base stage because that is where
+it lives: a numeric fluent's persistence is the carried value entering
+`num_commit`, not a generated inertia rule — those are emitted per *boolean*
+fluent. The `:= 0` ramification an author writes today is exactly a base of 0,
+restated as content.)
 
 One corollary is decided with it — **commit-time visibility**: a judgment
 consulted from the commit (a verdict tested in an effect expression)
