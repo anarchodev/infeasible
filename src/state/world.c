@@ -1946,6 +1946,13 @@ int world_step_lanes_check(world *w, const uint32_t *actions, int nactions,
             if (sf->kind[a] != WORLD_STEP_PRIMED)
                 continue;
             for (int e = 0; e < sf->nent; e++) {
+                /* Skip lane-only synthetic readouts the same way the commit loop
+                 * does (fl_of < 0): a numeric effect's fired marker is a PRIMED
+                 * local whose ground atom exists in no N=1 family, so comparing
+                 * it against N=1 asks a question with no answer — it would report
+                 * a difference on every world that has a numeric effect at all. */
+                if (sf->fl_of[(size_t)a * sf->nent + e] < 0)
+                    continue;
                 uint32_t pa = sf->ground[(size_t)a * sf->nent + e];   /* the f' atom */
                 for (int neg = 0; neg < 2; neg++) {
                     dl_lit la = { (uint32_t)a, neg != 0 };

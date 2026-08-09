@@ -331,6 +331,74 @@ static int test_derived_body_join(void)
     return 0;
 }
 
+/* The same import seam, but with the imported atom's COMPLEMENT derived.
+ *
+ * In DERIVED_JOIN nothing ever concludes `~weak`, so an unproved import is
+ * always the finitely-failed case and the injection of a NEGATIVE import is
+ * never exercised. That distinction is the whole subtlety of the import branch
+ * — REFUTED (-∂a, finitely failed) must NOT be injected as `~a`, while a
+ * genuinely proved `~a` must be — and dropping the negative injection entirely
+ * passed the whole suite before this case existed.
+ *
+ * Three actors give the three import states in one world: guard is poisoned so
+ * `weak` is PROVED, thug is resilient so `~weak` is PROVED, and mage is neither
+ * so `weak` merely fails and nothing may be injected for it. */
+static const char *DERIVED_JOIN_NEG =
+    "sort actor, item\n"
+    "entity (guard, thug, mage : actor)\n"
+    "entity (torch, vase : item)\n"
+    "state (poisoned(actor) resilient(actor) holding(actor, item) fragile(item))\n"
+    "rule weakens(X: actor): poisoned(X) => weak(X)\n"
+    "rule tough(X: actor): resilient(X) => ~weak(X)\n"
+    "rule fumbles(X: actor, T: item):"
+    "     weak(X) & holding(X, T) & fragile(T) => drops(X, T)\n"
+    "init (poisoned(guard) resilient(thug) holding(guard, vase)"
+    "      holding(thug, torch) holding(mage, torch)"
+    "      fragile(vase) fragile(torch))\n";
+
+static int test_derived_body_join_neg(void)
+{
+    intern *sy = intern_new();
+    story_diag di[16];
+    story_diags d = { di, 16, 0, 0 };
+    world *w = story_compile(DERIVED_JOIN_NEG, "derivedneg.story", sy, &d);
+    if (!w) {
+        fprintf(stderr, "FAIL compile: %s\n", d.count ? d.items[0].msg : "?");
+        intern_free(sy);
+        return 1;
+    }
+    CHECK(d.nerrors == 0);
+
+    /* the three import states, on the N=1 path first */
+    CHECK(world_query(w, dl_pos(intern_id(sy, "weak(guard)"))) == DL_PROVED);
+    CHECK(world_query(w, dl_neg(intern_id(sy, "weak(thug)")))  == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "weak(mage)")))  != DL_PROVED);
+    CHECK(world_query(w, dl_neg(intern_id(sy, "weak(mage)")))  != DL_PROVED);
+
+    /* the differential: the join family importing `weak` must reproduce all
+     * three, including the negative one */
+    bool ok = false;
+    CHECK(world_lanes_check(w, &ok) > 0);
+    CHECK(ok);
+
+    /* and the join's own conclusion follows the import's polarity */
+    CHECK(world_query(w, dl_pos(intern_id(sy, "drops(guard,vase)")))  == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "drops(thug,torch)")))  != DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "drops(mage,torch)")))  != DL_PROVED);
+
+    /* flip resilience off: thug's `~weak` collapses to the merely-failed case,
+     * so the negative injection must stop happening */
+    world_set(w, intern_id(sy, "resilient(thug)"), false);
+    CHECK(world_query(w, dl_neg(intern_id(sy, "weak(thug)"))) != DL_PROVED);
+    bool ok2 = false;
+    CHECK(world_lanes_check(w, &ok2) > 0);
+    CHECK(ok2);
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
 /* The transition layer on lanes: a homogeneous single-sort boolean step world.
  * `arm` is an action (causal, beats inertia on the acted lane only); `wary` is a
  * ramification reading the NEXT state (`armed(X)'`) — inertia, causal, and a
@@ -492,6 +560,7 @@ int main(void)
     if (test_join_matcher()) return 1;
     if (test_join3_matcher()) return 1;
     if (test_derived_body_join()) return 1;
+    if (test_derived_body_join_neg()) return 1;
     if (test_step_lanes()) return 1;
     if (test_step_lanes_global()) return 1;
     printf("test_lanes: all passed\n");
