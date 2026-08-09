@@ -350,6 +350,10 @@ static int symbol_kind(story_sym_kind k)
         case STORY_SYM_ACTION:   return 6;   /* Method    */
         case STORY_SYM_RULE:     return 24;  /* Event     */
         case STORY_SYM_VALUE:    return 13;  /* Variable  */
+        case STORY_SYM_EMIT:     return 24;  /* Event — a burst cue literally is
+                                              * one (#11); shares the icon with
+                                              * rules, which the detail string
+                                              * disambiguates */
     }
     return 13;   /* Variable — unreachable fallback */
 }
@@ -450,6 +454,7 @@ static const char *sym_kind_word(story_sym_kind k)
         case STORY_SYM_ACTION:   return "action";
         case STORY_SYM_RULE:     return "rule";
         case STORY_SYM_VALUE:    return "value";
+        case STORY_SYM_EMIT:     return "emit";
     }
     return "atom";
 }

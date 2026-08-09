@@ -142,6 +142,14 @@ struct world {
      * are dense uint32, so a direct-indexed array is the natural perfect hash).
      * Grown geometrically; slot value -1 = absent. Fluents/nums are append-only. */
     int *fluent_of; uint32_t fluent_of_cap;
+    /* Transient emissions (#11, §12): burst cues. Each declared emit atom keeps
+     * a primed twin exactly like a fluent's, because an emission is concluded
+     * about the NEXT state (it is an effect head) — but it takes no base fact,
+     * no inertia and no commit: the step reads its primed verdict into
+     * `emitbuf` and forgets it. */
+    uint32_t *emits, *emit_primed; int nemit, capemit;
+    int *emit_of; uint32_t emit_of_cap;      /* emit atom -> emits index */
+    uint32_t *emitbuf; int nemitbuf, capemitbuf;   /* last step's stream */
     int *num_of;    uint32_t num_of_cap;
     int *guard_of;  uint32_t guard_of_cap;   /* guard atom  -> guards index  */
     int *prov_of;   uint32_t prov_of_cap;    /* provider atom -> provs index */
@@ -498,6 +506,10 @@ void world_free(world *w)
     free(w->fl_nargs);
     free(w->fl_args);
     free(w->fluent_of);
+    free(w->emits);
+    free(w->emit_primed);
+    free(w->emit_of);
+    free(w->emitbuf);
     free(w->watch_of);
     free(w->num_of);
     free(w->guard_of);
@@ -590,6 +602,44 @@ void world_declare_fluent(world *w, uint32_t atom)
     w->nfl++;
     w->struct_ver++;             /* structural edit (#63) */
     w->lanes_ok = false;          /* a structural edit stales the lane families */
+}
+
+static int emit_index(const world *w, uint32_t atom)
+{
+    return atom < w->emit_of_cap ? w->emit_of[atom] : -1;
+}
+
+/* Declare a burst cue (#11, §12). Idempotent — the grounder declares each
+ * ground emit atom where it is USED (an effect head), so a cue over a sort
+ * costs one atom per firing rule instance, never a cross product. */
+void world_declare_emit(world *w, uint32_t atom)
+{
+    if (emit_index(w, atom) >= 0)
+        return;
+    int oldcap = w->capemit;
+    GROW(w->emits, w->nemit, w->capemit);
+    if (w->capemit != oldcap)
+        w->emit_primed = realloc(w->emit_primed,
+                                 (size_t)w->capemit * sizeof *w->emit_primed);
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s'", intern_name(w->syms, atom));
+    w->emits[w->nemit] = atom;
+    w->emit_primed[w->nemit] = intern_id(w->syms, buf);
+    atom_map_set(&w->emit_of, &w->emit_of_cap, atom, w->nemit);
+    w->nemit++;
+    w->struct_ver++;             /* structural edit (#63) */
+    w->lanes_ok = false;
+}
+
+bool world_has_emit(const world *w, uint32_t atom)
+{
+    return emit_index(w, atom) >= 0;
+}
+
+const uint32_t *world_emits(const world *w, int *count)
+{
+    if (count) *count = w->nemitbuf;
+    return w->emitbuf;
 }
 
 /* Where a fluent was declared (§6.3), for its generated inertia rules'
@@ -1984,6 +2034,9 @@ void world_step_why(world *w, dl_lit q, bool next, FILE *out)
         int i = fluent_index(w, atom);
         if (i >= 0)
             atom = w->primed[i];
+        else if ((i = emit_index(w, atom)) >= 0)
+            atom = w->emit_primed[i];  /* a burst cue is only ever about the
+                                        * transition — "why did it fire?" (#11) */
     }
     bool fam_stale = w->fam_ver != w->struct_ver;
     if (!w->fam || fam_stale ||
@@ -2166,6 +2219,10 @@ static void assign_locs(world *w)
         w->fl_loc[i] = assign_loc(w, w->fluents[i], &n);
         w->pr_loc[i] = assign_loc(w, w->primed[i], &n);
     }
+    /* burst cues (#11): only the primed twin gets a column — an emission has no
+     * current-state reading to assign one for */
+    for (int i = 0; i < w->nemit; i++)
+        assign_loc(w, w->emit_primed[i], &n);
     for (int j = 0; j < w->njr; j++) {
         assign_loc(w, w->jrules[j].head.atom, &n);
         for (int i = 0; i < w->jrules[j].nbody; i++)
@@ -2402,6 +2459,18 @@ static dlcol *build_step_family(world *w, int sv, bool mix)
         }
         for (int e = 0; e < r->neffects; e++) {
             dl_lit eff = r->effects[e];
+            int em = emit_index(w, eff.atom);
+            if (em >= 0) {         /* a burst cue (#11): concluded about this
+                                    * transition, competing with no inertia
+                                    * (there is none) and committed nowhere */
+                dl_lit ehead = { w->loc_of[w->emit_primed[em]], eff.neg };
+                snprintf(buf, sizeof buf, "%s/%s%s", r->name,
+                         eff.neg ? "~" : "", intern_name(w->syms, eff.atom));
+                int eid = dlcol_add_rule(f, buf, DL_DEFEASIBLE, ehead, body, nbody);
+                if (r->prov)
+                    dlcol_set_prov(f, eid, r->prov);
+                continue;
+            }
             int fi = fluent_index(w, eff.atom);
             if (fi < 0) {          /* tripwire (#92): effect heads must be
                                     * declared fluents; pr_loc[-1] is silent OOB */
@@ -2537,8 +2606,13 @@ static void ensure_split_space(world *w)
             else
                 sadd(w, r->body[b].lit.atom);   /* guard / judgment / marker */
         }
-        for (int e = 0; e < r->neffects; e++)
-            sadd_fluent(w, fluent_index(w, r->effects[e].atom));
+        for (int e = 0; e < r->neffects; e++) {
+            int em = emit_index(w, r->effects[e].atom);
+            if (em >= 0)                       /* burst cue: the primed twin only */
+                sadd(w, w->emit_primed[em]);
+            else
+                sadd_fluent(w, fluent_index(w, r->effects[e].atom));
+        }
     }
     w->sp.space_ver = w->struct_ver;
 }
@@ -2627,6 +2701,22 @@ static dlcol *build_step_family_sparse(world *w, int sv)
         }
         for (int e = 0; e < r->neffects; e++) {
             dl_lit eff = r->effects[e];
+            int em = emit_index(w, eff.atom);
+            if (em >= 0) {                     /* a burst cue (#11): no inertia
+                                                * to outrank, nothing to commit.
+                                                * Kept identical to the dense
+                                                * builder so the two cannot
+                                                * disagree if the mixed route
+                                                * ever admits a cue — today
+                                                * ensure_fam declines to mix */
+                dl_lit ehead = { w->sp.smap[w->emit_primed[em]], eff.neg };
+                snprintf(buf, sizeof buf, "%s/%s%s", r->name,
+                         eff.neg ? "~" : "", intern_name(w->syms, eff.atom));
+                int eid = dlcol_add_rule(f, buf, DL_DEFEASIBLE, ehead, body, nbody);
+                if (r->prov)
+                    dlcol_set_prov(f, eid, r->prov);
+                continue;
+            }
             int fi = fluent_index(w, eff.atom);
             dl_lit head = { w->sp.spr_loc[fi], eff.neg };
             snprintf(buf, sizeof buf, "%s/%s%s", r->name,
@@ -2688,7 +2778,8 @@ static void ensure_fam(world *w)
          * residue builds on the SPARSE space (O(residue) per step, the #77
          * trick); a value with no lane family stays on the dense schema. */
         bool mix = false;
-        if (w->npg == 0 && w->lanes_ok)
+        if (w->npg == 0 && w->lanes_ok && w->nemit == 0)   /* the lane half has no
+                                                            * emit columns (#11) */
             for (int k = 0; k < w->nsteplanes; k++)
                 if (w->steplanes[k].split_value == v) { mix = true; break; }
         if (!w->sp.fams[v] || w->sp.vers[v] != w->struct_ver ||
@@ -3176,6 +3267,9 @@ static int world_step_lanes(world *w, const uint32_t *actions, int nactions,
 int world_step(world *w, const uint32_t *actions, int nactions,
                char *err, size_t errsz)
 {
+    w->nemitbuf = 0;               /* burst cues are the LAST step's (#11): a
+                                    * rejected step below emits nothing */
+
     /* Loud no-op actions (#119): an action atom that triggers ZERO step rules
      * can never do anything in this world — that is a host bug (typo'd atom,
      * wrong intern, protocol drift), not a legal no-op. Report it and leave
@@ -3275,6 +3369,7 @@ int world_step(world *w, const uint32_t *actions, int nactions,
      * (covers_numeric): the boolean firing solves bit-parallel and the numeric
      * columns commit column-parallel. (w->lanes_ok guards post-compile edits.) */
     if (w->lanes_ok && w->nsteplanes == 1 && w->npg == 0 && w->sp.nvals == 0 &&
+        w->nemit == 0 &&           /* lanes carry no emit columns (#11) */
         (w->nnum == 0 || w->steplanes[0].covers_numeric)) {
         int rc = world_step_lanes(w, actions, nactions, err, errsz);
         if (rc == 0) w->tick++;                    /* monotone step counter (§5.10) */
@@ -3534,6 +3629,21 @@ int world_step(world *w, const uint32_t *actions, int nactions,
             rc = -1;
             break;
         }
+    }
+
+    /* burst cues (#11, §12): read the transition's emissions off the SAME final
+     * solve the boolean next-state came from, in declaration order (I4). An
+     * emission that nothing concluded is simply absent — there is no inertia to
+     * carry it and no closed-world fact to refute it. */
+    for (int i = 0; rc == 0 && i < w->nemit; i++) {
+        uint32_t pr = w->emit_primed[i];
+        uint32_t loc = pr < w->aloc_cap ? w->aloc_of[pr] : LOC_NONE;
+        if (loc == LOC_NONE)
+            continue;                                /* outside this schema */
+        if (dlcol_defeasible(f, (dl_lit){ loc, false }, 0) != DL_PROVED)
+            continue;
+        GROW(w->emitbuf, w->nemitbuf, w->capemitbuf);
+        w->emitbuf[w->nemitbuf++] = w->emits[i];
     }
 
     if (rc == 0) {

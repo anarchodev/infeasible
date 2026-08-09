@@ -32,6 +32,7 @@ static const char *EXAMPLES[] = {
     "cellar_prop.story",
     "combat5e.story",
     "combat_srd.story",
+    "cues.story",
     "encounter5e.story",
     "fireball5e.story",
     "mv_door.story",

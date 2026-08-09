@@ -31,7 +31,7 @@
         },
         {
           "name": "storage.type.story",
-          "match": "\\b(sort|domain|enum|entity|state|init|provider|function|module|extend|scene|bands|set|of|in|int)\\b"
+          "match": "\\b(sort|domain|enum|entity|state|init|provider|function|value|emit|fact|module|extend|scene|bands|set|of|in|int)\\b"
         }
       ]
     },

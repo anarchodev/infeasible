@@ -39,3 +39,10 @@ from JS.`
   separate M2 work over the same `world_subscribe` delta seam.
 - `inf_step` marshals an action array through the WASM heap; `inf_step1` is the
   single-action convenience the cellar uses.
+- Burst cues (#11, §12) cross the boundary the way the delta will:
+  `inf_emit_count` + `inf_emits` hand back the step's emission buffer as a
+  pointer into WASM memory, read as a zero-copy
+  `new Uint32Array(M.HEAPU32.buffer, ptr, n)` view and resolved to names with
+  `inf_name` — one crossing per step, never one per event. `web/loop_driver.mjs`
+  drives the same channel over the `wf_*` shim (`wf_declare_emit`,
+  `wf_emit_count`, `wf_emits`).

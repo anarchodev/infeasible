@@ -2808,6 +2808,48 @@ sprites at RTS scale. Nothing in the surface may assume more.
   a weekend to port, and now the whole cart-facing platform rather than only
   its drawing half.
 
+**Burst cues: the one output of a step that is not state.** Those four
+surfaces are what a cart *calls*; what a step *hands back* is the other half of
+the interface, and it is three streams — the fluent delta (§11 M2), the §5.8
+commit receipts, and the **emission buffer**. Presentation cues split in two,
+and only one half needs a construct. A *persistent* cue — an aura while a
+condition holds, a burning-ground loop — is a function of a fluent being set,
+so the client subscribes to that fluent's delta and starts/stops the loop on
+the transition; nothing new is required. A *burst* cue — a hit spark, a
+floating "Resisted!", a death cry — is over before the next tick and has no
+fluent to watch. Reifying one as state would mean a fact set to fire the
+renderer and immediately retracted, which is exactly the write-back I1 exists
+to forbid.
+
+So a burst cue is declared `emit spark(actor)` and fired from a `causes`
+clause like any effect, and the step reads it off the same solve the next state
+comes from. An emission is the **transient twin of an action**: an action is a
+transient input to a step, an emission a transient output of one; neither is
+ever a fact. The consequences are the whole contract:
+
+- *Write-only.* No rule body, guard, `requires` or `init` may name a cue —
+  a located compile error. Reading one back would make it state (I1) and would
+  give the renderer's channel a path into the logic.
+- *Positive only.* `~spark(X)` is an error. A cue fires when its rule fires, so
+  a suppression condition belongs in the rule's body — which is where
+  defeasibility already lives, since that body reads defeated judgments like
+  any other. Emissions therefore carry no defeat structure of their own.
+- *A proposition, not a count.* Two rules firing one cue in a step emit it
+  once; distinguish sources by parameterizing the atom. This is what makes the
+  stream a set of atom ids rather than an event log with multiplicity.
+- *Deterministic (I4).* The stream is a pure function of (state, actions), in
+  declaration order, so a replay reproduces it exactly — a requirement for
+  lockstep, rollback and the replay debugger, not a nicety.
+- *Flat, one crossing.* `world_emits` is a per-tick buffer of ground atom ids
+  the client reads through a typed-array view over WASM memory, exactly like
+  the delta — per step, never per atom.
+
+A cue is momentary, so its *condition* must be too: a ramification gated on
+`~alive'` alone fires every step thereafter, while one gated on
+`alive & ~alive'` fires on the transition. That is an authoring property of
+edges vs. levels, not a construct — the same distinction `btnp` draws against
+`btn` on the input side.
+
 **Save compatibility: loading old saves is schema migration, and most
 patches need none.** A production game patches content under players' feet;
 the save's exposure to that splits three ways, in increasing difficulty:

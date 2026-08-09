@@ -304,6 +304,8 @@ typedef struct {
     bool     is_num;              /* a numeric fluent (§5.8) */
     bool     is_cell;             /* a store-backed opaque-domain fluent (§5.6) */
     bool     is_provider;         /* a computed relation, host-answered (§5.6) */
+    bool     is_emit;             /* #11: a burst cue (§12) — an effect head the
+                                   * step FIRES and nothing stores or reads */
     bool     is_value;            /* an engine-derived value (#82): defined by a
                                    * rule, inlined at read sites, never stored */
     bool     is_kindpred;         /* #124: a kind predicate — build-time-only,
@@ -374,6 +376,10 @@ typedef struct {
     int nfluents;
     ast_fluent  providers[MAX_FLUENTS];   /* computed relations (§5.6), host-answered */
     int nproviders;
+    ast_fluent  emits[MAX_FLUENTS];       /* burst cues (#11, §12): one-shot events
+                                           * a step fires at the presentation
+                                           * client — write-only vocabulary */
+    int nemits;
     ast_function functions[MAX_FLUENTS];  /* value-returning fn providers (§5.6) */
     int nfunctions;
     ast_fluent  valuedecls[MAX_FLUENTS];  /* engine-derived values (#82): `value v(…) : int` */
@@ -629,6 +635,7 @@ static void parse_sort(parser *p)
 {
     advance(p);                                    /* 'sort' */
     bool grouped = false;
+    int ln = p->cur.line;
     if (p->cur.kind == TK_LPAREN) { grouped = true; advance(p); }
     do {
         if (p->cur.kind != TK_IDENT) {
@@ -643,10 +650,15 @@ static void parse_sort(parser *p)
         copy_ident(p->sorts[p->nsorts].name, MAX_NAME, p->cur);
         p->sorts[p->nsorts].line = p->cur.line;
         p->sorts[p->nsorts].col = p->cur.col;
+        ln = p->cur.line;
         p->nsorts++;
         advance(p);
         if (p->cur.kind == TK_COMMA) advance(p);    /* optional separator */
-    } while (p->cur.kind == TK_IDENT);
+        /* The ungrouped form is ONE line: a name on the next line is the next
+         * declaration, not another sort. Without this, `sort actor` followed by
+         * a contextual-keyword declaration (`emit`, `fact`, `exclusive`) ate
+         * the keyword as a sort name and reported the error a token later. */
+    } while (p->cur.kind == TK_IDENT && (grouped || p->cur.line == ln));
     if (grouped && !expect(p, TK_RPAREN)) return;
 }
 
@@ -658,6 +670,7 @@ static void parse_domain(parser *p)
 {
     advance(p);                                    /* 'domain' */
     bool grouped = false;
+    int ln = p->cur.line;
     if (p->cur.kind == TK_LPAREN) { grouped = true; advance(p); }
     do {
         if (p->cur.kind != TK_IDENT) {
@@ -673,10 +686,11 @@ static void parse_domain(parser *p)
         p->sorts[p->nsorts].line = p->cur.line;
         p->sorts[p->nsorts].col = p->cur.col;
         p->sorts[p->nsorts].is_domain = true;
+        ln = p->cur.line;
         p->nsorts++;
         advance(p);
         if (p->cur.kind == TK_COMMA) advance(p);    /* optional separator */
-    } while (p->cur.kind == TK_IDENT);
+    } while (p->cur.kind == TK_IDENT && (grouped || p->cur.line == ln));
     if (grouped && !expect(p, TK_RPAREN)) return;
 }
 
@@ -1557,6 +1571,46 @@ static void parse_state(parser *p)
         }
         if (!parse_fdecl(p, &p->fluents[p->nfluents])) return;
         p->nfluents++;
+    } while (grouped && p->cur.kind == TK_IDENT);
+    if (grouped && !expect(p, TK_RPAREN)) return;
+}
+
+/* emit := 'emit' ( edecl | '(' edecl* ')' ); edecl := IDENT [ '(' sort,… ')' ]
+ *
+ * A burst cue (#11, DESIGN.md §12): a one-shot event a step fires at the
+ * presentation client — a hit spark, a "resisted!" — with no lasting state.
+ * Declared like a boolean state predicate and with no value type: an emission
+ * carries only its arguments, because everything numeric about the tick is
+ * already in the step's delta/receipt. `emit` is contextual (like `fact`), so
+ * a fluent named `emit` stays legal; a superiority statement whose left label
+ * is literally `emit` misparses here with a located error — the same trade the
+ * other contextual keywords take. */
+static void parse_emit(parser *p)
+{
+    advance(p);                                    /* 'emit' */
+    bool grouped = false;
+    if (p->cur.kind == TK_LPAREN) { grouped = true; advance(p); }
+    do {
+        if (p->cur.kind != TK_IDENT) {
+            char d[64]; tok_desc(p->cur, d, sizeof d);
+            fail(p, p->cur.line, p->cur.col, "expected a cue name, found %s", d);
+            return;
+        }
+        if (p->nemits >= MAX_FLUENTS) {
+            fail(p, p->cur.line, p->cur.col, "too many emissions (max %d)",
+                 MAX_FLUENTS);
+            return;
+        }
+        ast_fluent tmp;
+        if (!parse_fdecl(p, &tmp)) return;
+        if (tmp.is_num || tmp.is_mv || tmp.is_cell) {
+            fail(p, tmp.line, tmp.col,
+                 "an emission has no value type — a cue is fired, not stored "
+                 "(#11); put the number in the fluent the step also writes, "
+                 "and read it from the delta");
+            return;
+        }
+        p->emits[p->nemits++] = tmp;
     } while (grouped && p->cur.kind == TK_IDENT);
     if (grouped && !expect(p, TK_RPAREN)) return;
 }
@@ -2725,6 +2779,26 @@ static void build_pred_registry(parser *p)
         }
     }
 
+    /* burst cues (#11) register a write-only relation with its arg sorts. Not a
+     * fluent (no fact, no inertia, no commit) and not a head (nothing may read
+     * one, so it is nobody's premise) — an effect target and nothing else. */
+    for (int i = 0; i < p->nemits; i++) {
+        ast_fluent *em = &p->emits[i];
+        pred_info *pi = find_pred(p, em->pred);
+        if (pi && (pi->is_fluent || pi->is_provider || pi->is_emit)) {
+            serr(p, em->line, em->col, "'%s' is already declared",
+                 intern_name(p->syms, em->pred));
+            continue;
+        }
+        pi = intern_pred(p, em->pred, em->nargs);
+        if (!pi) { serr(p, em->line, em->col, "too many predicates"); return; }
+        pi->is_emit = true;
+        pi->arity = em->nargs;
+        for (int k = 0; k < em->nargs; k++)
+            pi->argsort[k] = decode_sort(p, -(int)em->argsort[k] - 2,
+                                         em->line, em->col, "an emit declaration");
+    }
+
     /* engine-derived values (#82) register the pred with its arg sorts. Not a
      * fluent (never stored, no inertia, no effects) and not a head (its
      * definitions are the attackable literals, never the value itself). */
@@ -2783,6 +2857,13 @@ static void build_pred_registry(parser *p)
                      "`value`-sorted arguments belong to kind predicates "
                      "(`value k(value, …)`) — '%s' is stored state, a runtime "
                      "object", intern_name(p->syms, p->fluents[i].pred));
+    for (int i = 0; i < p->nemits; i++)
+        for (int k = 0; k < p->emits[i].nargs; k++)
+            if (p->emits[i].argsort[k] == p->metaval)
+                serr(p, p->emits[i].line, p->emits[i].col,
+                     "`value`-sorted arguments belong to kind predicates "
+                     "(`value k(value, …)`) — '%s' is a runtime cue, fired at "
+                     "entities", intern_name(p->syms, p->emits[i].pred));
     for (int i = 0; i < p->nproviders; i++)
         for (int k = 0; k < p->providers[i].nargs; k++)
             if (p->providers[i].argsort[k] == p->metaval)
@@ -2843,7 +2924,7 @@ static void check_pred_args(parser *p, uint32_t pred, pred_info *pi,
                             const ast_arg *args, int nargs,
                             var_bind *vars, int nvars, const char *ctx)
 {
-    bool schema = pi && (pi->is_fluent || pi->is_provider);
+    bool schema = pi && (pi->is_fluent || pi->is_provider || pi->is_emit);
     for (int k = 0; k < nargs; k++) {
         const ast_arg *arg = &args[k];
         int want = schema ? pi->argsort[k] : -1;
@@ -3369,6 +3450,50 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
             return;
         }
     }
+    {   /* #11 burst cues (§12): write-only vocabulary. An emission is an OUTPUT
+         * of a step — the transient twin of an action — so the one legal place
+         * to name one is an effect, positively. Reading one back would make a
+         * cue a fact (I1) and give the renderer's channel a way into the logic. */
+        pred_info *epi = find_pred(p, at->pred);
+        if (epi && epi->is_emit) {
+            const char *en = intern_name(p->syms, at->pred);
+            if (!in_effect) {
+                serr(p, at->line, at->col,
+                     "'%s' is an emission — a one-shot cue a step fires at the "
+                     "client (#11). It is never a fact: it cannot be read in "
+                     "%s, only fired in a `causes` clause. Guard on the state "
+                     "the same rule writes instead", en, ctx);
+                return;
+            }
+            if (at->neg) {
+                serr(p, at->line, at->col,
+                     "an emission is fired, never suppressed — `~%s` has no "
+                     "meaning (#11). A cue fires when its rule does, so put "
+                     "the condition in the rule's body", en);
+                return;
+            }
+            if (at->primed) {
+                serr(p, at->line, at->col,
+                     "`%s'` marks an emission next-state, but an emission is "
+                     "only ever about this transition — drop the `'`", en);
+                return;
+            }
+            if (at->value != INTERN_NONE || at->is_num_effect || at->is_guard) {
+                serr(p, at->line, at->col,
+                     "'%s' is an emission — it carries only its arguments, no "
+                     "value (#11); fire it bare (`%s(…)`)", en, en);
+                return;
+            }
+            if (epi->arity != at->nargs) {
+                serr(p, at->line, at->col,
+                     "'%s' takes %d argument%s but %d given", en, epi->arity,
+                     epi->arity == 1 ? "" : "s", at->nargs);
+                return;
+            }
+            check_pred_args(p, at->pred, epi, at->args, at->nargs, vars, nvars, ctx);
+            return;
+        }
+    }
     if (at->is_defined) {                           /* `defined v(args)` (#116) */
         check_defined_read(p, at, vars, nvars, note, in_effect, ctx);
         return;
@@ -3571,6 +3696,20 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
             serr(p, at->line, at->col,
                  "'%s' is not a value of '%s'",
                  intern_name(p->syms, at->value), intern_name(p->syms, at->pred));
+    }
+    /* An effect writes state, so its target must be vocabulary the step can
+     * write: declared state, or a burst cue (#11). Anything else — a typo, a
+     * provider, a judgment — used to compile clean and abort inside the step
+     * family ("effect on undeclared fluent"); a located error is the same
+     * regain-totality trade the rest of the front end takes (EPIC #154). */
+    if (in_effect && (!pi || !pi->is_fluent)) {
+        const char *n = intern_name(p->syms, at->pred);
+        serr(p, at->line, at->col,
+             "'%s' is written by a `causes` clause but is not declared state — "
+             "declare `state %s%s` for a fact that persists, or `emit %s%s` for "
+             "a one-shot cue the client renders (#11); typo?",
+             n, n, at->nargs ? "(…)" : "", n, at->nargs ? "(…)" : "");
+        return;
     }
     check_pred_args(p, at->pred, pi, at->args, at->nargs, vars, nvars, ctx);
 }
@@ -7303,6 +7442,17 @@ static void emit_num_effect(parser *p, int rule, const ast_atom *e,
     world_add_num_effect(p->w, rule, num, e->numop, code, nc);
 }
 
+/* A burst cue is declared where it is FIRED (#11), not by cross product: the
+ * ground atoms that exist are exactly the ones some rule instance can emit, so
+ * a cue over a sort costs one atom per firing instance and an unused arm of the
+ * sort costs nothing. Idempotent in the world, so repeats are free. */
+static void declare_if_emit(parser *p, uint32_t pred, uint32_t ground)
+{
+    pred_info *pi = find_pred(p, pred);
+    if (pi && pi->is_emit)
+        world_declare_emit(p->w, ground);
+}
+
 static void ground_action(parser *p, ast_action *a)
 {
     a->srule_lo = a->srule_hi = world_step_rule_count(p->w);
@@ -7358,7 +7508,9 @@ static void ground_action(parser *p, ast_action *a)
             if (e->is_num_effect)                  /* numeric: emitted below */
                 continue;
             if (e->value == INTERN_NONE) {         /* boolean effect */
-                eff[ne++] = ground_lit(p, e, a->vars, a->nvars, binding);
+                eff[ne] = ground_lit(p, e, a->vars, a->nvars, binding);
+                declare_if_emit(p, e->pred, eff[ne].atom);   /* #11 */
+                ne++;
                 continue;
             }
             uint32_t args[MAX_ARGS];
@@ -7463,7 +7615,9 @@ static void ground_action(parser *p, ast_action *a)
                     int ne2 = 0;
                     if (!e->is_num_effect) {
                         if (e->value == INTERN_NONE) {
-                            eff2[ne2++] = ground_lit(p, e, cv, ncv, cb);
+                            eff2[ne2] = ground_lit(p, e, cv, ncv, cb);
+                            declare_if_emit(p, e->pred, eff2[ne2].atom);   /* #11 */
+                            ne2++;
                         } else {                       /* MV: chosen value + sibling negations */
                             uint32_t mvarg[MAX_ARGS];
                             for (int k = 0; k < e->nargs; k++)
@@ -8881,7 +9035,10 @@ static bool step_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var,
         return false;                              /* numeric guard / MV: out */
     pred_info *pi = find_pred(p, a->pred);
     if (!pi || !pi->is_fluent || pi->is_mv || pi->is_num)
-        return false;
+        return false;                              /* a burst cue (#11) lands here
+                                                    * too: no emit columns on the
+                                                    * lanes, so the family bails
+                                                    * and the world steps N=1 */
     if (pi->arity == 0)
         return !is_effect;                         /* global: read-only broadcast */
     if (pi->arity != 1 || pi->argsort[0] != S)
@@ -9931,6 +10088,12 @@ static story_model *harvest_model(parser *p)
         sm_add_sym(m, nm, STORY_SYM_PROVIDER, p->providers[i].line, p->providers[i].col, det);
         sm_add_ref(m, nm, STORY_OCC_DECL, p->providers[i].line, p->providers[i].col);
     }
+    for (int i = 0; i < p->nemits; i++) {          /* burst cues (#11) */
+        const char *nm = intern_name(p->syms, p->emits[i].pred);
+        build_fluent_detail(det, sizeof det, p, &p->emits[i], "emit");
+        sm_add_sym(m, nm, STORY_SYM_EMIT, p->emits[i].line, p->emits[i].col, det);
+        sm_add_ref(m, nm, STORY_OCC_DECL, p->emits[i].line, p->emits[i].col);
+    }
     for (int i = 0; i < p->nkindpreds; i++) {      /* kind predicates (#124/#126):
                                                     * the detail says BUILD-TIME
                                                     * out loud (the LSP hover) */
@@ -10099,6 +10262,7 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
         case TK_BANDS:  parse_bands(p);  break;
         case TK_IDENT:
             if (ident_is(p->cur, "fact"))           parse_fact(p);  /* #124 */
+            else if (ident_is(p->cur, "emit"))      parse_emit(p);  /* #11 */
             else if (ident_is(p->cur, "exclusive")) parse_exclusive(p); /* #159 */
             else                                    parse_sup(p);
             break;
