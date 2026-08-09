@@ -2766,6 +2766,47 @@ sprites at RTS scale. Nothing in the surface may assume more.
   learnable in an afternoon, which is what the remix community needs from
   presentation — the utility target and the durability target are one
   decision.
+- **Input, audio and persistence are frozen here too, and each is frozen
+  for a determinism reason rather than an aesthetic one.** Freezing the draw
+  ops alone does not make a cart portable: the moment content reaches for
+  `addEventListener`, Web Audio or `localStorage`, the optional native player
+  (§13) stops implementing a dozen ops and starts reimplementing a browser,
+  and the weekend-sized claim above is gone. All three sit *inside* the
+  presentation interface, below the durability line, and nothing outside it is
+  reachable from a cart.
+  - **Input is polled, never delivered as events.** `pointer()` in internal
+    resolution coordinates, `button(i)`/`pressed(i)` over three pointer
+    buttons, `key(k)`/`keyp(k)` over a frozen named key set. The polling shape
+    is PICO-8's, adopted for I4 and not for nostalgia: the save is an action
+    log, so a callback firing between ticks lets a cart branch on input the
+    replay never observes. Input is sampled once per tick at the tick
+    boundary, and the only path from input into the world is *becoming an
+    action* — nothing reads input during a solve. Coordinates arrive already
+    mapped back through the letterbox and the integer upscale, because that
+    inverse belongs below the line: every cart computing it independently is
+    every cart getting the letterbox edges wrong. Keys are a frozen named set
+    and never raw codes — browser `KeyboardEvent.code` and native scancodes
+    disagree, and a raw code is the platform leaking into the cart.
+  - **Audio is write-only.** `sound(id, gain)`, `stop(id)`, `music(id, gain)`,
+    `music_stop()`. A cart may start and stop sound; it may never ask whether
+    something is playing, how far in it is, or whether it finished. Each of
+    those readbacks is wall-clock in disguise, and a rule that branches on one
+    is nondeterministic by construction (I4). Audio is a projection of the
+    delta and emit streams exactly as the renderer is.
+  - **Persistence is not storage.** The save is `(engine-hash, game-hash,
+    action-log)` and the *platform* owns it; a cart gets no general key-value
+    store. State written outside the action log is state replay cannot
+    reproduce, which forfeits shareable playthroughs, branching and time
+    travel in one move — the three properties the action-log save exists to
+    buy. What a cart does get is PICO-8's `cartdata` shape: one small
+    fixed-size numeric blob for cross-run **non-game** state (settings,
+    cosmetic unlocks), explicitly outside the save and explicitly not
+    readable by rules. A fluent may never be initialised from it, or a
+    world's history stops being a function of its log.
+
+  Twenty-odd ops across all four surfaces — still an afternoon to learn, still
+  a weekend to port, and now the whole cart-facing platform rather than only
+  its drawing half.
 
 **Save compatibility: loading old saves is schema migration, and most
 patches need none.** A production game patches content under players' feet;
