@@ -62,6 +62,16 @@ static const variant VARIANTS[] = {
     { "test() in RHS",           "num_eff_ok: RHS must constant-fold",
       "action hurt(T: unit): causes hp(T) -= 7 * (1 - test(immune_fire(T)))\n", false },
 
+    /* the row above trips the gate with ONE conditional read; this one carries
+     * the whole 5e response ladder (immunity, resistance, vulnerability, and
+     * the exception between the last two). Their costs are the measure of what
+     * ladder DEPTH is worth once the gate has tripped — the answer is nothing,
+     * so the frontier is a cliff at the first non-folding read, not a gradient. */
+    { "test() ladder (3 reads)",  "num_eff_ok: depth past the first read",
+      "action hurt(T: unit): causes hp(T) -= (1 - test(immune_fire(T)))\n"
+      "    * (7 + test(resist_fire(T)) * (1 - test(vuln_fire(T))) * (7 / 2 - 7)\n"
+      "         + test(vuln_fire(T)) * (1 - test(resist_fire(T))) * 7)\n", false },
+
     { "judgment guard",          "step_atom_ok: guards must be fluents",
       "rule res(X: unit): resist_fire(X) => mitigated(X)\n"
       "action hurt(T: unit): requires ~mitigated(T)\n"
@@ -169,6 +179,9 @@ int main(int argc, char **argv)
            "(has_pguards), a numeric effect whose RHS does not constant-fold\n"
            "(num_eff_ok/expr_fold — this also excludes every rolled amount, so no dice\n"
            "damage lanes today), and a step rule reading a judgment (step_atom_ok).\n"
+           "The two test() rows price DEPTH: one conditional read and a three-read\n"
+           "ladder cost the same, so what the gate charges for is the first non-folding\n"
+           "read, not how much reasoning follows it. Widening buys the whole ladder.\n"
            "A `<==` marker means the frontier MOVED: re-price the widening work in #165\n"
            "and update this table's expectations.\n");
     return 0;
