@@ -1,5 +1,6 @@
 #include "logic/dl.h"
 #include "logic/dl_trace.h"
+#include "logic/dl_graph.h"
 #include "core/arena.h"
 #include "core/grow.h"
 
@@ -81,6 +82,18 @@ struct dl_result {
     bool    *scc_attacked;   /* [nscc] */
     bool    *completed;      /* [nlits] */
     int      nscc;
+
+    /* §5.2 item 2: the evaluator's SCC schedule — a condensation of the
+     * DEPENDENCY graph (dep_to above), which is a different and strictly
+     * larger graph than the support one: an attacker's body decides its
+     * target too, so `body -> head^1` edges belong here and not in the
+     * cycle rule's support graph. Components carry Tarjan's numbering, which
+     * is reverse topological, so evaluating them in DESCENDING id order
+     * visits every literal after the literals it reads. */
+    int32_t *sched_of;       /* [nlits]    component id */
+    int32_t *sched_off;      /* [nsched+1] members, grouped */
+    int32_t *sched_lit;      /* [nlits]    member literal indices */
+    int      nsched;
 };
 
 dl_theory *dl_theory_new(intern *syms)
@@ -376,62 +389,9 @@ static void build_scc(dl_result *res)
     }
     free(fill);
 
-    /* iterative Tarjan */
-    int32_t *low = malloc((size_t)(n ? n : 1) * sizeof *low);
-    int32_t *idx = malloc((size_t)(n ? n : 1) * sizeof *idx);
-    int32_t *stk = malloc((size_t)(n ? n : 1) * sizeof *stk);
-    bool    *onstk = calloc((size_t)(n ? n : 1), 1);
-    int32_t *frame_v = malloc((size_t)(n ? n : 1) * sizeof *frame_v);
-    int32_t *frame_e = malloc((size_t)(n ? n : 1) * sizeof *frame_e);
-    for (int i = 0; i < n; i++) idx[i] = -1;
-    int counter = 0, sp = 0, nscc = 0;
-    for (int root = 0; root < n; root++) {
-        if (idx[root] >= 0) continue;
-        int fp = 0;
-        frame_v[fp] = root; frame_e[fp] = aoff[root];
-        idx[root] = low[root] = counter++;
-        stk[sp++] = root; onstk[root] = true;
-        while (fp >= 0) {
-            int v = frame_v[fp];
-            if (frame_e[fp] < aoff[v + 1]) {
-                int w = ato[frame_e[fp]++];
-                if (idx[w] < 0) {
-                    idx[w] = low[w] = counter++;
-                    stk[sp++] = w; onstk[w] = true;
-                    fp++;
-                    frame_v[fp] = w; frame_e[fp] = aoff[w];
-                } else if (onstk[w] && idx[w] < low[v]) {
-                    low[v] = idx[w];
-                }
-            } else {
-                if (low[v] == idx[v]) {
-                    int m;
-                    do {
-                        m = stk[--sp];
-                        onstk[m] = false;
-                        res->scc[m] = nscc;
-                    } while (m != v);
-                    nscc++;
-                }
-                fp--;
-                if (fp >= 0 && low[v] < low[frame_v[fp]])
-                    low[frame_v[fp]] = low[v];
-            }
-        }
-    }
+    int nscc = dl_tarjan(n, aoff, ato, res->scc);
     res->nscc = nscc;
-    free(low); free(idx); free(stk); free(onstk);
-    free(frame_v); free(frame_e);
-
-    /* members grouped by SCC (counting sort) */
-    res->scc_off = calloc((size_t)nscc + 2, sizeof *res->scc_off);
-    res->scc_lit = malloc((size_t)(n ? n : 1) * sizeof *res->scc_lit);
-    for (int i = 0; i < n; i++) res->scc_off[res->scc[i] + 1]++;
-    for (int c = 0; c < nscc; c++) res->scc_off[c + 1] += res->scc_off[c];
-    int32_t *f2 = malloc((size_t)(nscc ? nscc : 1) * sizeof *f2);
-    memcpy(f2, res->scc_off, (size_t)nscc * sizeof *f2);
-    for (int i = 0; i < n; i++) res->scc_lit[f2[res->scc[i]]++] = i;
-    free(f2);
+    dl_group_by_comp(n, nscc, res->scc, &res->scc_off, &res->scc_lit);
 
     /* cyclic: size > 1, or a self-loop edge */
     res->scc_cyclic = calloc((size_t)(nscc ? nscc : 1), 1);
@@ -498,6 +458,43 @@ static void sweep(const dl_result *res, signed char *status,
         for (int qi = 0; qi < res->nlits; qi++)
             if (status[qi] == DL_UNDECIDED && eval(res, qi))
                 changed = true;
+    }
+}
+
+/* SCC-ordered ("weak-topological") sweep — DESIGN.md §5.2 item 2.
+ *
+ * Walk the dependency condensation in topological order (descending component
+ * id, see build_sched) and iterate only INSIDE a component. Every literal is
+ * therefore evaluated after everything it reads is final, so an acyclic theory
+ * decides in exactly one ordered pass — the plain sweep's O(passes * nlits)
+ * scan-order cliff (passes ~ the longest chain running against index order)
+ * disappears without the worklist's random-access dependency-chasing.
+ *
+ * Same least fixpoint as sweep(): the evals are monotone in the statuses they
+ * read, so iterating a component to a local fixpoint over final inputs yields
+ * that component's final values (chaotic iteration). A singleton needs exactly
+ * one eval even when it carries a self-loop: a second call would see identical
+ * inputs and an unchanged status, so it can only repeat the first answer. */
+static void sweep_scc(const dl_result *res, signed char *status,
+                      bool (*eval)(const dl_result *, int))
+{
+    for (int c = res->nsched - 1; c >= 0; c--) {
+        int lo = res->sched_off[c], hi = res->sched_off[c + 1];
+        if (hi - lo == 1) {
+            int qi = res->sched_lit[lo];
+            if (status[qi] == DL_UNDECIDED)
+                eval(res, qi);
+            continue;
+        }
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (int k = lo; k < hi; k++) {
+                int qi = res->sched_lit[k];
+                if (status[qi] == DL_UNDECIDED && eval(res, qi))
+                    changed = true;
+            }
+        }
     }
 }
 
@@ -633,6 +630,18 @@ static void build_dep(dl_result *res)
     free(dfill);
 }
 
+/* Condense the dependency graph into the evaluator's schedule (§5.2 item 2).
+ * The adjacency is dep_off/dep_to itself — the graph a decision propagates
+ * along is exactly the graph the sweep must be ordered by — so this is one
+ * Tarjan pass on top of build_dep(), which it requires. */
+static void build_sched(dl_result *res)
+{
+    int n = res->nlits;
+    res->sched_of = malloc((size_t)(n ? n : 1) * sizeof *res->sched_of);
+    res->nsched = dl_tarjan(n, res->dep_off, res->dep_to, res->sched_of);
+    dl_group_by_comp(n, res->nsched, res->sched_of, &res->sched_off, &res->sched_lit);
+}
+
 static dl_result *result_new(dl_theory *t)
 {
     dl_result *res = calloc(1, sizeof *res);
@@ -653,6 +662,22 @@ dl_result *dl_solve(dl_theory *t)
     do sweep(res, res->delta, eval_delta);  /* delta first: constant during part */
     while (complete_pass(res, res->delta, true));
     do sweep(res, res->part, eval_part);
+    while (complete_pass(res, res->part, false));
+    return res;
+}
+
+/* SCC-ordered sweep (§5.2 item 2) behind the same API. Same fixpoint as
+ * dl_solve, reached by scheduling rather than rescanning; pinned against both
+ * other drivers by test_dl's differential. */
+dl_result *dl_solve_scc(dl_theory *t)
+{
+    dl_result *res = result_new(t);
+    build_scc(res);                      /* #109: cycle rule support */
+    build_dep(res);
+    build_sched(res);
+    do sweep_scc(res, res->delta, eval_delta);
+    while (complete_pass(res, res->delta, true));
+    do sweep_scc(res, res->part, eval_part);
     while (complete_pass(res, res->part, false));
     return res;
 }
@@ -699,6 +724,9 @@ void dl_result_free(dl_result *r)
     free(r->scc_cyclic);
     free(r->scc_attacked);
     free(r->completed);
+    free(r->sched_of);
+    free(r->sched_off);
+    free(r->sched_lit);
     free(r);
 }
 

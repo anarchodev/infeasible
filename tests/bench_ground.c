@@ -107,7 +107,7 @@ static void bench_one(int arity, int N)
      * ground size grows (a 1M-instance grounding needn't run seven times) */
     int iters = want <= 1e4 ? 7 : want <= 1e5 ? 3 : 1;
     double best = 1e18;
-    int njr = 0; uint32_t atoms = 0;
+    int njr = 0; uint32_t atoms = 0; int compiled = 0;
     for (int it = 0; it < iters; it++) {
         intern *syms = intern_new();
         double t = now_ms();
@@ -115,6 +115,7 @@ static void bench_one(int arity, int N)
         double dt = now_ms() - t;
         if (dt < best) best = dt;            /* min = least-noisy grounding cost */
         if (w) {
+            compiled = 1;
             njr = world_judgment_rule_count(w);
             atoms = intern_count(syms);
             world_free(w);
@@ -123,17 +124,24 @@ static void bench_one(int arity, int N)
     }
     free(src);
 
-    int dropped = (want > (double)MAX_INSTANCES);   /* grounder drops past the cap */
+    /* Observed, not predicted. Past the ceiling a matchable rule is ROUTED to
+     * the tick-time matcher (#59) — it compiles, and contributes zero EAGER
+     * rules because its instances materialize per tick against the live facts.
+     * So "0 rules" past the cap is the routed path working, not a dropped rule;
+     * a genuinely refused rule shows up as a failed compile. */
+    int over = (want > (double)MAX_INSTANCES);
     long rss = maxrss_kb();
 
     printf("  arity %d  N=%-7d  want %11.0f inst  ", arity, N, want);
-    if (dropped)
-        printf("DROPPED (>%d cap): rules=%-8d  ", MAX_INSTANCES, njr);
+    if (!compiled)
+        printf("REFUSED at compile (>%d)            ", MAX_INSTANCES);
+    else if (over)
+        printf("ROUTED to matcher: eager rules=%-4d ", njr);
     else
         printf("rules=%-8d atoms=%-8u  ", njr, atoms);
     printf("compile %8.2f ms  peakRSS %7.1f MB%s\n",
            best, rss / 1024.0,
-           (!dropped && want > CARD_WARN) ? "  [card-warn]" : "");
+           (!over && want > CARD_WARN) ? "  [card-warn]" : "");
 }
 
 int main(int argc, char **argv)
@@ -160,10 +168,23 @@ int main(int argc, char **argv)
     int a3[] = { 30, 64, 100, 128, 256 };
     for (size_t i = 0; i < sizeof a3 / sizeof *a3; i++) bench_one(3, a3[i]);
 
-    printf("\nReading: 'DROPPED' rows are rules past the 2²⁰ cap — the grounder "
-           "now rejects them\nwith a hard compile error (#27) instead of "
-           "silently dropping them, at a flat cost\ninstead of the old N^arity "
-           "spike; the M3 tick-time matcher (#26) is what will let\nthese "
-           "un-anchored cross products ground affordably.\n");
+    printf("\nReading: past the 2²⁰ ceiling the cap is a ROUTING threshold, not a stop\n"
+           "(#59). A rule whose every variable is bound by a positive base fluent goes\n"
+           "to the tick-time matcher: it compiles, contributes zero EAGER rules, and\n"
+           "grounds per tick against the live facts, so its cost tracks matches rather\n"
+           "than the sort cross product. A rule the matcher cannot take — one whose\n"
+           "variables are bound only by guards, which enumerate nothing — is REFUSED at\n"
+           "compile time, loudly, rather than silently dropped.\n"
+           "\n"
+           "A REFUSED row here is NOT the rule: at arity 2, N=2000 the rule routes fine\n"
+           "and the compile still fails on the STATE declaration — `adj(actor, actor)`\n"
+           "is 4M ground booleans of store. Routing moves the RULE-side cliff; the\n"
+           "fluent-side one (dense n-ary state) is separate and is what the sparse\n"
+           "universe (#92) addresses.\n"
+           "\n"
+           "The eager rows are what routing avoids: the N^arity materialization is\n"
+           "linear in instances (~0.6-1.4 us each) but the instance COUNT is the whole\n"
+           "problem, and peak RSS is why — 418 MB for one binary rule at N=1024.\n");
+
     return 0;
 }

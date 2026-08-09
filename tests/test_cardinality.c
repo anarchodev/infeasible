@@ -13,14 +13,25 @@
  * the join matcher (no init facts => it grounds nothing) to keep it fast while
  * still exercising the check.
  *
- * It also pins the *hard* cap one tier up: a cross product past MAX_INSTANCES
- * (2²⁰) is a compile ERROR, not a warning and not a silent nᵏ drop (#27) — a
- * rule the author wrote must never vanish from the theory unremarked.
+ * It also pins the MAX_INSTANCES (2²⁰) ceiling one tier up, where the outcome
+ * depends on whether the tick-time matcher can take the rule (#59, §8.1):
+ *
+ *   - matchable (every var bound by a positive base-fluent atom) — the rule is
+ *     ROUTED to the matcher and the compile SUCCEEDS with a warning. Its cross
+ *     product is Nᵏ only on paper; the live extension is what gets walked.
+ *   - not matchable — a compile ERROR, and the message says why routing could
+ *     not save it. Never a warning, and never a silent nᵏ drop (#27): a rule
+ *     the author wrote must not vanish from the theory unremarked.
+ *
+ * A routed rule must also still ANSWER, so the routed case is queried, not just
+ * compiled — a rule that compiles and concludes nothing is the silent drop this
+ * cap exists to prevent, wearing a different hat.
  */
 
 #include "lang/story.h"
 #include "state/world.h"
 #include "core/intern.h"
+#include "logic/dl.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,7 +77,7 @@ static int expect(const char *src, int nwarn, const char *needle)
 
 /* Compile via the EAGER path (story_compile, where the odometer materializes
  * the cross product); assert the compile FAILED and some error diag carries
- * `needle`. This is the hard 2²⁰ cap, distinct from the anchor-aware warning. */
+ * `needle`. Past 2²⁰ this is the outcome for a rule the matcher cannot take. */
 static int expect_cap_error(const char *src, const char *needle)
 {
     intern *sy = intern_new();
@@ -83,6 +94,49 @@ static int expect_cap_error(const char *src, const char *needle)
             fprintf(stderr, "no diag contains '%s':\n", needle);
             for (int i = 0; i < d.count; i++) fprintf(stderr, "  [%d] %s\n", i, di[i].msg);
             rc = 1;
+        }
+    }
+    if (w) world_free(w);
+    intern_free(sy);
+    return rc;
+}
+
+/* Compile via the EAGER path past the cap and assert it SUCCEEDED by routing
+ * (#59): a warning carrying `needle`, no error — and then that the routed rule
+ * actually concludes, by setting two facts and querying the pair. */
+static int expect_cap_routed(const char *src, const char *needle)
+{
+    intern *sy = intern_new();
+    story_diag di[32];
+    story_diags d = { di, 32, 0, 0 };
+    world *w = story_compile(src, "cap.story", sy, &d);
+    int rc = 0;
+    if (!w || d.nerrors != 0) {
+        fprintf(stderr, "expected the over-cap rule to ROUTE, but the compile failed: %s\n",
+                d.count ? di[0].msg : "?");
+        rc = 1;
+    } else {
+        int found = 0;
+        for (int i = 0; i < d.count; i++) if (strstr(di[i].msg, needle)) found = 1;
+        if (!found) {
+            fprintf(stderr, "no diag contains '%s':\n", needle);
+            for (int i = 0; i < d.count; i++) fprintf(stderr, "  [%d] %s\n", i, di[i].msg);
+            rc = 1;
+        }
+        /* and it must CONCLUDE: routing that silently grounds nothing is the
+         * dropped rule this cap exists to prevent */
+        if (!rc) {
+            world_set(w, intern_id(sy, "awake(e0)"), true);
+            world_set(w, intern_id(sy, "awake(e1)"), true);
+            if (world_query(w, dl_pos(intern_id(sy, "paired(e0,e1)"))) != DL_PROVED) {
+                fprintf(stderr, "routed rule compiled but concluded nothing\n");
+                rc = 1;
+            }
+            /* a pair whose facts are absent must NOT be concluded */
+            if (world_query(w, dl_pos(intern_id(sy, "paired(e0,e2)"))) == DL_PROVED) {
+                fprintf(stderr, "routed rule concluded an unsupported pair\n");
+                rc = 1;
+            }
         }
     }
     if (w) world_free(w);
@@ -133,8 +187,9 @@ int main(void)
         ENTS);
     if (expect(src, 0, NULL)) return 1;
 
-    /* --- errors: past the 2²⁰ hard cap it's a compile ERROR, not a warning and
-     *     not a silent drop (#27). 1025² = 1050625 > MAX_INSTANCES (2²⁰). --- */
+    /* --- past the 2²⁰ ceiling, MATCHABLE: routed, not refused (#59).
+     *     1025² = 1050625 > MAX_INSTANCES. Both vars are bound by a positive
+     *     base fluent, so the matcher can enumerate them from the extension. --- */
     {
         static char big[12288];
         gen_entities(big, sizeof big, 1025);
@@ -145,7 +200,24 @@ int main(void)
             "entity ( %s : actor )\n"
             "rule pair(X: actor, Y: actor): awake(X) & awake(Y) => paired(X, Y)\n",
             big);
-        if (expect_cap_error(cap, "cardinality cap")) return 1;
+        if (expect_cap_routed(cap, "grounding it at tick time")) return 1;
+    }
+
+    /* --- past the ceiling, NOT matchable: still an ERROR. The vars are bound
+     *     only by numeric guards, which satisfy range-restriction safety but
+     *     enumerate nothing — there is no extension for the matcher to walk, so
+     *     routing cannot save this one and the cap stays a stop. --- */
+    {
+        static char big[12288];
+        gen_entities(big, sizeof big, 1025);
+        static char cap[24576];
+        snprintf(cap, sizeof cap,
+            "sort actor\n"
+            "state ( hp(actor) : int in 0 .. 10 )\n"
+            "entity ( %s : actor )\n"
+            "rule pair(X: actor, Y: actor): hp(X) >= 1 & hp(Y) >= 1 => paired(X, Y)\n",
+            big);
+        if (expect_cap_error(cap, "cannot be matched at tick time")) return 1;
     }
 
     printf("test_cardinality: all passed\n");

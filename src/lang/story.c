@@ -3361,11 +3361,11 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
          * this checker; its selection is consumed at expansion) */
         pred_info *kpi = find_pred(p, at->pred);
         if (kpi && kpi->is_kindpred) {
+            const char *kn = intern_name(p->syms, at->pred);
             serr(p, at->line, at->col,
                  "'%s' is a kind predicate — build-time only, readable in a "
-                 "functor modifier's body (`%s(V, …)` with `V : value`); "
-                 "derived kinds at runtime land with #125",
-                 intern_name(p->syms, at->pred));
+                 "functor modifier's body (`%s(V, …)` with `V : value`)",
+                 kn, kn);
             return;
         }
     }
@@ -5287,8 +5287,9 @@ static void expand_kind_rules(parser *p)
                     continue;                      /* wildcard facet */
                 if (vi >= 0) {
                     serr(p, ka->args[a].line, ka->args[a].col,
-                         "a variable facet ('%s') needs the derived-kind "
-                         "stratum (#125) — this slice takes a constant or `_`",
+                         "a variable facet ('%s') needs selector expansion over "
+                         "the solved stratum (#179) — this slice takes a "
+                         "constant or `_`",
                          intern_name(p->syms, nm));
                     bad = true;
                     continue;
@@ -5786,16 +5787,40 @@ static void semantic_pass(parser *p)
 /* Takes the intern table directly (not the parser) so the tick-time matcher
  * (#28) can reuse the EXACT ground-atom spelling post-compile — byte-identical
  * atoms and why-traces by construction. */
+/* snprintf-compatible append: copies what fits (always NUL-terminating) and
+ * returns the length it WANTED to write, so a caller accumulates an offset
+ * exactly as it did with snprintf. Unlike the snprintf chain it replaces, this
+ * stays safe once the offset passes `cap` — that chain computed `cap - off` as
+ * a size_t, which underflowed. */
+static int append_term(char *buf, size_t cap, int off, const char *s)
+{
+    size_t l = strlen(s);
+    if (off >= 0 && (size_t)off < cap) {
+        size_t room = cap - (size_t)off - 1;
+        size_t c = l < room ? l : room;
+        memcpy(buf + off, s, c);
+        buf[(size_t)off + c] = '\0';
+    }
+    return (int)l;
+}
+
+/* Spell a ground atom "pred(e1,e2)" into buf. HOT: once per instance in the
+ * eager grounder, and once per match per tick in the tick-time matcher, where
+ * it plus intern_id is ~85% of a re-ground. Hand-written rather than a chain of
+ * snprintf calls, each of which re-parses a format string to copy one string.
+ * Output is byte-identical, which is load-bearing: ground atom spellings are
+ * the ABI a host interning the same name relies on (§6.3). */
 static int build_term(intern *syms, uint32_t pred, const uint32_t *args, int n,
                       char *buf, size_t cap)
 {
-    int off = snprintf(buf, cap, "%s", intern_name(syms, pred));
+    int off = append_term(buf, cap, 0, intern_name(syms, pred));
     if (n == 0) return off;
-    off += snprintf(buf + off, cap - (size_t)off, "(");
-    for (int i = 0; i < n && off < (int)cap; i++)
-        off += snprintf(buf + off, cap - (size_t)off, "%s%s",
-                        i ? "," : "", intern_name(syms, args[i]));
-    if (off < (int)cap) off += snprintf(buf + off, cap - (size_t)off, ")");
+    off += append_term(buf, cap, off, "(");
+    for (int i = 0; i < n && off < (int)cap; i++) {
+        if (i) off += append_term(buf, cap, off, ",");
+        off += append_term(buf, cap, off, intern_name(syms, args[i]));
+    }
+    if (off < (int)cap) off += append_term(buf, cap, off, ")");
     return off;
 }
 
@@ -6489,6 +6514,17 @@ static bool members_ok(parser *p, ast_atom *body, int n, var_bind *vars,
     return true;
 }
 
+/* Would eager grounding of this rule blow the cardinality ceiling? Split out of
+ * ground_rule so the router (#59) can ask BEFORE committing to the eager path. */
+static bool rule_over_cap(parser *p, ast_rule *r)
+{
+    if (r->head.is_valuedef || r->head.is_kinddef) return false;
+    if (rule_is_kind(p, r)) return false;
+    bool of = false;
+    (void)instance_count(p, r->vars, r->nvars, &of);
+    return of;
+}
+
 static void ground_rule(parser *p, ast_rule *r)
 {
     if (r->head.is_valuedef || r->head.is_kinddef) return;   /* #82: never dl rules */
@@ -6503,8 +6539,10 @@ static void ground_rule(parser *p, ast_rule *r)
          * must add a sparser anchor rather than ship a dropped rule. When the
          * matcher/router lands this cap becomes a routing threshold, not a stop. */
         serr(p, r->line, r->col,
-             "rule '%s' grounds to more than %d instances — add a sparser "
-             "anchor or split the sorts (§5.2 cardinality cap)",
+             "rule '%s' grounds to more than %d instances and cannot be matched "
+             "at tick time — every variable must be bound by a positive base-fluent "
+             "atom for that; add a sparser anchor or split the sorts "
+             "(§5.2 cardinality cap)",
              r->label, MAX_INSTANCES);
         return;
     }
@@ -7108,6 +7146,15 @@ static void matcher_capture(story_matcher *m, parser *p, ast_rule *r, bool islan
     d->nbody = r->nbody;
     for (int b = 0; b < r->nbody && b < MAX_BODY; b++)
         m_capture_atom(p, &d->body[b], &r->body[b]);
+    /* #45: tell the world which predicates this rule READS, so a base-fact edit
+     * that cannot change the match set does not force a re-ground. Every body
+     * atom is registered regardless of kind — negated bodies decide a match just
+     * as positive ones do, and a guard's numeric fluent is read the same way.
+     * The head goes in too: a matchable rule may read another's conclusion once
+     * derived bodies land (#44), and over-registering only costs a re-ground. */
+    world_matcher_watch(p->w, r->head.pred);
+    for (int b = 0; b < r->nbody && b < MAX_BODY; b++)
+        world_matcher_watch(p->w, r->body[b].pred);
     d->island = island;
     d->view = island ? world_view_new(p->w, r->head.pred, r->head.neg, r->kind)
                      : -1;
@@ -9860,6 +9907,14 @@ void story_model_free(story_model *m)
  * `mret` (when non-NULL) retains a tick-time matcher plan (#28): matched rules
  * are captured (not eagerly ground) into `*mret`, and the judgment layer is left
  * for the caller's first story_matcher_reground; implies matched grounding. */
+/* Defined beside story_compile_matcher, below; forward-declared so the #59
+ * auto-routing tail can install it. The materialize/schema thunks are already
+ * defined above. */
+static void matcher_reground_thunk(void *ctx, world *w);
+
+/* #59: the world disposes a compiler-installed matcher at world_free. */
+static void matcher_free_thunk(void *ctx) { story_matcher_free((story_matcher *)ctx); }
+
 static world *compile_impl(const char *src, const char *srcname, intern *syms,
                            story_diags *diags, bool matched,
                            story_model **out, story_matcher **mret,
@@ -9952,11 +10007,40 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
                 world_matched_checkpoint(p->w);       /* boundary: static | matched */
                 matcher_capture_schema(m, p);         /* #92: outlive the parser */
             } else {
+                /* #59: the cardinality ceiling is a ROUTING threshold, not a
+                 * stop. A rule whose cross product blows the cap but whose every
+                 * variable is generator-bound is exactly the shape the tick-time
+                 * matcher exists for — its instances are Nᵏ only on paper, while
+                 * the live extension is sparse. Route it there instead of
+                 * refusing the program; an over-cap rule the matcher CANNOT take
+                 * still errors in ground_rule, and says why.
+                 *
+                 * The matcher is created on demand, so a story that never trips
+                 * the cap pays nothing and behaves exactly as before. */
                 for (int i = 0; i < p->nrules; i++) {
-                    if (p->ground_matched && rule_matchable(p, &p->rules[i]))
-                        ground_rule_matched(p, &p->rules[i]);
-                    else
-                        ground_rule(p, &p->rules[i]);
+                    ast_rule *r = &p->rules[i];
+                    if (p->ground_matched && rule_matchable(p, r)) {
+                        ground_rule_matched(p, r);
+                    } else if (rule_over_cap(p, r) && rule_matchable(p, r)) {
+                        if (!m) {
+                            m = calloc(1, sizeof *m);
+                            m->syms = syms;
+                            m->w = p->w;
+                        }
+                        matcher_capture(m, p, r, rule_island(p, r));
+                        warn(p, r->line, r->col,
+                             "rule '%s' exceeds %d eager instances; grounding it "
+                             "at tick time against the live facts instead "
+                             "(§8.1 routing) — its cost now tracks matches, not "
+                             "the sort cross product",
+                             r->label, MAX_INSTANCES);
+                    } else {
+                        ground_rule(p, r);
+                    }
+                }
+                if (m) {                       /* the matched region starts here */
+                    world_matched_checkpoint(p->w);
+                    matcher_capture_schema(m, p);
                 }
             }
             for (int i = 0; i < p->nactions; i++) ground_action(p, &p->actions[i]);
@@ -9980,11 +10064,27 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
              * into the world (only captured), so a judgment lane family would
              * shadow the re-materialized layer with stale, un-re-ground results.
              * lane↔matcher routing is a later slice (#28 router). */
-            if (p->nerrors == 0 && !mret) build_lane_families(p);   /* the DoD thesis, 2a */
+            /* `m` covers the #59 auto-routed case too: either way the matched
+             * rules are captured, not in the world, so a judgment lane family
+             * would shadow the re-materialized layer with stale results. */
+            if (p->nerrors == 0 && !mret && !m) build_lane_families(p);   /* the DoD thesis, 2a */
         }
     }
 
-    if (p->nerrors == 0) { result = p->w; if (mret) *mret = m; }
+    if (p->nerrors == 0) {
+        result = p->w;
+        if (mret) {
+            *mret = m;                     /* caller asked for it, caller frees it */
+        } else if (m) {
+            /* #59: the compiler installed this matcher on its own. The caller
+             * asked for a plain world and never learns it exists, so the world
+             * takes the hooks AND the lifetime. */
+            world_set_reground_fn(p->w, matcher_reground_thunk, m);
+            world_set_materialize_fn(p->w, matcher_materialize_thunk, m);
+            world_set_schema_fn(p->w, matcher_schema_thunk, m);
+            world_own_reground_ctx(p->w, matcher_free_thunk);
+        }
+    }
     else { world_free(p->w); story_matcher_free(m); if (mret) *mret = NULL; }
 
     /* Harvest the span model before the parser tables are torn down —

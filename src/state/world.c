@@ -154,6 +154,21 @@ struct world {
      * matched_stale, to refresh the matched layer against current facts before a
      * solve. `regrounding` guards the callback against re-entering a rebuild. */
     world_reground_fn reground_fn; void *reground_ctx; bool matched_stale, regrounding;
+    /* Optional: the world OWNS the re-ground context and disposes it at
+     * world_free. Set when the compiler routes an over-cap rule to the matcher
+     * on its own (#59) — the caller asked for a plain world and never learns a
+     * matcher exists, so it cannot be the one to free it. Left NULL when a
+     * caller builds the matcher explicitly and keeps ownership. */
+    void (*reground_free)(void *);
+    /* Predicates some matchable rule READS (#45). A base-fact edit only stales
+     * the matched layer when it touches one of these — editing a fluent no
+     * matchable rule mentions cannot change the match set, so re-deriving it
+     * would be pure waste. Registered by the lang layer at rule capture.
+     * Default-open: with nothing registered (`watch_set` false) every edit
+     * stales, so a caller that never registers keeps the conservative
+     * behaviour, and forgetting to register can only cost time, never
+     * correctness. */
+    int *watch_of; uint32_t watch_cap; bool watch_set;
 
     /* Matched views (#80): island judgments as sets instead of matched rules.
      * Rows are the per-tick match set (cleared by world_views_reset, caps
@@ -386,6 +401,14 @@ world *world_new(intern *syms)
     return w;
 }
 
+/* Does any matchable rule read `pred`? Conservative before registration. */
+static bool matcher_watches(const world *w, uint32_t pred)
+{
+    if (!w->watch_set || pred == INTERN_NONE)
+        return true;
+    return pred < w->watch_cap && w->watch_of[pred] >= 0;
+}
+
 /* A base-fact edit: the judgment family and every lane family must re-solve. */
 static void invalidate_state_solved(world *w)
 {
@@ -395,8 +418,26 @@ static void invalidate_state_solved(world *w)
         w->lanes[i].solved = false;
 }
 
+/* As above, for an edit whose predicate is known: the matched layer is staled
+ * only if some matchable rule reads that predicate. The judgment family and the
+ * lanes still re-solve unconditionally — they hold every rule, not just the
+ * matchable ones. */
+static void invalidate_state_solved_of(world *w, uint32_t pred)
+{
+    w->jfam_solved = false;
+    if (matcher_watches(w, pred))
+        w->matched_stale = true;
+    for (int i = 0; i < w->nlanes; i++)
+        w->lanes[i].solved = false;
+}
+
 void world_free(world *w)
 {
+    if (w->reground_free && w->reground_ctx) {     /* #59: compiler-owned matcher */
+        w->reground_free(w->reground_ctx);
+        w->reground_ctx = NULL;
+        w->reground_fn = NULL;
+    }
     if (w->fam0)
         dlcol_free(w->fam0);           /* w->fam only borrows (fam0 or a slot) */
     for (int v = 0; v < w->sp.nvals; v++) {
@@ -451,6 +492,7 @@ void world_free(world *w)
     free(w->fl_nargs);
     free(w->fl_args);
     free(w->fluent_of);
+    free(w->watch_of);
     free(w->num_of);
     free(w->guard_of);
     free(w->prov_of);
@@ -501,6 +543,17 @@ static void atom_map_set(int **map, uint32_t *cap, uint32_t key, int val)
 static int fluent_index(const world *w, uint32_t atom)
 {
     return atom < w->fluent_of_cap ? w->fluent_of[atom] : -1;
+}
+
+/* Register a predicate some matchable rule reads (#45). The first call flips
+ * the world from watch-everything to watch-this-set, so the lang layer must
+ * register EVERY predicate its matchable rules read — body atoms of any kind,
+ * including negated ones and guards — before the first edit. */
+void world_matcher_watch(world *w, uint32_t pred)
+{
+    if (pred == INTERN_NONE) return;
+    atom_map_set(&w->watch_of, &w->watch_cap, pred, 1);
+    w->watch_set = true;
 }
 
 void world_declare_fluent(world *w, uint32_t atom)
@@ -592,7 +645,9 @@ void world_set(world *w, uint32_t atom, bool value)
     if (i >= 0) {
         if (w->vals[i] != value) fidx_update(w, i, value);   /* index tracks the change */
         w->vals[i] = value;
-        invalidate_state_solved(w);                /* judgments now stale */
+        /* pred-scoped: an edit to a fluent no matchable rule reads leaves the
+         * match set provably unchanged, so it must not force a re-ground */
+        invalidate_state_solved_of(w, w->fl_pred[i]);
     }
 }
 
@@ -1144,6 +1199,11 @@ void world_set_reground_fn(world *w, world_reground_fn fn, void *ctx)
     w->reground_fn = fn;
     w->reground_ctx = ctx;
     w->matched_stale = true;        /* the first solve re-grounds the initial layer */
+}
+
+void world_own_reground_ctx(world *w, void (*free_fn)(void *))
+{
+    w->reground_free = free_fn;
 }
 
 /* ---- matched views (#80): island judgments as sets, not rules ---- */
@@ -2757,6 +2817,55 @@ static void num_clamp_bounds(const world *w, int idx, long *lo, long *hi)
                                : w->nums[idx].max;
 }
 
+/* ---- the value algebra, instantiated at the integers (§5.8) --------------
+ *
+ * The numeric tier is one algebra: a JOIN resolving `:=` collisions, a
+ * commutative MONOID accumulating the deltas, that monoid acting on the
+ * carrier, and a RETRACTION onto the declared range. Both commit paths run
+ * exactly it — the N=1 loop over named atoms and the routed lane fold over
+ * columns — so it is written here once instead of in two copies that drift
+ * apart the first time either grows a case.
+ *
+ * `static inline` rather than a vtable, deliberately. Naming the operations is
+ * what a second domain needs; parameterizing by domain is a later step, and
+ * one whose cost on the lane path (which folds inlined arithmetic over `long`
+ * columns) has to be measured rather than assumed. */
+
+/* `:=` join under the fluent's declared merge (#85). Returns 1 when `v` becomes
+ * the winner (the caller may record its provenance), 0 when the incumbent
+ * stands, and -1 when the collision is irreconcilable — REGISTER's two
+ * different constants, the contested step of §5.8. */
+static inline int num_join(world_merge mode, bool have, long *cur, long v)
+{
+    if (!have)                     { *cur = v; return 1; }
+    if (mode == WORLD_MERGE_MIN)   { if (v < *cur) { *cur = v; return 1; } return 0; }
+    if (mode == WORLD_MERGE_MAX)   { if (v > *cur) { *cur = v; return 1; } return 0; }
+    return v == *cur ? 0 : -1;
+}
+
+/* The delta monoid's signed contribution. One definition of the sign
+ * convention, so a receipt item and a lane column cannot disagree about it. */
+static inline long num_signed(world_numop op, long k)
+{
+    return op == WORLD_OP_ADD ? k : -k;
+}
+
+/* The fixed commit pipeline for one fluent: base (the winning `:=`, else the
+ * carried value) -> the accumulated deltas -> retract onto the declared range.
+ * The clamp is outermost because the schema's range is the last word (§5.8). */
+static inline long num_commit(const world *w, int idx, bool have,
+                              long assigned, long delta)
+{
+    long v = (have ? assigned : w->nums[idx].value) + delta;
+    if (w->nums[idx].has_range) {
+        long lo, hi;
+        num_clamp_bounds(w, idx, &lo, &hi);
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+    }
+    return v;
+}
+
 /* A step rule fires this step iff its action occurred (or it is a ramification)
  * and every body literal holds in the settled step theory. Numeric effects run
  * in the commit phase, so their firing is read off the solved columns rather
@@ -2934,12 +3043,11 @@ static int compute_step_lane_numerics(world *w, step_lane_family *sf,
             size_t c = (size_t)ef->schema * nent + e;
             if (ef->op == WORLD_OP_ASSIGN) {
                 world_merge mg = w->nums[sf->num_cell[c]].merge;   /* #85 */
-                if (!have[c]) { have[c] = true; aval[c] = ef->konst; }
-                else if (mg == WORLD_MERGE_MIN) { if (ef->konst < aval[c]) aval[c] = ef->konst; }
-                else if (mg == WORLD_MERGE_MAX) { if (ef->konst > aval[c]) aval[c] = ef->konst; }
-                else if (ef->konst != aval[c]) confl[c] = true;
+                if (num_join(mg, have[c], &aval[c], ef->konst) < 0)
+                    confl[c] = true;
+                have[c] = true;
             } else {
-                delta[c] += (ef->op == WORLD_OP_ADD) ? ef->konst : -ef->konst;
+                delta[c] += num_signed(ef->op, ef->konst);
             }
         }
     }
@@ -2957,14 +3065,7 @@ static int compute_step_lane_numerics(world *w, step_lane_family *sf,
                 rc = -1;
                 break;
             }
-            long base = have[c] ? aval[c] : w->nums[idx].value;
-            long val = base + delta[c];
-            if (w->nums[idx].has_range) {
-                long lo, hi; num_clamp_bounds(w, idx, &lo, &hi);
-                if (val < lo) val = lo;
-                if (val > hi) val = hi;
-            }
-            nextcol[c] = val;
+            nextcol[c] = num_commit(w, idx, have[c], aval[c], delta[c]);
         }
 
     free(delta); free(aval); free(have); free(confl);
@@ -3288,26 +3389,15 @@ int world_step(world *w, const uint32_t *actions, int nactions,
                     break;
                 }
                 if (ef->op == WORLD_OP_ASSIGN) {
-                    world_merge mg = w->nums[i].merge;
-                    if (!acc[i].have) {
-                        acc[i].have = true;
-                        acc[i].assign_val = v;
-                        acc[i].rule = r->name;
-                    } else if (mg == WORLD_MERGE_MIN) {
-                        if (v < acc[i].assign_val) {
-                            acc[i].assign_val = v;
-                            acc[i].rule = r->name;      /* the extreme's provenance */
-                        }
-                    } else if (mg == WORLD_MERGE_MAX) {
-                        if (v > acc[i].assign_val) {
-                            acc[i].assign_val = v;
-                            acc[i].rule = r->name;
-                        }
-                    } else if (v != acc[i].assign_val) {
+                    int took = num_join(w->nums[i].merge, acc[i].have,
+                                        &acc[i].assign_val, v);
+                    acc[i].have = true;
+                    if (took < 0)
                         acc[i].conflict = true;         /* register: contested (§5.8) */
-                    }
+                    else if (took > 0)
+                        acc[i].rule = r->name;          /* the winner's provenance */
                 } else {
-                    long d = (ef->op == WORLD_OP_ADD) ? v : -v;
+                    long d = num_signed(ef->op, v);
                     acc[i].delta += d;
                     rcpt_push(&w->rcpt[i], r->name, ef->op, d);
                 }
@@ -3345,16 +3435,9 @@ int world_step(world *w, const uint32_t *actions, int nactions,
                 rcp->items[0].op = WORLD_OP_ASSIGN;
                 rcp->items[0].amount = acc[i].assign_val;
             }
-            long base = acc[i].have ? acc[i].assign_val : w->nums[i].value;
-            rcp->base = base;
-            long total = acc[i].delta;
-            long val = base + total;
-            if (w->nums[i].has_range) {
-                long lo, hi; num_clamp_bounds(w, i, &lo, &hi);
-                if (val < lo) val = lo;
-                if (val > hi) val = hi;
-            }
-            nextnum[i] = val;
+            rcp->base = acc[i].have ? acc[i].assign_val : w->nums[i].value;
+            nextnum[i] = num_commit(w, i, acc[i].have, acc[i].assign_val,
+                                    acc[i].delta);
         }
 
         /* mint this stratum's primed-guard facts (§5.8 #87): strict inputs

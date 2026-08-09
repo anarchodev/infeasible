@@ -17,7 +17,13 @@ emcc -O2 -I"$here/src" \
   "$here/src/core/arena.c" \
   "$here/src/core/intern.c" \
   "$here/src/logic/dl.c" \
+  "$here/src/logic/dl_col.c" \
+  "$here/src/logic/dl_graph.c" \
+  "$here/src/logic/dl_trace.c" \
   "$here/src/state/world.c" \
+  "$here/src/state/factindex.c" \
+  "$here/src/lang/lexer.c" \
+  "$here/src/lang/story.c" \
   "$here/src/wasm/bindings.c" \
   -sMODULARIZE=1 \
   -sEXPORT_ES6=1 \

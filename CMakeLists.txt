@@ -18,6 +18,7 @@ add_library(infeasible_core STATIC
   src/core/intern.c
   src/logic/dl.c
   src/logic/dl_col.c
+  src/logic/dl_graph.c
   src/logic/dl_trace.c
   src/state/world.c
   src/state/factindex.c
@@ -32,7 +33,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 enable_testing()
-foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse test_scene test_bands test_clamp test_setparam test_domain test_intargs test_functional test_store test_fnprovider test_ground test_mv test_numeric test_numpipe test_numeff test_ramif test_prov test_lanes test_binder test_numlane test_binderlane test_judgstep test_provider test_safety test_cardinality test_spatial test_factindex test_matcher test_ticktime test_selectivity test_dlcol_incr test_locstable test_matchview test_sparsejfam test_sparseuniverse test_lazyq test_inits test_model test_lsp test_div test_value test_enumarg test_merge test_exprtest test_strata test_layers test_modeled test_kinds test_reaction test_split test_taxonomy test_taxprobe test_partial test_conflict test_cycle test_excl test_probe5e)
+foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse test_scene test_bands test_clamp test_setparam test_domain test_intargs test_functional test_store test_fnprovider test_ground test_mv test_numeric test_numpipe test_numeff test_ramif test_prov test_lanes test_binder test_numlane test_binderlane test_judgstep test_provider test_safety test_cardinality test_spatial test_factindex test_matcher test_ticktime test_selectivity test_dlcol_incr test_locstable test_matchview test_sparsejfam test_sparseuniverse test_lazyq test_inits test_model test_lsp test_div test_value test_enumarg test_merge test_exprtest test_strata test_layers test_modeled test_kinds test_reaction test_split test_taxonomy test_taxprobe test_partial test_conflict test_cycle test_excl test_matchwatch test_probe5e)
   add_executable(${t} tests/${t}.c)
   target_link_libraries(${t} PRIVATE infeasible_core)
   add_test(NAME ${t} COMMAND ${t})
@@ -80,6 +81,18 @@ target_compile_options(bench_step PRIVATE -O2)
 add_executable(bench_5e tests/bench_5e.c)
 target_link_libraries(bench_5e PRIVATE infeasible_core)
 target_compile_options(bench_5e PRIVATE -O2)
+
+# Rule-complexity benchmark (DESIGN.md 8): columnar solve across schema depth x
+# width, the axis bench_col/bench_5e hold fixed. Build Release for real numbers.
+add_executable(bench_complexity tests/bench_complexity.c)
+target_link_libraries(bench_complexity PRIVATE infeasible_core)
+target_compile_options(bench_complexity PRIVATE -O2)
+
+# Step-lane frontier benchmark (#75/#165, 5.8/8.1): which authoring shapes reach
+# the lanes, and what each bail costs. Doubles as a marker when a bail retires.
+add_executable(bench_lanes tests/bench_lanes.c)
+target_link_libraries(bench_lanes PRIVATE infeasible_core)
+target_compile_options(bench_lanes PRIVATE -O2)
 
 # Grounding-cost benchmark (§5.2/§8, EPIC #26): eager grounder over a synthetic
 # nᵏ cross product — compile time, ground atoms, peak memory, MAX_INSTANCES cliff.

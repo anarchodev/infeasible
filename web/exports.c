@@ -41,7 +41,7 @@ EXPORT inf_session *inf_compile(const char *src)
 
     story_diag items[64];
     story_diags diags = { items, 64, 0, 0 };
-    world *w = story_compile(src, syms, &diags);
+    world *w = story_compile(src, "<host>", syms, &diags);
 
     /* surface every diagnostic (errors and warnings) to the host */
     size_t off = 0;

@@ -296,6 +296,11 @@ void world_matched_reset(world *w);
  * Registering marks the layer stale so the first solve re-grounds. */
 typedef void (*world_reground_fn)(void *ctx, world *w);
 void world_set_reground_fn(world *w, world_reground_fn fn, void *ctx);
+/* Hand the re-ground context's lifetime to the world: `free_fn(ctx)` runs at
+ * world_free. Used when the COMPILER installs a matcher the caller never asked
+ * for and cannot see (#59 over-cap routing) — a caller that builds a matcher
+ * explicitly keeps ownership and must not call this. */
+void world_own_reground_ctx(world *w, void (*free_fn)(void *));
 
 /* Fluent schema hook (#92, the sparse fluent universe): under tick-time
  * compilation the grounder no longer declares the sort cross-product of every
@@ -349,6 +354,16 @@ int  world_view_new(world *w, uint32_t head_pred, bool head_neg,
 void world_views_reset(world *w);
 void world_view_add(world *w, int view, uint32_t atom,
                     const uint32_t *bind, int nvars);
+/* Register a predicate some matchable rule READS (#45), so a base-fact edit
+ * that cannot change the match set does not force a re-ground. The first call
+ * switches the world from staling the matched layer on EVERY edit to staling it
+ * only for registered predicates — so a caller that registers must register
+ * every predicate its matchable rules read (body atoms of any kind, negated
+ * ones and guards included). Failing to register costs a missed re-ground and
+ * therefore stale matches: register conservatively. Registering nothing keeps
+ * the always-stale behaviour. */
+void world_matcher_watch(world *w, uint32_t pred);
+
 void world_set_materialize_fn(world *w, world_materialize_fn fn, void *ctx);
 /* Introspection (bench/tests): rows currently present; bytes held by the view
  * store (rows + maps) — the space the matched layer occupies instead of rules. */
@@ -410,8 +425,9 @@ void       world_why(world *w, dl_lit q, FILE *out);
  * atoms). A per-sort N-lane dl_col family for the homogeneous single-variable
  * judgment rules over that sort — the same rules run once across 64 entities per
  * word instead of grounded per entity into distinct atoms. The grounder emits
- * them; they are validated against the N=1 query path but not yet routed to (the
- * dl_col-was-prototyped-before-adopted playbook). `ground` is a flat
+ * them; world_query answers from the family when the queried atom is a lane
+ * cell, with world_lanes_check the differential pin against the N=1 query
+ * path. `ground` is a flat
  * natoms*nent array of the equivalent named ground atom for each
  * (predicate-local-id, lane); `is_fluent` flags which locals take base facts.
  * `is_import` (may be NULL = none) flags locals that are DERIVED elsewhere and
@@ -451,8 +467,9 @@ int  world_lanes_check(world *w, bool *ok);
  * causal/ramification rules. `kind[loc]` classifies each local; `ground[loc*nent
  * + e]` is the named ground atom for that (local, lane) — the primed local's
  * ground atom is the fluent's `f'` twin. The world copies both and owns `fam`.
- * Prototype-before-adopt: built and validated (world_step_lanes_check) but not
- * yet routed through world_step, mirroring how the judgment lanes landed. */
+ * world_step routes the transition here when one family covers the whole step
+ * world — no primed guards, no value split, numerics only if covers_numeric;
+ * world_step_lanes_check is the differential pin against the N=1 path. */
 /* WORLD_STEP_BCAST: a broadcast cast trigger (a `for each` binder's action) —
  * one signal ANDed into every target-lane, true when any of the action's ground
  * cast atoms occurred this step (see world_step_lane_set_bcast). */

@@ -285,14 +285,21 @@ propagation sweep.
   5. Cardinality warnings: any rule ranging over a large cross product with no
      sparse anchor is a compile-time warning with the estimated count.
 
-**Scaffold status.** The current C engine implements the standard semantics
-with a straightforward tri-valued fixpoint (correct, O(n·rules) worst case)
-over pre-ground rules, evaluated by a sequential *sweep* (the default
-`dl_solve`; an order-independent worklist `dl_solve_wl` exists as a differential
-oracle — `test_drivers_agree` — and a cliff-free fallback). The linear-time path
-(M3) is deliberately factored into a build-time half and a run-time half, both
-behind the same API, with the golden tests pinning the semantics so the swap is
-safe:
+**Status.** The engine implements the standard semantics with a tri-valued
+fixpoint over pre-ground rules. The linear-time path (M3) is factored into a
+build-time half and a run-time half, both behind the same API, with the golden
+tests pinning the semantics so each swap is safe. **The run-time half has
+landed** (item 2 below): the columnar engine — the one that actually runs a
+tick, `dlcol_solve` under every `world_step`, judgment family and lane —
+evaluates in SCC-scheduled order, and the schedule is compiled once with the
+rest of the schema, so a tick pays only the walk. The scalar reference
+(`dl.c`, the `.story` kind stratum's build-time solver) keeps the plain sweep
+as its default and carries the ordered driver as `dl_solve_scc` alongside the
+order-independent worklist `dl_solve_wl`; both are differential oracles
+(`test_drivers_agree`), and neither wins there because that path recompiles
+per solve, so a schedule it cannot amortize costs more than the rescans it
+saves. **The build-time half — the Antoniou transformation and the
+stratifying compiler of item 1 — is what remains.**
 
 1. *Transformation + stratification (build time).* The size-preserving
    Antoniou transformation (TOCL 2001) eliminates defeaters and compiles away
@@ -355,8 +362,8 @@ safe:
    over the solved statuses; the matcher's derived-body widening (#44)
    inherits recursion as ordinary semi-naive iteration on the extension
    index, a scope item, not a semantics question.
-2. *SCC-ordered sweep (run time).* Rather than Maher's counter-and-worklist
-   algorithm (Delores, TPLP 2001), the evaluator is a single
+2. *SCC-ordered sweep (run time; landed).* Rather than Maher's
+   counter-and-worklist algorithm (Delores, TPLP 2001), the evaluator is a single
    *weak-topologically ordered* sweep: solve the SCC condensation in topological
    order, iterating only within a genuine component to a local fixpoint. On a
    transformed, near-acyclic theory the components collapse toward singletons and
@@ -366,9 +373,24 @@ safe:
    already wins the dense/shallow scene-tier workload and the entity-indexed
    bitvector lift of the columnar backing (both §8), pays none of the worklist's
    random-access dependency-chasing, and confines residual iteration to the SCCs
-   where cycles actually remain. (A robustness-only variant — SCC scan order over
-   the *untransformed* theory — already removes the sweep's sole weakness, an
-   O(n²) scan-order cliff on adversarial deep chains, without the transformation.)
+   where cycles actually remain. It runs over the *untransformed* theory today —
+   which is already enough to remove the sweep's sole weakness, an O(n²)
+   scan-order cliff on adversarial deep chains — and the transformation above
+   will only shrink the components it walks.
+
+   **The schedule is condensed from the dependency graph, not the support
+   graph** the cycle rule uses. The distinction is load-bearing and easy to get
+   wrong: deciding a literal reads the bodies of the rules that *attack* it as
+   well as those that support it, so the edge set is `body → head` **and**
+   `body → head^1`, defeaters included. A schedule condensed from support edges
+   alone would evaluate a literal before the attackers that refute it. That
+   double edge also buys the columnar engine its per-rule applicability refresh:
+   a rule's bodies are predecessors of both its head and its head's complement,
+   so whichever is visited first, they have already settled — the evaluator
+   refreshes the rules it is about to read instead of every rule once per pass.
+   The two condensations coexist because they answer different questions; the
+   cycle rule's is about *meaning* (which loops may complete to REFUTED, §5.2
+   above), the schedule's is about *order*.
 
 **Precedent and honest status.** SCC-decomposed evaluation of a monotone
 fixpoint is a standard, independently-rediscovered technique in the fields
@@ -382,11 +404,35 @@ condensation). The DL-specific *linear* implementations of record (Maher's
 Delores; SPINdle) instead take the counter route, so wiring the SCC schedule to
 defeasible logic's proof conditions is our synthesis, not a published DL
 result — it is validated by the differential golden tests, not by an external
-theorem, and it must be *measured* to earn the swap (Delores is the cautionary
+theorem, and it had to be *measured* to earn the swap (Delores is the cautionary
 case: its transformation, linear in theory, did not behave linearly in the
-shipped system). Consistent with §8 this is a conditional optimization — the
-sweep already clears frame budget at scale, the counter form's real prize is
-incremental cone re-solve (M4), and the compiler is free to pick per workload.
+shipped system).
+
+**What the measurement said.** Columnar solve is **1.7–1.9× faster** across the
+scale range — `bench_col` 0.30 → 0.18 ms at N=100k, `bench_5e` 0.42 → 0.22 ms
+at N=100k, `bench_slice`'s judgment phase 0.030 → 0.017 ms mean — with the
+replay hash unchanged, which is the differential stated in the units that
+matter. Two results carry more weight than the ratio. First, the win is *not*
+the cliff: these are the dense, shallow, forward-ordered theories the plain
+sweep was already best at, and the schedule beats it there anyway, because
+visiting a literal once with settled inputs beats rescanning it, and because
+refreshing only the rules about to be read beats refreshing every rule once per
+pass. Second, the cliff goes too — `bench_dl`'s `rev` mode reverses the atom
+numbering of an otherwise identical theory, and the plain sweep runs 0.43 → 2.74
+ms across that relabelling while the ordered one holds at 0.52. Scan order stops
+being a performance variable, which is the robustness half of the claim:
+reordering declarations in a `.story` file cannot silently cost 5×.
+
+The scalar reference is the honest exception. There the schedule build (~0.59 ms
+of a 0.74 ms solve at 4000 atoms) is paid per call, because that path recompiles
+the theory on every solve, so it does not pay for itself on forward-ordered
+theories even though the ordered *evaluation* alone is ~3× cheaper. The columnar
+engine has the opposite shape — schema and schedule compile once per rule-set
+change (§4.1's two-tier split; the incremental surface of `dlcol_truncate_rules`)
+and are reused every tick — which is why the swap lands there and stays a driver
+choice here. Consistent with §8 this remains a conditional optimization: the
+counter form's real prize is incremental cone re-solve (M4), and the compiler
+stays free to pick per workload.
 
 ### 5.3 State and time: defeasible inertia
 
@@ -968,6 +1014,49 @@ so the hatches are shaped for strangers:
    the other two, authored and traced; #94's commutation check rightly
    refuses the two-undefeated-layers encoding.
 
+   **Two forms, and the choice is the author's (decided).** The paragraph
+   above describes the pipeline as layered derived values; `test_modeled`
+   pins it as transient accumulators with a response over the total. Both are
+   real, both are authorable today, and they are not the same semantics —
+   so the surface offers both and the author picks by what a *step* means in
+   their game.
+
+   - **Per instance** — `value fire_dmg(unit) : int` with a `prior /2` layer
+     for resistance, ordered against vulnerability and immunity, and each
+     attack committing `hp(T) -= fire_dmg(T)`. Mitigation happens per
+     contribution and the deltas sum order-free. No accumulator, no primed
+     read, no stratum.
+   - **Per total** — a transient accumulator (`inc_fire`) summing the tick's
+     contributions, and a response reading `inc_fire(X)'` and subtracting
+     once. This is what a *simultaneous batch* means: several contributions
+     that resolve as one instance.
+
+   They differ in exactly one place: floored division does not distribute
+   over addition. Two 3s against resistance are `floor(6/2) = 3` per total
+   and `1 + 1 = 2` per instance; doubling agrees either way (it distributes),
+   immunity agrees, and unmitigated damage agrees. So the divergence is a
+   rounding boundary, not a different model of damage.
+
+   Which is right depends on what a step is, which is the *host's* choice of
+   tick granularity and therefore not the engine's to make. A step that
+   resolves one attack never distinguishes them. A step that batches
+   simultaneous effects does, and then per-total is the claim that the batch
+   is one instance.
+
+   **Per instance is the recommended default**: it is the cheaper shape — no
+   accumulator to reset, no primed read, hence no stratum, and every stage is
+   a marker judgment the trace can interrogate rather than arithmetic inside
+   one effect expression. Reach for the accumulator when a step really is a
+   batch, or when a rule needs the aggregate itself (*"if total damage this
+   round exceeds 50, stagger"*), which per-instance cannot express at all —
+   that is the shape §5.8's primed read exists for, and no reformulation
+   removes it (the additive-fluent result below).
+
+   The cost of the per-instance form is the ordering #94 demands: resistance,
+   vulnerability, immunity and both-cancel are mutually applicable and
+   non-commuting, so they need a total order — a `bands` ladder (§6.2) rather
+   than the pairwise edges, which is what bands are for.
+
 **The receipt is structured data, not only a rendering.** BG3-style floating
 combat text — every hit displaying its source and damage type — is a *view of
 the commit receipt*. The commit already computes the multiset of undefeated
@@ -1018,6 +1107,39 @@ disjoint, and the composition is the decided semantics of a tick:
    superiority, commutation-checked by class (#94). Nothing anywhere
    orders by declaration, commit time, or timestamp — the prohibition at
    the top of this passage holds at every level.
+
+**The two accumulator kinds, and why the response stage reads primed
+(decided).** The additive-fluent literature separates exactly the two shapes
+this tier uses. *Additive-inertial* — new value = old value + Σ contributions
+— is an ordinary numeric fluent under `+=`/`-=`, carried across ticks by
+inertia. *Additive-default-zero* — new value = Σ contributions, and 0 when no
+action contributes — is the per-tick transient accumulator, spelled here as a
+`:= 0` base plus `+=` deltas so that the reset is an ordinary operator-class
+commit rather than a second lifetime rule.
+
+The consequence worth pinning is a *lower bound*, not a technique: an effect
+that depends on the **total** of concurrent contributions must read that total
+after the contributions land. C+ reaches the same place from planning — a
+constraint on a total is written over an auxiliary additive-default-zero
+fluent, read in the resulting state (`caused false if departed(G,L) eq M after
+num(G,L) eq N && M > N`). So the response stage's primed read is inherent to
+aggregate-then-respond and no remodeling removes it: a formulation that
+mitigates each contribution as it lands is a *different semantics*
+(per-contribution rather than per-total), not the same one written better. The
+lane frontier's answer is therefore to widen the evaluator, never to rewrite
+the pipeline.
+
+One difference from that prior art is ours to close: there the kind is
+**declared**, here it is **inferred** from the presence of a primed guard.
+Inference is why a single accumulator anywhere puts a whole world on the
+general stratified path — a compiler told that a fluent is default-zero knows
+its commit pipeline's **base stage is 0 rather than the carried value**, and
+that the shape is a fixed two-phase commit, which is a pattern to lane rather
+than a hazard to retreat from. (Stated as the base stage because that is where
+it lives: a numeric fluent's persistence is the carried value entering
+`num_commit`, not a generated inertia rule — those are emitted per *boolean*
+fluent. The `:= 0` ramification an author writes today is exactly a base of 0,
+restated as content.)
 
 One corollary is decided with it — **commit-time visibility**: a judgment
 consulted from the commit (a verdict tested in an effect expression)
@@ -2280,7 +2402,9 @@ programmer's. So the tradeoff is made *local, explicit, and visible*.
 
 - **The same axis recurs at every layer,** controllable at the granularity it
   lives at: *grounding* — materialize (flat nᵏ) vs matcher (∝ matches), per
-  rule; *recompute scope* — scene-tier full recompute vs demand-cone wake-up
+  rule; *state density* — every instance of a fluent declared up front vs
+  declared on touch, per fluent (below); *recompute scope* — scene-tier full
+  recompute vs demand-cone wake-up
   (M4), per scope/fluent; *family evaluation* — lanes (pay the full width each
   tick) vs scalar sparse wake, per family; *plan stability* — pinned vs adaptive
   re-plan, per rule. Scenes (§5.5/§6.4) scope the policy to the state it governs
@@ -2309,6 +2433,38 @@ programmer's. So the tradeoff is made *local, explicit, and visible*.
   number, so the tooling obligation follows (§9): surface, per rule/family, the
   static worst case (free, from declared domains) *and* the measured per-tick
   distribution. Exposing a lever without its cost only relocates the guessing.
+
+- **State density is a policy, never a consequence of size (decided).** A
+  plain boolean fluent's ground universe is **sparse by default** — instances
+  exist when touched (by an init, a rule, an action, or a host write), and
+  everything else answers closed-world through the schema hook. **Dense is the
+  override**: an author who needs the flat tail asks for it, and gets the
+  guarantee this section is about — every slot allocated before the first
+  tick, so no declaration, no atom-map growth and no family rebuild can land
+  inside a frame. Both directions are principled, and which is the default is
+  decided by what each costs when the author is wrong.
+
+  Sparse-by-default, because dense is not merely N^k of *store*: the step
+  theory generates inertia **per declared fluent**, two rules each, so a dense
+  binary fluent is 2N² rules re-solved every tick. That is the term the
+  grounding analysis found dominant — closed-world negative inertia over n-ary
+  fluents was 79% of a measured 5e-shaped ground set, and eliding it cut a
+  1000-actor world from 541k ground rules to 43k. An author who never thinks
+  about density should not be paying that.
+
+  Dense-as-override rather than dense-on-overflow, because a predicate that
+  silently changes its tail behaviour when someone adds the 1025th entity is
+  the *opposite* of a provable worst case. Spilling into a different cost
+  model at a size threshold would make density an accident of content, and
+  content is exactly what a mod changes. The cardinality ceiling stays what
+  §5.2 makes it — a memory backstop, and for rules a routing threshold — not a
+  silent switch between tail guarantees.
+
+  Two kinds are dense **by nature, not by policy**, and carry no lever:
+  *multi-valued* fluents (an effect setting one value negates every sibling,
+  so all sibling atoms must exist) and *numeric* fluents (value-store slots,
+  which are O(instances) because that is what the author declared). The lever
+  exists only where the choice is real.
 
 - **Default auto; the lever is a scalpel.** The measured cost model carries the
   common case. Overrides are for the parts the author has reasoned about, where
@@ -2983,7 +3139,13 @@ semantics. Names are working names.
 - M. Shanahan, *Solving the Frame Problem*, MIT Press 1997.
 - E. Mueller, *Commonsense Reasoning*, 2nd ed., 2014.
 - J. Lee, V. Lifschitz, *Describing Additive Fluents in Action Language C+*,
-  IJCAI 2003. (concurrent numeric effects that combine)
+  IJCAI 2003, pp. 1079–1084; earlier as *Additive Fluents*, AAAI Spring
+  Symposium 2001. (concurrent numeric effects that combine — and the source of
+  §5.8's two accumulator kinds. Also the independent confirmation that a law
+  over a *total* of concurrent contributions must read that total in the
+  resulting state: `caused false if departed(G,L) eq M after num(G,L) eq N &&
+  M > N`, where the auxiliary `departed` is additive-default-zero and the `if`
+  part is evaluated after the contributions land)
 - M. Bartholomew, J. Lee, *Stable Models of Formulas with Intensional
   Functions*, KR 2012. (functional stable models / ASPMT)
 - J. Lee, Y. Meng, *Answer Set Programming Modulo Theories and Reasoning

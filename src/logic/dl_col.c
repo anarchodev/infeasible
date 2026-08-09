@@ -1,5 +1,6 @@
 #include "logic/dl_col.h"
 #include "logic/dl_trace.h"
+#include "logic/dl_graph.h"
 #include "core/grow.h"
 
 #include <string.h>
@@ -60,6 +61,18 @@ struct dlcol {
     bool    *scc_cyclic, *scc_attacked;        /* [nscc] */
     int      nscc;
     uint64_t *completed;                       /* [nlits][W] */
+
+    /* §5.2 item 2: the evaluator's SCC schedule, condensed from the DEPENDENCY
+     * graph — a strictly larger graph than the cycle rule's support one, since
+     * an attacker's body decides its target too (edges body -> head AND
+     * body -> head^1, defeaters included). Tarjan numbers components in reverse
+     * topological order, so walking them DESCENDING visits every literal after
+     * everything it reads. Compiled once with the rest of the schema and reused
+     * by every solve — the columnar path pays this build per rule-set change,
+     * not per tick. */
+    int32_t *sched_of;                         /* [nlits]    component id */
+    int32_t *sched_off, *sched_lit;            /* members grouped by component */
+    int      nsched;
 };
 
 static int lit_idx(dl_lit l) { return (int)l.atom * 2 + (l.neg ? 1 : 0); }
@@ -118,6 +131,7 @@ void dlcol_free(dlcol *f)
     free(f->completed);
     free(f->scc_of); free(f->scc_off); free(f->scc_lit);
     free(f->scc_cyclic); free(f->scc_attacked);
+    free(f->sched_of); free(f->sched_off); free(f->sched_lit);
     free(f->delta_t); free(f->delta_f);
     free(f->part_t); free(f->part_f);
     free(f->app_t); free(f->app_f);
@@ -303,60 +317,9 @@ static void build_scc_c(dlcol *f)
     }
     free(fill);
 
-    int32_t *low = malloc((size_t)(n ? n : 1) * sizeof *low);
-    int32_t *idx = malloc((size_t)(n ? n : 1) * sizeof *idx);
-    int32_t *stk = malloc((size_t)(n ? n : 1) * sizeof *stk);
-    bool    *onstk = calloc((size_t)(n ? n : 1), 1);
-    int32_t *frame_v = malloc((size_t)(n ? n : 1) * sizeof *frame_v);
-    int32_t *frame_e = malloc((size_t)(n ? n : 1) * sizeof *frame_e);
-    for (int i = 0; i < n; i++) idx[i] = -1;
-    int counter = 0, sp = 0, nscc = 0;
-    for (int root = 0; root < n; root++) {
-        if (idx[root] >= 0) continue;
-        int fp = 0;
-        frame_v[fp] = root; frame_e[fp] = aoff[root];
-        idx[root] = low[root] = counter++;
-        stk[sp++] = root; onstk[root] = true;
-        while (fp >= 0) {
-            int v = frame_v[fp];
-            if (frame_e[fp] < aoff[v + 1]) {
-                int w = ato[frame_e[fp]++];
-                if (idx[w] < 0) {
-                    idx[w] = low[w] = counter++;
-                    stk[sp++] = w; onstk[w] = true;
-                    fp++;
-                    frame_v[fp] = w; frame_e[fp] = aoff[w];
-                } else if (onstk[w] && idx[w] < low[v]) {
-                    low[v] = idx[w];
-                }
-            } else {
-                if (low[v] == idx[v]) {
-                    int m;
-                    do {
-                        m = stk[--sp];
-                        onstk[m] = false;
-                        f->scc_of[m] = nscc;
-                    } while (m != v);
-                    nscc++;
-                }
-                fp--;
-                if (fp >= 0 && low[v] < low[frame_v[fp]])
-                    low[frame_v[fp]] = low[v];
-            }
-        }
-    }
+    int nscc = dl_tarjan(n, aoff, ato, f->scc_of);
     f->nscc = nscc;
-    free(low); free(idx); free(stk); free(onstk);
-    free(frame_v); free(frame_e);
-
-    f->scc_off = calloc((size_t)nscc + 2, sizeof *f->scc_off);
-    f->scc_lit = malloc((size_t)(n ? n : 1) * sizeof *f->scc_lit);
-    for (int i = 0; i < n; i++) f->scc_off[f->scc_of[i] + 1]++;
-    for (int c = 0; c < nscc; c++) f->scc_off[c + 1] += f->scc_off[c];
-    int32_t *f2 = malloc((size_t)(nscc ? nscc : 1) * sizeof *f2);
-    memcpy(f2, f->scc_off, (size_t)nscc * sizeof *f2);
-    for (int i = 0; i < n; i++) f->scc_lit[f2[f->scc_of[i]]++] = i;
-    free(f2);
+    dl_group_by_comp(n, nscc, f->scc_of, &f->scc_off, &f->scc_lit);
 
     f->scc_cyclic = calloc((size_t)(nscc ? nscc : 1), 1);
     for (int c = 0; c < nscc; c++)
@@ -369,6 +332,50 @@ static void build_scc_c(dlcol *f)
     f->scc_attacked = calloc((size_t)(nscc ? nscc : 1), 1);
     for (int r = 0; r < f->nrules; r++)
         f->scc_attacked[f->scc_of[f->rules[r].head ^ 1]] = true;
+    free(aoff); free(ato);
+}
+
+/* ---- §5.2 item 2: the evaluator's SCC schedule ---------------------------
+ *
+ * Condense the DEPENDENCY graph: for every rule (defeaters included) and every
+ * body literal b, edges b -> head and b -> head^1. Both edges are load-bearing.
+ * The first is support — b decides whether the rule fires for its head. The
+ * second is attack — solve_part reads the rules for ~q when deciding q, so an
+ * attacker's body decides its target too, and a schedule missing those edges
+ * would evaluate a literal before the attackers that refute it.
+ *
+ * That double edge is also what makes the per-rule applicability refresh below
+ * sound: a rule's bodies are predecessors of BOTH its head and its head's
+ * complement, so by the time either is visited they have settled. */
+
+static void build_sched_c(dlcol *f)
+{
+    int n = f->nlits;
+    free(f->sched_of); free(f->sched_off); free(f->sched_lit);
+    f->sched_of = malloc((size_t)(n ? n : 1) * sizeof *f->sched_of);
+
+    int nedge = 0;
+    for (int r = 0; r < f->nrules; r++)
+        nedge += 2 * (body_end_c(f, r) - f->rules[r].body_off);
+    int32_t *aoff = calloc((size_t)n + 2, sizeof *aoff);
+    int32_t *ato = malloc((size_t)(nedge ? nedge : 1) * sizeof *ato);
+    for (int r = 0; r < f->nrules; r++)
+        for (int b = f->rules[r].body_off; b < body_end_c(f, r); b++)
+            aoff[f->body[b] + 1] += 2;
+    for (int i = 0; i < n; i++) aoff[i + 1] += aoff[i];
+    int32_t *fill = malloc((size_t)(n ? n : 1) * sizeof *fill);
+    memcpy(fill, aoff, (size_t)n * sizeof *fill);
+    for (int r = 0; r < f->nrules; r++) {
+        int h = f->rules[r].head;
+        for (int b = f->rules[r].body_off; b < body_end_c(f, r); b++) {
+            ato[fill[f->body[b]]++] = h;
+            ato[fill[f->body[b]]++] = h ^ 1;
+        }
+    }
+    free(fill);
+
+    f->nsched = dl_tarjan(n, aoff, ato, f->sched_of);
+    dl_group_by_comp(n, f->nsched, f->sched_of, &f->sched_off, &f->sched_lit);
     free(aoff); free(ato);
 }
 
@@ -454,12 +461,41 @@ static void compile_indices(dlcol *f)
     f->app_t = calloc((size_t)(f->nrules ? f->nrules : 1) * f->W, sizeof *f->app_t);
     f->app_f = calloc((size_t)(f->nrules ? f->nrules : 1) * f->W, sizeof *f->app_f);
     build_scc_c(f);                            /* #109: cycle-rule condensation */
+    build_sched_c(f);                          /* §5.2: the evaluator's order   */
     f->dirty = false;
 }
 
-/* ---- delta phase: strict rules + facts, vectorized eval_delta ---- */
+/* ---- delta phase: strict rules + facts, vectorized eval_delta ----
+ *
+ * Walks the SCC schedule (§5.2 item 2): components in topological order,
+ * iterating only inside a genuine one. A singleton is visited exactly once —
+ * its inputs are already final, and a second visit would read identical bits
+ * and recompute the identical answer (true even of a self-loop). */
 
-static void solve_delta(dlcol *f)
+/* Drive one phase over the schedule: components in topological order, iterating
+ * only inside a genuine one. `eval` decides one literal for every entity at
+ * once and reports whether any bit moved. A singleton component is visited
+ * exactly once — its inputs are final, so a second visit would read identical
+ * bits and recompute the identical answer (true even of a self-loop). */
+static void sweep_sched(dlcol *f, bool (*eval)(dlcol *, int))
+{
+    for (int c = f->nsched - 1; c >= 0; c--) {
+        int lo = f->sched_off[c], hi = f->sched_off[c + 1];
+        if (hi - lo == 1) {
+            eval(f, f->sched_lit[lo]);
+            continue;
+        }
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (int k = lo; k < hi; k++)
+                if (eval(f, f->sched_lit[k]))
+                    changed = true;
+        }
+    }
+}
+
+static bool eval_delta_col(dlcol *f, int q)
 {
     const int W = f->W;
     uint64_t *prove   = f->scratch + 0 * W;
@@ -467,89 +503,100 @@ static void solve_delta(dlcol *f)
     uint64_t *conj_t  = f->scratch + 2 * W;
     uint64_t *dead    = f->scratch + 3 * W;
 
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (int q = 0; q < f->nlits; q++) {
-            uint64_t *dt = row(f->delta_t, f, q), *df = row(f->delta_f, f, q);
-            /* skip literals decided for every entity — statuses are
-             * monotone, so nothing here can change (the columnar analog of
-             * the scalar sweep's decided-skip; at small W the branchless
-             * recompute would otherwise dominate). */
-            uint64_t undec = 0;
-            for (int w = 0; w < W; w++)
-                undec |= ~(dt[w] | df[w]) & ((w == W - 1) ? f->tail : ~0ull);
-            if (!undec)
-                continue;
-            memcpy(prove, row(f->fact, f, q), (size_t)W * sizeof *prove);
-            memset(alldead, 0xff, (size_t)W * sizeof *alldead);
-            for (int k = f->head_off[q]; k < f->head_off[q + 1]; k++) {
-                int r = f->head_rule[k];
-                if (f->rules[r].kind != DL_STRICT)
-                    continue;
-                memset(conj_t, 0xff, (size_t)W * sizeof *conj_t);
-                memset(dead, 0, (size_t)W * sizeof *dead);
-                for (int i = f->rules[r].body_off; i < body_end_c(f, r); i++) {
-                    const uint64_t *bt = row(f->delta_t, f, f->body[i]);
-                    const uint64_t *bf = row(f->delta_f, f, f->body[i]);
-                    for (int w = 0; w < W; w++) {
-                        conj_t[w] &= bt[w];
-                        dead[w] |= bf[w];
-                    }
-                }
-                for (int w = 0; w < W; w++) {
-                    prove[w] |= conj_t[w];
-                    alldead[w] &= dead[w];
-                }
-            }
-            uint64_t any = 0;
+    uint64_t *dt = row(f->delta_t, f, q), *df = row(f->delta_f, f, q);
+    /* skip literals decided for every entity — statuses are monotone, so
+     * nothing here can change (the columnar analog of the scalar sweep's
+     * decided-skip; at small W the branchless recompute would otherwise
+     * dominate). */
+    uint64_t undec = 0;
+    for (int w = 0; w < W; w++)
+        undec |= ~(dt[w] | df[w]) & ((w == W - 1) ? f->tail : ~0ull);
+    if (!undec)
+        return false;
+    memcpy(prove, row(f->fact, f, q), (size_t)W * sizeof *prove);
+    memset(alldead, 0xff, (size_t)W * sizeof *alldead);
+    for (int k = f->head_off[q]; k < f->head_off[q + 1]; k++) {
+        int r = f->head_rule[k];
+        if (f->rules[r].kind != DL_STRICT)
+            continue;
+        memset(conj_t, 0xff, (size_t)W * sizeof *conj_t);
+        memset(dead, 0, (size_t)W * sizeof *dead);
+        for (int i = f->rules[r].body_off; i < body_end_c(f, r); i++) {
+            const uint64_t *bt = row(f->delta_t, f, f->body[i]);
+            const uint64_t *bf = row(f->delta_f, f, f->body[i]);
             for (int w = 0; w < W; w++) {
-                uint64_t m = (w == W - 1) ? f->tail : ~0ull;
-                uint64_t nt = (prove[w] & ~df[w] & ~dt[w]) & m;
-                dt[w] |= nt;
-                uint64_t nf = (alldead[w] & ~row(f->fact, f, q)[w]
-                               & ~row(f->open, f, q)[w]    /* #116: open stays
-                                                            * undecided */
-                               & ~dt[w] & ~df[w]) & m;
-                df[w] |= nf;
-                any |= nt | nf;
+                conj_t[w] &= bt[w];
+                dead[w] |= bf[w];
             }
-            if (any)
-                changed = true;
+        }
+        for (int w = 0; w < W; w++) {
+            prove[w] |= conj_t[w];
+            alldead[w] &= dead[w];
         }
     }
+    uint64_t any = 0;
+    for (int w = 0; w < W; w++) {
+        uint64_t m = (w == W - 1) ? f->tail : ~0ull;
+        uint64_t nt = (prove[w] & ~df[w] & ~dt[w]) & m;
+        dt[w] |= nt;
+        uint64_t nf = (alldead[w] & ~row(f->fact, f, q)[w]
+                       & ~row(f->open, f, q)[w]    /* #116: open stays
+                                                    * undecided */
+                       & ~dt[w] & ~df[w]) & m;
+        df[w] |= nf;
+        any |= nt | nf;
+    }
+    return any != 0;
+}
+
+static void solve_delta(dlcol *f)
+{
+    sweep_sched(f, eval_delta_col);
 }
 
 /* ---- part phase: vectorized eval_part ---- */
 
-/* Recompute every rule's applicability pair from the current part masks:
- * app_t = AND over body of +d(b), app_f = OR over body of -d(b). */
-static void refresh_applicability(dlcol *f)
+/* Recompute one rule's applicability pair from the current part masks:
+ * app_t = AND over body of +d(b), app_f = OR over body of -d(b).
+ *
+ * Refreshed per rule on demand rather than for every rule once per pass: under
+ * the SCC schedule a rule's bodies have settled by the time either its head or
+ * its head's complement is visited (both carry dependency edges from the body),
+ * so the only rules whose rows can still move are the ones inside the component
+ * being iterated. */
+static void refresh_rule(dlcol *f, int r)
 {
     const int W = f->W;
-    for (int r = 0; r < f->nrules; r++) {
-        uint64_t *at = f->app_t + (size_t)r * W, *af = f->app_f + (size_t)r * W;
-        /* a rule whose applicability is decided everywhere can't change:
-         * per entity, app_t and app_f are exclusive and monotone */
-        uint64_t undec = 0;
-        for (int w = 0; w < W; w++)
-            undec |= ~(at[w] | af[w]) & ((w == W - 1) ? f->tail : ~0ull);
-        if (!undec)
-            continue;
-        memset(at, 0xff, (size_t)W * sizeof *at);
-        memset(af, 0, (size_t)W * sizeof *af);
-        for (int i = f->rules[r].body_off; i < body_end_c(f, r); i++) {
-            const uint64_t *pt = row(f->part_t, f, f->body[i]);
-            const uint64_t *pf = row(f->part_f, f, f->body[i]);
-            for (int w = 0; w < W; w++) {
-                at[w] &= pt[w];
-                af[w] |= pf[w];
-            }
+    uint64_t *at = f->app_t + (size_t)r * W, *af = f->app_f + (size_t)r * W;
+    /* a rule whose applicability is decided everywhere can't change:
+     * per entity, app_t and app_f are exclusive and monotone */
+    uint64_t undec = 0;
+    for (int w = 0; w < W; w++)
+        undec |= ~(at[w] | af[w]) & ((w == W - 1) ? f->tail : ~0ull);
+    if (!undec)
+        return;
+    memset(at, 0xff, (size_t)W * sizeof *at);
+    memset(af, 0, (size_t)W * sizeof *af);
+    for (int i = f->rules[r].body_off; i < body_end_c(f, r); i++) {
+        const uint64_t *pt = row(f->part_t, f, f->body[i]);
+        const uint64_t *pf = row(f->part_f, f, f->body[i]);
+        for (int w = 0; w < W; w++) {
+            at[w] &= pt[w];
+            af[w] |= pf[w];
         }
     }
 }
 
-static void solve_part(dlcol *f)
+/* Every rule this literal's evaluation reads: the rules concluding it (support,
+ * and the team-defeat winners reached through beat_by, which all head here) and
+ * the rules concluding its complement (its attackers). */
+static void refresh_head_rules(dlcol *f, int q)
+{
+    for (int k = f->head_off[q]; k < f->head_off[q + 1]; k++)
+        refresh_rule(f, f->head_rule[k]);
+}
+
+static bool eval_part_col(dlcol *f, int q)
 {
     const int W = f->W;
     uint64_t *sup_t = f->scratch + 0 * W;   /* supported(q)            */
@@ -559,91 +606,93 @@ static void solve_part(dlcol *f)
     uint64_t *bt    = f->scratch + 4 * W;   /* beaten-by-supporter t   */
     uint64_t *bf    = f->scratch + 5 * W;   /* beaten-by-supporter f   */
 
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        refresh_applicability(f);
-        for (int q = 0; q < f->nlits; q++) {
-            int nq = q ^ 1;
-            uint64_t *pt = row(f->part_t, f, q), *pf = row(f->part_f, f, q);
-            /* decided-everywhere literals can't move; skip (see solve_delta) */
-            uint64_t undec = 0;
-            for (int w = 0; w < W; w++)
-                undec |= ~(pt[w] | pf[w]) & ((w == W - 1) ? f->tail : ~0ull);
-            if (!undec)
-                continue;
+    int nq = q ^ 1;
+    uint64_t *pt = row(f->part_t, f, q), *pf = row(f->part_f, f, q);
+    /* decided-everywhere literals can't move; skip (see solve_delta).
+     * Safe to skip the applicability refresh with it: the rules for q
+     * and ~q are read only while visiting q or ~q, and ~q's own visit
+     * refreshes both. */
+    uint64_t undec = 0;
+    for (int w = 0; w < W; w++)
+        undec |= ~(pt[w] | pf[w]) & ((w == W - 1) ? f->tail : ~0ull);
+    if (!undec)
+        return false;
+    refresh_head_rules(f, q);
+    refresh_head_rules(f, nq);
 
-            /* supported(q): OR of applicable over strict/defeasible rules
-             * for q; empty set -> (false, true). sup_f doubles as
-             * notsupported(q)'s true-mask (AND of NOT applicable). */
-            memset(sup_t, 0, (size_t)W * sizeof *sup_t);
-            memset(sup_f, 0xff, (size_t)W * sizeof *sup_f);
-            for (int k = f->head_off[q]; k < f->head_off[q + 1]; k++) {
-                int r = f->head_rule[k];
-                if (f->rules[r].kind == DL_DEFEATER)
-                    continue;
-                const uint64_t *at = f->app_t + (size_t)r * W;
-                const uint64_t *af = f->app_f + (size_t)r * W;
-                for (int w = 0; w < W; w++) {
-                    sup_t[w] |= at[w];
-                    sup_f[w] &= af[w];
-                }
-            }
-
-            /* Attackers: every rule for ~q (defeaters included).
-             *   countered(s,q) = NOT applicable(s) OR beaten(s,q)
-             *   aac = AND over s of countered      (empty -> true)
-             *   auc = OR over s of (applicable(s) AND NOT beaten(s,q))
-             *                                      (empty -> false)   */
-            memset(aac_t, 0xff, (size_t)W * sizeof *aac_t);
-            memset(auc_t, 0, (size_t)W * sizeof *auc_t);
-            for (int k = f->head_off[nq]; k < f->head_off[nq + 1]; k++) {
-                int s = f->head_rule[k];
-                /* beaten(s,q): OR of applicable over the strict/defeasible
-                 * rules for q that beat s; empty -> (false, true). */
-                memset(bt, 0, (size_t)W * sizeof *bt);
-                memset(bf, 0xff, (size_t)W * sizeof *bf);
-                for (int b = f->beat_off[s]; b < f->beat_off[s + 1]; b++) {
-                    int t = f->beat_by[b];
-                    if (f->rules[t].kind == DL_DEFEATER || f->rules[t].head != q)
-                        continue;
-                    const uint64_t *at = f->app_t + (size_t)t * W;
-                    const uint64_t *af = f->app_f + (size_t)t * W;
-                    for (int w = 0; w < W; w++) {
-                        bt[w] |= at[w];
-                        bf[w] &= af[w];
-                    }
-                }
-                const uint64_t *at = f->app_t + (size_t)s * W;
-                const uint64_t *af = f->app_f + (size_t)s * W;
-                for (int w = 0; w < W; w++) {
-                    aac_t[w] &= af[w] | bt[w];
-                    auc_t[w] |= at[w] & bf[w];
-                }
-            }
-
-            /* +d q = +Delta q  OR  (-Delta ~q AND supported AND aac)
-             * -d q = -Delta q AND (+Delta ~q OR notsupported OR auc)
-             * Merge monotonically, proved first, tail-masked. */
-            const uint64_t *dtq = row(f->delta_t, f, q);
-            const uint64_t *dfq = row(f->delta_f, f, q);
-            const uint64_t *dtn = row(f->delta_t, f, nq);
-            const uint64_t *dfn = row(f->delta_f, f, nq);
-            uint64_t any = 0;
-            for (int w = 0; w < W; w++) {
-                uint64_t m = (w == W - 1) ? f->tail : ~0ull;
-                uint64_t pos = dtq[w] | (dfn[w] & sup_t[w] & aac_t[w]);
-                uint64_t nt = (pos & ~pf[w] & ~pt[w]) & m;
-                pt[w] |= nt;
-                uint64_t neg = dfq[w] & (dtn[w] | sup_f[w] | auc_t[w]);
-                uint64_t nf = (neg & ~pt[w] & ~pf[w]) & m;
-                pf[w] |= nf;
-                any |= nt | nf;
-            }
-            if (any)
-                changed = true;
+    /* supported(q): OR of applicable over strict/defeasible rules
+     * for q; empty set -> (false, true). sup_f doubles as
+     * notsupported(q)'s true-mask (AND of NOT applicable). */
+    memset(sup_t, 0, (size_t)W * sizeof *sup_t);
+    memset(sup_f, 0xff, (size_t)W * sizeof *sup_f);
+    for (int k = f->head_off[q]; k < f->head_off[q + 1]; k++) {
+        int r = f->head_rule[k];
+        if (f->rules[r].kind == DL_DEFEATER)
+            continue;
+        const uint64_t *at = f->app_t + (size_t)r * W;
+        const uint64_t *af = f->app_f + (size_t)r * W;
+        for (int w = 0; w < W; w++) {
+            sup_t[w] |= at[w];
+            sup_f[w] &= af[w];
         }
     }
+
+    /* Attackers: every rule for ~q (defeaters included).
+     *   countered(s,q) = NOT applicable(s) OR beaten(s,q)
+     *   aac = AND over s of countered      (empty -> true)
+     *   auc = OR over s of (applicable(s) AND NOT beaten(s,q))
+     *                                      (empty -> false)   */
+    memset(aac_t, 0xff, (size_t)W * sizeof *aac_t);
+    memset(auc_t, 0, (size_t)W * sizeof *auc_t);
+    for (int k = f->head_off[nq]; k < f->head_off[nq + 1]; k++) {
+        int s = f->head_rule[k];
+        /* beaten(s,q): OR of applicable over the strict/defeasible
+         * rules for q that beat s; empty -> (false, true). */
+        memset(bt, 0, (size_t)W * sizeof *bt);
+        memset(bf, 0xff, (size_t)W * sizeof *bf);
+        for (int b = f->beat_off[s]; b < f->beat_off[s + 1]; b++) {
+            int t = f->beat_by[b];
+            if (f->rules[t].kind == DL_DEFEATER || f->rules[t].head != q)
+                continue;
+            const uint64_t *at = f->app_t + (size_t)t * W;
+            const uint64_t *af = f->app_f + (size_t)t * W;
+            for (int w = 0; w < W; w++) {
+                bt[w] |= at[w];
+                bf[w] &= af[w];
+            }
+        }
+        const uint64_t *at = f->app_t + (size_t)s * W;
+        const uint64_t *af = f->app_f + (size_t)s * W;
+        for (int w = 0; w < W; w++) {
+            aac_t[w] &= af[w] | bt[w];
+            auc_t[w] |= at[w] & bf[w];
+        }
+    }
+
+    /* +d q = +Delta q  OR  (-Delta ~q AND supported AND aac)
+     * -d q = -Delta q AND (+Delta ~q OR notsupported OR auc)
+     * Merge monotonically, proved first, tail-masked. */
+    const uint64_t *dtq = row(f->delta_t, f, q);
+    const uint64_t *dfq = row(f->delta_f, f, q);
+    const uint64_t *dtn = row(f->delta_t, f, nq);
+    const uint64_t *dfn = row(f->delta_f, f, nq);
+    uint64_t any = 0;
+    for (int w = 0; w < W; w++) {
+        uint64_t m = (w == W - 1) ? f->tail : ~0ull;
+        uint64_t pos = dtq[w] | (dfn[w] & sup_t[w] & aac_t[w]);
+        uint64_t nt = (pos & ~pf[w] & ~pt[w]) & m;
+        pt[w] |= nt;
+        uint64_t neg = dfq[w] & (dtn[w] | sup_f[w] | auc_t[w]);
+        uint64_t nf = (neg & ~pt[w] & ~pf[w]) & m;
+        pf[w] |= nf;
+        any |= nt | nf;
+    }
+    return any != 0;
+}
+
+static void solve_part(dlcol *f)
+{
+    sweep_sched(f, eval_part_col);
 }
 
 void dlcol_solve(dlcol *f)
