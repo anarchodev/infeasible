@@ -107,6 +107,12 @@ typedef struct {
         world_numop op;
         long       konst;         /* S1: constant RHS (RHS constant-folds) */
         uint32_t   marker;        /* family-local: the fired marker (readout) */
+        /* #165: an RHS reading k test() verdicts is a table of 2^k constants over
+         * k bit-columns — the commit indexes it per lane, no per-entity VM. */
+        int        ntest;
+        uint32_t   tloc[WORLD_LANE_MAXTEST];    /* family-local column per read */
+        uint8_t    tneg[WORLD_LANE_MAXTEST];    /* its polarity */
+        long      *table;                       /* [1 << ntest] */
     } *numeff;
     bool     covers_numeric;      /* numeric commit is fully laned -> routable */
 
@@ -1798,7 +1804,10 @@ void world_add_step_lane_family(world *w, dlcol *fam, int nloc, int nent,
 void world_step_lane_set_numeric(world *w, int numsc, const uint32_t *num_atom_cell,
                                  int nnumeff, const int *eff_schema,
                                  const int *eff_op, const long *eff_konst,
-                                 const uint32_t *eff_marker)
+                                 const uint32_t *eff_marker,
+                                 const int *eff_ntest, const uint32_t *eff_tloc,
+                                 const uint8_t *eff_tneg,
+                                 const long *const *eff_table, int tstride)
 {
     if (w->nsteplanes == 0) return;
     step_lane_family *sf = &w->steplanes[w->nsteplanes - 1];
@@ -1814,6 +1823,18 @@ void world_step_lane_set_numeric(world *w, int numsc, const uint32_t *num_atom_c
         sf->numeff[i].op     = (world_numop)eff_op[i];
         sf->numeff[i].konst  = eff_konst[i];
         sf->numeff[i].marker = eff_marker[i];
+        int k = eff_ntest ? eff_ntest[i] : 0;
+        if (k > WORLD_LANE_MAXTEST) k = WORLD_LANE_MAXTEST;
+        sf->numeff[i].ntest = k;
+        for (int j = 0; j < k; j++) {
+            sf->numeff[i].tloc[j] = eff_tloc[(size_t)i * tstride + j];
+            sf->numeff[i].tneg[j] = eff_tneg[(size_t)i * tstride + j];
+        }
+        size_t ne = (size_t)1 << k;
+        sf->numeff[i].table = malloc(ne * sizeof *sf->numeff[i].table);
+        for (size_t m = 0; m < ne; m++)
+            sf->numeff[i].table[m] = (eff_table && eff_table[i]) ? eff_table[i][m]
+                                                                 : eff_konst[i];
     }
     sf->covers_numeric = true;
 }
@@ -3041,13 +3062,25 @@ static int compute_step_lane_numerics(world *w, step_lane_family *sf,
         for (int e = 0; e < nent; e++) {
             if (dlcol_defeasible(sf->fam, m, e) != DL_PROVED) continue;   /* did not fire */
             size_t c = (size_t)ef->schema * nent + e;
+            /* #165: this lane's own verdicts select the RHS value. Bit j is
+             * test j's verdict, exactly as EXPR_TEST reads it (PROVED = 1). */
+            long konst = ef->konst;
+            if (ef->ntest > 0) {
+                unsigned mask = 0;
+                for (int j = 0; j < ef->ntest; j++) {
+                    dl_lit tl = { ef->tloc[j], ef->tneg[j] != 0 };
+                    if (dlcol_defeasible(sf->fam, tl, e) == DL_PROVED)
+                        mask |= 1u << j;
+                }
+                konst = ef->table[mask];
+            }
             if (ef->op == WORLD_OP_ASSIGN) {
                 world_merge mg = w->nums[sf->num_cell[c]].merge;   /* #85 */
-                if (num_join(mg, have[c], &aval[c], ef->konst) < 0)
+                if (num_join(mg, have[c], &aval[c], konst) < 0)
                     confl[c] = true;
                 have[c] = true;
             } else {
-                delta[c] += num_signed(ef->op, ef->konst);
+                delta[c] += num_signed(ef->op, konst);
             }
         }
     }
