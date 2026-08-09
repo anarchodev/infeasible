@@ -521,6 +521,17 @@ void world_step_lane_set_numeric(world *w, int numsc, const uint32_t *num_atom_c
                                  const int *eff_ntest, const uint32_t *eff_tloc,
                                  const uint8_t *eff_tneg,
                                  const long *const *eff_table, int tstride);
+/* Attach receipt provenance to the last-added step lane family (#88): which
+ * entity each lane stands for, and per numeric effect the authored rule name,
+ * its predicate atom, and the variable the lane binds. A laned effect has no
+ * ground instance name — one schema rule runs for every lane — so a commit
+ * receipt reconstructs the binding per lane from these instead of formatting a
+ * name per commit. Names are copied. */
+void world_step_lane_set_prov(world *w, const uint32_t *lane_ents, int nent,
+                              const char *const *eff_name,
+                              const uint32_t *eff_pred, const uint32_t *eff_var,
+                              int nnumeff);
+
 /* Register a `for each` binder's broadcast cast triggers on the last-added step
  * lane family: each ground cast atom drives its WORLD_STEP_BCAST local (all lanes)
  * when it occurs — the discrete cast fans out over the target lanes. */
@@ -581,20 +592,80 @@ void world_step_why(world *w, dl_lit q, bool next, FILE *out);
 int world_step(world *w, const uint32_t *actions, int nactions,
                char *err, size_t errsz);
 
-/* The commit receipt (§5.8): after a successful world_step, how a numeric
- * fluent reached its value. `*base` is the pipeline base (winning `:=`, else
- * the pre-step value); `out` receives the undefeated contributions in
- * application order (the winning assign first, if any, then each delta). The
- * final value is base + sum(deltas) clamped to the declared range. Returns the
- * contribution count (may exceed `cap`; only the first `cap` are written).
- * Valid only immediately after a step that returned 0. */
+/* ---- the step readout: what changed, and why (#88) -----------------------
+ *
+ * Everything a step tells its client, past the next state itself. Three
+ * surfaces, all valid only until the next world_step and all owned by the
+ * world: the CHANGESET (what moved), the RECEIPT (how a number got there), and
+ * world_emits above (what fired). Together they are the structured form of a
+ * combat log line — "12 fire damage to grik from vera's fireball, 5 absorbed"
+ * — so a client never parses a rendered string to recover what happened.
+ *
+ * The changeset is the §11 M2 delta's leaf case: the base facts that actually
+ * moved this step, enumerated rather than polled. A client that knows which
+ * atoms to ask about can still ask (world_get / world_get_num); one that wants
+ * "what happened?" reads these. */
+typedef struct { uint32_t atom; bool value; } world_bool_delta;
+typedef struct { uint32_t atom; long from, to; } world_num_delta;
+
+const world_bool_delta *world_bool_deltas(const world *w, int *count);
+const world_num_delta  *world_num_deltas(const world *w, int *count);
+
+/* One contribution to a numeric fluent's commit.
+ *
+ * Provenance is kept STRUCTURED, not formatted: `pred` is the authored action /
+ * rule name and `vars`/`ents` its binding (`C=vera, T=grik`), so a client
+ * renders its own sentence instead of parsing "fireball[C=vera,T=grik]" back
+ * apart. `rule` remains the engine's own name for the ground rule — the ground
+ * instance name on the N=1 path, the authored name on the routed lane path,
+ * where the per-lane binding lives in `ents` instead. `pred` is INTERN_NONE
+ * when nothing registered a binding (a hand-built world); then `rule` is all
+ * there is.
+ *
+ * `defeated` marks a contribution that did NOT apply: an effect whose action
+ * was submitted this step but whose rule failed its guards, carrying what it
+ * WOULD have contributed — the "Immune — 0" row. Ramifications are excluded (a
+ * ramification that does not fire is not a thwarted attempt, it is every other
+ * rule in the world), and so is the routed lane path, whose effect columns
+ * carry no link back to the action that triggered them. */
 typedef struct {
-    const char *rule;     /* source step-rule name (borrowed from the world) */
-    world_numop op;
-    long        amount;   /* the assigned value, or the signed delta applied */
+    const char     *rule;     /* step-rule name (borrowed from the world) */
+    uint32_t        pred;     /* authored action/rule name atom, or INTERN_NONE */
+    const uint32_t *vars;     /* [nbind] variable-name atoms (borrowed) */
+    const uint32_t *ents;     /* [nbind] what each variable was bound to */
+    int             nbind;
+    world_numop     op;
+    long            amount;   /* the assigned value, or the signed delta */
+    bool            defeated;
 } world_contrib;
 
-int world_num_receipt(const world *w, uint32_t atom, long *base,
-                      world_contrib *out, int cap);
+/* How a numeric fluent reached its value (§5.8): base (the winning `:=`, else
+ * the pre-step value) -> `raw` = base + Σ undefeated deltas -> `applied`, the
+ * committed value after the declared range retracts it. Reporting both ends is
+ * what makes overkill and absorption renderable — a 12-damage hit on a 5 HP
+ * target has raw -7 and applied 0, and `clamped` says the range spoke.
+ * `lo`/`hi` are the bounds this step actually used (a dynamic bound is
+ * evaluated per commit, so they are not the declaration's constants).
+ *
+ * Returns false for an atom that is not a declared numeric fluent. Valid only
+ * immediately after a step that returned 0; `items` points into world memory. */
+typedef struct {
+    long base, raw, applied;
+    long lo, hi;
+    bool has_range;           /* false: lo/hi are meaningless, applied == raw */
+    bool clamped;             /* the range moved the value (applied != raw) */
+    const world_contrib *items;
+    int  n;
+} world_receipt;
+
+bool world_num_receipt(const world *w, uint32_t atom, world_receipt *out);
+
+/* Register a step rule's SOURCE identity (#88): the authored action/rule name
+ * and this ground instance's binding, by its world_add_step_rule handle. The
+ * state tier keeps them as ids — it never learns the term grammar — and hands
+ * them back on every contribution the rule makes. Copied; `n` may be 0 (an
+ * arity-0 action still names its pred). */
+void world_set_step_binding(world *w, int rule, uint32_t pred,
+                            const uint32_t *vars, const uint32_t *ents, int n);
 
 #endif

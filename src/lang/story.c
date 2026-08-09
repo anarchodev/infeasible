@@ -7531,6 +7531,15 @@ static void ground_action(parser *p, ast_action *a)
         if (a->stratum > 0) world_set_step_stratum(p->w, h, a->stratum);   /* #87 */
         char pbuf[MAX_NAME + 24];
         world_set_step_prov(p->w, h, prov_str(p, a->line, pbuf, sizeof pbuf));
+        /* the same identity the instance name spells, kept STRUCTURED (#88):
+         * a commit receipt hands the client `strike` + `A=hero, T=goblin`
+         * rather than a string to parse back apart */
+        {
+            uint32_t vn[MAX_ARGS];
+            for (int k = 0; k < a->nvars; k++) vn[k] = a->vars[k].name;
+            world_set_step_binding(p->w, h, intern_id(p->syms, a->name),
+                                   vn, binding, a->nvars);
+        }
 
         /* numeric effects (§5.8): ground the target value-store atom and
          * compile the RHS expression to VM bytecode for this instance. */
@@ -7641,6 +7650,14 @@ static void ground_action(parser *p, ast_action *a)
                         world_set_step_stratum(p->w, h2, a->stratum);   /* #87 */
                     char pbuf[MAX_NAME + 24];
                     world_set_step_prov(p->w, h2, prov_str(p, bnd->line, pbuf, sizeof pbuf));
+                    {   /* #88: the cast's binding EXTENDED by the binder's —
+                         * one Fireball target's row names both C and T */
+                        uint32_t vn[2 * MAX_ARGS];
+                        int nvn = ncv < 2 * MAX_ARGS ? ncv : 2 * MAX_ARGS;
+                        for (int k = 0; k < nvn; k++) vn[k] = cv[k].name;
+                        world_set_step_binding(p->w, h2, intern_id(p->syms, a->name),
+                                               vn, cb, nvn);
+                    }
                     if (e->is_num_effect) {
                         uint32_t narg[MAX_ARGS];
                         for (int k = 0; k < e->nargs; k++)
@@ -9554,6 +9571,36 @@ static void emit_step_lanes(parser *p)
                                     sc_schema, sc_op, sc_konst, effmark,
                                     sc_ntest, &sc_tloc[0][0], &sc_tneg[0][0],
                                     sc_table, MAX_LANE_TESTS);
+
+        /* Receipt provenance (#88). A laned effect has no ground instance name
+         * — one schema rule runs for all lanes — so a contribution's identity
+         * is the authored rule plus (its variable, this lane's entity). The
+         * lane entities are the sort's own order, the same order `ground` was
+         * filled in, so a receipt row on the routed path carries exactly what
+         * the N=1 row's binding does. */
+        const char *sc_name[2 * MAX_LANE_NUMEFF];
+        uint32_t sc_pred[2 * MAX_LANE_NUMEFF], sc_var[2 * MAX_LANE_NUMEFF];
+        int ns = 0;
+        for (int k = 0; k < nne; k++, ns++) {
+            ast_action *a = &p->actions[neff_act[k]];
+            sc_name[ns] = a->name;
+            sc_pred[ns] = intern_id(p->syms, a->name);
+            sc_var[ns]  = a->nvars > 0 ? a->vars[0].name : INTERN_NONE;
+        }
+        for (int k = 0; k < nbitem; k++, ns++) {
+            ast_action *a = &p->actions[bitem_act[k]];
+            ast_binder *bnd = &p->binders[a->bind_ix[0]];
+            sc_name[ns] = a->name;
+            sc_pred[ns] = intern_id(p->syms, a->name);
+            sc_var[ns]  = bnd->nvars > 0 ? bnd->vars[0].name : INTERN_NONE;
+                                          /* the TARGET var: a binder's lane
+                                           * axis is the bound one, not the cast's */
+        }
+        uint32_t *lane_ents = malloc((size_t)(nent ? nent : 1) * sizeof *lane_ents);
+        for (int e = 0; e < nent; e++) lane_ents[e] = domain_at(p, S, e);
+        world_step_lane_set_prov(p->w, lane_ents, nent, sc_name, sc_pred, sc_var,
+                                 ns);
+        free(lane_ents);
         free(numcell);
     }
 

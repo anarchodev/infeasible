@@ -29,6 +29,7 @@ const stepRaw   = c("wf_step",       "number", ["number","number","number","numb
 const declEmit  = c("wf_declare_emit", null,   ["number", "number"]);
 const emitCount = c("wf_emit_count", "number", ["number"]);
 const emitsPtr  = c("wf_emits",      "number", ["number"]);
+const boolDelta = c("wf_bool_deltas","number", ["number", "number", "number"]);
 const wmalloc   = c("wf_malloc",     "number", ["number"]);
 const wfree     = c("wf_free",       null,     ["number"]);
 
@@ -112,6 +113,19 @@ function emissions() {
 }
 const nameOf = (id) => Object.keys(A).find((k) => A[k] === id) ?? `#${id}`;
 
+// The step's CHANGESET (#88): what actually moved, enumerated by the engine
+// instead of polled atom by atom. Cells are `long` (8 bytes under wasm64-style
+// LP64 emscripten builds is 4 here — HEAP32 matches `long` in this build).
+function changed() {
+  const cap = 64, p = wmalloc(cap * 4);
+  const need = boolDelta(w, p, cap);
+  const view = new Int32Array(M.HEAP32.buffer, p, Math.min(need, cap));
+  const out = [];
+  for (let i = 0; i + 1 < view.length; i += 2) out.push(`${nameOf(view[i])}=${view[i + 1]}`);
+  wfree(p);
+  return out;
+}
+
 function step(actionName) {
   const pa = u32([atom(actionName)]);
   const errp = wmalloc(128);
@@ -132,6 +146,8 @@ console.log("turn 1 — aria: sword_strike");
 step("sword_strike");
 check("grunk is wounded", isSet("wounded_grunk"));
 check("the hit spark fired", emissions().join(",") === "hit_spark_grunk");
+// the changeset says exactly what moved — no polling, no diffing on the JS side
+check("changeset: only wounded_grunk moved", changed().join(",") === "wounded_grunk=1");
 check("grunk not yet dead", !isSet("dead_grunk"));
 check("wounded goblin now wants to flee (judgment)", query("wants_flee_grunk") === PROVED);
 
@@ -143,6 +159,9 @@ check("ramification fired: shortbow on floor", isSet("on_floor_shortbow"));
 // direct and indirect events of one transition, in one buffer, declaration order
 check("spark and death cry both fired",
       emissions().join(",") === "hit_spark_grunk,death_cry_grunk");
+check("changeset: the kill and its ramification",
+      changed().sort().join(",") ===
+        ["dead_grunk=1", "holding_shortbow_grunk=0", "on_floor_shortbow=1"].sort().join(","));
 
 console.log("turn 3 — aria: sword_strike (the corpse)");
 step("sword_strike");

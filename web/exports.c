@@ -113,6 +113,55 @@ EXPORT int inf_step1(inf_session *s, unsigned action)
     return world_step(s->w, &action, 1, g_err, sizeof g_err);
 }
 
+/* The step log (#88): the changeset and the commit receipt, marshalled into a
+ * caller-provided buffer of `long`. Each returns the number of cells the FULL
+ * answer needs, so a short buffer is a grow-and-retry rather than a silent
+ * truncation. Layouts are the ones documented on the wf_* shim: pairs
+ * [atom, value], triples [atom, from, to], and a receipt header
+ * [base, raw, applied, lo, hi, flags, nrows] followed by variable-length rows
+ * [op, amount, defeated, pred, nbind, (var, ent) * nbind]. */
+EXPORT int inf_bool_deltas(inf_session *s, long *out, int cap)
+{
+    int n;
+    const world_bool_delta *d = world_bool_deltas(s->w, &n);
+    for (int i = 0; i < n && 2 * i + 1 < cap; i++) {
+        out[2 * i]     = (long)d[i].atom;
+        out[2 * i + 1] = d[i].value ? 1 : 0;
+    }
+    return 2 * n;
+}
+
+EXPORT int inf_num_deltas(inf_session *s, long *out, int cap)
+{
+    int n;
+    const world_num_delta *d = world_num_deltas(s->w, &n);
+    for (int i = 0; i < n && 3 * i + 2 < cap; i++) {
+        out[3 * i]     = (long)d[i].atom;
+        out[3 * i + 1] = d[i].from;
+        out[3 * i + 2] = d[i].to;
+    }
+    return 3 * n;
+}
+
+EXPORT int inf_num_receipt(inf_session *s, unsigned atom, long *out, int cap)
+{
+    world_receipt r;
+    if (!world_num_receipt(s->w, atom, &r)) return 0;
+    int k = 0;
+#define PUT(v) do { if (k < cap) out[k] = (long)(v); k++; } while (0)
+    PUT(r.base); PUT(r.raw); PUT(r.applied); PUT(r.lo); PUT(r.hi);
+    PUT((r.has_range ? 1 : 0) | (r.clamped ? 2 : 0));
+    PUT(r.n);
+    for (int i = 0; i < r.n; i++) {
+        const world_contrib *c = &r.items[i];
+        PUT(c->op); PUT(c->amount); PUT(c->defeated ? 1 : 0);
+        PUT(c->pred); PUT(c->nbind);
+        for (int b = 0; b < c->nbind; b++) { PUT(c->vars[b]); PUT(c->ents[b]); }
+    }
+#undef PUT
+    return k;
+}
+
 /* Burst cues (#11, §12): the step's transient emission stream. One boundary
  * crossing per step, like the delta buffer — inf_emits hands back a pointer
  * into the engine's linear memory, which JS reads as a zero-copy

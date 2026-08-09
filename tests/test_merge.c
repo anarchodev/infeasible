@@ -56,12 +56,11 @@ static int test_engine_max(void)
     CHECK(world_get_num(w, ac) == 15);             /* max(10,14) + 1 */
 
     /* the receipt's assign row names the extreme's rule */
-    long base;
-    world_contrib items[8];
-    int n = world_num_receipt(w, ac, &base, items, 8);
-    CHECK(n >= 2);
-    CHECK(items[0].op == WORLD_OP_ASSIGN && items[0].amount == 14);
-    CHECK(items[0].rule && strcmp(items[0].rule, "plate") == 0);
+    world_receipt rp;
+    CHECK(world_num_receipt(w, ac, &rp));
+    CHECK(rp.n >= 2);
+    CHECK(rp.items[0].op == WORLD_OP_ASSIGN && rp.items[0].amount == 14);
+    CHECK(rp.items[0].rule && strcmp(rp.items[0].rule, "plate") == 0);
 
     world_free(w);
     intern_free(sy);
