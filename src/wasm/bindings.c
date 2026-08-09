@@ -85,3 +85,15 @@ API int wf_step(world *w, const uint32_t *actions, int nactions,
                 char *err, int errsz) {
     return world_step(w, actions, nactions, err, (size_t) errsz);
 }
+
+/* --- burst cues (#11, §12): the transient emission channel ---
+ *
+ * The per-tick stream crosses the boundary the way §12's delta buffer does:
+ * ONE crossing per step, not one per event. wf_emits returns a pointer into
+ * the engine's own linear memory, so JS reads it as a zero-copy
+ * `new Uint32Array(M.HEAPU32.buffer, ptr, n)` view — the engine writes its
+ * memory, JS reads through the view, nothing is marshalled per atom. The view
+ * is valid until the next wf_step (and until any memory.grow detaches it). */
+API void wf_declare_emit(world *w, uint32_t atom) { world_declare_emit(w, atom); }
+API int  wf_emit_count(world *w) { int n; world_emits(w, &n); return n; }
+API const uint32_t *wf_emits(world *w) { int n; return world_emits(w, &n); }

@@ -417,6 +417,31 @@ void world_add_num_effect(world *w, int rule, uint32_t num_atom,
  * defeasible layers, one committing effect (DESIGN.md §5.8). Typed damage is
  * content, not engine. */
 
+/* Transient emissions — burst cues (#11, DESIGN.md §12). A one-shot event a
+ * step FIRES, never a fact it stores: an emit atom is an effect head like any
+ * other, but it takes no base fact, generates no inertia, and is read by
+ * nothing. It holds for exactly the step that concluded it and vanishes.
+ *
+ * - I1/I2-clean: an emission is an OUTPUT of a step (the symmetric twin of an
+ *   action, which is a transient input), never stored, never queried, never
+ *   re-derived. Nothing in the theory may read one — the .story front end
+ *   rejects a body that mentions an emit predicate.
+ * - I4: emissions are a pure function of (state, actions) — the same solve the
+ *   next state is read from — so a replay reproduces the exact stream.
+ * - Positive only: an emit head is never negated, so emissions have no defeat
+ *   structure of their own. Defeasibility lives upstream, in the firing rule's
+ *   body (which reads defeated judgments like any step rule). Two rules firing
+ *   the same cue emit it ONCE — an emission is a proposition about the
+ *   transition, not a count; parameterize the atom to distinguish sources.
+ *
+ * `world_emits` returns the flat per-tick buffer: the emit atoms concluded by
+ * the last successful world_step, in DECLARATION order (deterministic, I4).
+ * Cleared at the top of every world_step, so a rejected step emits nothing.
+ * The pointer is owned by the world and valid until the next step. */
+void world_declare_emit(world *w, uint32_t atom);
+bool world_has_emit(const world *w, uint32_t atom);
+const uint32_t *world_emits(const world *w, int *count);
+
 /* Query the current state (facts + judgment rules). */
 dl_verdict world_query(world *w, dl_lit q);
 void       world_why(world *w, dl_lit q, FILE *out);
@@ -547,7 +572,12 @@ void world_step_why(world *w, dl_lit q, bool next, FILE *out);
  * do anything in this world, so submitting it is a host bug (typo'd atom,
  * protocol drift), never a legal no-op. An action whose matching rules all
  * fail their guards is NOT an error: it steps normally and the turn is spent.
- * A speculative host should pre-check with world_query, not rely on silence. */
+ * A speculative host should pre-check with world_query, not rely on silence.
+ *
+ * Burst cues fired by this step are read afterwards with world_emits. A world
+ * that declares emissions steps N=1: the lane routes carry no emit columns, so
+ * routing one would silently drop the stream (the .story grounder builds no
+ * step lane family for such a world; this is the engine-side backstop). */
 int world_step(world *w, const uint32_t *actions, int nactions,
                char *err, size_t errsz);
 

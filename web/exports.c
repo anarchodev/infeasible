@@ -113,6 +113,24 @@ EXPORT int inf_step1(inf_session *s, unsigned action)
     return world_step(s->w, &action, 1, g_err, sizeof g_err);
 }
 
+/* Burst cues (#11, §12): the step's transient emission stream. One boundary
+ * crossing per step, like the delta buffer — inf_emits hands back a pointer
+ * into the engine's linear memory, which JS reads as a zero-copy
+ * `new Uint32Array(M.HEAPU32.buffer, ptr, n)` view and resolves to names with
+ * inf_name. Valid until the next step. */
+EXPORT int inf_emit_count(inf_session *s)
+{
+    int n;
+    world_emits(s->w, &n);
+    return n;
+}
+
+EXPORT const unsigned *inf_emits(inf_session *s)
+{
+    int n;
+    return world_emits(s->w, &n);
+}
+
 EXPORT const char *inf_last_err(void)  { return g_err; }
 EXPORT const char *inf_last_diag(void) { return g_diag; }
 

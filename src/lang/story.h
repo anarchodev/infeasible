@@ -44,7 +44,7 @@
  *
  *   file    := decl*
  *   decl    := sort | enum | entity | state | provider | function | value | init
- *            | rule | action | sup
+ *            | emit | rule | action | sup
  *   sort    := 'sort'   ( IDENT | '(' IDENT (','? IDENT)* ')' )
  *   enum    := 'enum' IDENT '{' IDENT (',' IDENT)* '}'  -- named value domain (§13);
  *                                          -- also legal as an argument sort and a
@@ -78,6 +78,19 @@
  *                                          -- grounded.
  *   function:= 'function' IDENT '(' vtype (',' vtype)* ')' ':' vtype
  *                                          -- spelling alias for a typed provider
+ *   emit    := 'emit' ( edecl | '(' edecl* ')' )        -- burst cue (#11, §12):
+ *   edecl   := IDENT [ '(' IDENT (',' IDENT)* ')' ]     -- a one-shot event a step
+ *                                          -- FIRES at the presentation client
+ *                                          -- (hit spark, "Resisted!"). Write-only
+ *                                          -- vocabulary: legal ONLY as a positive
+ *                                          -- effect atom, never read in a body,
+ *                                          -- guard, `init` or rule head, never
+ *                                          -- negated or primed, and with no value
+ *                                          -- type — each a located error. It takes
+ *                                          -- no fact, no inertia and no commit:
+ *                                          -- world_emits returns the step's stream
+ *                                          -- and the next step clears it.
+ *                                          -- Contextual keyword (like `fact`)
  *   value   := 'value' ( vdecl | '(' vdecl* ')' )       -- engine-derived value (#82)
  *   vdecl   := IDENT [ '(' IDENT* ')' ] ':' 'int'       -- defined by a rule, inlined
  *                                                        -- at reads; roll sites key on

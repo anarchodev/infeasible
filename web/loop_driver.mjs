@@ -4,7 +4,9 @@
 // compiled to WASM (build with scripts/build_wasm.sh, then `node web/loop_driver.mjs`).
 // This is the boolean shadow of combat5e (M0 has no numerics): grunk's HP is a
 // two-step state machine (healthy -> wounded -> dead). It exercises the real
-// host->core->step->read-judgments->branch loop across the JS/WASM boundary.
+// host->core->step->read-judgments->branch loop across the JS/WASM boundary —
+// including the burst-cue channel (#11, §12): the renderer's one-shot events
+// arrive as a per-tick buffer JS reads through a zero-copy typed-array view.
 
 import createModule from "../build-wasm/infeasible.mjs";
 
@@ -24,6 +26,9 @@ const addRule   = c("wf_add_rule",   "number",
 const addStepR  = c("wf_add_step_rule", null,
   ["number","string","number","number","number","number","number","number","number","number"]);
 const stepRaw   = c("wf_step",       "number", ["number","number","number","number","number"]);
+const declEmit  = c("wf_declare_emit", null,   ["number", "number"]);
+const emitCount = c("wf_emit_count", "number", ["number"]);
+const emitsPtr  = c("wf_emits",      "number", ["number"]);
 const wmalloc   = c("wf_malloc",     "number", ["number"]);
 const wfree     = c("wf_free",       null,     ["number"]);
 
@@ -76,6 +81,16 @@ stepRule("kill",  strike, [["holding_longsword_aria",0,0], ["adjacent",0,0], ["w
 stepRule("death_drop", NONE, [["dead_grunk",0,1], ["holding_shortbow_grunk",0,0]],
                              [["holding_shortbow_grunk", 1], ["on_floor_shortbow", 0]]);
 
+// burst cues (#11): write-only vocabulary — no fact, no inertia, no commit.
+// `hit_spark` rides with the wound; `death_cry` is fired by the ramification,
+// so one buffer carries both the direct and the indirect event of a step.
+const CUES = ["hit_spark_grunk", "death_cry_grunk"];
+for (const e of CUES) declEmit(w, atom(e));
+stepRule("spark", strike, [["holding_longsword_aria",0,0], ["adjacent",0,0]],
+                          [["hit_spark_grunk", 0]]);
+stepRule("cry",  NONE, [["dead_grunk",0,1], ["dead_grunk",1,0]],
+                       [["death_cry_grunk", 0]]);
+
 // initial state
 const INIT = { holding_longsword_aria:1, adjacent:1, monster_grunk:1, holding_shortbow_grunk:1,
                wounded_grunk:0, dead_grunk:0, on_floor_shortbow:0 };
@@ -84,6 +99,19 @@ for (const [f, v] of Object.entries(INIT)) setFluent(w, atom(f), v);
 // ---- helpers --------------------------------------------------------------
 const query = (name) => queryRaw(w, atom(name), 0);
 const isSet = (name) => getFluent(w, atom(name)) === 1;
+// The step's emission stream: one crossing, read in place out of WASM memory
+// (HEAPU32 is re-derived per call — a memory.grow detaches an old view).
+function emissions() {
+  const n = emitCount(w);
+  if (!n) return [];
+  const ptr = emitsPtr(w);
+  const view = new Uint32Array(M.HEAPU32.buffer, ptr, n);
+  const names = [];
+  for (const id of view) names.push(nameOf(id));
+  return names;
+}
+const nameOf = (id) => Object.keys(A).find((k) => A[k] === id) ?? `#${id}`;
+
 function step(actionName) {
   const pa = u32([atom(actionName)]);
   const errp = wmalloc(128);
@@ -103,6 +131,7 @@ check("goblin does not want to flee", query("wants_flee_grunk") === REFUTED);
 console.log("turn 1 — aria: sword_strike");
 step("sword_strike");
 check("grunk is wounded", isSet("wounded_grunk"));
+check("the hit spark fired", emissions().join(",") === "hit_spark_grunk");
 check("grunk not yet dead", !isSet("dead_grunk"));
 check("wounded goblin now wants to flee (judgment)", query("wants_flee_grunk") === PROVED);
 
@@ -111,6 +140,15 @@ step("sword_strike");
 check("grunk is dead", isSet("dead_grunk"));
 check("ramification fired: shortbow dropped", !isSet("holding_shortbow_grunk"));
 check("ramification fired: shortbow on floor", isSet("on_floor_shortbow"));
+// direct and indirect events of one transition, in one buffer, declaration order
+check("spark and death cry both fired",
+      emissions().join(",") === "hit_spark_grunk,death_cry_grunk");
+
+console.log("turn 3 — aria: sword_strike (the corpse)");
+step("sword_strike");
+// a cue is not state: nothing carried it into this tick, and the death cry is
+// an EDGE (dead now, alive before), so only the spark repeats
+check("cues do not persist", emissions().join(",") === "hit_spark_grunk");
 
 console.log(failures === 0 ? "\nloop_driver: all passed" : `\nloop_driver: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

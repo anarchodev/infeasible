@@ -16,6 +16,7 @@ state (
     strength(actor) : int
     door : { locked, closed, open }
     poisoned(actor)
+    on_floor(item)
 )
 
 init (
