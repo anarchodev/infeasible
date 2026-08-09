@@ -480,11 +480,22 @@ void world_add_step_lane_family(world *w, dlcol *fam, int nloc, int nent,
  * `num_atom_cell` [numsc*nent] gives each (schema, lane)'s ground numeric atom
  * (resolved to a w->nums index internally); the effect arrays give each fired
  * numeric effect its schema, op, constant RHS, and the family-local id of its
- * fired marker. Marks the family covers_numeric (routable). */
+ * fired marker. Marks the family covers_numeric (routable).
+ *
+ * #165: an RHS may also read `test()` verdicts. A verdict is 0/1, so an RHS over
+ * `k` of them takes 2^k compile-time-known values. Per effect, `eff_ntest[i]`
+ * gives k, `eff_tloc`/`eff_tneg` (both [nnumeff][tstride]) the family-local
+ * column and polarity of each read, and `eff_table[i]` points at the 1<<k folded
+ * values, indexed by those verdicts as bits. k=0 means the RHS is a plain
+ * constant and `eff_konst` is used — the table is then redundant but valid. */
+#define WORLD_LANE_MAXTEST 6           /* max test() reads in a laned numeric RHS */
 void world_step_lane_set_numeric(world *w, int numsc, const uint32_t *num_atom_cell,
                                  int nnumeff, const int *eff_schema,
                                  const int *eff_op, const long *eff_konst,
-                                 const uint32_t *eff_marker);
+                                 const uint32_t *eff_marker,
+                                 const int *eff_ntest, const uint32_t *eff_tloc,
+                                 const uint8_t *eff_tneg,
+                                 const long *const *eff_table, int tstride);
 /* Register a `for each` binder's broadcast cast triggers on the last-added step
  * lane family: each ground cast atom drives its WORLD_STEP_BCAST local (all lanes)
  * when it occurs — the discrete cast fans out over the target lanes. */

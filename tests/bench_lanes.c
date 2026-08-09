@@ -59,18 +59,18 @@ static const variant VARIANTS[] = {
       "action hurt(T: unit): requires ~immune_fire(T)\n"
       "    causes hp(T) -= inc_fire(T)\n", false },
 
-    { "test() in RHS",           "num_eff_ok: RHS must constant-fold",
-      "action hurt(T: unit): causes hp(T) -= 7 * (1 - test(immune_fire(T)))\n", false },
+    { "test() in RHS",           "laned: verdicts fold to a 2^k table (#165)",
+      "action hurt(T: unit): causes hp(T) -= 7 * (1 - test(immune_fire(T)))\n", true },
 
-    /* the row above trips the gate with ONE conditional read; this one carries
-     * the whole 5e response ladder (immunity, resistance, vulnerability, and
-     * the exception between the last two). Their costs are the measure of what
-     * ladder DEPTH is worth once the gate has tripped — the answer is nothing,
-     * so the frontier is a cliff at the first non-folding read, not a gradient. */
-    { "test() ladder (3 reads)",  "num_eff_ok: depth past the first read",
+    /* the row above reads ONE verdict; this one carries the whole 5e response
+     * ladder (immunity, resistance, vulnerability, and the exception between the
+     * last two). Their costs together are the measure of what ladder DEPTH buys
+     * — the answer is nothing, because depth is table WIDTH (2^k constants
+     * folded at compile time), not per-entity work. */
+    { "test() ladder (3 reads)",  "laned: depth is table width, not tick cost",
       "action hurt(T: unit): causes hp(T) -= (1 - test(immune_fire(T)))\n"
       "    * (7 + test(resist_fire(T)) * (1 - test(vuln_fire(T))) * (7 / 2 - 7)\n"
-      "         + test(vuln_fire(T)) * (1 - test(resist_fire(T))) * 7)\n", false },
+      "         + test(vuln_fire(T)) * (1 - test(resist_fire(T))) * 7)\n", true },
 
     { "judgment guard",          "step_atom_ok: guards must be fluents",
       "rule res(X: unit): resist_fire(X) => mitigated(X)\n"
@@ -176,12 +176,13 @@ int main(int argc, char **argv)
     printf("\nReading: the bail is world-wide — one disqualifying construct drops every\n"
            "family, so these costs are the whole step, not the affected rules. Three\n"
            "independent gates, any one of which is sufficient: a primed guard anywhere\n"
-           "(has_pguards), a numeric effect whose RHS does not constant-fold\n"
-           "(num_eff_ok/expr_fold — this also excludes every rolled amount, so no dice\n"
-           "damage lanes today), and a step rule reading a judgment (step_atom_ok).\n"
-           "The two test() rows price DEPTH: one conditional read and a three-read\n"
-           "ladder cost the same, so what the gate charges for is the first non-folding\n"
-           "read, not how much reasoning follows it. Widening buys the whole ladder.\n"
+           "(has_pguards), a numeric effect whose RHS reads a numeric fluent, a roll or\n"
+           "a fn-provider call (num_eff_ok/expr_fold — so no dice damage lanes today),\n"
+           "and a step rule reading a judgment (step_atom_ok).\n"
+           "The two test() rows are LANED (#165): a verdict is 0/1, so an RHS over k of\n"
+           "them folds to 2^k constants the commit indexes by the lane's own bits. They\n"
+           "cost the same as each other, which is the point — depth is table width, paid\n"
+           "at compile time, so the whole 5e response ladder rides the columnar path.\n"
            "A `<==` marker means the frontier MOVED: re-price the widening work in #165\n"
            "and update this table's expectations.\n");
     return 0;

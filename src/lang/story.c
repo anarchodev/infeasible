@@ -8889,15 +8889,108 @@ static bool step_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var,
     return a->nargs == 1 && a->args[0].name == var;
 }
 
+/* A verdict is 0 or 1, so an RHS whose only non-folding leaves are test() reads
+ * takes at most 2^k values — all known at compile time (#165). Each such leaf
+ * must already be a lane bit-column: a boolean fluent, arity-1 over S, read on
+ * the action's own var. Then the commit is a table lookup indexed by the lane's
+ * own verdict bits, and no expression VM runs per entity.
+ *
+ * Leaf identity is (pred, neg): `test(p(X))` and `test(~p(X))` are distinct
+ * reads, and NOT complements — a literal can be neither proved nor refuted. */
+#define MAX_LANE_TESTS 6                 /* 64 table entries; beyond this, N=1 */
+typedef struct { uint32_t pred; bool neg; } lane_test;
+
+/* Gather the distinct laneable test() leaves of `e`; false if any leaf is
+ * something a constant table cannot stand in for (a numeric read, a roll, a
+ * host call, `prior`, or a test that is not a lane column). */
+static bool collect_lane_tests(parser *p, int e, int S, uint32_t var,
+                               lane_test *ts, int *nts)
+{
+    ex_node *n = &p->exprs[e];
+    switch (n->kind) {
+    case EX_CONST: return true;
+    case EX_LOAD: case EX_ROLL: case EX_CALL: case EX_PRIOR:
+        return false;
+    case EX_TEST: {
+        pred_info *ti = find_pred(p, n->pred);
+        if (!ti || !ti->is_fluent || ti->is_mv || ti->is_num) return false;
+        if (ti->arity != 1 || ti->argsort[0] != S) return false;
+        if (n->nargs != 1 || n->args[0].name != var) return false;
+        bool neg = n->konst != 0;
+        for (int i = 0; i < *nts; i++)
+            if (ts[i].pred == n->pred && ts[i].neg == neg) return true;
+        if (*nts >= MAX_LANE_TESTS) return false;
+        ts[*nts].pred = n->pred; ts[*nts].neg = neg; (*nts)++;
+        return true;
+    }
+    case EX_NEG: return collect_lane_tests(p, n->lhs, S, var, ts, nts);
+    default:
+        return collect_lane_tests(p, n->lhs, S, var, ts, nts)
+            && collect_lane_tests(p, n->rhs, S, var, ts, nts);
+    }
+}
+
+/* expr_fold under an assignment of the collected tests: bit i of `mask` is the
+ * verdict of ts[i]. Deliberately delegates every operator to expr_fold's own
+ * arithmetic by folding children first, so the table cannot drift from what the
+ * N=1 effect VM computes — that identity is what makes world_step_lanes_check
+ * agree by construction rather than by luck. */
+static bool fold_under_tests(parser *p, int e, const lane_test *ts, int nts,
+                             unsigned mask, long *out)
+{
+    ex_node *n = &p->exprs[e];
+    long a, b;
+    if (n->kind == EX_TEST) {
+        bool neg = n->konst != 0;
+        for (int i = 0; i < nts; i++)
+            if (ts[i].pred == n->pred && ts[i].neg == neg) {
+                *out = (mask >> i) & 1u;
+                return true;
+            }
+        return false;
+    }
+    if (n->kind == EX_CONST) { *out = n->konst; return true; }
+    if (n->kind == EX_NEG) {
+        if (!fold_under_tests(p, n->lhs, ts, nts, mask, &a)) return false;
+        *out = -a; return true;
+    }
+    if (n->kind == EX_LOAD || n->kind == EX_ROLL || n->kind == EX_CALL
+        || n->kind == EX_PRIOR)
+        return false;
+    if (!fold_under_tests(p, n->lhs, ts, nts, mask, &a)
+        || !fold_under_tests(p, n->rhs, ts, nts, mask, &b))
+        return false;
+    switch (n->kind) {
+    case EX_ADD: *out = a + b; return true;
+    case EX_SUB: *out = a - b; return true;
+    case EX_MUL: *out = a * b; return true;
+    case EX_DIV:                            /* floored, matching EXPR_DIV exactly */
+        if (b == 0) return false;           /* the VM defines x/0 = 0: stays dynamic */
+        *out = a / b - ((a % b != 0 && (a < 0) != (b < 0)) ? 1 : 0);
+        return true;
+    case EX_MIN: *out = a < b ? a : b; return true;
+    case EX_MAX: *out = a > b ? a : b; return true;
+    default: return false;
+    }
+}
+
 /* S1: a numeric effect laneable iff it writes a numeric fluent arity-1 over S on
- * the action's own var with a constant-folding RHS (*konst gets the value). */
-static bool num_eff_ok(parser *p, const ast_atom *e, int S, uint32_t var, long *konst)
+ * the action's own var and its RHS is a constant *given the verdicts it reads*.
+ * `ts`/`*nts` receive the distinct test columns (0 for a plain constant RHS) and
+ * `table` the 2^nts folded values, indexed by those verdicts as bits. */
+static bool num_eff_ok(parser *p, const ast_atom *e, int S, uint32_t var,
+                       lane_test *ts, int *nts, long *table)
 {
     pred_info *pi = find_pred(p, e->pred);
     if (!pi || !pi->is_fluent || !pi->is_num) return false;
     if (pi->arity != 1 || pi->argsort[0] != S) return false;
     if (e->nargs != 1 || e->args[0].name != var) return false;
-    return expr_fold(p, e->expr_root, konst);
+    *nts = 0;
+    if (!collect_lane_tests(p, e->expr_root, S, var, ts, nts)) return false;
+    for (unsigned m = 0; m < (1u << *nts); m++)
+        if (!fold_under_tests(p, e->expr_root, ts, *nts, m, &table[m]))
+            return false;
+    return true;
 }
 
 #define MAX_LANE_NUMEFF 512
@@ -8954,6 +9047,14 @@ static void emit_step_lanes(parser *p)
     for (int i = 0; i < p->nactions; i++) { act_has_num[i] = false; act_is_binder[i] = false; }
     int neff_act[MAX_LANE_NUMEFF], neff_schema[MAX_LANE_NUMEFF], neff_op[MAX_LANE_NUMEFF];
     long neff_konst[MAX_LANE_NUMEFF];
+    /* #165: a test()-reading RHS is a table of 2^k constants over k verdict
+     * columns. `static` because the table array is 256KB — too much stack — and
+     * this pass has many early returns, so a malloc would need unwinding at each.
+     * Safe: emit_step_lanes is a single non-recursive compiler pass and every
+     * entry is written before it is read. */
+    static int neff_ntest[MAX_LANE_NUMEFF];
+    static lane_test neff_test[MAX_LANE_NUMEFF][MAX_LANE_TESTS];
+    static long neff_table[MAX_LANE_NUMEFF][1 << MAX_LANE_TESTS];
     int nne = 0;
     /* binder items to lane (one numeric const effect per item): its action, item
      * index, target-numeric schema, op, constant. */
@@ -8980,7 +9081,14 @@ static void emit_step_lanes(parser *p)
             for (int it = 0; it < bnd->nitems; it++) {
                 binder_item *item = &bnd->items[it];
                 long k;
-                if (!item->eff.is_num_effect || !num_eff_ok(p, &item->eff, S, tv, &k)) return;
+                lane_test bts[MAX_LANE_TESTS];
+                int bnts = 0;
+                long btab[1 << MAX_LANE_TESTS];
+                if (!item->eff.is_num_effect
+                    || !num_eff_ok(p, &item->eff, S, tv, bts, &bnts, btab)
+                    || bnts != 0)                /* binder casts: constant RHS only */
+                    return;
+                k = btab[0];
                 int sc = -1;
                 for (int j = 0; j < nnp; j++)
                     if (p->preds[numpred[j]].pred == item->eff.pred) { sc = j; break; }
@@ -9011,15 +9119,23 @@ static void emit_step_lanes(parser *p)
         for (int b = 0; b < a->neff; b++) {
             ast_atom *e = &a->effects[b];
             if (e->is_num_effect) {                /* a numeric effect: lane it (S1) */
-                long k;
-                if (!num_eff_ok(p, e, S, var, &k)) return;   /* not laneable -> N=1 */
+                lane_test ts[MAX_LANE_TESTS];
+                int nts = 0;
+                long table[1 << MAX_LANE_TESTS];
+                if (!num_eff_ok(p, e, S, var, ts, &nts, table))
+                    return;                                  /* not laneable -> N=1 */
                 if (nne >= MAX_LANE_NUMEFF) return;
                 int sc = -1;
                 for (int j = 0; j < nnp; j++)
                     if (p->preds[numpred[j]].pred == e->pred) { sc = j; break; }
                 if (sc < 0) return;
                 neff_act[nne] = i; neff_schema[nne] = sc;
-                neff_op[nne] = (int)e->numop; neff_konst[nne] = k;
+                neff_op[nne] = (int)e->numop; neff_konst[nne] = table[0];
+                /* the verdict columns this RHS reads, and its 2^k folded values */
+                neff_ntest[nne] = nts;
+                for (int j = 0; j < nts; j++) neff_test[nne][j] = ts[j];
+                for (unsigned m = 0; m < (1u << nts); m++)
+                    neff_table[nne][m] = table[m];
                 nne++;
                 act_has_num[i] = true;
             } else if (!step_atom_ok(p, e, S, var, true)) {
@@ -9247,18 +9363,40 @@ static void emit_step_lanes(parser *p)
         int sc_schema[2 * MAX_LANE_NUMEFF], sc_op[2 * MAX_LANE_NUMEFF], nspec = 0;
         long sc_konst[2 * MAX_LANE_NUMEFF];
         uint32_t effmark[2 * MAX_LANE_NUMEFF];
+        /* #165: per spec, the verdict columns its RHS reads and its 2^k table —
+         * the table is pointed at in place (neff_table, or the constant itself
+         * for a binder item) rather than copied into a second 512KB buffer */
+        int sc_ntest[2 * MAX_LANE_NUMEFF];
+        uint32_t sc_tloc[2 * MAX_LANE_NUMEFF][MAX_LANE_TESTS];
+        uint8_t sc_tneg[2 * MAX_LANE_NUMEFF][MAX_LANE_TESTS];
+        const long *sc_table[2 * MAX_LANE_NUMEFF];
         for (int k = 0; k < nne; k++) {
             sc_schema[nspec] = neff_schema[k]; sc_op[nspec] = neff_op[k];
             sc_konst[nspec] = neff_konst[k];
-            effmark[nspec] = (uint32_t)marker_local[neff_act[k]]; nspec++;
+            effmark[nspec] = (uint32_t)marker_local[neff_act[k]];
+            sc_ntest[nspec] = neff_ntest[k];
+            for (int j = 0; j < neff_ntest[k]; j++) {
+                int fi = -1;                        /* the tested pred's CUR column */
+                for (int q = 0; q < nf; q++)
+                    if (p->preds[fpred[q]].pred == neff_test[k][j].pred) { fi = q; break; }
+                if (fi < 0) { free(numcell); return; }   /* not a lane column: N=1 */
+                sc_tloc[nspec][j] = (uint32_t)cur_local[fi];
+                sc_tneg[nspec][j] = neff_test[k][j].neg ? 1 : 0;
+            }
+            sc_table[nspec] = neff_table[k];
+            nspec++;
         }
         for (int k = 0; k < nbitem; k++) {
             sc_schema[nspec] = bitem_schema[k]; sc_op[nspec] = bitem_op[k];
             sc_konst[nspec] = bitem_konst[k];
-            effmark[nspec] = (uint32_t)bmarker[k]; nspec++;
+            effmark[nspec] = (uint32_t)bmarker[k];
+            sc_ntest[nspec] = 0; sc_table[nspec] = &bitem_konst[k];
+            nspec++;
         }
         world_step_lane_set_numeric(p->w, nnp, numcell, nspec,
-                                    sc_schema, sc_op, sc_konst, effmark);
+                                    sc_schema, sc_op, sc_konst, effmark,
+                                    sc_ntest, &sc_tloc[0][0], &sc_tneg[0][0],
+                                    sc_table, MAX_LANE_TESTS);
         free(numcell);
     }
 
