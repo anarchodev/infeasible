@@ -518,7 +518,15 @@ bool world_routes_numeric(const world *w);
 /* Differential pin for the transition layer: solve both the N=1 step family and
  * the step lane family from the current state + the given actions, and compare
  * each fluent's next-state (primed) verdict per lane. Commits nothing. Returns
- * the number of comparisons; sets *ok false on any mismatch (both polarities). */
+ * the number of comparisons; sets *ok false on any mismatch (both polarities).
+ *
+ * SCOPE — this covers BOOLEAN fluents only. Numeric next-values are produced by
+ * the commit pipeline (base + Σ deltas, clamped) which runs outside the verdict
+ * columns entirely, so a wrong numeric delta passes this check unseen. A laned
+ * numeric effect needs a committed-state comparison as well; test_lanefront runs
+ * both pins over the same shapes for exactly that reason. Lane-only synthetic
+ * readouts (a numeric effect's fired marker) are skipped — they exist in no N=1
+ * family, so they have no counterpart to be compared against. */
 int  world_step_lanes_check(world *w, const uint32_t *actions, int nactions,
                             bool *ok);
 
