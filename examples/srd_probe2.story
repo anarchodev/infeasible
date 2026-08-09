@@ -1,36 +1,64 @@
 // srd_probe2.story — second adversarial slice: SUMMONING and PERSISTENT
-// TERRAIN. Chosen because they are structurally unlike combat5e/srd_probe
-// (fixed rosters, instantaneous effects). The question each asks is narrow:
-// does the EXISTING design (§5.9 spawning, §5.6 space) already cover the SRD
-// content, or does it expose a NEW unfrozen construct the M1 parser must wait
-// on? Answer, up front: no new construct. Both reuse designed surface — and
-// both re-summon the SAME binder srd_probe P1 found. That convergence is the
-// real result: there is one gap, and it shows up everywhere.
+// TERRAIN, re-probed on the shipped M1 surface. (Originally a pre-parser
+// sketch; see git history. The original's consolidated verdict named two
+// things to settle — the set-quantified binder and first-class value
+// domains — and BOTH landed; what remains below is narrower.)
+//
+// Verdict summary:
+//   P6 Conjure Animals  ✓ fixed-count summons compile (function-provider
+//                          placement, §5.6); the count-CHOSEN-AT-CAST form
+//                          still waits on two marked gaps: §5.9 pool sugar
+//                          (`wolf[8]`) and the binder's `limit n` rider.
+//   P7 Wall of Fire     ✓ CLOSED — but by §5.6's decision, not by the
+//                          construct the original asked for: the ZONE is the
+//                          host's geometry behind a provider, not a fluent
+//                          over cells. The hazard tick and the grease trip
+//                          are ordinary rules, live below.
 
 scene wilds
 
+domain cell                           // §5.6 store-backed positions (landed —
+                                      // was "⟂ cell value domain" in the sketch)
 sort actor
-enum school { conjuration, evocation }        // ⟂ same value-domain gap as P1
+enum school { conjuration, evocation }   // landed (#95/#96) — was the P1 gap
 
 entity (
     dara  : actor                   // druid (the player)
-    wolf[8] : actor                 // §5.9 pool sugar — 8 prebaked slots
+    // ⟂ GAP (§5.9, still open): `wolf[8] : actor` pool sugar — 8 prebaked
+    // slots in one declaration. Until it lands, the pool is spelled out:
+    wolf1, wolf2 : actor            // (two slots suffice for this slice)
     ogre  : actor
 )
 
+function summon_spot(cell, int) : cell   // host geometry: the i-th free cell
+                                         // adjacent to the caster (§5.6 — the
+                                         // grid lives behind the seam)
+
 state (
-    active(actor)                   // §5.9 pool membership fluent
+    active(actor)                   // §5.9 pool membership — doubling as "present
+                                    // on the field", which also gives the spatial
+                                    // rules below their positive generator (§5.2
+                                    // cardinality: a provider never anchors)
     hp(actor)     : int in 0 .. hp_max(actor)
     hp_max(actor) : int
-    at(actor)     : cell            // §5.6 functional fluent (⟂ `cell` value domain)
+    at(actor)     : cell            // store-backed position (§5.6, landed)
     monster(actor)
-    on_fire(cell)                   // ⟂ terrain state: a fluent OVER cells
-    greased(cell)
+
+    // persistent zones: the zone's EXISTENCE is engine state; its EXTENT is
+    // host geometry behind the providers below (space is providers, §5.6)
+    wall_of_fire_up
+    grease_down
 )
 
 provider (
-    in_area(cell, cell, int)        // cells within R of a center cell
-    at_cell(actor, cell)            // actor occupies cell (index over at(·))
+    in_fire_zone(actor)             // host: at(X) intersects the wall's line
+    in_grease(actor)                // host: at(X) is on the greased square
+)
+
+init (
+    active(dara)        hp_max(dara) = 24   hp(dara) = 24
+    hp_max(wolf1) = 11  hp_max(wolf2) = 11
+    active(ogre)        hp_max(ogre) = 59   hp(ogre) = 59   monster(ogre)
 )
 
 // ===========================================================================
@@ -39,87 +67,92 @@ provider (
 // ===========================================================================
 //
 // §5.9 says spawning is an ordinary action that flips `active` on pool
-// members. A FIXED-count summon writes cleanly, no new surface:
+// members. A FIXED-count summon compiles today — placement is a function
+// provider (the host picks free adjacent cells), hp comes up with the slot:
 
-action summon_two_wolves(C: actor, a: cell, b: cell):
-    causes active(wolf_1) & at(wolf_1) := a & hp(wolf_1) := 11
-         & active(wolf_2) & at(wolf_2) := b & hp(wolf_2) := 11
+action summon_two_wolves(C: actor):
+    requires ~active(wolf1) & ~active(wolf2)
+    causes   active(wolf1) & at(wolf1) := summon_spot(at(C), 1) & hp(wolf1) := 11
+           & active(wolf2) & at(wolf2) := summon_spot(at(C), 2) & hp(wolf2) := 11
+
+// Two casters summoning in one step would contest the same slots; the
+// exclusivity protocol (#159) makes one-summon-per-step CHECKED, not hoped:
+exclusive summon_two_wolves(_)
 
 // ...but the count is CHOSEN AT CAST (1/2/4/8). Writing one action per count
-// is the tell: the natural form wants to activate the first N idle slots —
+// is still the tell. The natural form wants to activate the first N idle
+// slots:
 //
-//     action conjure(C: actor, n: int, where: set of cell):
-//         for each W: actor where wolf(W) & ~active(W)  limit n {   // ⟂ GAP
-//             causes active(W) & at(W) := next(where) & hp(W) := 11
-//         }
+//     action conjure(C: actor, n: int):
+//         causes for each W: actor where ~active(W)  limit n :   // ⟂ GAP
+//             active(W) & at(W) := summon_spot(at(C), 1) & hp(W) := 11
 //
-// ⟂ GAP 6 — THIS IS P1's BINDER AGAIN, on the spawn side. "Apply an effect to
-// N members of a provider/pool-answered set" is the identical missing
-// construct as Fireball's "apply an effect to each target in radius." The only
-// new rider is `limit n` (bounded quantification) — and §5.9 already bounds it
-// for free: the pool is size 8, so `limit` degrades to "up to the pool." Not a
-// second gap; the SAME gap, which strengthens the case that its shape must be
-// settled before M1 effect parsing.
+// ⟂ GAP — `limit n` (bounded quantification) is the binder's one unlanded
+// rider (grammar: "a later slice"). The binder itself, `where` over state,
+// and provider placement all landed; only the bound is missing. §5.9 still
+// bounds it for free (the pool is finite), so the gap is the SURFACE for
+// "first N", not groundability.
 //
-// A SINGLE named summon (Find Familiar) is the other §5.9 path — mechanism 2,
-// scope instantiation — and needs no binder at all. Its one open point is the
-// already-known §13 template identity, not new surface. Confirmed, not novel.
+// A SINGLE named summon (Find Familiar) is the other §5.9 path — mechanism
+// 2, scope instantiation — and needs no binder at all. Its one open point is
+// the already-known §13 template identity, not new surface.
 
 // ===========================================================================
-// P7 — WALL OF FIRE / GREASE.  Persistent zones: state attached to SPACE, that
-// acts on whoever occupies it, each tick, until it ends.
+// P7 — WALL OF FIRE / GREASE.  Persistent zones: state attached to SPACE,
+// that acts on whoever occupies it, each tick, until it ends.
 // ===========================================================================
 //
-// §5.6 keeps the logic spatially blind: zone membership is a PROVIDER answer,
-// the zone itself is a fluent over cells. Both pieces already exist in the
-// design. The hazard is then an ordinary ramification (§5.3) gated by the
-// provider — structurally identical to combat5e's torch-drop, just spatial:
+// ✓ CLOSED — by the §5.6 decision, which is SHARPER than what the original
+// probe asked for. The sketch wanted `on_fire(cell)` — a fluent over cells —
+// and a binder to paint it. But cells are an OPEN domain (`domain cell`),
+// not a finite sort: terrain-as-per-cell-fluents would drag the grid into
+// the engine, which is exactly what "space is providers" forbids. The
+// shipped shape: the zone's EXISTENCE is one fluent (I2: actions raise and
+// drop it), its EXTENT is host geometry answered through a provider, and
+// the hazard is an ordinary ramification gated on both:
 
-rule fire_tick(X: actor, c: cell):
-    at_cell(X, c)' & on_fire(c)'  causes  hp(X)' -= 5
-    // "ends its turn in the wall" — a per-tick ramification over occupancy.
+action cast_wall_of_fire(C: actor):
+    causes wall_of_fire_up
+    // the host records the line's geometry when it sees this action commit
+    // (it is the geometry authority, §5.6); replay re-derives it from the
+    // action log the same way (I4)
 
-rule grease_fall(X: actor, c: cell):
-    at_cell(X, c) & greased(c)  =>  prone(X)      // a judgment, recomputes on move (I3)
+rule fire_tick(X: actor):
+    wall_of_fire_up & active(X) & in_fire_zone(X)  causes  hp(X) -= 5
+    // "in the wall at the start of its turn" — a per-tick ramification over
+    // provider-answered occupancy; structurally combat5e's torch-drop,
+    // just spatial
 
-action cast_wall_of_fire(C: actor, line: set of cell):
-    causes on_fire(each c in line)               // ⟂ GAP 7 = the binder, on cells
+action cast_grease(C: actor):    requires ~grease_down  causes grease_down
+action grease_dries(C: actor):   requires grease_down   causes ~grease_down
+    // complementary `requires` = the #160 exclusion, same move as srd_probe's
+    // concentration pair: a compile proves no step contests `grease_down`
 
-// ⟂ GAP 7 — setting a zone is "assert on_fire(c) for each c in the area": the
-// SAME set-quantified effect, its bound variable ranging over cells instead of
-// actors. And the wall "lasts 1 minute" -> P4's turn-counter decomposition,
-// unchanged. No new construct: value-domain (`cell`) + provider (designed) +
-// ramification (designed) + the binder + P4. All already on the list.
+rule grease_fall(X: actor):
+    grease_down & active(X) & in_grease(X)  =>  prone(X)
+    // a judgment — recomputes on movement, never stored (I1)
+
+// The wall "lasts 1 minute" -> the P4 duration decomposition (#7, decided):
+// a host turn-counter, or reaction5e's engine-side cleanup countdown.
 
 // ---- consolidated verdict across all three scripts -------------------------
 //
-// combat5e.story  — the curated happy path. Bands, multi-valued defeat, the
-//                    ladder override, primed numeric guards, the pipeline. ✓
-// srd_probe.story  — combat corners: AoE, reactions, concentration, duration,
-//                    the die roll.
-// srd_probe2.story — summoning + terrain.
+// combat5e.story  — the curated path, now COMPILING on shipped surface:
+//                    bands, team defeat, derived values with min-class
+//                    layers, defeat-the-definitions, dynamic clamp, the
+//                    stratified dying trigger. Its one marked gap: §6.2's
+//                    `overriding` annotation.
+// srd_probe.story — COMPILING: binder AoE with engine-side dice and shared
+//                    draws, per-target `when`, relational-provenance
+//                    retract on the concentration edge. Marked gaps: #76
+//                    (set-retract sugar).
+// srd_probe2      — COMPILING: fixed-count summons + provider zones. Marked
+//                    gaps: §5.9 pool sugar, binder `limit n`.
 //
-// Everything that stalls reduces to exactly TWO things to settle before the
-// M1 effect parser — no more, no less:
-//
-//   (1) THE SET-QUANTIFIED EFFECT BINDER — `for each T where <guard> [limit n]:
-//       <effect> [when <cond>]`. Found in P1 (Fireball), reappears in P3
-//       (concentration retract), P6 (summon N), P7 (zone paint). Its riders:
-//       per-target `when`, transient action-scoped inputs, relational
-//       provenance (`faerie_fire_by`), `limit n`. This IS the M3 grounding
-//       risk. It is the one thing whose SHAPE must be frozen first.
-//
-//   (2) FIRST-CLASS VALUE DOMAINS beyond entity sorts — `cell`, `point`,
-//       `enum school { … }`. Needed by targeted/area/typed-value spells.
-//       Smaller, orthogonal, and mechanical once decided.
-//
-// Everything else is already designed or already a known open question:
-//   - reactions      -> host two-phase loop protocol (P2), a DESIGN note
-//   - randomness     -> above world_*, injected as action params (P5), a note
-//   - duration       -> host turn-counter + retract ramification (P4), a note
-//   - summon identity, cross-scope identity -> §13, already open
-//   - spawning, space -> §5.9 / §5.6, already designed; SRD content fits them
-//
-// So: M1 is NOT blocked wholesale. Declarations, judgment rules, bands, simple
-// (fixed-arity) actions can be parsed now. Only the EFFECT grammar waits on
-// (1)+(2). That is a much smaller freeze than "the surface isn't ready."
+// The original two-item freeze list (binder shape, value domains) is fully
+// landed. What the probes now mark is a short tail, none of it blocking:
+//   - `limit n` on the binder (P6)              — surface, not groundability
+//   - §5.9 pool sugar `wolf[8]`                 — declaration convenience
+//   - §6.2 `overriding` ladder-override annotation (combat5e)
+//   - #76 set-retract-with-provenance sugar (srd_probe P3)
+//   - negative MV effects (§5.7 family reification; srd_probe P3 note)
