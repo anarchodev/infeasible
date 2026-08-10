@@ -245,6 +245,17 @@ EXPORT const unsigned *inf_emits(inf_session *s)
  * of the rule that came closest to firing, as pairs [atom, neg], so `inf_why`
  * on one prints the argument that refused it. Each returns the size the FULL
  * answer needs — grow and retry, never a silent truncation. */
+/* A derived number (#82), evaluated against current state. Returns 1 and fills
+ * `out` when the value is defined, 0 when it is not registered or has no
+ * applicable definition (#116) — undefined, never a sentinel. */
+EXPORT int inf_get_value(inf_session *s, unsigned atom, double *out)
+{
+    long v = 0;
+    if (!world_get_value(s->w, atom, &v)) return 0;
+    *out = (double)v;
+    return 1;
+}
+
 EXPORT int inf_actions(inf_session *s, unsigned *out, int cap)
 {
     return world_actions(s->w, out, cap);

@@ -91,10 +91,26 @@ check('a refused command printed the guard that refused it',
 
 clickCmd('GO HALL');
 check('a click moved the hero', world.state.at('hero') === 'hall', world.state.at('hero'));
+
+// A verb grounds once per binding, so a flat menu shows DROP TORCH once per
+// room. Every APPLICABLE instance is a real choice and stays; a verb with none
+// contributes at most one refused row, because "you cannot drop it here" is
+// not three different reasons.
+check('no verb is listed twice', (() => {
+  const labels = scene.model().menu.map((b) => b.label);
+  return new Set(labels).size === labels.length;
+})(), labels());
 check('the cue table played a sound the STORY chose',
       backend.played.some(([k, id]) => k === 'sound' && id === 'snd_step'),
       JSON.stringify(backend.played));
 clickCmd('TAKE TORCH');
+check('...still no duplicates once the torch is in hand', (() => {
+  const l = scene.model().menu.map((b) => b.label);
+  return new Set(l).size === l.length && l.filter((x) => x === 'DROP TORCH').length === 1;
+})(), labels());
+check('and the one DROP TORCH kept is the one that applies',
+      scene.model().menu.find((b) => b.label === 'DROP TORCH')?.term === 'drop_torch(hero,hall)',
+      scene.model().menu.find((b) => b.label === 'DROP TORCH')?.term);
 clickCmd('GO CELLAR');
 check('the fetched torch lit the room, and the fog is gone',
       backend.ops('shade').length === 0);

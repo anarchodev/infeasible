@@ -243,8 +243,60 @@ static int test_errors(void)
     return 0;
 }
 
+/* --- a derived number a CLIENT can read (#82) -----------------------------
+ *
+ * The engine has derived booleans (judgments) and stored numbers (fluents).
+ * This is the third thing, and it exists so arithmetic can stay in the story
+ * instead of migrating into whichever client draws it: a bar's width is
+ * `48 * hp / hp_max`, and with nothing to ask for that number, the only place
+ * that expression can live is inside the widget — one formula, one source
+ * fluent, frozen for every game that ever uses it. */
+static int test_readable_value(void)
+{
+    static const char *SRC =
+        "sort actor\n"
+        "entity ( hero, ogre : actor )\n"
+        "state ( hp(actor) : int in 0 .. 40   cap(actor) : int in 0 .. 40\n"
+        "        ward(actor) : int in 0 .. 40   hurt(actor) )\n"
+        "init ( hp(hero) = 30  cap(hero) = 40  ward(hero) = 5\n"
+        "       hp(ogre) = 8   cap(ogre) = 20  ward(ogre) = 0 )\n"
+        "value ( shown(actor) : int   width(actor) : int )\n"
+        "rule sh(X: actor): => shown(X) = hp(X) + ward(X)\n"
+        "rule wd(X: actor): => width(X) = 48 * shown(X) / cap(X)\n"
+        "action wound(X: actor): causes hp(X) -= 10 & hurt(X)\n";
+
+    intern *sy = intern_new();
+    world *w = compile_ok(SRC, sy);
+    CHECK(w != NULL);
+
+    long v = 0;
+    /* a value nothing in the world reads is still readable — which is the
+     * whole point, since a bar is computed for a client and for nobody else */
+    CHECK(world_get_value(w, intern_id(sy, "shown(hero)"), &v) && v == 35);
+    CHECK(world_get_value(w, intern_id(sy, "shown(ogre)"), &v) && v == 8);
+
+    /* values compose: `width` reads `shown`, which reads two fluents */
+    CHECK(world_get_value(w, intern_id(sy, "width(hero)"), &v) && v == 42);
+    CHECK(world_get_value(w, intern_id(sy, "width(ogre)"), &v) && v == 19);
+
+    /* ...and it is a function of CURRENT state, not of load time */
+    CHECK(step(w, sy, "wound(hero)") == 0);
+    CHECK(world_get_value(w, intern_id(sy, "shown(hero)"), &v) && v == 25);
+    CHECK(world_get_value(w, intern_id(sy, "width(hero)"), &v) && v == 30);
+
+    /* an atom that is not a registered value says so rather than reading 0 —
+     * the difference between "no such number" and "the number is zero" */
+    CHECK(!world_get_value(w, intern_id(sy, "hp(hero)"), &v));
+    CHECK(!world_get_value(w, intern_id(sy, "shown(nobody)"), &v));
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
 int main(void)
 {
+    if (test_readable_value()) return 1;
     if (test_shared_d20()) return 1;
     if (test_guard_effect_coherence()) return 1;
     if (test_nested_and_folded()) return 1;
