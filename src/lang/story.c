@@ -1029,6 +1029,56 @@ static int parse_expr(parser *p)
     return l;
 }
 
+/* Is `name` a numeric fluent DECLARED so far in this parse? (#130 — the same
+ * declare-before-use discipline find_value already relies on.) */
+static bool is_declared_num(parser *p, uint32_t name)
+{
+    for (int i = 0; i < p->nfluents; i++)
+        if (p->fluents[i].pred == name && p->fluents[i].is_num)
+            return true;
+    return false;
+}
+
+/* A conjunct led by a numeric fluent read is a plain comparison guard
+ * (`hp(X) <= 0` — a stored threshold the loader asserts closed-world) or the
+ * start of an EXPRESSION guard (`atk_die(A) + atk_mod(A) >= ac(T)`). Peek past
+ * the read to tell them apart, on a COPY of the lexer so nothing is consumed:
+ *
+ *   read <arith> …            -> expression   (`+ - * /`)
+ *   read <cmp> INT <end>      -> plain guard  (today's path, unchanged)
+ *   read <cmp> anything else  -> expression   (a value, a fluent, a call)
+ *
+ * Keeping the INT case on the plain path matters: that is the form the primed
+ * dying trigger (§5.8 #87) and the threshold-harvesting stratifier read. */
+static bool numread_starts_expr(parser *p)
+{
+    lexer lx = p->lx;                 /* positioned just after p->cur */
+    token t = lexer_next(&lx);
+    if (t.kind == TK_LPAREN) {        /* skip the argument list */
+        int depth = 1;
+        while (depth > 0) {
+            t = lexer_next(&lx);
+            if (t.kind == TK_LPAREN) depth++;
+            else if (t.kind == TK_RPAREN) depth--;
+            else if (t.kind == TK_EOF || t.kind == TK_ERROR) return false;
+        }
+        t = lexer_next(&lx);
+    }
+    if (t.kind == TK_PLUS || t.kind == TK_MINUS || t.kind == TK_STAR ||
+        t.kind == TK_SLASH)
+        return true;
+    if (t.kind != TK_LE && t.kind != TK_LT && t.kind != TK_GE &&
+        t.kind != TK_GT && t.kind != TK_EQ)
+        return false;                 /* a prime, a `&`, an arrow: not ours */
+    t = lexer_next(&lx);              /* the right-hand side */
+    if (t.kind == TK_MINUS) t = lexer_next(&lx);       /* a negative threshold */
+    if (t.kind != TK_INT)
+        return true;                  /* compared against something computed */
+    t = lexer_next(&lx);              /* `hp <= 4 + 1` is still an expression */
+    return t.kind == TK_PLUS || t.kind == TK_MINUS || t.kind == TK_STAR ||
+           t.kind == TK_SLASH;
+}
+
 /* atom := [ '~' ] IDENT [ '(' arg (',' arg)* ')' ] */
 static bool parse_atom(parser *p, ast_atom *out)
 {
@@ -1038,10 +1088,17 @@ static bool parse_atom(parser *p, ast_atom *out)
      * conjunct starts with something a boolean atom can't: a `roll`/`min`/`max`/
      * `divup` function call, an int, `(`, `-`, or a declared `value` (#82).
      * Covers the d20: `roll(20) + atk(A) >= ac(T)`, `max(roll(20,1),
-     * roll(20,2)) + atk >= ac`, and `atk_roll(A,T) + atk(A) >= ac(T)`. */
+     * roll(20,2)) + atk >= ac`, and `atk_roll(A,T) + atk(A) >= ac(T)`.
+     *
+     * A conjunct led by a numeric FLUENT read joins them when it continues into
+     * arithmetic or compares against something computed (#130) — `atk_die(A) +
+     * atk_mod(A) >= ac(T)` is the natural spelling, and demanding the leading
+     * paren it used to need produced a diagnostic about rule arrows. */
     if (ident_is(p->cur, "roll") || ident_is(p->cur, "min") || ident_is(p->cur, "max") ||
         ident_is(p->cur, "divup") ||
         (p->cur.kind == TK_IDENT && find_value(p, intern_tok(p, p->cur)) >= 0) ||
+        (p->cur.kind == TK_IDENT && is_declared_num(p, intern_tok(p, p->cur)) &&
+         numread_starts_expr(p)) ||
         p->cur.kind == TK_INT || p->cur.kind == TK_LPAREN || p->cur.kind == TK_MINUS) {
         token lead = p->cur;
         int lhs = parse_expr(p);
@@ -6093,6 +6150,106 @@ static void emit_value_inline(parser *p, uint32_t pred, const uint32_t *rargs,
 static void touch_ground_fluent(parser *p, uint32_t atom, uint32_t pred,
                                 const uint32_t *args, int nargs);
 
+/* Render expr node `e` under `binding` back into source-like text (#132): the
+ * author's own words for a guard, so a why-trace can say
+ * `atk_die(grunk) + atk_mod(grunk) >= ac(vera)` instead of naming the synthetic
+ * marker atom the guard compiled to. Precedence-aware, so it parenthesises only
+ * where the spelling would otherwise change meaning. Reads the SAME binding the
+ * bytecode does, so the text and the code cannot describe different things.
+ * Truncation is clamped by `append_term`, never silent past the buffer. */
+static int expr_prec(ex_kind k)
+{
+    switch (k) {
+    case EX_ADD: case EX_SUB: return 1;
+    case EX_MUL: case EX_DIV: return 2;
+    case EX_NEG:              return 3;
+    default:                  return 4;    /* leaves and call-like forms */
+    }
+}
+
+static void render_expr(parser *p, int e, var_bind *vars, int nvars,
+                        const uint32_t *binding, char *buf, size_t cap, int *off)
+{
+    ex_node *n = &p->exprs[e];
+    char tmp[64];
+    switch (n->kind) {
+    case EX_CONST:
+        snprintf(tmp, sizeof tmp, "%ld", n->konst);
+        *off += append_term(buf, cap, *off, tmp);
+        return;
+    case EX_PRIOR:
+        *off += append_term(buf, cap, *off, "prior");
+        return;
+    case EX_ROLL:
+        snprintf(tmp, sizeof tmp, "roll(%ld)", n->konst);
+        *off += append_term(buf, cap, *off, tmp);
+        return;
+    case EX_LOAD: case EX_TEST: case EX_CALL: {
+        if (n->kind == EX_TEST) {
+            *off += append_term(buf, cap, *off, "test(");
+            if (n->konst) *off += append_term(buf, cap, *off, "~");
+        }
+        *off += append_term(buf, cap, *off, intern_name(p->syms, n->pred));
+        if (n->kind == EX_CALL) {
+            *off += append_term(buf, cap, *off, "(");
+            for (int k = 0; k < n->nargs; k++) {
+                if (k) *off += append_term(buf, cap, *off, ", ");
+                render_expr(p, n->cargs[k], vars, nvars, binding, buf, cap, off);
+            }
+            *off += append_term(buf, cap, *off, ")");
+        } else if (n->nargs > 0) {
+            *off += append_term(buf, cap, *off, "(");
+            for (int k = 0; k < n->nargs; k++) {
+                if (k) *off += append_term(buf, cap, *off, ",");
+                uint32_t a = resolve_arg(vars, nvars, binding, n->args[k]);
+                *off += append_term(buf, cap, *off, intern_name(p->syms, a));
+            }
+            *off += append_term(buf, cap, *off, ")");
+        }
+        if (n->nprimed) *off += append_term(buf, cap, *off, "'");
+        if (n->kind == EX_TEST) *off += append_term(buf, cap, *off, ")");
+        return;
+    }
+    case EX_MIN: case EX_MAX:
+        *off += append_term(buf, cap, *off, n->kind == EX_MIN ? "min(" : "max(");
+        render_expr(p, n->lhs, vars, nvars, binding, buf, cap, off);
+        *off += append_term(buf, cap, *off, ", ");
+        render_expr(p, n->rhs, vars, nvars, binding, buf, cap, off);
+        *off += append_term(buf, cap, *off, ")");
+        return;
+    case EX_NEG:
+        *off += append_term(buf, cap, *off, "-");
+        goto unary;
+    default: break;
+    }
+    {   /* the binary arithmetic set */
+        const char *opsym = n->kind == EX_ADD ? " + " : n->kind == EX_SUB ? " - "
+                          : n->kind == EX_MUL ? " * " : " / ";
+        int me = expr_prec(n->kind);
+        bool lp = expr_prec(p->exprs[n->lhs].kind) < me;
+        /* a right operand at EQUAL precedence still needs parens under the
+         * non-associative operators: `a - (b - c)` is not `a - b - c` */
+        bool rp = expr_prec(p->exprs[n->rhs].kind) < me ||
+                  (expr_prec(p->exprs[n->rhs].kind) == me &&
+                   (n->kind == EX_SUB || n->kind == EX_DIV));
+        if (lp) *off += append_term(buf, cap, *off, "(");
+        render_expr(p, n->lhs, vars, nvars, binding, buf, cap, off);
+        if (lp) *off += append_term(buf, cap, *off, ")");
+        *off += append_term(buf, cap, *off, opsym);
+        if (rp) *off += append_term(buf, cap, *off, "(");
+        render_expr(p, n->rhs, vars, nvars, binding, buf, cap, off);
+        if (rp) *off += append_term(buf, cap, *off, ")");
+        return;
+    }
+unary:
+    {
+        bool par = expr_prec(p->exprs[n->lhs].kind) < expr_prec(EX_NEG);
+        if (par) *off += append_term(buf, cap, *off, "(");
+        render_expr(p, n->lhs, vars, nvars, binding, buf, cap, off);
+        if (par) *off += append_term(buf, cap, *off, ")");
+    }
+}
+
 /* Emit RPN bytecode for expr node `e` under `binding`, folding constant
  * subtrees and resolving fluent reads to their ground value-store atom. */
 static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
@@ -6426,6 +6583,18 @@ static dl_lit ground_lit(parser *p, ast_atom *at, var_bind *vars, int nvars,
         inst_name(p, nm, sizeof nm, label, vars, nvars, binding);
         uint32_t g = intern_id(p->syms, nm);
         world_add_expr_guard(p->w, g, lcode, nl, rcode, nr, at->cmp);
+        {   /* the author's spelling, for the why-trace (#132) — a guard that
+             * renders as `eg14[A=grunk,T=vera]` makes the reader do archaeology */
+            char src[MAX_GROUND];
+            int off = 0;
+            src[0] = '\0';
+            render_expr(p, at->lhs_root, vars, nvars, binding, src, sizeof src, &off);
+            off += append_term(src, sizeof src, off, " ");
+            off += append_term(src, sizeof src, off, cmp_spelling(at->cmp));
+            off += append_term(src, sizeof src, off, " ");
+            render_expr(p, at->rhs_root, vars, nvars, binding, src, sizeof src, &off);
+            world_set_expr_guard_src(p->w, g, src);
+        }
         return at->neg ? dl_neg(g) : dl_pos(g);
     }
     uint32_t args[MAX_ARGS];

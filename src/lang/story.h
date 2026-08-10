@@ -215,6 +215,19 @@
  *                                          -- overrides the blanket per member
  *   conj    := eatom ( '&' eatom )*
  *   eatom   := atom [ cmp INT | '=' IDENT | numop expr ] -- guard / MV / effect
+ *            | expr cmp expr                          -- EXPRESSION guard (§5.8/
+ *                                          -- §5.10). Recognised on a lead the
+ *                                          -- boolean grammar cannot start with
+ *                                          -- (`roll`/`min`/`max`/`divup`, an
+ *                                          -- int, `(`, `-`, a declared `value`)
+ *                                          -- or on a numeric FLUENT read that
+ *                                          -- continues into arithmetic or
+ *                                          -- compares against something
+ *                                          -- computed (#130): `atk_die(A) +
+ *                                          -- atk_mod(A) >= ac(T)`. A read
+ *                                          -- against a plain INT threshold
+ *                                          -- (`hp(X) <= 0`) stays the landmark
+ *                                          -- guard the stratifier harvests
  *            | 'defined' IDENT [ '(' arg (',' arg)* ')' ] -- definedness of a
  *                                          -- PARTIAL value (#116): a first-class
  *                                          -- body atom, the disjunction of the
