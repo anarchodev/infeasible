@@ -31,6 +31,7 @@ web/build.sh                                  # emits web/infeasible.js
 node web/gen_binding.mjs examples/cellar_play.story    # the typed binding
 node web/platform_check.mjs                   # the interface + the cart, headless
 node web/browser_check.mjs                    # the cart in real Chromium (skips without one)
+node web/pure_check.mjs                       # the same cellar, played with NO game code
 node web/host.mjs                             # the data boundary alone
 node web/binding_check.mjs                    # generated from reaction5e.story
 ```
@@ -86,6 +87,21 @@ inside the page hands back the same module instance the running game uses, so
 `cart.buttons` is the live command list. It **skips** when no Chromium is
 present (`CHROMIUM=/path/to/chromium` to point it at one) and is not part of
 ctest.
+
+## The infeasible cart (§12)
+
+`pure.html` plays the same cellar **without a cart**. `examples/cellar_pure.story`
+carries its own presentation — the frame, the labels, what is where, which
+commands exist and which are refused, which sound each cue plays — as ordinary
+judgments over enum constants, and `platform/scene.mjs` draws whatever a story
+concluded in that vocabulary. It has never heard of a cellar; point it at
+another `.story` and it draws another game. `platform/purecart.mjs` is the
+driver that ties it to the runtime and contains no game at all.
+
+`pure_check.mjs` plays it to the end headlessly and then prints the price,
+which is the actual result of the experiment: 62 presentation rules, 37 enum
+members, 14 rows of geometry, zero game JS, and 244 lines of *generic* renderer
+standing in for a 318-line cart. DESIGN.md §12 records the six frictions.
 
 The cart is worth reading for how little it decides. It does not know when the
 door may be forced (`q.can_force_door(who)`); it does not compute what a click

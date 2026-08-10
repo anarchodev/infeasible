@@ -13,6 +13,8 @@ export const SOURCE_HASH = "7471681b";
 export const SORTS = {"actor":["grunk","vera"]};
 export const ENUMS = {};
 
+export const IFACE = {"judgments":[{"name":"incoming_hit","args":["actor","actor"]},{"name":"crit","args":["actor"]},{"name":"can_react","args":["actor"]},{"name":"down","args":["actor"]}],"state":[{"name":"phase","args":[],"type":"enum","values":["declare","react","resolve","cleanup"]},{"name":"alive","args":["actor"],"type":"bool"},{"name":"hp","args":["actor"],"type":"int"},{"name":"acb","args":["actor"],"type":"int"},{"name":"atkb","args":["actor"],"type":"int"},{"name":"dmgb","args":["actor"],"type":"int"},{"name":"pending","args":["actor","actor"],"type":"bool"},{"name":"atk_die","args":["actor"],"type":"int"},{"name":"atk_mod","args":["actor"],"type":"int"},{"name":"has_shield","args":["actor"],"type":"bool"},{"name":"window_due","args":[],"type":"bool"},{"name":"shielded","args":["actor"],"type":"bool"},{"name":"reacted","args":["actor"],"type":"bool"},{"name":"blessed","args":["actor"],"type":"bool"},{"name":"bless_left","args":["actor"],"type":"int"}],"actions":[{"name":"strike","params":["actor","actor"]},{"name":"cast_shield","params":["actor"]},{"name":"pass","params":["actor"]}]};
+
 // #159 exclusive groups, exactly as world_step checks them: a step admits at
 // most one member per (group, key). The builder below refuses the second at
 // ADD time, naming the order already in the set — a networked host collecting

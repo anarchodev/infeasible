@@ -127,6 +127,19 @@ w(`export const ENUMS = ${JSON.stringify(
   Object.fromEntries(iface.enums.map((e) => [e.name, e.values])))};`);
 w();
 
+// The vocabulary as DATA, not only as helpers. A generic client — one that has
+// never heard of this story — enumerates ground instances of a predicate by
+// crossing its argument domains, which needs the arity and the sorts, not a
+// function per name.
+w(`export const IFACE = ${JSON.stringify({
+  judgments: iface.judgments.map((j) => ({ name: j.name, args: j.args })),
+  state: iface.state.map((f) => ({ name: f.name, args: f.args, type: f.type,
+                                   values: f.values })),
+  actions: iface.actions.map((a) => ({ name: a.name,
+                                       params: a.params.map((p) => p.sort) })),
+})};`);
+w();
+
 // the exclusive-group protocol, as data the builder enforces
 w(`// #159 exclusive groups, exactly as world_step checks them: a step admits at`);
 w(`// most one member per (group, key). The builder below refuses the second at`);

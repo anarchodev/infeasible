@@ -14,6 +14,8 @@ export const SOURCE_HASH = "c8c5d5a2";
 export const SORTS = {"actor":["hero","guard"],"item":["antidote"]};
 export const ENUMS = {};
 
+export const IFACE = {"judgments":[{"name":"weakened","args":["actor"]},{"name":"can_force_door","args":["actor"]}],"state":[{"name":"poisoned","args":["actor"],"type":"bool"},{"name":"holding","args":["actor","item"],"type":"bool"},{"name":"strong","args":["actor"],"type":"bool"},{"name":"door_closed","args":[],"type":"bool"}],"actions":[{"name":"force_door","params":["actor"]}]};
+
 // #159 exclusive groups, exactly as world_step checks them: a step admits at
 // most one member per (group, key). The builder below refuses the second at
 // ADD time, naming the order already in the set — a networked host collecting
