@@ -11,7 +11,7 @@
 /** @typedef {"cellar" | "hall" | "vault"} T_room */
 
 export const STORY = "examples/cellar_play.story";
-export const SOURCE_HASH = "cbf9aa64";
+export const SOURCE_HASH = "a576566f";
 export const SORTS = {"actor":["hero","guard"],"item":["rusty_key","torch","antidote"]};
 export const ENUMS = {"room":["cellar","hall","vault"]};
 
@@ -163,9 +163,9 @@ export function open(M, src) {
 
     holding: (a0, a1) => { chk("actor", a0); chk("item", a1);
       return !!api.get(s, id(`holding(${a0},${a1})`)); },
-    /** @returns {"locked" | "closed" | "open"|undefined} */
+    /** @returns {"locked" | "jammed" | "open"|undefined} */
     door: () => { 
-      for (const v of ["locked","closed","open"])
+      for (const v of ["locked","jammed","open"])
         if (api.get(s, id("door" + '=' + v))) return v;
       return undefined; },
     /**
@@ -193,7 +193,7 @@ export function open(M, src) {
     holding: (a0, a1, a2) => { chk("actor", a0); chk("item", a1);
       api.set(s, id(`holding(${a0},${a1})`), a2 === false ? 0 : 1); },
     door: (a0) => { 
-      for (const v of ["locked","closed","open"])
+      for (const v of ["locked","jammed","open"])
         api.set(s, id("door" + '=' + v), v === a0 ? 1 : 0); },
     poisoned: (a0, a1) => { chk("actor", a0);
       api.set(s, id(`poisoned(${a0})`), a1 === false ? 0 : 1); },
@@ -277,9 +277,9 @@ export function open(M, src) {
 
     holding: (a0, a1) => { chk("actor", a0); chk("item", a1);
       return `holding(${a0},${a1})`; },
-    /** @param {"locked" | "closed" | "open"} a0 */
+    /** @param {"locked" | "jammed" | "open"} a0 */
     door: (a0) => { 
-      if (!["locked","closed","open"].includes(a0))
+      if (!["locked","jammed","open"].includes(a0))
         throw new TypeError(`'${a0}' is not a value of 'door'`);
       return "door" + '=' + a0; },
     /**

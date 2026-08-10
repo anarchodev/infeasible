@@ -66,7 +66,7 @@
 static const char *ACTORS[] = { "hero", "guard" };
 static const char *ITEMS[]  = { "rusty_key", "torch", "antidote" };
 static const char *ROOMS[]  = { "cellar", "hall", "vault" };
-static const char *DOORV[]  = { "locked", "closed", "open" };
+static const char *DOORV[]  = { "locked", "jammed", "open" };
 enum { NACT = 2, NITEM = 3, NROOM = 3, NDOOR = 3 };
 
 /* Everything this client puts on screen, and nothing else. */

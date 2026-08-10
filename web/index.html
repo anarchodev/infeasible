@@ -1,6 +1,9 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>infeasible — the cellar</title>
+<!-- inline, because §12's first rot rule is that nothing is fetched at
+     runtime — and because a missing favicon is a 404 in every console -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8'%3E%3Crect width='8' height='8' fill='%230b0d10'/%3E%3Crect x='2' y='1' width='4' height='6' fill='%238a5a2b'/%3E%3Crect x='4' y='4' width='1' height='1' fill='%23e8c37a'/%3E%3C/svg%3E">
 <!--
   The playable cellar in a browser (DESIGN.md §11 M2): the WASM engine, the
   .story world, the generated typed binding, the frozen presentation interface
@@ -23,10 +26,13 @@
   :root { color-scheme: dark; }
   html, body { margin: 0; height: 100%; background: #0b0d10; color: #6b7f99;
                font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
-  body { display: flex; flex-direction: column; align-items: center;
-         justify-content: center; gap: 10px; }
-  canvas { width: min(96vw, 160vh); aspect-ratio: 16 / 9; image-rendering: pixelated;
-           background: #000; touch-action: none; }
+  body { display: flex; flex-direction: column; gap: 8px; padding: 8px; box-sizing: border-box; }
+  /* The canvas fills what is left and the ENGINE letterboxes inside it (§12).
+     Constraining the element's aspect ratio too would letterbox twice, and the
+     second one only costs integer scale: at 921px the upscale is ×2, at 960 it
+     is ×3. Give the surface everything and let the frozen rule do its job. */
+  canvas { flex: 1 1 auto; width: 100%; min-height: 0; display: block;
+           image-rendering: pixelated; background: #000; touch-action: none; }
   p { margin: 0; text-align: center; }
   a { color: #79b8e8; }
   #err { color: #e06666; white-space: pre-wrap; font-size: 11px; max-width: 90vw; }
