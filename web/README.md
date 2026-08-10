@@ -30,6 +30,7 @@ Requires Emscripten (`emcc`) and Node.
 web/build.sh                                  # emits web/infeasible.js
 node web/gen_binding.mjs examples/cellar_play.story    # the typed binding
 node web/platform_check.mjs                   # the interface + the cart, headless
+node web/browser_check.mjs                    # the cart in real Chromium (skips without one)
 node web/host.mjs                             # the data boundary alone
 node web/binding_check.mjs                    # generated from reaction5e.story
 ```
@@ -62,6 +63,19 @@ It then plays the real cart on the real world through the polled input surface,
 from the locked door to the antidote, asserting on the recorded ops — the
 headless backend makes a frame a list of ops, so "what did the cart draw?" has
 a data answer.
+
+`browser_check.mjs` covers what a headless suite structurally cannot: whether
+the module graph loads, whether the WASM module arrives with a MIME type Chrome
+will execute, whether a pointer event survives the letterbox inverse, and
+whether anything is on screen at all. It drives Chromium over the DevTools
+protocol with no puppeteer — Node's built-in `WebSocket` and the browser's own
+`/json` endpoint — and plays the cellar with real mouse events, screenshotting
+with `--shots <dir>`. It clicks real buttons without any test hook in the cart,
+because ES modules are singletons per realm: `import('/web/carts/cellar.mjs')`
+inside the page hands back the same module instance the running game uses, so
+`cart.buttons` is the live command list. It **skips** when no Chromium is
+present (`CHROMIUM=/path/to/chromium` to point it at one) and is not part of
+ctest.
 
 The cart is worth reading for how little it decides. It does not know when the
 door may be forced (`q.can_force_door(who)`); it does not compute what a click

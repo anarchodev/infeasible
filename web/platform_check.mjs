@@ -172,7 +172,7 @@ check('the fog lifted — a judgment the renderer reads',
 click('TAKE RUSTY KEY');
 click('GO TO HALL');
 click('UNLOCK DOOR');
-check('the lock turned', world.state.door() === 'closed');
+check('the lock turned, but the door is jammed', world.state.door() === 'jammed');
 check('the cue said so', backend.played.some(([k, id]) => k === 'sound' && id === 'clunk'));
 check('the hero still cannot force it — poison, not the lock',
       world.q.can_force_door('hero') === 'refuted');

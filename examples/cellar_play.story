@@ -23,7 +23,11 @@ state (
     at(actor)          : room       // multi-valued: exactly one room, always
     on_floor(item, room)
     holding(actor, item)
-    door               : { locked, closed, open }
+    // Three states, and the middle one is the puzzle: turning the lock does
+    // not open the door, it only stops the lock from being the reason you
+    // cannot. A jammed door still has to be shouldered — which is why solving
+    // this needs two actors, one with the key and one with the shoulders.
+    door               : { locked, jammed, open }
     poisoned(actor)
     hp(actor)          : int in 0 .. 12
 )
@@ -61,15 +65,15 @@ rule poison_weakens(X: actor): poisoned(X) => weakened(X) unless holding(X, anti
 // is what the cart puts under a greyed-out button.
 rule may_enter(X: actor):  at(X) = hall                  => can_enter_vault(X)
 rule locked_out(X: actor): at(X) = hall & door = locked  => ~can_enter_vault(X)
-rule shut_out(X: actor):   at(X) = hall & door = closed  => ~can_enter_vault(X)
+rule jammed_shut(X: actor):at(X) = hall & door = jammed  => ~can_enter_vault(X)
 locked_out > may_enter
-shut_out   > may_enter
+jammed_shut > may_enter
 
 rule can_unlock(X: actor):
     at(X) = hall & door = locked & holding(X, rusty_key) => can_unlock_door(X)
 
-// Strong shoulders open a closed door — but not a weakened one's.
-rule can_force(X: actor): at(X) = hall & door = closed => can_force_door(X)
+// Strong shoulders free a jammed door — but not a weakened one's.
+rule can_force(X: actor): at(X) = hall & door = jammed => can_force_door(X)
 rule too_weak(X: actor):  weakened(X)                  => ~can_force_door(X)
 too_weak > can_force
 
@@ -123,7 +127,7 @@ action drop(X: actor, T: item, R: room):
 
 action unlock(X: actor):
     requires can_unlock_door(X)
-    causes   door = closed & clunk
+    causes   door = jammed & clunk
 
 // Forcing the door costs you: the numeric fluent whose receipt the cart shows.
 action force_door(X: actor):

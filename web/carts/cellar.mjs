@@ -129,15 +129,17 @@ export const cart = {
       if (name === 'heave')   this.burst(ctx, arg, 'OOF', RED);
       if (name === 'sip')     this.burst(ctx, arg, 'AAH', LIME);
       if (name === 'pickup')  this.burst(ctx, arg, 'GOT IT', GOLD);
-      if (name === 'clunk')   this.event = 'the lock turns';
+      if (name === 'clunk')   this.event = 'the lock turns - the door is jammed';
     }
     // The numeric receipt (#88): how hp reached its value, in the author's own
     // terms. A projection of the delta, never a parsed why-string.
     for (const d of ctx.step.changed) {
       if (!d.atom.startsWith('hp(')) continue;
       const r = ctx.world.receipt(d.atom);
+      // `amount` is the SIGNED delta; `op` only says which operator wrote it,
+      // so re-deriving a sign from `op` prints "--2".
       const rows = (r?.items ?? []).filter((i) => !i.defeated)
-        .map((i) => `${i.rule} ${i.op === 'sub' ? '-' : '+'}${i.amount}`);
+        .map((i) => `${i.rule} ${i.amount >= 0 ? '+' : ''}${i.amount}`);
       this.note = `${d.atom}: ${r.base} -> ${r.applied}  (${rows.join(', ')})`;
     }
     // The edges: subscribed conclusions that moved this tick.
@@ -149,9 +151,13 @@ export const cart = {
   },
 
   burst(ctx, who, text, color) {
-    const room = ctx.world.state.at(who);
-    const p = this.actorRect(ctx.world, who) ?? slot(room ?? 'hall', 0);
-    this.fx.push({ x: p.x, y: p.y - 4, text, color, life: 40 });
+    const room = ctx.world.state.at(who) ?? 'hall';
+    const p = this.actorRect(ctx.world, who) ?? slot(room, 0);
+    const b = BOX[room];
+    // keep a cue inside the room it belongs to, so it reads as that room's
+    const half = text.length * 2;
+    const x = Math.min(b.x + b.w - half, Math.max(b.x + half, p.x + 4));
+    this.fx.push({ x, y: Math.max(b.y + 4, p.y - 4), text, color, life: 40 });
   },
 
   // ---- what the world currently allows ------------------------------------
@@ -225,7 +231,7 @@ export const cart = {
     // burst cues, animating above the line: presentation state, no fact
     d.clip(0, 10, 320, BAR_Y - 10);
     for (const f of this.fx) {
-      d.print(f.text, f.x - d.textWidth(f.text) / 2 + 4, f.y - (40 - f.life) / 4, f.color);
+      d.print(f.text, f.x - d.textWidth(f.text) / 2, f.y - (40 - f.life) / 4, f.color);
       f.life--;
     }
     d.clip();
@@ -313,9 +319,18 @@ export const cart = {
     d.rectfill(2, 12, 316, BAR_Y - 14, 1);
     d.rect(2, 12, 316, BAR_Y - 14, DIM);
     let ly = 15;
-    for (const line of this.why.split('\n').slice(0, 10)) {
-      d.print(clamp(line, 78), 5, ly, line.includes('-- applicable') ? RED : PALE);
-      ly += 6;
+    // Wrapped, not truncated. A trace line ends in the operands the solve
+    // actually compared, so cutting it at the panel edge throws away the half
+    // that answers the question. Colour is decided per SOURCE line, so a rule
+    // that applied stays one red statement however many rows it takes.
+    for (const src of this.why.split('\n')) {
+      if (!src.trim()) continue;
+      const c = src.includes('-- applicable') ? RED : PALE;
+      for (const line of wrap(src, 77)) {
+        if (ly > BAR_Y - 8) return;
+        d.print(line, 5, ly, c);
+        ly += 6;
+      }
     }
   },
 };
@@ -325,6 +340,22 @@ export const cart = {
 const hit = (p, r) => p.x >= r.x && p.x < r.x + r.w && p.y >= r.y && p.y < r.y + r.h;
 const word = (s) => String(s ?? '?').replace(/_/g, ' ').toUpperCase();
 const clamp = (s, n) => (s.length > n ? s.slice(0, n - 1) + '>' : s);
+
+/** One line to `n` columns, continuing under its own indent so a proof trace
+ *  keeps the shape that makes it readable. */
+function wrap(line, n) {
+  const cont = (line.match(/^ */)?.[0] ?? '') + '  ';
+  const out = [];
+  let rest = line;
+  while (rest.length > n) {
+    let cut = rest.lastIndexOf(' ', n);
+    if (cut <= cont.length) cut = n;
+    out.push(rest.slice(0, cut));
+    rest = cont + rest.slice(cut).replace(/^ +/, '');
+  }
+  out.push(rest);
+  return out;
+}
 
 /** `pickup(hero,torch)` -> ['pickup', 'hero'] — cue names, not atoms to query. */
 function parseTerm(t) {
