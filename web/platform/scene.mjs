@@ -42,9 +42,12 @@ const say = (atom) => String(atom).replace(/^[a-z]_/, '').replace(/_/g, ' ').toU
 
 /** `take_torch(hero,hall)` -> `take_torch`; the label a menu row shows. */
 const verb = (term) => term.replace(/\(.*/, '');
-/** Is this ground action about that entity? Its arguments are in its name. */
-const mentions = (term, e) =>
-  term.slice(term.indexOf('(') + 1, -1).split(',').includes(e);
+/** A ground term's arguments — they are in its name, which is the spelling the
+ *  §6.3 artifact publishes. */
+const args = (term) =>
+  (term.includes('(') ? term.slice(term.indexOf('(') + 1, -1).split(',') : []);
+/** Is this ground action about that entity? */
+const mentions = (term, e) => args(term).includes(e);
 
 /** Cross an argument list's domains into every ground tuple. */
 function tuples(domains) {
@@ -99,18 +102,50 @@ export function createScene(w, iface, doms) {
     // world instead: every ground action it has a rule for, whether it applies
     // now, and the guards that refused it. Filtered to the picked actor by the
     // one thing a client legitimately knows — the actor is in the term.
+    // THE MENU IS THE ENGINE'S ANSWER. It used to be an `offers`/`blocked`
+    // pair of judgments the story wrote beside every action — the `requires`
+    // clause restated, free to drift from the original. `w.menu()` asks the
+    // world instead: every ground action it has a rule for, whether it applies
+    // now, and the guards that refused it. Filtered to the picked actor by the
+    // one thing a client legitimately knows — the actor is in the term.
+    //
+    // A verb grounds once per binding, so `drop_torch` is three ground actions
+    // for three rooms and a flat list shows DROP TORCH three times. The rule
+    // that fixes it without losing anything: every APPLICABLE instance is a
+    // real choice and all of them are listed (attacking two different goblins
+    // is two rows), but a verb with no applicable instance contributes at most
+    // ONE refused row — the reason you cannot drop the torch is not three
+    // different reasons.
+    const rows = picked ? w.menu().filter((item) => mentions(item.term, picked)) : [];
+    const byVerb = new Map();
+    for (const r of rows) {
+      const g = byVerb.get(verb(r.term)) ?? { ok: [], blocked: [] };
+      (r.status === 'applies' ? g.ok : g.blocked).push(r);
+      byVerb.set(verb(r.term), g);
+    }
+    const visible = [];
+    for (const g of byVerb.values()) {
+      if (g.ok.length) { visible.push(...g.ok); continue; }
+      const best = g.blocked.find(offerable);
+      if (best) visible.push(best);
+    }
+
+    // ...and where one verb DOES leave several rows, the label has to say
+    // which is which, so the distinguishing arguments come back into it.
+    const many = new Set(visible.map((r) => verb(r.term))
+                                .filter((v, i, a) => a.indexOf(v) !== i));
     const menu = [];
     if (picked) {
       const m = geom.a_menu ?? { x: 8, y: 244, w: 176, h: 12 };
-      let i = 0;
-      for (const item of w.menu()) {
-        if (!mentions(item.term, picked)) continue;
-        if (item.status !== 'applies' && !offerable(item)) continue;
-        menu.push({ term: item.term, ok: item.ok, label: say(verb(item.term)),
-                    blockers: item.blockers ?? [],
-                    x: m.x, y: m.y + i * (m.h + 3), w: m.w, h: m.h });
-        i++;
-      }
+      visible.forEach((item, i) => {
+        const rest = args(item.term).filter((a) => a !== picked);
+        menu.push({
+          term: item.term, ok: item.ok, blockers: item.blockers ?? [],
+          label: say(verb(item.term)) +
+                 (many.has(verb(item.term)) && rest.length ? ' ' + rest.map(say).join(' ') : ''),
+          x: m.x, y: m.y + i * (m.h + 3), w: m.w, h: m.h,
+        });
+      });
     }
 
     model = {
