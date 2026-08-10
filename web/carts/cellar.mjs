@@ -86,6 +86,10 @@ const DOOR = { x: 420, y: 108, w: 16, h: 32 };
 const BAR_Y = 224;                     // the command bar's top edge
 const STAT_X = 216;                    // where the status column starts
 
+/** The large text cell (§12): one of two frozen sizes, chosen per call. The
+ *  UI takes it; the why-trace does not, because a proof line wants columns. */
+const BIG = { big: true };
+
 // palette shorthands
 const INK = 0, DIM = 2, MID = 3, PALE = 4, BONE = 5, GOLD = 6, RED = 10, LIME = 13, SKY = 15;
 
@@ -191,7 +195,7 @@ export const cart = {
     const p = this.actorRect(ctx.world, who) ?? slot(room, 0);
     const b = BOX[room];
     // keep a cue inside the room it belongs to, so it reads as that room's
-    const half = text.length * 2;
+    const half = text.length * 3;
     const x = Math.min(b.x + b.w - half, Math.max(b.x + half, p.x + 4));
     this.fx.push({ x, y: Math.max(b.y + 4, p.y - 4), text, color, life: 40 });
   },
@@ -229,8 +233,8 @@ export const cart = {
     if (w.state.holding(who, 'antidote') && w.state.poisoned(who))
       add('DRINK ANTIDOTE', w.a.drink(who), true);
 
-    let y = BAR_Y + 18;
-    for (const b of out) { b.x = 8; b.y = y; b.w = 176; b.h = 11; y += 13; }
+    let y = BAR_Y + 20;
+    for (const b of out) { b.x = 8; b.y = y; b.w = 176; b.h = 12; y += 15; }
     return out;
   },
 
@@ -247,12 +251,13 @@ export const cart = {
     const [W, H] = this.resolution;
     d.cls(INK);
 
-    // title
+    // title. Everything a player reads at a glance is in the LARGE cell; the
+    // small one is kept for the proof trace, which wants columns instead.
     d.rectfill(0, 0, W, 14, DIM);
-    d.print('THE CELLAR', 8, 4, BONE);
-    d.print(`DOOR: ${word(w.state.door())}`, 240, 4, MID);
-    d.print(`TICK ${ctx.tick}`, 360, 4, MID);
-    d.print('CLICK AN ACTOR OR PRESS TAB TO SWITCH', 420, 4, MID);
+    d.print('THE CELLAR', 8, 3, BONE, BIG);
+    d.print(`DOOR: ${word(w.state.door())}`, 240, 3, MID, BIG);
+    d.print(`TICK ${ctx.tick}`, 380, 3, MID, BIG);
+    d.print('TAB SWITCHES', 512, 3, MID, BIG);
 
     for (const room of ROOMS) this.drawRoom(ctx, room);
     this.drawDoor(ctx);
@@ -260,10 +265,10 @@ export const cart = {
     // the command bar
     d.line(0, BAR_Y, W - 1, BAR_Y, DIM);
     d.print(`${word(this.sel)} - ${word(w.state.at(this.sel))}`, 8, BAR_Y + 5,
-            this.sel === 'hero' ? SKY : RED);
+            this.sel === 'hero' ? SKY : RED, BIG);
     for (const b of this.buttons) {
       d.rect(b.x, b.y, b.w, b.h, b.ok ? MID : DIM);
-      d.print(b.label, b.x + 4, b.y + 3, b.ok ? BONE : DIM);
+      d.print(b.label, b.x + 4, b.y + 2, b.ok ? BONE : DIM, BIG);
     }
 
     this.drawStatus(ctx);
@@ -272,7 +277,8 @@ export const cart = {
     // burst cues, animating above the line: presentation state, no fact
     d.clip(0, 14, W, BAR_Y - 14);
     for (const f of this.fx) {
-      d.print(f.text, f.x - d.textWidth(f.text) / 2, f.y - (40 - f.life) / 4, f.color);
+      d.print(f.text, f.x - d.textWidth(f.text, true) / 2, f.y - (40 - f.life) / 4,
+              f.color, BIG);
       f.life--;
     }
     d.clip();
@@ -286,7 +292,7 @@ export const cart = {
       for (let tx = 0; tx < b.w / 8; tx++)
         d.tile('tiles', T.FLOOR, b.x + tx * 8, b.y + ty * 8);
     d.rect(b.x - 1, b.y - 1, b.w + 2, b.h + 2, MID);
-    d.print(word(room), b.x, b.y - 10, MID);
+    d.print(word(room), b.x, b.y - 11, MID, BIG);
 
     // items on this floor — the second row of slots
     let i = 4;
@@ -350,16 +356,16 @@ export const cart = {
     let y = BAR_Y + 5;
     for (const who of SORTS.actor) {
       const hp = w.state.hp(who);
-      d.print(word(who), STAT_X, y, who === this.sel ? BONE : MID);
-      d.rectfill(STAT_X + 44, y, 48, 6, DIM);
-      d.rectfill(STAT_X + 44, y, Math.max(0, Math.round(48 * hp / 12)), 6,
+      d.print(word(who), STAT_X, y, who === this.sel ? BONE : MID, BIG);
+      d.rectfill(STAT_X + 44, y + 1, 48, 6, DIM);
+      d.rectfill(STAT_X + 44, y + 1, Math.max(0, Math.round(48 * hp / 12)), 6,
                  hp > 6 ? LIME : RED);
-      d.print(`${hp}`, STAT_X + 98, y, MID);
-      d.print(w.q.weakened(who) === 'proved' ? 'WEAKENED' : '', STAT_X + 118, y, RED);
-      y += 9;
+      d.print(`${hp}`, STAT_X + 98, y, MID, BIG);
+      d.print(w.q.weakened(who) === 'proved' ? 'WEAKENED' : '', STAT_X + 122, y, RED, BIG);
+      y += 11;
     }
-    if (this.note)  d.print(clamp(this.note, 100), STAT_X, y + 4, GOLD);
-    if (this.event) d.print(clamp(this.event, 100), STAT_X, y + 13, SKY);
+    if (this.note)  d.print(clamp(this.note, 68), STAT_X, y + 4, GOLD, BIG);
+    if (this.event) d.print(clamp(this.event, 68), STAT_X, y + 15, SKY, BIG);
   },
 
   /** The `why?` debugger, on screen. A refused button is not a dead end — it

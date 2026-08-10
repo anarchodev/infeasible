@@ -41,7 +41,7 @@ export function createHeadlessBackend({ resolution = DEFAULT_RESOLUTION } = {}) 
     tile(sheet, i, x, y)       { be.sheet(sheet); rec('tile', sheet, i, x, y); },
     spr(sheet, i, x, y, o)     { be.sheet(sheet); rec('spr', sheet, i, x, y, o); },
     shade(sheet, i, x, y)      { be.sheet(sheet); rec('shade', sheet, i, x, y); },
-    print(t, x, y, c)          { rec('print', t, x, y, c); },
+    print(t, x, y, c, o)       { rec('print', t, x, y, c, o); },
     line(x0, y0, x1, y1, c)    { rec('line', x0, y0, x1, y1, c); },
     rect(x, y, w, h, c)        { rec('rect', x, y, w, h, c); },
     rectfill(x, y, w, h, c)    { rec('rectfill', x, y, w, h, c); },

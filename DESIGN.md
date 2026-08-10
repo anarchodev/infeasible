@@ -2917,6 +2917,17 @@ font without any cart's UI shifting by a pixel. And the letterbox *inverse*
 itself: every cart computing it independently is every cart getting the edges
 wrong.
 
+There are **two** frozen text cells, and the arithmetic rather than taste is
+why. A game picks its internal resolution from the blessed set, but the cell is
+in internal pixels, so at 640×360 a 4×6 cell puts 160 columns on screen and a
+capital is 1.4% of screen height — against PICO-8's 3.9%. That is a terminal,
+not a game UI. The reflex is to grow the cell, but the dense one earns its keep
+precisely where columns matter: a `why?` trace reads unwrapped at 160 columns
+and wraps at 100. One size is wrong for one of the two jobs, so `print` takes a
+size the way `spr` takes flip and alpha — a second cell on an existing op,
+never a thirteenth op. A backend implements two bitmap fonts, which is still a
+weekend to port.
+
 **Burst cues: the one output of a step that is not state.** Those four
 surfaces are what a cart *calls*; what a step *hands back* is the other half of
 the interface, and it is three streams — the fluent delta (§11 M2), the §5.8

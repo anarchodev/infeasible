@@ -23,8 +23,8 @@
 // reaches it (§12).
 
 import { DRAW_OPS, AUDIO_OPS, PALETTE, DEFAULT_RESOLUTION, KEYS,
-         GLYPH_W, letterbox, toInternal } from './spec.mjs';
-import { glyph } from './font.mjs';
+         GLYPH_W, BIG_GLYPH_W, letterbox, toInternal } from './spec.mjs';
+import { glyph, glyphBig } from './font.mjs';
 
 /** Browser key codes → the frozen named set. A raw code never reaches a cart. */
 const KEYMAP = (() => {
@@ -141,15 +141,17 @@ export function createCanvasBackend(canvas, { resolution = DEFAULT_RESOLUTION } 
       blit(name, i, x, y);
       g.globalCompositeOperation = prev;
     },
-    print(text, x, y, c) {
+    print(text, x, y, c, o = {}) {
       g.fillStyle = PALETTE[c];
+      const big = !!o.big;
+      const rowsN = big ? 7 : 5, colsN = big ? 5 : 3, adv = big ? BIG_GLYPH_W : GLYPH_W;
       let px = x;
       for (const ch of text) {
-        const rows = glyph(ch);
-        for (let r = 0; r < 5; r++)
-          for (let k = 0; k < 3; k++)
+        const rows = big ? glyphBig(ch) : glyph(ch);
+        for (let r = 0; r < rowsN; r++)
+          for (let k = 0; k < colsN; k++)
             if (rows[r][k]) g.fillRect(px + k, y + r, 1, 1);
-        px += GLYPH_W;
+        px += adv;
       }
     },
     line(x0, y0, x1, y1, c) {
