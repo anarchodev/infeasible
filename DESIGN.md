@@ -722,12 +722,35 @@ concern; loaded actors' positions are scene facts. An encounter grid is a set
 of encounter-scoped position fluents (§5.5) that free on teardown. Off-screen
 crowds stay renderer-side until explicitly promoted into the fact store (§8).
 
+**A provider must be able to explain itself, or the trace has a hole in it.**
+The more faithfully a game takes the advice above — dense computed relations
+are host territory, the logic joins only sparse results — the more of its
+interesting reasoning ends up behind a callback that answers yes or no and
+accounts for nothing. `los(a,b) [PROVED]` is the whole story the trace can
+tell, while *what* the ray hit is sitting in the host's answer and is
+discarded. That is the exact failure `why?` exists to prevent: the author sees
+*that* the engine believed something and goes reading host code to find out
+why.
+
+So both provider kinds carry an optional account, and both are strictly
+**trace-time**, because an explanation must not be able to change what it
+explains. A boolean relation takes a render callback phrasing one ground
+answer, appended where the trace already prints the atom
+(`near(g,i) [manhattan 4 > 2]`); registering none leaves traces byte-identical,
+which is what makes it additive. A value-returning function takes an opt-in
+call log — the calls a step made, with their arguments and results — because a
+receipt can say a number changed by 3 but not that `neighbor(at(x), north)`
+answered it. The log is off by default: the provider boundary is the hot path
+(§8.1), and it is a side-channel that cannot alter a call's answer, so a run
+with it on and one with it off are the same run (I4).
+
 **Golden test to pin it:** a `move` action changes exactly one actor's cell and
 leaves every other position inert across the step (spatial Yale-shooting); a
 proximity rule fires iff the provider reports the actors within range, and
-recomputes when a move changes that range (I3); and a rule with no spatial
+recomputes when a move changes that range (I3); a rule with no spatial
 anchor over a populated grid raises the cardinality warning rather than
-grounding the cross product.
+grounding the cross product; and the proximity rule's trace carries the host's
+own account of the distance it measured.
 
 ### 5.7 Multi-valued fluents and defeat across values
 

@@ -139,6 +139,29 @@ bool world_provider_holds_at(const world *w, uint32_t pred,
 bool world_num_cmp_holds(const world *w, uint32_t num_atom,
                          world_cmp op, long threshold);
 
+/* Trace-time provider rendering (#178). A host-answered relation contributes
+ * nothing to a why-trace but its own verdict: `los(a,b) [PROVED]` is the whole
+ * story, while WHAT the ray hit — the crate at (3,7), the 3.2 metres — sits in
+ * the host's answer and is discarded. In an engine whose product is the trace,
+ * that leaves a black box in the middle of it.
+ *
+ * The callback writes a short phrase for one ground provider atom; return the
+ * number of bytes written (0 = nothing to say, and the trace renders exactly as
+ * it does today, so this is additive and costs nothing to skip):
+ *
+ *   los(a,b) [blocked by crate at (3,7)] [PROVED]
+ *
+ * Consulted ONLY while rendering a trace, never during a solve — it exists to
+ * explain a verdict already reached, so it cannot perturb one. That keeps it
+ * outside I4 entirely: a render callback that is slow, allocating, or
+ * nondeterministic in its PHRASING cannot affect replay. `holds` is the verdict
+ * being explained, so one callback can phrase both the yes and the no. */
+typedef int (*world_provider_render_fn)(void *ctx, uint32_t pred,
+                                        const uint32_t *args, int nargs,
+                                        bool holds, char *buf, size_t cap);
+void world_set_provider_render_fn(world *w, world_provider_render_fn fn,
+                                  void *ctx);
+
 /* Value-returning function providers (§5.6): a host function that returns a
  * value (a cell handle / int), not a relation — e.g. `neighbor(at(X), dir)` for
  * directional movement. Consulted from the effect-VM (EXPR_CALL) at commit time;
@@ -149,6 +172,19 @@ bool world_num_cmp_holds(const world *w, uint32_t num_atom,
 typedef long (*world_fn_provider_fn)(void *ctx, uint32_t pred,
                                      const long *args, int nargs);
 void world_set_fn_provider_fn(world *w, world_fn_provider_fn fn, void *ctx);
+
+/* The value-provider call log (#178, the other half of provider opacity). A
+ * value-returning provider hands the effect VM a number and no account of where
+ * it came from: a receipt says `-3` and cannot say `neighbor(at(x), north)`
+ * answered `3`. With the log on, every call a step makes is recorded in order —
+ * a debugging facility, off by default because the provider boundary is the
+ * hot path (§8.1) and a step should not pay for an explanation nobody asked
+ * for. Recording is a side-channel, never a semantic one: it cannot change what
+ * a call returns, so a replay with the log on and one with it off are the same
+ * run (I4). Cleared at the top of every world_step; valid until the next one. */
+typedef struct { uint32_t pred; int nargs; long args[4]; long result; } world_fn_call;
+void world_set_fn_call_log(world *w, bool on);
+const world_fn_call *world_fn_calls(const world *w, int *count);
 
 /* Seeded randomness (§5.10): a roll is a keyed lookup, not a stream. `seed` is
  * save state; `tick` is a monotone step counter the engine bumps each successful
