@@ -178,6 +178,18 @@ Two tiers, one semantics:
   `why?` debugger, the editor, and §5.3's dry-run query are ad hoc by nature.
   Declared interest buys the incremental path; it does not gate the ask.
 
+**The surface is one primitive, and it is already there.** `world_subscribe`
+takes a literal — base fact or derived judgment, no distinction at the call —
+and each step reports which subscribed literals flipped, alongside the level
+each one now holds. The pair is what a loop wants: decide from the level, react
+to the edge (§12's `btn`/`btnp` shape). Naming a *conclusion* rather than a
+storage location is what makes a fluent refactored into a judgment, or back,
+invisible to every client; the two cases differ in what they cost, which is a
+warning, not a second call shape. What the cone above buys is that cost — today
+a subscribed step re-solves the judgment family, the same solve the client's
+first query would have paid; the demanded-and-reachable narrowing is M4 and
+changes no answer.
+
 This split is an optimization, not a second semantics — see §5.4.
 
 ### 4.2 Kernel, driver, clients

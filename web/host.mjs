@@ -42,6 +42,18 @@ for (const who of SORTS.actor) {
 console.log('\n--- why can_force_door(guard)? ---');
 process.stdout.write(w.why('can_force_door(guard)'));
 
+// The reactive channel (§11 M2): declare interest once, then react to what
+// flipped. One call shape for the base fact and for the judgment in its cone —
+// which is the point, since a fluent refactored into a judgment must not touch
+// a client call site.
+const watch = {
+  door: w.subscribe('door_closed'),
+  guardCanForce: w.subscribe('can_force_door(guard)'),
+  heroCanForce: w.subscribe('can_force_door(hero)'),
+};
+console.log('\nsubscribed:',
+  Object.entries(watch).map(([k, h]) => `${k}=${w.verdict(h)}`).join('  '));
+
 // The action set is assembled through the builder (§6.3): an action that does
 // not exist is unconstructible, and the protocol checks happen at `add`.
 console.log(`\ndoor_closed before: ${w.state.door_closed()}`);
@@ -53,6 +65,12 @@ console.log(`door_closed after force_door(guard): ${w.state.door_closed()}`);
 // diff, and does not need to know which atoms to ask about.
 for (const d of w.changed())
   console.log(`  changed: ${d.atom} = ${'value' in d ? d.value : `${d.from} -> ${d.to}`}`);
+
+// …and what it changed that this client asked about. The door fact and both
+// judgments standing on it flip together, reported in subscription order.
+for (const e of w.edges())
+  console.log(`  ${e.rose ? 'rose' : e.fell ? 'fell' : 'moved'}: ` +
+              `${e.neg ? '~' : ''}${e.atom} (${e.from} -> ${e.to})`);
 
 // The vocabulary check is real, not decorative:
 try {

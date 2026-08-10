@@ -637,6 +637,45 @@ void world_step_why(world *w, dl_lit q, bool next, FILE *out);
 int world_step(world *w, const uint32_t *actions, int nactions,
                char *err, size_t errsz);
 
+/* Subscriptions (§11 M2): the client's reactive channel, and deliberately ONE
+ * primitive over facts AND judgments. Register interest in a literal; each step
+ * reports the subscribed literals whose verdict flipped.
+ *
+ * Base facts are the free leaf case — the step already computes its changeset —
+ * while a derived judgment is the cone-recompute case (§4.1 wake-ups), so the
+ * two differ in COST, not in call shape. That is the point: a fluent refactored
+ * into a judgment (or back) never touches a client call site, because a
+ * subscription names a CONCLUSION, not a storage decision. A subscription to a
+ * large-cone judgment is a cardinality-style warning, not a different primitive.
+ *
+ * Two readouts, the pair a client loop actually wants (§12): the LEVEL —
+ * world_sub_verdict, the current answer — and the EDGES, which flipped this
+ * step (the `btnp` to level's `btn`). An edge is a per-step difference: the
+ * verdict at the end of this step against the end of the previous one, or
+ * against the moment of subscription. Seeding state between steps with
+ * world_set therefore folds into the next step's edges, which is the honest
+ * reading — state is constant within a tick, and a load is not a tick.
+ *
+ * Handles are stable: unsubscribing never renumbers another subscription.
+ * Edges are reported in subscription order and cleared at the top of every
+ * step, so a rejected step reports none (I4: the same actions on the same state
+ * produce the same edge stream).
+ *
+ * The demand-cone optimization §4.1 describes — maintaining only what is both
+ * reachable and demanded — is M4, and invisible here: it changes what a
+ * subscription COSTS, never what it says. */
+int        world_subscribe(world *w, dl_lit q);
+void       world_unsubscribe(world *w, int sub);
+dl_verdict world_sub_verdict(world *w, int sub);
+
+typedef struct {
+    int        sub;              /* the world_subscribe handle */
+    dl_lit     lit;              /* the literal it names */
+    dl_verdict from, to;         /* rose = to PROVED; fell = from PROVED */
+} world_sub_edge;
+
+const world_sub_edge *world_sub_edges(const world *w, int *count);
+
 /* ---- the step readout: what changed, and why (#88) -----------------------
  *
  * Everything a step tells its client, past the next state itself. Three

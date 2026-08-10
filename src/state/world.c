@@ -171,6 +171,13 @@ struct world {
      * second pass. Cleared at the top of every step, like the emissions. */
     world_bool_delta *bdelta; int nbdelta, capbdelta;
     world_num_delta  *ndelta; int nndelta, capndelta;
+    /* Subscriptions (§11 M2): the client's declared interest, and the edges the
+     * last step produced. `last` is the verdict as of the previous step
+     * boundary — the baseline an edge is measured against. Append-only so
+     * handles stay stable; `live` false is an unsubscribed slot. */
+    struct { dl_lit lit; dl_verdict last; bool live; } *subs;
+    int nsubs, capsubs;
+    world_sub_edge *sedge; int nsedge, capsedge;
     int *num_of;    uint32_t num_of_cap;
     int *guard_of;  uint32_t guard_of_cap;   /* guard atom  -> guards index  */
     int *prov_of;   uint32_t prov_of_cap;    /* provider atom -> provs index */
@@ -550,6 +557,8 @@ void world_free(world *w)
     free(w->emitbuf);
     free(w->bdelta);
     free(w->ndelta);
+    free(w->subs);
+    free(w->sedge);
     free(w->watch_of);
     free(w->num_of);
     free(w->guard_of);
@@ -666,6 +675,8 @@ static void ndelta_push(world *w, uint32_t atom, long from, long to)
     w->ndelta[w->nndelta].to = to;
     w->nndelta++;
 }
+
+static void refresh_subs(world *w);      /* §11 M2, defined with the readouts */
 
 static int emit_index(const world *w, uint32_t atom)
 {
@@ -3617,6 +3628,7 @@ int world_step(world *w, const uint32_t *actions, int nactions,
     w->nemitbuf = 0;               /* burst cues are the LAST step's (#11): a
                                     * rejected step below emits nothing */
     w->nbdelta = w->nndelta = 0;   /* and so is the changeset (#88) */
+    w->nsedge = 0;                 /* and the subscription edges (§11 M2) */
     if (w->fnlog) w->fnlog->n = 0;                 /* and the call log (#178) */
 
     /* Loud no-op actions (#119): an action atom that triggers ZERO step rules
@@ -3721,7 +3733,10 @@ int world_step(world *w, const uint32_t *actions, int nactions,
         w->nemit == 0 &&           /* lanes carry no emit columns (#11) */
         (w->nnum == 0 || w->steplanes[0].covers_numeric)) {
         int rc = world_step_lanes(w, actions, nactions, err, errsz);
-        if (rc == 0) w->tick++;                    /* monotone step counter (§5.10) */
+        if (rc == 0) {
+            w->tick++;                             /* monotone step counter (§5.10) */
+            refresh_subs(w);                       /* the reactive channel (§11 M2) */
+        }
         return rc;
     }
 
@@ -4052,6 +4067,10 @@ int world_step(world *w, const uint32_t *actions, int nactions,
     free(mix_next);
     free(next);
     free(nextnum);
+    if (rc == 0) refresh_subs(w);                  /* the reactive channel (§11 M2):
+                                                    * after the commit, so a
+                                                    * subscription reads the state
+                                                    * the step produced */
     return rc;
 }
 
@@ -4087,6 +4106,62 @@ const world_num_delta *world_num_deltas(const world *w, int *count)
 {
     if (count) *count = w->nndelta;
     return w->ndelta;
+}
+
+/* ---- subscriptions (§11 M2) ---------------------------------------------- */
+
+int world_subscribe(world *w, dl_lit q)
+{
+    GROW(w->subs, w->nsubs, w->capsubs);
+    int h = w->nsubs++;
+    w->subs[h].lit = q;
+    w->subs[h].live = true;
+    /* the level is valid immediately: a client may subscribe mid-run and read
+     * before the next step, and its first edge should be measured from here */
+    w->subs[h].last = world_query(w, q);
+    return h;
+}
+
+void world_unsubscribe(world *w, int sub)
+{
+    if (sub >= 0 && sub < w->nsubs)
+        w->subs[sub].live = false;     /* the slot stays: handles are stable */
+}
+
+dl_verdict world_sub_verdict(world *w, int sub)
+{
+    if (sub < 0 || sub >= w->nsubs || !w->subs[sub].live)
+        return DL_UNDECIDED;
+    /* Answered live rather than from a cache: within a tick the judgment family
+     * is already solved, so this is a column read, and across a tick a cache
+     * would be the stale-derived-state bug I1 exists to prevent. */
+    return world_query(w, w->subs[sub].lit);
+}
+
+const world_sub_edge *world_sub_edges(const world *w, int *count)
+{
+    if (count) *count = w->nsedge;
+    return w->sedge;
+}
+
+/* Re-read every subscription against the committed state and record the flips.
+ * One judgment solve covers all of them (the family settles together), so the
+ * cost is that solve — which the client's first query would have paid anyway —
+ * plus one column read per subscription. */
+static void refresh_subs(world *w)
+{
+    for (int i = 0; i < w->nsubs; i++) {
+        if (!w->subs[i].live) continue;
+        dl_verdict now = world_query(w, w->subs[i].lit);
+        if (now == w->subs[i].last) continue;
+        GROW(w->sedge, w->nsedge, w->capsedge);
+        w->sedge[w->nsedge].sub = i;
+        w->sedge[w->nsedge].lit = w->subs[i].lit;
+        w->sedge[w->nsedge].from = w->subs[i].last;
+        w->sedge[w->nsedge].to = now;
+        w->nsedge++;
+        w->subs[i].last = now;
+    }
 }
 
 /* The state tier keeps the binding as ids and never learns the term grammar —
