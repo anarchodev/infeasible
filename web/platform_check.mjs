@@ -30,7 +30,7 @@ import { createRuntime } from './platform/runtime.mjs';
 import { cart, open, STORY } from './carts/cellar.mjs';
 
 const require = createRequire(import.meta.url);
-const createInfeasible = require('./infeasible.cjs');
+const createInfeasible = require('./infeasible.js');
 
 let failed = 0;
 const check = (what, cond, extra = '') => {

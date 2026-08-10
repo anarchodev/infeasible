@@ -5,6 +5,6 @@ compile_commands.json
 .emsdk/
 
 # Generated WASM module (regenerate with web/build.sh)
-web/infeasible.cjs
+web/infeasible.js
 web/infeasible.mjs
 web/*.wasm

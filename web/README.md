@@ -27,20 +27,25 @@ JS against `world_*` — no engine code, and no build step to run or remix.
 Requires Emscripten (`emcc`) and Node.
 
 ```sh
-web/build.sh                                  # emits web/infeasible.cjs
+web/build.sh                                  # emits web/infeasible.js
 node web/gen_binding.mjs examples/cellar_play.story    # the typed binding
 node web/platform_check.mjs                   # the interface + the cart, headless
 node web/host.mjs                             # the data boundary alone
 node web/binding_check.mjs                    # generated from reaction5e.story
 ```
 
-To play it, serve the **repo root** (the page fetches the `.story` source —
-source is always shipped, §12) and open `/web/`:
+To play it:
 
 ```sh
-python3 -m http.server 8000
-xdg-open http://localhost:8000/web/
+web/serve.sh            # builds infeasible.js if missing, then serves
+                        # → http://localhost:8000/web/
 ```
+
+`serve.sh` is a plain static file server; the only thing it really guarantees
+is the root it serves from. The page fetches the `.story` **source** at runtime
+(§12: source is always shipped, the compiled form is a cache), so `examples/`
+has to be reachable — serving `web/` alone 404s the story and shows a blank
+canvas with an error line, a confusing failure for a correct setup.
 
 ## The presentation interface (§12)
 
@@ -101,8 +106,16 @@ the one place a host still types an atom by hand.
 
 - The module is **CommonJS**, loaded from the ESM host via `createRequire`:
   emscripten 3.1.6's `EXPORT_ES6` output references `__dirname`, undefined under
-  Node ESM. A native ESM module (newer emcc, or a thin loader) lands with the
-  browser build; the browser path never touches `__dirname`.
+  Node ESM. The browser loads the same file as a classic `<script>`, which never
+  touches `__dirname`. Its extension is `.js` and that is load-bearing: a host
+  serving an unknown extension as `application/octet-stream` under
+  `X-Content-Type-Options: nosniff` (GitHub Pages does) makes the browser refuse
+  to execute it, and `.js` is the one extension every host maps to a JavaScript
+  MIME type. Node needs no help either way — with no `package.json` declaring
+  `"type": "module"` above `web/`, `.js` is CommonJS.
+- The module is **git-ignored**: it is build output, so a fresh clone runs
+  `web/build.sh` once (it bootstraps the repo-local pinned emsdk itself — no
+  system emscripten needed). Everything else in `web/` is committed source.
 - Audio ships no assets: `sound(id)` looks `id` up in the backend's registry
   and is a no-op until the page registers one. The op set is frozen; the asset
   format is still open (§13).
