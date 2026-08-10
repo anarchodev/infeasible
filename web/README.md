@@ -60,9 +60,11 @@ canvas with an error line, a confusing failure for a correct setup.
 
 `platform/spec.mjs` is the freeze, as data: twelve draw ops, four audio ops,
 five input ops, two persistence ops, the blessed 1080-divisor resolution set,
-the sixteen-entry palette, the frozen key set, the 4×6 text cell, and the
-letterbox arithmetic (with its inverse, which belongs below the line — every
-cart computing it independently is every cart getting the edges wrong).
+the sixteen-entry palette, the frozen key set, the two text cells (4×6 dense
+and 6×8 readable — one density cannot serve both a `why?` trace and a button
+label), and the letterbox arithmetic (with its inverse, which belongs below the
+line — every cart computing it independently is every cart getting the edges
+wrong).
 
 `platform_check.mjs` asserts the correspondence in both directions: the
 cart-facing surfaces expose exactly those names, and each backend implements

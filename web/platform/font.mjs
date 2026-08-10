@@ -1,11 +1,18 @@
-// font.mjs — the built-in 3×5 glyph set, drawn in the frozen 4×6 text cell.
+// font.mjs — the two built-in glyph sets, one per frozen text cell.
 //
-// §12 freezes text METRICS, not letter shapes: `print` advances GLYPH_W per
-// character and a line is GLYPH_H tall on every backend, so a native player may
-// substitute its own font without any cart's UI shifting by a pixel. This is
-// the Canvas2D backend's font, and it is bitmap rather than `fillText` for one
-// reason: text renders at internal resolution like everything else, or the
-// aesthetic splits into game pixels and suspiciously sharp text.
+// §12 freezes text METRICS, not letter shapes: `print` advances a fixed cell
+// per character on every backend, so a native player may substitute its own
+// font without any cart's UI shifting by a pixel. These are the Canvas2D
+// backend's, and they are bitmap rather than `fillText` for one reason: text
+// renders at internal resolution like everything else, or the aesthetic splits
+// into game pixels and suspiciously sharp text.
+//
+// There are TWO because one density cannot serve both jobs. A proof trace wants
+// columns — the 4×6 cell puts 160 of them across a 640-wide surface, and the
+// trace reads unwrapped. Everything a player reads at a glance wants size — at
+// that cell a capital is 1.4% of screen height, against PICO-8's 3.9%. So the
+// cell is a per-call choice between two frozen sizes rather than a compromise
+// that is wrong for both.
 //
 // Encoding: five octal digits per glyph, top row first, bit 4 = left column.
 // Codepoints 32..95; lowercase folds to uppercase, anything else prints '?'.
@@ -37,6 +44,59 @@ export function glyph(ch) {
   for (let r = 0; r < 5; r++) {
     const bits = GLYPHS.charCodeAt(off + r) - 48;
     rows.push([(bits & 4) !== 0, (bits & 2) !== 0, (bits & 1) !== 0]);
+  }
+  return rows;
+}
+
+/** The LARGE glyph set: 5×7 letters in the 6×8 cell, as a sheet — sixteen
+ *  glyphs across, four bands, ASCII 32..95 in order. Written as pixels rather
+ *  than packed bits because a font is the one table where a typo is invisible
+ *  in code and glaring on screen, and this way it is glaring in both. */
+const BIG = [
+  //   ! " #  $  %  &  '  (  )  *  +  ,  -  .  /
+  '.......#...#.#..#.#...#..##..#.##....#.....#..#................................#',
+  '.......#...#.#..#.#..######..##..#...#....#....#..#.#.#..#....................#.',
+  '.......#.......######.#.....#.#.#........#......#..###...#....................#.',
+  '.......#........#.#..###...#...#.........#......#.##########.....#####.......#..',
+  '.......#.......#####..#.#.#...#.#.#......#......#..###...#....##............#...',
+  '................#.#.####.#..###..#........#....#..#.#.#..#....#.........##..#...',
+  '.......#........#.#...#..#..##.##.#........#..#..............#..........##.#....',
+  // 0 1 2 3 4 5 6 7 8 9 : ; < = > ?
+  '.###...#...###.#####...#.#####..##.#####.###..###..............#.......#....###.',
+  '#...#.##..#...#...#...##.#.....#...#...##...##...#..##...##...#.........#..#...#',
+  '#..##..#......#..#...#.#.####.#........##...##...#..##...##..#...#####...#.....#',
+  '#.#.#..#.....#....#.#..#.....#####....#..###..####..........#.............#...#.',
+  '##..#..#....#......######....##...#..#..#...#....#..##...##..#...#####...#...#..',
+  '#...#..#...#...#...#...#.#...##...#..#..#...#...#...##...#....#.........#.......',
+  '.###..###.#####.###....#..###..###...#...###..##........#......#.......#.....#..',
+  // @ A B C D E F G H I J K L M N O
+  '.###...#..####..###.###..##########.###.#...#.###....###...##....#...##...#.###.',
+  '#...#.#.#.#...##...##..#.#....#....#...##...#..#......##..#.#....##.####..##...#',
+  '#.####...##...##....#...##....#....#....#...#..#......##.#..#....#.#.##.#.##...#',
+  '#.#.##...#####.#....#...#####.####.#.########..#......###...#....#.#.##..###...#',
+  '#.#########...##....#...##....#....#...##...#..#..#...##.#..#....#...##...##...#',
+  '#....#...##...##...##..#.#....#....#...##...#..#..#...##..#.#....#...##...##...#',
+  '.###.#...#####..###.###..######.....#####...#.###..###.#...#######...##...#.###.',
+  // P Q R S T U V W X Y Z [ \ ] ^ _
+  '####..###.####..##########...##...##...##...##...######.###.#.....###...#.......',
+  '#...##...##...##......#..#...##...##...##...##...#....#.#...#.......#..#.#......',
+  '#...##...##...##......#..#...##...##...#.#.#..#.#....#..#....#......#.#...#.....',
+  '####.#...#####..###...#..#...##...##.#.#..#....#....#...#.....#.....#...........',
+  '#....#.#.##.#......#..#..#...##...##.#.#.#.#...#...#....#.....#.....#...........',
+  '#....#..#.#..#.....#..#..#...#.#.#.##.###...#..#..#.....#......#....#...........',
+  '#.....##.##...#####...#...###...#..#...##...#..#..#####.###.....#.###......#####',
+];
+
+/** Rows of a character in the LARGE cell — 7 rows of 5 booleans. */
+export function glyphBig(ch) {
+  let code = (FOLD[ch] ?? ch).charCodeAt(0);
+  if (code >= 97 && code <= 122) code -= 32;
+  if (code < 32 || code > 95) code = 63;
+  const band = Math.floor((code - 32) / 16), col = ((code - 32) % 16) * 5;
+  const rows = [];
+  for (let r = 0; r < 7; r++) {
+    const src = BIG[band * 7 + r];
+    rows.push([0, 1, 2, 3, 4].map((k) => src[col + k] === '#'));
   }
   return rows;
 }

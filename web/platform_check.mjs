@@ -76,7 +76,7 @@ console.log('\nthe cart surface');
 // `glyphW`/`glyphH`/`textWidth` are the frozen text CELL, not ops: derived
 // constants a cart lays text out against, which is why they are not a
 // thirteenth call for a backend to implement.
-const METRICS = ['glyphW', 'glyphH', 'textWidth'];
+const METRICS = ['glyphW', 'glyphH', 'bigGlyphW', 'bigGlyphH', 'textWidth'];
 check('draw exposes exactly the frozen ops, plus the text metric',
       same(Object.keys(platform.cart.draw).filter((k) => !METRICS.includes(k)), DRAW_OPS),
       Object.keys(platform.cart.draw).join(','));

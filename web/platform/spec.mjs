@@ -46,7 +46,7 @@ export const DRAW_OPS = [
   'tile',       // tile(sheet, index, x, y)         — atlas blit, the map layer
   'spr',        // spr(sheet, index, x, y, opts)    — sprite: flipX/flipY/alpha
   'shade',      // shade(sheet, index, x, y)        — THE composite op (fog)
-  'print',      // print(text, x, y, color)         — text, at internal res
+  'print',      // print(text, x, y, color, opts)   — text: one of two cells
   'line',       // line(x0, y0, x1, y1, color)
   'rect',       // rect(x, y, w, h, color)
   'rectfill',   // rectfill(x, y, w, h, color)
@@ -86,16 +86,27 @@ export const KEYS = [
   'space', 'enter', 'escape', 'tab', 'shift', 'ctrl', 'alt',
 ];
 
-/** The text cell. Frozen as METRICS, not as glyphs: a backend may draw its
- *  letters however it likes, but `print` advances GLYPH_W per character and a
- *  line is GLYPH_H tall everywhere. Freezing layout and not shapes is what
- *  lets a native player substitute its own bitmap font without every cart's
- *  UI shifting by a pixel. */
+/** The text cells. Frozen as METRICS, not as glyphs: a backend may draw its
+ *  letters however it likes, but `print` advances the cell width per character
+ *  and a line is the cell height everywhere. Freezing layout and not shapes is
+ *  what lets a native player substitute its own bitmap font without every
+ *  cart's UI shifting by a pixel.
+ *
+ *  There are TWO cells because one density cannot serve both jobs, and the
+ *  arithmetic says so rather than taste. At 640×360 the small cell gives 160
+ *  columns — a proof trace reads unwrapped — but a capital is 1.4% of screen
+ *  height against PICO-8's 3.9%, which is a terminal, not a game UI. So `print`
+ *  takes `{ big: true }`, the way `spr` takes flip and alpha: a second SIZE on
+ *  an existing op, never a thirteenth op. A backend implements two bitmap
+ *  fonts; that is still a weekend to port. */
 export const GLYPH_W = 4;
 export const GLYPH_H = 6;
+export const BIG_GLYPH_W = 6;
+export const BIG_GLYPH_H = 8;
 
 /** Width of a string in internal pixels — derived, so it is not an op. */
-export const textWidth = (s) => s.length * GLYPH_W;
+export const textWidth = (s, big = false) =>
+  s.length * (big ? BIG_GLYPH_W : GLYPH_W);
 
 /**
  * The upscale: nearest-neighbor INTEGER scale with letterboxing. A wider

@@ -16,7 +16,7 @@
 // slightly differently.
 
 import { DRAW_OPS, AUDIO_OPS, KEYS, BUTTONS, PALETTE, CARTDATA_CELLS,
-         GLYPH_W, GLYPH_H, textWidth } from './spec.mjs';
+         GLYPH_W, GLYPH_H, BIG_GLYPH_W, BIG_GLYPH_H, textWidth } from './spec.mjs';
 
 const KEYSET = new Set(KEYS);
 
@@ -57,9 +57,9 @@ function makeDraw(be) {
                                                      alpha: o.alpha === undefined ? 1 : +o.alpha }),
     shade:    (sheet, i, x, y)           => be.shade(sheet, i | 0,
                                                      int('shade', 'x', x), int('shade', 'y', y)),
-    print:    (text, x, y, c = 5)        => be.print(String(text),
-                                                     int('print', 'x', x), int('print', 'y', y),
-                                                     col('print', c)),
+    print:    (text, x, y, c = 5, o = {}) => be.print(String(text),
+                                                      int('print', 'x', x), int('print', 'y', y),
+                                                      col('print', c), { big: !!o.big }),
     line:     (x0, y0, x1, y1, c)        => be.line(int('line', 'x0', x0), int('line', 'y0', y0),
                                                     int('line', 'x1', x1), int('line', 'y1', y1),
                                                     col('line', c)),
@@ -78,6 +78,8 @@ function makeDraw(be) {
   // measures text by guessing at the backend's font
   d.glyphW = GLYPH_W;
   d.glyphH = GLYPH_H;
+  d.bigGlyphW = BIG_GLYPH_W;
+  d.bigGlyphH = BIG_GLYPH_H;
   d.textWidth = textWidth;
   return d;
 }
