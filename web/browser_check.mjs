@@ -35,7 +35,6 @@ import { letterbox } from './platform/spec.mjs';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const PORT = 8099;
-const INTERNAL = [320, 180];
 
 const shotsAt = process.argv.indexOf('--shots');
 const SHOTS = shotsAt > 0 ? process.argv[shotsAt + 1] : null;
@@ -89,7 +88,7 @@ await sleep(600);
 
 browser = spawn(CHROME, [
   '--headless=new', '--disable-gpu', '--no-sandbox', '--hide-scrollbars',
-  '--window-size=1280,760', '--remote-debugging-port=0',
+  '--window-size=1600,1000', '--remote-debugging-port=0',
   `--user-data-dir=${profile}`, 'about:blank',
 ], { stdio: ['ignore', 'ignore', 'pipe'] });
 
@@ -190,6 +189,12 @@ check('the canvas has a picture on it, not one flat colour', paint.colours > 8,
 
 // ---- geometry: internal pixels -> screen ------------------------------------
 
+// The internal resolution is the CART's choice within the frozen set, so it is
+// read from the running cart rather than assumed here — hardcoding it makes
+// every click land somewhere else the day a game picks a different one.
+const INTERNAL = await evaluate(
+  `(async () => (await import('/web/carts/cellar.mjs')).cart.resolution)()`);
+
 const geom = await evaluate(`(() => {
   const c = document.getElementById('screen');
   const r = c.getBoundingClientRect();
@@ -203,7 +208,12 @@ const toScreen = (ix, iy) => ({
   y: geom.top + (box.y + iy * box.scale) * perBuf,
 });
 
-check('the frozen upscale is an integer, and more than 1:1', box.scale >= 2,
+// Integer and inside the buffer is the frozen rule; ×1 is a legitimate scale
+// for a game that picked a large internal resolution on a small window, so
+// asserting ×2 here would be asserting a window size.
+check('the frozen upscale is an integer that fits the surface',
+      Number.isInteger(box.scale) && box.scale >= 1 &&
+      box.w <= geom.bufW && box.h <= geom.bufH && box.x >= 0 && box.y >= 0,
       JSON.stringify({ ...box, buf: [geom.bufW, geom.bufH] }));
 
 // ---- the live cart, through the module registry -----------------------------
@@ -229,23 +239,23 @@ check('it opens on the commands the world allows',
 // boundary (§12), so a press and release inside one 50ms tick is a press the
 // game never observes. That is the frozen contract, not a bug — a driver has
 // to hold the button like a hand does.
-async function clickInternal(ix, iy) {
+async function clickInternal(ix, iy, holdMs = 150) {
   const p = toScreen(ix, iy);
   const base = { x: Math.round(p.x), y: Math.round(p.y), button: 'left',
                  buttons: 1, clickCount: 1 };
   await send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...base, buttons: 0 });
   await send('Input.dispatchMouseEvent', { type: 'mousePressed', ...base });
-  await sleep(150);
+  await sleep(holdMs);
   await send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...base, buttons: 0 });
-  await sleep(150);
+  await sleep(200);
 }
 
-async function command(label) {
+async function command(label, holdMs) {
   st = await cartState();
   const b = st.buttons.find((x) => x.label === label);
   if (!b) throw new Error(`no command '${label}' — offered: ` +
                           st.buttons.map((x) => x.label).join(', '));
-  await clickInternal(b.x + 4, b.y + 4);
+  await clickInternal(b.x + 4, b.y + 4, holdMs);
   st = await cartState();
   return b;
 }
@@ -270,7 +280,14 @@ check('clicking the greyed command printed the argument that refused it',
       st.why.includes('too_weak') || st.why.includes('can_force_door'), st.why);
 await shot('02-why');
 
-await command('GO TO CELLAR');
+// A FAST click: 15ms, well inside one 50ms tick, so the press and the release
+// both land between two samples. The backend latches a press until the next
+// sample consumes it — without that, this click is one the game never sees,
+// and a real mouse is often quicker than a tick.
+await command('GO TO CELLAR', 15);
+check('a click shorter than a tick is not dropped',
+      st.buttons.some((b) => b.label === 'TAKE TORCH'),
+      st.buttons.map((b) => b.label).join(' | '));
 await command('TAKE TORCH');
 await command('TAKE RUSTY KEY');
 await command('GO TO HALL');
@@ -282,7 +299,7 @@ await shot('03-unlocked');
 // path, and the one that exercises the letterbox inverse on an arbitrary
 // point rather than a wide button. The hall's second actor slot, in internal
 // pixels; the cart's own hit test decides whether the click landed.
-await clickInternal(139, 36);
+await clickInternal(296, 72);   // hall, second actor slot
 st = await cartState();
 check('clicking an actor selects them', st.sel === 'guard', st.sel);
 check('the guard can force what the hero cannot',
@@ -295,15 +312,16 @@ check('the receipt rendered the cost in the author\'s terms',
 check('and the subscription narrated the door', st.event.includes('door'), st.event);
 await shot('04-forced');
 
-// tab back to the hero — the keyboard path
+// tab back to the hero — the keyboard path, and a TAP rather than a hold: a
+// key has the same problem a button does, and 15ms is well inside a tick.
 await send('Input.dispatchKeyEvent', { type: 'keyDown', code: 'Tab', key: 'Tab',
                                        windowsVirtualKeyCode: 9 });
-await sleep(150);
+await sleep(15);
 await send('Input.dispatchKeyEvent', { type: 'keyUp', code: 'Tab', key: 'Tab',
                                        windowsVirtualKeyCode: 9 });
-await sleep(150);
+await sleep(200);
 st = await cartState();
-check('tab switches actors', st.sel === 'hero', st.sel);
+check('a tab tap shorter than a tick switches actors', st.sel === 'hero', st.sel);
 
 await command('ENTER VAULT');
 await command('TAKE ANTIDOTE');

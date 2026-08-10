@@ -224,8 +224,31 @@ export function createCanvasBackend(canvas, { resolution = DEFAULT_RESOLUTION } 
     music_stop() { if (be.track) { be.track.pause(); be.track = null; } },
 
     // ---- input: listeners here, polling out there -------------------------
+    //
+    // The LATCH is the whole subtlety. Input is sampled once per tick at the
+    // tick boundary (§12, for I4), and a tick is 50ms — but a real mouse click
+    // is often shorter than that, so a press and release that both land
+    // between two samples would be a click the game never observed. The
+    // browser saw it; the sampler did not.
+    //
+    // So a press is remembered until the next sample consumes it: `readInput`
+    // reports a button as down if it IS down or if it WENT down since the last
+    // call, then clears the memory. Held buttons still read held, a tap reads
+    // down for exactly one tick, and the determinism rule is untouched — the
+    // cart still gets one frozen snapshot per tick, and `readInput` is called
+    // exactly once per tick by the platform. (Two taps inside one tick collapse
+    // into one, which is what sampling at 20Hz means.)
     raw: { x: 0, y: 0, buttons: [false, false, false], keys: new Set() },
-    readInput() { return be.raw; },
+    latchB: [false, false, false],
+    latchK: new Set(),
+    readInput() {
+      const out = { x: be.raw.x, y: be.raw.y,
+                    buttons: be.raw.buttons.map((b, i) => b || be.latchB[i]),
+                    keys: new Set([...be.raw.keys, ...be.latchK]) };
+      be.latchB = [false, false, false];
+      be.latchK.clear();
+      return out;
+    },
 
     // ---- persistence: the cartdata blob, and nothing else ------------------
     loadCartdata() {
@@ -268,7 +291,9 @@ export function createCanvasBackend(canvas, { resolution = DEFAULT_RESOLUTION } 
       target.addEventListener('pointermove', move);
       target.addEventListener('pointerdown', (e) => {
         move(e);
-        const b = be.raw.buttons.slice(); b[Math.min(2, e.button)] = true;
+        const i = Math.min(2, e.button);
+        const b = be.raw.buttons.slice(); b[i] = true;
+        be.latchB[i] = true;
         be.raw = { ...be.raw, buttons: b };
       });
       const up = (e) => {
@@ -277,13 +302,18 @@ export function createCanvasBackend(canvas, { resolution = DEFAULT_RESOLUTION } 
       };
       target.addEventListener('pointerup', up);
       window.addEventListener('blur', () => {
+        // a key held when focus left is not held any more, and a latch that
+        // outlives the window would fire on return
         be.raw = { ...be.raw, buttons: [false, false, false], keys: new Set() };
+        be.latchB = [false, false, false];
+        be.latchK.clear();
       });
       window.addEventListener('keydown', (e) => {
         const k = KEYMAP[e.code];
         if (!k) return;
         e.preventDefault();
         const s = new Set(be.raw.keys); s.add(k);
+        be.latchK.add(k);
         be.raw = { ...be.raw, keys: s };
       });
       window.addEventListener('keyup', (e) => {
