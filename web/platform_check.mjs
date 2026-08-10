@@ -215,6 +215,21 @@ check('cartdata survives a write and is not part of the log', (() => {
   return platform.cart.data.get(3) === 42 && rt.ctx.log.length === 10;
 })());
 
+console.log('\nthe two clients meet on one save');
+{
+  // `examples/cellar_play.log` is the fixture `tests/test_secondclient.c`
+  // replays through `world_*` alone. The cart reached it by CLICKING; the C
+  // client has to land in the same world from the same lines. Neither client
+  // can be quietly special, because the save is the only thing they share.
+  const text = readFileSync(new URL('../examples/cellar_play.log', import.meta.url), 'utf8');
+  const lines = text.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
+  const named = lines.shift();
+  check('the save names the world it was played against', named === `story ${STORY}`, named);
+  const played = rt.ctx.log.map((t) => t.join(' '));
+  check('the log the cart produced by clicking IS that fixture', same(lines, played),
+        `file:   ${lines.join(' / ')}\n        played: ${played.join(' / ')}`);
+}
+
 world.close();
 console.log(failed ? `\nplatform_check: ${failed} FAILED` : '\nplatform_check: all passed');
 process.exit(failed ? 1 : 0);

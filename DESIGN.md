@@ -247,9 +247,34 @@ it is a kernel with clients:
   Everything a client does (declare fluents, register actions, emit rules,
   query, propose) goes through the public surface every client gets;
   `world.h` already *is* that surface, and the hand-built test worlds are
-  the proof. Because there is no blessed client, the test is now carried
-  entirely by having a *second* one: M2 ships a trivial second client in
-  tests to pin the claim the way golden tests pin semantics (§11).
+  the proof. Because there is no blessed client, the test is carried
+  entirely by having a *second* one, in tests, pinning the claim the way
+  golden tests pin semantics (§11).
+
+  A second client is evidence only if it is genuinely a second one, so it
+  is built to be unlike the browser cart in every dimension that could
+  hide a private dependency: a different language (C against `world_*`,
+  not JS against the §6.3 binding), a different presentation (a text
+  frame), and — the load-bearing one — a different *architecture*. The
+  cart is **polled**: it re-asks the world everything it draws, every
+  frame. The second client is **reactive**: it polls once at startup and
+  after that maintains its picture only from what a step reports, the
+  subscription edges plus the numeric changeset, never re-reading a fluent
+  it already knows about.
+
+  That difference is what turns the test from "it compiles" into a
+  check with a failure mode. A reactive client's cached picture must equal
+  a freshly polled one at *every* tick, and the test asserts exactly that
+  after every step — so a subscription channel that misses an edge, or
+  reports one no step caused, separates the two pictures and fails. It is
+  the only check that the reactive channel is **complete** rather than
+  merely correct about what it does report.
+
+  The two clients meet on one artifact: an action log (§12's save). The
+  cart plays the world by clicking and asserts the log it produced is the
+  committed fixture; the second client replays that fixture and asserts it
+  lands in the same world, offering the same commands. Neither client can
+  drift into being the special one, because the save is all they share.
 
 ## 5. Logical foundations
 
