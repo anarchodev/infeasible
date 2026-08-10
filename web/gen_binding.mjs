@@ -120,6 +120,11 @@ w(`export const SOURCE_HASH = ${JSON.stringify(SOURCE_HASH)};`);
 w(`export const SORTS = ${JSON.stringify(
   Object.fromEntries(iface.sorts.filter((s) => s.kind === 'sort')
                                 .map((s) => [s.name, s.entities])))};`);
+// Enum domains are argument vocabularies too (#96: a value grounds like an
+// entity), so the runtime check below covers them — otherwise a `room`
+// argument is the one position where a typo still interns a fresh atom.
+w(`export const ENUMS = ${JSON.stringify(
+  Object.fromEntries(iface.enums.map((e) => [e.name, e.values])))};`);
 w();
 
 // the exclusive-group protocol, as data the builder enforces
@@ -184,12 +189,13 @@ w(`  const ids = new Map();`);
 w(`  const id = (t) => { let v = ids.get(t); if (v === undefined) { v = api.intern(s, t); ids.set(t, v); } return v; };`);
 w(`  const VERDICT = ['undecided', 'proved', 'refuted'];`);
 w(`  const nameOf = (atom) => api.name(s, atom);`);
-w(`  // a ground argument must be a member of its sort: the binding's own`);
-w(`  // vocabulary check, for values that arrive as data rather than literals`);
+w(`  // a ground argument must be a member of its sort or enum domain: the`);
+w(`  // binding's own vocabulary check, for values that arrive as data rather`);
+w(`  // than literals (a literal is already checked by the JSDoc union type)`);
 w(`  const chk = (sort, v) => {`);
-w(`    const dom = SORTS[sort];`);
+w(`    const dom = SORTS[sort] ?? ENUMS[sort];`);
 w(`    if (dom && !dom.includes(v))`);
-w(`      throw new TypeError(\`'\${v}' is not a member of sort '\${sort}' (\${dom.join(', ')})\`);`);
+w(`      throw new TypeError(\`'\${v}' is not a member of '\${sort}' (\${dom.join(', ')})\`);`);
 w(`    return v;`);
 w(`  };`);
 w();
@@ -246,6 +252,43 @@ for (const f of iface.state) {
     w(`    ${jsName(f.name)}: (${[...params(args), last].join(', ')}) => { ${chks}`);
     w(`      for (const v of ${JSON.stringify(f.values)})`);
     w(`        api.set(s, id(${term(f.name, args)} + '=' + v), v === ${last} ? 1 : 0); },`);
+  }
+}
+w(`  };`);
+w();
+
+// --- ground-term constructors
+//
+// `subscribe`, `why` and `receipt` all name a literal by its ground spelling,
+// and that spelling is the artifact's to decide (`ground.atom`,
+// `ground.value`). Generating it here is what keeps those three calls inside
+// the typed surface instead of leaving them as the one place a host still
+// types an atom by hand — the exact hole the artifact exists to close.
+w(`  /** Ground terms, spelled the way the interface artifact says (§6.3) —`);
+w(`   *  what \`subscribe\`, \`why\` and \`receipt\` take. A multi-valued fluent`);
+w(`   *  takes its value as the last argument, because the ATOM is the`);
+w(`   *  (fluent, value) pair. */`);
+w(`  const lit = {`);
+for (const j of iface.judgments) {
+  const chks = j.args.map((sort, i) => `chk(${JSON.stringify(sort)}, a${i});`).join(' ');
+  w(jsdoc(j.args, 'string').replace(/^ {2}/gm, '    '));
+  w(`    ${jsName(j.name)}: (${params(j.args).join(', ')}) => { ${chks}`);
+  w(`      return ${term(j.name, j.args)}; },`);
+}
+for (const f of iface.state) {
+  const args = f.args;
+  const chks = args.map((sort, i) => `chk(${JSON.stringify(sort)}, a${i});`).join(' ');
+  if (f.type === 'enum') {
+    const last = `a${args.length}`;
+    w(`    /** @param {${union(f.values)}} ${last} */`);
+    w(`    ${jsName(f.name)}: (${[...params(args), last].join(', ')}) => { ${chks}`);
+    w(`      if (!${JSON.stringify(f.values)}.includes(${last}))`);
+    w(`        throw new TypeError(\`'\${${last}}' is not a value of '${f.name}'\`);`);
+    w(`      return ${term(f.name, args)} + '=' + ${last}; },`);
+  } else {
+    w(jsdoc(args, 'string').replace(/^ {2}/gm, '    '));
+    w(`    ${jsName(f.name)}: (${params(args).join(', ')}) => { ${chks}`);
+    w(`      return ${term(f.name, args)}; },`);
   }
 }
 w(`  };`);
@@ -315,7 +358,7 @@ w(`    return view;`);
 w(`  };`);
 w();
 w(`  const world = {`);
-w(`    q, state: st, set, a,`);
+w(`    q, state: st, set, a, lit,`);
 w(`    /** A fresh action set for the next step. */`);
 w(`    actions: () => new ActionSet(),`);
 w(`    /** Advance one step. Throws on a rejected step: with the builder`);

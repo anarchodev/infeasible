@@ -11,6 +11,7 @@
 export const STORY = "examples/reaction5e.story";
 export const SOURCE_HASH = "7471681b";
 export const SORTS = {"actor":["grunk","vera"]};
+export const ENUMS = {};
 
 // #159 exclusive groups, exactly as world_step checks them: a step admits at
 // most one member per (group, key). The builder below refuses the second at
@@ -72,12 +73,13 @@ export function open(M, src) {
   const id = (t) => { let v = ids.get(t); if (v === undefined) { v = api.intern(s, t); ids.set(t, v); } return v; };
   const VERDICT = ['undecided', 'proved', 'refuted'];
   const nameOf = (atom) => api.name(s, atom);
-  // a ground argument must be a member of its sort: the binding's own
-  // vocabulary check, for values that arrive as data rather than literals
+  // a ground argument must be a member of its sort or enum domain: the
+  // binding's own vocabulary check, for values that arrive as data rather
+  // than literals (a literal is already checked by the JSDoc union type)
   const chk = (sort, v) => {
-    const dom = SORTS[sort];
+    const dom = SORTS[sort] ?? ENUMS[sort];
     if (dom && !dom.includes(v))
-      throw new TypeError(`'${v}' is not a member of sort '${sort}' (${dom.join(', ')})`);
+      throw new TypeError(`'${v}' is not a member of '${sort}' (${dom.join(', ')})`);
     return v;
   };
 
@@ -256,6 +258,145 @@ export function open(M, src) {
       api.setNum(s, id(`bless_left(${a0})`), a1); },
   };
 
+  /** Ground terms, spelled the way the interface artifact says (§6.3) —
+   *  what `subscribe`, `why` and `receipt` take. A multi-valued fluent
+   *  takes its value as the last argument, because the ATOM is the
+   *  (fluent, value) pair. */
+  const lit = {
+    /**
+     * @param {T_actor} a0
+     * @param {T_actor} a1
+     * @returns {string}
+     */
+
+    incoming_hit: (a0, a1) => { chk("actor", a0); chk("actor", a1);
+      return `incoming_hit(${a0},${a1})`; },
+    /**
+     * @param {T_actor} a0
+     * @returns {string}
+     */
+
+    crit: (a0) => { chk("actor", a0);
+      return `crit(${a0})`; },
+    /**
+     * @param {T_actor} a0
+     * @returns {string}
+     */
+
+    can_react: (a0) => { chk("actor", a0);
+      return `can_react(${a0})`; },
+    /**
+     * @param {T_actor} a0
+     * @returns {string}
+     */
+
+    down: (a0) => { chk("actor", a0);
+      return `down(${a0})`; },
+    /** @param {"declare" | "react" | "resolve" | "cleanup"} a0 */
+    phase: (a0) => { 
+      if (!["declare","react","resolve","cleanup"].includes(a0))
+        throw new TypeError(`'${a0}' is not a value of 'phase'`);
+      return "phase" + '=' + a0; },
+    /**
+     * @param {T_actor} a0
+     * @returns {string}
+     */
+
+    alive: (a0) => { chk("actor", a0);
+      return `alive(${a0})`; },
+    /**
+     * @param {T_actor} a0
+     * @returns {string}
+     */
+
+    hp: (a0) => { chk("actor", a0);
+      return `hp(${a0})`; },
+    /**
+     * @param {T_actor} a0
+     * @returns {string}
+     */
+
+    acb: (a0) => { chk("actor", a0);
+      return `acb(${a0})`; },
+    /**
+     * @param {T_actor} a0
+     * @returns {string}
+     */
+
+    atkb: (a0) => { chk("actor", a0);
+      return `atkb(${a0})`; },
+    /**
+     * @param {T_actor} a0
+     * @returns {string}
+     */
+
+    dmgb: (a0) => { chk("actor", a0);
+      return `dmgb(${a0})`; },
+    /**
+     * @param {T_actor} a0
+     * @param {T_actor} a1
+     * @returns {string}
+     */
+
+    pending: (a0, a1) => { chk("actor", a0); chk("actor", a1);
+      return `pending(${a0},${a1})`; },
+    /**
+     * @param {T_actor} a0
+     * @returns {string}
+     */
+
+    atk_die: (a0) => { chk("actor", a0);
+      return `atk_die(${a0})`; },
+    /**
+     * @param {T_actor} a0
+     * @returns {string}
+     */
+
+    atk_mod: (a0) => { chk("actor", a0);
+      return `atk_mod(${a0})`; },
+    /**
+     * @param {T_actor} a0
+     * @returns {string}
+     */
+
+    has_shield: (a0) => { chk("actor", a0);
+      return `has_shield(${a0})`; },
+    /**
+     * @returns {string}
+     */
+
+    window_due: () => { 
+      return "window_due"; },
+    /**
+     * @param {T_actor} a0
+     * @returns {string}
+     */
+
+    shielded: (a0) => { chk("actor", a0);
+      return `shielded(${a0})`; },
+    /**
+     * @param {T_actor} a0
+     * @returns {string}
+     */
+
+    reacted: (a0) => { chk("actor", a0);
+      return `reacted(${a0})`; },
+    /**
+     * @param {T_actor} a0
+     * @returns {string}
+     */
+
+    blessed: (a0) => { chk("actor", a0);
+      return `blessed(${a0})`; },
+    /**
+     * @param {T_actor} a0
+     * @returns {string}
+     */
+
+    bless_left: (a0) => { chk("actor", a0);
+      return `bless_left(${a0})`; },
+  };
+
   /** Action constructors. An unknown or misspelled action is unconstructible
    *  — there is no function to call — which is #119's loud no-op retired at
    *  the interface rather than caught at the step. */
@@ -314,7 +455,7 @@ export function open(M, src) {
   };
 
   const world = {
-    q, state: st, set, a,
+    q, state: st, set, a, lit,
     /** A fresh action set for the next step. */
     actions: () => new ActionSet(),
     /** Advance one step. Throws on a rejected step: with the builder
