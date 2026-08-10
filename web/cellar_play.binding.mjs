@@ -11,7 +11,7 @@
 /** @typedef {"cellar" | "hall" | "vault"} T_room */
 
 export const STORY = "examples/cellar_play.story";
-export const SOURCE_HASH = "d80d0e7f";
+export const SOURCE_HASH = "6c654bd8";
 export const SORTS = {"actor":["hero","guard"],"item":["rusty_key","torch","antidote"]};
 export const ENUMS = {"room":["cellar","hall","vault"]};
 
@@ -115,6 +115,13 @@ export function open(M, src) {
 
     can_force_door: (a0) => { chk("actor", a0);
       return VERDICT[api.query(s, id(`can_force_door(${a0})`), 0)]; },
+    /**
+     * @param {T_room} a0
+     * @returns {'undecided'|'proved'|'refuted'}
+     */
+
+    torch_in: (a0) => { chk("room", a0);
+      return VERDICT[api.query(s, id(`torch_in(${a0})`), 0)]; },
     /**
      * @param {T_actor} a0
      * @returns {'undecided'|'proved'|'refuted'}
@@ -234,6 +241,13 @@ export function open(M, src) {
 
     can_force_door: (a0) => { chk("actor", a0);
       return `can_force_door(${a0})`; },
+    /**
+     * @param {T_room} a0
+     * @returns {string}
+     */
+
+    torch_in: (a0) => { chk("room", a0);
+      return `torch_in(${a0})`; },
     /**
      * @param {T_actor} a0
      * @returns {string}

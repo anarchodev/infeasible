@@ -219,7 +219,11 @@ export const cart = {
     if (at === 'vault') add('LEAVE VAULT', w.a.leave_vault(who), true);
 
     for (const it of SORTS.item) {
-      if (w.state.on_floor(it, at)) add(`TAKE ${word(it)}`, w.a.take(who, it, at), true);
+      // You cannot pick up what you cannot see — and the cart does not know
+      // that rule either, it asks. A greyed TAKE prints why the room is dark.
+      if (w.state.on_floor(it, at))
+        add(`TAKE ${word(it)}`, w.a.take(who, it, at),
+            w.q.in_dark(who) !== 'proved', w.lit.in_dark(who));
       else if (w.state.holding(who, it)) add(`DROP ${word(it)}`, w.a.drop(who, it, at), true);
     }
     if (w.state.holding(who, 'antidote') && w.state.poisoned(who))

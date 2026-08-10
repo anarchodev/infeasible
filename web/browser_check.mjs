@@ -233,8 +233,9 @@ let st = await cartState();
 check('the running game is reachable as a module singleton',
       Array.isArray(st.buttons) && st.buttons.length > 0, JSON.stringify(st).slice(0, 160));
 check('it opens on the commands the world allows',
-      st.buttons.map((b) => b.label).join(' | ') === 'GO TO HALL | TAKE RUSTY KEY | TAKE TORCH',
-      st.buttons.map((b) => b.label).join(' | '));
+      st.buttons.map((b) => `${b.label}${b.ok ? '' : '*'}`).join(' | ') ===
+        'GO TO HALL | TAKE RUSTY KEY*',
+      st.buttons.map((b) => `${b.label}${b.ok ? '' : '*'}`).join(' | '));
 
 // ---- real mouse events ------------------------------------------------------
 //
@@ -287,11 +288,14 @@ await shot('02-why');
 // both land between two samples. The backend latches a press until the next
 // sample consumes it — without that, this click is one the game never sees,
 // and a real mouse is often quicker than a tick.
-await command('GO TO CELLAR', 15);
+await command('TAKE TORCH', 15);
 check('a click shorter than a tick is not dropped',
-      st.buttons.some((b) => b.label === 'TAKE TORCH'),
+      st.buttons.some((b) => b.label === 'DROP TORCH'),
       st.buttons.map((b) => b.label).join(' | '));
-await command('TAKE TORCH');
+await command('GO TO CELLAR');
+check('the fetched torch lit the cellar',
+      st.buttons.some((b) => b.label === 'TAKE RUSTY KEY' && b.ok),
+      st.buttons.map((b) => `${b.label}${b.ok ? '' : '*'}`).join(' | '));
 await command('TAKE RUSTY KEY');
 await command('GO TO HALL');
 await command('UNLOCK DOOR');

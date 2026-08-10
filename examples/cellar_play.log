@@ -7,7 +7,9 @@
 # per tick naming the orders submitted in that tick (space-separated; a blank
 # line is a tick that changed nothing).
 #
-# This particular log is the cellar solved. It is also the fixture two
+# This particular log is the cellar solved: fetch the torch from the hall
+# (nothing can be picked up in the dark cellar without it), then the key, then
+# the lock — and the guard for the shoulder the poisoned hero does not have. It is also the fixture two
 # different clients are held to: `web/platform_check.mjs` plays the cart by
 # CLICKING and asserts the log it produced is this file, and
 # `tests/test_secondclient.c` replays this file through `world_*` alone and
@@ -17,8 +19,8 @@
 story examples/cellar_play.story
 
 go_hall(hero)
+take(hero,torch,hall)
 go_cellar(hero)
-take(hero,torch,cellar)
 take(hero,rusty_key,cellar)
 go_hall(hero)
 unlock(hero)
