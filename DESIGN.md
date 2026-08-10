@@ -2970,6 +2970,130 @@ A cue is momentary, so its *condition* must be too: a ramification gated on
 edges vs. levels, not a construct — the same distinction `btnp` draws against
 `btn` on the input side.
 
+**The infeasible cart: presentation as a projection of the log.** The three
+streams above are not merely *sufficient* for a client — they are the complete
+input to one, and that makes a stronger target reachable: a cart written
+entirely in `.story`, with no host code at all. The engine's loop reads the
+streams and drives video and audio from what they describe. Host JS becomes the
+escape hatch rather than the default, which is the right polarity for three
+separate reasons — a cart with no host code cannot rot, the offline player
+(§13) can run it without embedding a JS engine, and the remix on-ramp becomes
+"edit rules" instead of "edit rules and also learn the host API".
+
+The architecture that makes it factorable is the signalling split, and it is
+worth stating as a table because getting it wrong is the classic game-audio
+bug — an aura loop that restarts every tick, or a hit sound implemented as a
+loop:
+
+| stream | answers | drives |
+| --- | --- | --- |
+| emission buffer | *what happened* | one-shots |
+| subscription edges | *what changed* | loops starting and stopping, tweens beginning |
+| changeset + receipts | *by how much* | damage numbers, bar animation, easing targets |
+
+**Levels drive loops; edges drive one-shots** — `btn` against `btnp` again,
+and the engine hands a client both separately so the two cannot be conflated by
+accident. The third row is why a cue carries only *who* and *what* and never a
+magnitude: the number already exists in the commit receipt, with provenance a
+cue could not carry. A floating damage number is a **join** across two streams
+in one tick, not a second copy of a number that can drift from the first.
+
+Two constraints on any table built over this, both consequences of decisions
+made elsewhere. Emissions are a **set per tick**, so two hits in one tick are
+one cue unless the atom is parameterized — an author who wants two sounds
+distinguishes them in the vocabulary, because counting is not available (I4).
+And audio is **write-only**, so a loop's lifecycle rides its level's
+enter/exit edges; "is it already playing" is not a question the interface
+answers, and a table that wanted to ask it is mis-factored.
+
+**Animation is CSS's factoring, and it belongs in the loop.** The reason
+motion does not need to be in the database is that the useful part of a
+transition model is not declarativeness but the factoring: state is discrete,
+interpolation is a pure function of (previous state, next state, elapsed wall
+time), and nothing flows back. I4 forbids the wall clock in the *logic core*;
+a renderer reading it to produce pixels can never touch a fact. So the platform
+records, per subscribed literal, *when* it last changed, and the cart eases its
+own values between two positions it computed itself — the database says
+`at(hero)` flipped, never where the sprite is mid-flight. Two details are worth
+stealing whole: a transition interrupted mid-flight must restart from the
+current *interpolated* value or fast flips snap, and layout changes want
+FLIP — compute the new layout, then play the difference. One way the analogy
+runs in our favour: a browser's intermediate state is unobservable and
+unrecoverable, whereas tick states here are exact, so scrubbing a replay lands
+on a known state and the tween simply restarts. Declarative animation and time
+travel do not fight, which they would if motion were stored.
+
+**Layers, because call order was doing three jobs at once.** In imperative
+drawing the sequence of calls silently provides z-order, repaint granularity,
+and transform scope. Derive the scene from a set of facts and all three are
+gone, so a declarative renderer names them: which layer is on top, which layer
+pre-renders and repaints only when a delta touches it (§12's tile-vs-sprite
+split, already assumed), and which layer is in world space rather than screen
+space (`camera` and `clip` stop being order-dependent ops and become layer
+attributes). Layers are an ordered list of **names**, not numeric z — an open
+numeric space invites `z: 999` and arbitrary gaps, and the ethos everywhere
+else here is a small enumerated set. Order *within* a layer is a determinism
+problem rather than a taste one: it must be total and stable, tie-broken by
+declaration order exactly as the emission stream is, or two peers render
+differently and the second-client differential (§4.2) quietly stops meaning
+anything.
+
+**Three things stay outside the database, each for a different reason.**
+*Per-viewer state* — selection, camera, which panel is open — is local, and a
+fluent that records it desyncs lockstep the moment two players look at
+different things; §5.5's private-vocabulary scopes are its home, which makes
+per-viewer presentation an M4 dependency of this whole direction. *Layout
+arithmetic* is expressible and miserable: "the i-th offered command" is ordinal
+reasoning over a dynamic set, which costs pairwise rules to author and is the
+Haskell-of-defeasible-logic failure the surface exists to avoid — so layout is
+a blessed built-in (list, grid, anchor) that assigns positions to a set, not a
+thing authors derive. *Sub-tick motion* has no representation because the tick
+is the unit of truth; it lives in the loop, per the tween clock above.
+
+What is *not* an obstacle is worth recording, because the intuition runs the
+wrong way. Positions are numeric fluents — store slots with an expression VM,
+not ground atoms — so a coordinate costs nothing to represent; what would
+explode is grounding a relation over coordinate pairs, which is precisely why
+§5.6 makes space a provider. And cost is not the constraint either: at
+columnar rates, a few hundred draw *decisions* re-derived per tick is noise.
+The database is good at deciding and bad at arithmetic, and the factoring above
+is that sentence made structural.
+
+**What the engine must grow for this to be reachable**: a presentation
+ontology (blessed vocabulary for sprite, layer, sound, so a renderer knows what
+a conclusion means), the layout built-ins above, and the per-viewer scopes.
+One constraint falls out of the engine having no string type, and it is more
+interesting than it looks: **the atom is the label**. `rusty_key` renders as
+"RUSTY KEY" by a renderer-side convention, so UI copy is vocabulary — which
+keeps a single source of truth and costs punctuation, sentences, and
+per-language text, pushing localization to a table keyed by atom.
+
+**Capabilities are gated by engine version, not by cart-carried code.** The
+alternative — a cart shipping its own compiled module, cartridge-with-a-chip —
+is declined. It solves a problem we do not have: cartridge silicon existed
+because the console was already in millions of homes and could not change,
+whereas the engine here travels with the artifact or is served by a platform
+that updates. Versioning also collapses four mechanisms into one that already
+exists, since the save is already keyed on an engine hash: no chip registry, no
+content-hash identity, no import-list audit, no redistributability rule, and no
+combinatorial support matrix — a runtime at version N supports everything up to
+N, a total order rather than a feature set.
+
+Two axes must not be conflated inside that, though. **Capability version** is
+monotone and additive, and a cart declares a minimum. **Semantics version**
+must be pinned exactly: if a release changes how a defeasible cycle resolves or
+how a clamp rounds, an older cart must still evaluate under the older
+behaviour, or every saved action log for it silently diverges. Only the second
+belongs in the save's engine hash, and the cost of this design — stated plainly
+because it is permanent — is that every evaluation behaviour ever shipped is
+shipped forever. The golden-test discipline already pushes hard against
+semantic churn; this is the reason it must.
+
+The direction is falsifiable, and cheaply: **express `cellar_play` with zero
+host JS.** If the ontology lands it in a few dozen rules, ship the ontology and
+make host code the escape hatch. If placing five buttons takes two hundred
+rules, the boundary has been found in the right place and at the right price.
+
 **Save compatibility: loading old saves is schema migration, and most
 patches need none.** A production game patches content under players' feet;
 the save's exposure to that splits three ways, in increasing difficulty:
@@ -3296,6 +3420,14 @@ semantics. Names are working names.
   migration vs. an authored cull predicate choosing survivors), and a
   fluent moving between scopes/tiers is the migration face of the
   cross-scope-identity question above — decide them together.
+- **The presentation ontology** (§12's infeasible cart): the blessed
+  vocabulary a zero-host-code cart concludes into — how a rule says "this
+  entity draws as that sprite, in that layer" — is undecided, and so is where
+  a transition's *declaration* lives. A cart-side table keeps presentation
+  above the durability line; an inert annotation in `.story`, riding the §6.3
+  artifact and never read by a rule, makes a cart's look travel with the world
+  so a second client animates it identically. Decide with the layout built-ins,
+  since both answer "what does a renderer read that is not a fact".
 - **Sound and music assets** (§12): the audio *ops* are frozen, but the
   format a cart ships its sounds in — and whether a cart may synthesize
   rather than sample — is open. Sampled assets are one more thing an
