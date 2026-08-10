@@ -10252,6 +10252,297 @@ static void dapp_varsorts(char *buf, size_t *off, size_t cap, parser *p,
     dapp(buf, off, cap, ")");
 }
 
+/* ---- the §6.3 interface artifact ------------------------------------------
+ *
+ * The declared vocabulary as DATA: entities and their sorts, state with its
+ * domains, providers and functions, derived values, emissions, judgment heads,
+ * action signatures, and the protocol declarations a client has to honour
+ * (`exclusive` groups, the `split` fluent). It is the compile-time twin of
+ * world.h's runtime contract, and the extension point every client checks
+ * against — the typed JS binding is the first backend, and any future front end
+ * fact-checks against this same artifact rather than reaching into the compiler.
+ *
+ * JSON because the consumers are out-of-process and out-of-language. The one
+ * thing a reader cannot infer and must not guess is how a ground atom is
+ * spelled, so the artifact states it: `pred(e1,e2)`, bare at arity 0, and a
+ * multi-valued fluent's value atoms as `pred(args)=value`. Get that wrong and a
+ * client interns a fresh always-false atom — exactly the silent failure this
+ * whole surface exists to kill. */
+
+typedef struct { char *b; size_t n, cap; } sbuf;
+
+static void sb_raw(sbuf *s, const char *t)
+{
+    size_t l = strlen(t);
+    if (s->n + l + 1 > s->cap) {
+        while (s->n + l + 1 > s->cap) s->cap = s->cap ? s->cap * 2 : 1024;
+        s->b = realloc(s->b, s->cap);
+    }
+    memcpy(s->b + s->n, t, l);
+    s->n += l;
+    s->b[s->n] = '\0';
+}
+
+static void sb_int(sbuf *s, long v)
+{
+    char t[32];
+    snprintf(t, sizeof t, "%ld", v);
+    sb_raw(s, t);
+}
+
+/* A JSON string. The .story identifier grammar is ASCII words, but a source
+ * name is a path, so escape properly rather than assuming. */
+static void sb_str(sbuf *s, const char *t)
+{
+    sb_raw(s, "\"");
+    char esc[8];
+    for (const unsigned char *c = (const unsigned char *)t; *c; c++) {
+        if (*c == '"' || *c == '\\') { esc[0] = '\\'; esc[1] = (char)*c; esc[2] = 0; sb_raw(s, esc); }
+        else if (*c == '\n') sb_raw(s, "\\n");
+        else if (*c < 0x20) { snprintf(esc, sizeof esc, "\\u%04x", *c); sb_raw(s, esc); }
+        else { esc[0] = (char)*c; esc[1] = 0; sb_raw(s, esc); }
+    }
+    sb_raw(s, "\"");
+}
+
+static void sb_kv(sbuf *s, const char *k, const char *v)
+{
+    sb_str(s, k); sb_raw(s, ": "); sb_str(s, v);
+}
+
+/* `["actor", "item"]` for a pred_info's argument sorts. INT_SORT prints as
+ * "int"; the #124 value meta-sort never reaches the artifact (kind predicates
+ * are build-time vocabulary and are omitted entirely). */
+static void sb_argsorts(sbuf *s, parser *p, const pred_info *pi)
+{
+    sb_raw(s, "[");
+    for (int k = 0; k < pi->arity; k++) {
+        if (k) sb_raw(s, ", ");
+        sb_str(s, pi->argsort[k] == INT_SORT ? "int" : sort_name(p, pi->argsort[k]));
+    }
+    sb_raw(s, "]");
+}
+
+/* Argument sorts for a JUDGMENT head. The registry records arity for a
+ * conclusion but not its argument sorts — a head is not a declaration — so read
+ * them off the first rule that concludes it: a head argument is either one of
+ * the rule's typed variables or a ground entity, and both know their sort.
+ * (Rules concluding one predicate with different sorts would already be a
+ * vocabulary error at their body atoms; first-writer-wins here is a reporting
+ * choice, not a semantic one.) */
+static void sb_head_argsorts(sbuf *s, parser *p, uint32_t pred, int arity)
+{
+    for (int i = 0; i < p->nrules; i++) {
+        ast_rule *r = &p->rules[i];
+        if (r->head.is_valuedef || r->head.is_kinddef) continue;
+        if (r->head.pred != pred || r->head.nargs != arity) continue;
+        sb_raw(s, "[");
+        for (int k = 0; k < arity; k++) {
+            if (k) sb_raw(s, ", ");
+            int vi = var_index(r->vars, r->nvars, r->head.args[k].name);
+            int ei = vi < 0 ? find_entity(p, r->head.args[k].name) : -1;
+            int sidx = vi >= 0 ? r->vars[vi].sort
+                     : ei >= 0 ? p->ents[ei].sort : -1;
+            sb_str(s, sidx >= 0 ? sort_name(p, sidx) : "?");
+        }
+        sb_raw(s, "]");
+        return;
+    }
+    sb_raw(s, "[");                                   /* no rule found: arity only */
+    for (int k = 0; k < arity; k++) { if (k) sb_raw(s, ", "); sb_str(s, "?"); }
+    sb_raw(s, "]");
+}
+
+/* The ast_fluent behind a declared predicate, for its domain details. */
+static const ast_fluent *iface_fluent(parser *p, uint32_t pred)
+{
+    for (int i = 0; i < p->nfluents; i++)
+        if (p->fluents[i].pred == pred) return &p->fluents[i];
+    return NULL;
+}
+
+static void sb_state_entry(sbuf *s, parser *p, const pred_info *pi)
+{
+    const ast_fluent *f = iface_fluent(p, pi->pred);
+    sb_raw(s, "{ ");
+    sb_kv(s, "name", intern_name(p->syms, pi->pred));
+    sb_raw(s, ", \"args\": ");
+    sb_argsorts(s, p, pi);
+    if (f && f->is_cell) {
+        sb_raw(s, ", "); sb_kv(s, "type", "cell");
+        sb_raw(s, ", "); sb_kv(s, "domain", intern_name(p->syms, f->val_sort));
+    } else if (f && f->is_num) {
+        sb_raw(s, ", "); sb_kv(s, "type", "int");
+        if (f->has_range) {
+            /* a dynamic bound is an expression, not a number: say so rather
+             * than exporting a constant that is only sometimes the bound */
+            if (f->rmin_expr < 0) { sb_raw(s, ", \"min\": "); sb_int(s, f->rmin); }
+            if (f->rmax_expr < 0) { sb_raw(s, ", \"max\": "); sb_int(s, f->rmax); }
+            if (f->rmin_expr >= 0 || f->rmax_expr >= 0)
+                sb_raw(s, ", \"dynamic_bounds\": true");
+        }
+    } else if (f && f->is_mv) {
+        sb_raw(s, ", "); sb_kv(s, "type", "enum");
+        sb_raw(s, ", \"values\": [");
+        for (int v = 0; v < f->nvalues; v++) {
+            if (v) sb_raw(s, ", ");
+            sb_str(s, intern_name(p->syms, f->values[v]));
+        }
+        sb_raw(s, "]");
+        if (f->is_split) sb_raw(s, ", \"split\": true");
+    } else {
+        sb_raw(s, ", "); sb_kv(s, "type", "bool");
+    }
+    sb_raw(s, " }");
+}
+
+/* Emit the interface artifact for the parsed file. The caller owns the string. */
+static char *harvest_iface(parser *p)
+{
+    sbuf s = { NULL, 0, 0 };
+    sb_raw(&s, "{\n  \"artifact\": \"infeasible.interface\",\n  \"version\": 1,\n  ");
+    sb_kv(&s, "story", p->srcname ? p->srcname : "<story>");
+    if (p->has_scene) { sb_raw(&s, ",\n  "); sb_kv(&s, "scene", p->scene_name); }
+
+    /* how a ground atom is spelled — the contract a client cannot guess */
+    sb_raw(&s, ",\n  \"ground\": { ");
+    sb_kv(&s, "atom", "pred(arg1,arg2)");
+    sb_raw(&s, ", "); sb_kv(&s, "nullary", "pred");
+    sb_raw(&s, ", "); sb_kv(&s, "value", "pred(args)=value");
+    sb_raw(&s, ", "); sb_kv(&s, "separator", ",");
+    sb_raw(&s, " }");
+
+    sb_raw(&s, ",\n  \"sorts\": [");
+    int sfirst = 1;
+    for (int i = 0; i < p->nsorts; i++) {
+        if (p->sorts[i].is_enum) continue;            /* listed under "enums" */
+        sb_raw(&s, sfirst ? "\n    " : ",\n    "); sfirst = 0;
+        sb_raw(&s, "{ ");
+        sb_kv(&s, "name", p->sorts[i].name);
+        sb_raw(&s, ", ");
+        sb_kv(&s, "kind", p->sorts[i].is_domain ? "domain" : "sort");
+        if (!p->sorts[i].is_domain) {
+            sb_raw(&s, ", \"entities\": [");
+            for (int e = 0; e < p->domain_n[i]; e++) {
+                if (e) sb_raw(&s, ", ");
+                sb_str(&s, intern_name(p->syms, p->domain_ents[i][e]));
+            }
+            sb_raw(&s, "]");
+        }
+        sb_raw(&s, " }");
+    }
+    sb_raw(&s, sfirst ? "]" : "\n  ]");
+
+    sb_raw(&s, ",\n  \"enums\": [");
+    for (int i = 0; i < p->nenums; i++) {
+        sb_raw(&s, i ? ",\n    " : "\n    ");
+        sb_raw(&s, "{ ");
+        sb_kv(&s, "name", p->enums[i].name);
+        sb_raw(&s, ", \"values\": [");
+        for (int v = 0; v < p->enums[i].nvalues; v++) {
+            if (v) sb_raw(&s, ", ");
+            sb_str(&s, intern_name(p->syms, p->enums[i].values[v]));
+        }
+        sb_raw(&s, "] }");
+    }
+    sb_raw(&s, p->nenums ? "\n  ]" : "]");
+
+    /* the predicate registry, classified — one pass, so a predicate cannot be
+     * in two sections or missing from all of them */
+    const char *sections[] = { "state", "providers", "values", "emits", "judgments" };
+    for (int sec = 0; sec < 5; sec++) {
+        sb_raw(&s, ",\n  \"");
+        sb_raw(&s, sections[sec]);
+        sb_raw(&s, "\": [");
+        int first = 1;
+        for (int i = 0; i < p->npreds; i++) {
+            pred_info *pi = &p->preds[i];
+            if (pi->is_kindpred) continue;            /* build-time vocabulary */
+            int want = pi->is_fluent ? 0 : pi->is_provider ? 1 : pi->is_value ? 2
+                     : pi->is_emit ? 3 : pi->is_head ? 4 : -1;
+            if (want != sec) continue;
+            sb_raw(&s, first ? "\n    " : ",\n    "); first = 0;
+            if (sec == 0) { sb_state_entry(&s, p, pi); continue; }
+            sb_raw(&s, "{ ");
+            sb_kv(&s, "name", intern_name(p->syms, pi->pred));
+            sb_raw(&s, ", \"args\": ");
+            if (sec == 4) sb_head_argsorts(&s, p, pi->pred, pi->arity);
+            else          sb_argsorts(&s, p, pi);
+            if (sec == 2) { sb_raw(&s, ", "); sb_kv(&s, "type", "int"); }
+            sb_raw(&s, " }");
+        }
+        sb_raw(&s, first ? "]" : "\n  ]");
+    }
+
+    sb_raw(&s, ",\n  \"functions\": [");
+    for (int i = 0; i < p->nfunctions; i++) {
+        ast_function *fn = &p->functions[i];
+        sb_raw(&s, i ? ",\n    " : "\n    ");
+        sb_raw(&s, "{ ");
+        sb_kv(&s, "name", intern_name(p->syms, fn->name));
+        sb_raw(&s, ", \"args\": [");
+        for (int k = 0; k < fn->nargs; k++) {
+            if (k) sb_raw(&s, ", ");
+            sb_str(&s, fn->argsort[k] ? intern_name(p->syms, fn->argsort[k]) : "int");
+        }
+        sb_raw(&s, "], ");
+        sb_kv(&s, "returns", fn->ret ? intern_name(p->syms, fn->ret) : "int");
+        sb_raw(&s, " }");
+    }
+    sb_raw(&s, p->nfunctions ? "\n  ]" : "]");
+
+    /* actions carry their PARAMETER names as well as sorts: a generated
+     * constructor wants `unlock(who)`, not `unlock(arg1)` */
+    sb_raw(&s, ",\n  \"actions\": [");
+    int first = 1;
+    for (int i = 0; i < p->nactions; i++) {
+        ast_action *a = &p->actions[i];
+        if (a->is_ramif) continue;                    /* no trigger: not callable */
+        sb_raw(&s, first ? "\n    " : ",\n    "); first = 0;
+        sb_raw(&s, "{ ");
+        sb_kv(&s, "name", a->name);
+        sb_raw(&s, ", \"params\": [");
+        for (int k = 0; k < a->nvars; k++) {
+            if (k) sb_raw(&s, ", ");
+            sb_raw(&s, "{ ");
+            sb_kv(&s, "name", intern_name(p->syms, a->vars[k].name));
+            sb_raw(&s, ", ");
+            sb_kv(&s, "sort", sort_name(p, a->vars[k].sort));
+            sb_raw(&s, " }");
+        }
+        sb_raw(&s, "] }");
+    }
+    sb_raw(&s, first ? "]" : "\n  ]");
+
+    /* #159: the protocol a bound host must enforce at construction (§6.3's
+     * builder), keyed exactly as world_step checks it. A `_` position never
+     * constrains; named positions matched by name form the key. */
+    sb_raw(&s, ",\n  \"exclusive\": [");
+    for (int i = 0; i < p->nexcls; i++) {
+        ast_excl *g = &p->excls[i];
+        sb_raw(&s, i ? ",\n    " : "\n    ");
+        sb_raw(&s, "{ \"members\": [");
+        for (int m = 0; m < g->nmem; m++) {
+            if (m) sb_raw(&s, ", ");
+            sb_raw(&s, "{ ");
+            sb_kv(&s, "action", g->mem[m].action);
+            sb_raw(&s, ", \"key\": [");
+            for (int k = 0; k < g->mem[m].nargs; k++) {
+                if (k) sb_raw(&s, ", ");
+                if (g->mem[m].vars[k])
+                    sb_str(&s, intern_name(p->syms, g->mem[m].vars[k]));
+                else
+                    sb_raw(&s, "null");               /* `_`: never constrains */
+            }
+            sb_raw(&s, "] }");
+        }
+        sb_raw(&s, "] }");
+    }
+    sb_raw(&s, p->nexcls ? "\n  ]" : "]");
+    sb_raw(&s, "\n}\n");
+    return s.b ? s.b : strdup("{}\n");
+}
+
 static story_model *harvest_model(parser *p)
 {
     story_model *m = calloc(1, sizeof *m);
@@ -10435,7 +10726,8 @@ static void matcher_free_thunk(void *ctx) { story_matcher_free((story_matcher *)
 static world *compile_impl(const char *src, const char *srcname, intern *syms,
                            story_diags *diags, bool matched,
                            story_model **out, story_matcher **mret,
-                           const char *kwhy_query, FILE *kwhy_out)
+                           const char *kwhy_query, FILE *kwhy_out,
+                           char **iface_out)
 {
     parser *p = calloc(1, sizeof *p);
     p->kwhy_query = kwhy_query;        /* #125 build-time why hook */
@@ -10608,6 +10900,9 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
     /* Harvest the span model before the parser tables are torn down —
      * best-effort, so navigation works even on a file that failed to compile. */
     if (out) *out = harvest_model(p);
+    /* The §6.3 interface artifact, on the same terms: the vocabulary a client
+     * checks against, harvested from the tables the checks themselves used. */
+    if (iface_out) *iface_out = p->nerrors == 0 ? harvest_iface(p) : NULL;
 
     if (p->kres) dl_result_free(p->kres);              /* #125 kind stratum */
     if (p->kth)  dl_theory_free(p->kth);
@@ -10633,7 +10928,8 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
 world *story_compile(const char *src, const char *srcname, intern *syms,
                      story_diags *diags)
 {
-    return compile_impl(src, srcname, syms, diags, false, NULL, NULL, NULL, NULL);
+    return compile_impl(src, srcname, syms, diags, false, NULL, NULL, NULL, NULL,
+                        NULL);
 }
 
 world *story_compile_kinds_why(const char *src, const char *srcname,
@@ -10641,22 +10937,32 @@ world *story_compile_kinds_why(const char *src, const char *srcname,
                                const char *query, FILE *out)
 {
     return compile_impl(src, srcname, syms, diags, false, NULL, NULL,
-                        query, out);
+                        query, out, NULL);
 }
 
 world *story_compile_model(const char *src, const char *srcname, intern *syms,
                            story_diags *diags, story_model **out)
 {
-    return compile_impl(src, srcname, syms, diags, false, out, NULL, NULL, NULL);
+    return compile_impl(src, srcname, syms, diags, false, out, NULL, NULL, NULL,
+                        NULL);
 }
 
 /* Same grammar and world, but ground rules in the join-matcher kernel via the
  * fact-store extension index (§5.2 item 4, #28) where eligible. Verdicts and
  * why-traces are identical to story_compile (pinned by test_matcher). */
+world *story_compile_iface(const char *src, const char *srcname, intern *syms,
+                           story_diags *diags, char **iface_out)
+{
+    if (iface_out) *iface_out = NULL;
+    return compile_impl(src, srcname, syms, diags, false, NULL, NULL, NULL, NULL,
+                        iface_out);
+}
+
 world *story_compile_matched(const char *src, const char *srcname, intern *syms,
                              story_diags *diags)
 {
-    return compile_impl(src, srcname, syms, diags, true, NULL, NULL, NULL, NULL);
+    return compile_impl(src, srcname, syms, diags, true, NULL, NULL, NULL, NULL,
+                        NULL);
 }
 
 /* Tick-time matcher: compile, retain the matchable-rule plan, and materialize the
@@ -10674,7 +10980,8 @@ story_matcher *story_compile_matcher(const char *src, const char *srcname,
                                      intern *syms, story_diags *diags, world **out)
 {
     story_matcher *m = NULL;
-    world *w = compile_impl(src, srcname, syms, diags, true, NULL, &m, NULL, NULL);
+    world *w = compile_impl(src, srcname, syms, diags, true, NULL, &m, NULL, NULL,
+                            NULL);
     if (out) *out = w;
     if (!w) return NULL;                 /* compile failed; m already NULL/freed */
     /* Auto re-ground: the world refreshes the matched layer itself before each

@@ -31,8 +31,8 @@ emcc -O2 -I"$root/src" \
     "$root/web/exports.c" \
     -sMODULARIZE=1 -sEXPORT_NAME=createInfeasible \
     -sSINGLE_FILE=1 -sALLOW_MEMORY_GROWTH=1 \
-    -sEXPORTED_RUNTIME_METHODS=cwrap,UTF8ToString \
-    -sEXPORTED_FUNCTIONS=_inf_compile,_inf_free,_inf_intern,_inf_name,_inf_query,_inf_get,_inf_set,_inf_step,_inf_step1,_inf_emit_count,_inf_emits,_inf_bool_deltas,_inf_num_deltas,_inf_num_receipt,_inf_last_err,_inf_last_diag,_inf_why,_malloc,_free \
+    -sEXPORTED_RUNTIME_METHODS=cwrap,UTF8ToString,HEAP32,HEAPU32 \
+    -sEXPORTED_FUNCTIONS=_inf_compile,_inf_free,_inf_intern,_inf_name,_inf_query,_inf_get,_inf_set,_inf_get_num,_inf_set_num,_inf_interface,_inf_step,_inf_step1,_inf_emit_count,_inf_emits,_inf_bool_deltas,_inf_num_deltas,_inf_num_receipt,_inf_last_err,_inf_last_diag,_inf_why,_malloc,_free \
     -o "$out"
 
 echo "built $out"

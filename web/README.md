@@ -23,11 +23,38 @@ Requires Emscripten (`emcc`) and Node.
 
 ```sh
 web/build.sh          # emits web/infeasible.cjs (~108 KB, git-ignored)
+node web/gen_binding.mjs examples/cellar_ground.story   # the typed binding
 node web/host.mjs
+node web/binding_check.mjs   # after generating from examples/reaction5e.story
 ```
 
 Expected output ends with `boundary OK: .story in, judgments/why/step out — all
 from JS.`
+
+## The typed binding (§6.3)
+
+`gen_binding.mjs` compiles a `.story`, reads the **interface artifact** the
+compiler emits — the declared vocabulary plus, crucially, how a ground atom is
+spelled — and writes a plain ES module of typed helpers over the WASM exports.
+
+That closes the host-side version of the failure the orphan pass exists to
+kill: `query(intern("can_force_dor(guard)"))` interns a fresh, always-false
+atom and answers refuted forever. Through the binding the same mistake is a
+missing property (`w.q.can_force_dor` is `undefined`), a bad entity is a
+`TypeError` where it is written, and an unknown action has no constructor at
+all. The generated module carries a hash of the source it was generated from
+and refuses a story it does not match, so a stale binding is loud rather than
+silently always-false.
+
+Types are JSDoc — `tsc --checkJs` and any editor consume them with **no build
+step**, and the module that type-checks is exactly the module that ships (§12).
+The generated files are committed: they are source-shaped, not build output.
+
+Action sets are assembled through a builder rather than passed as arrays, which
+is where §6.3 puts the host-protocol checks: `exclusive` groups (#159) are
+enforced at `add`, naming the order already in the set, so a host collecting
+orders from remote clients rejects one order instead of losing the tick.
+`binding_check.mjs` pins that behaviour against `examples/reaction5e.story`.
 
 ## Known rough edges (M2 to smooth)
 
