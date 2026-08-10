@@ -31,7 +31,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { letterbox } from './platform/spec.mjs';
+import { letterbox, RESOLUTIONS } from './platform/spec.mjs';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const PORT = 8099;
@@ -88,7 +88,10 @@ await sleep(600);
 
 browser = spawn(CHROME, [
   '--headless=new', '--disable-gpu', '--no-sandbox', '--hide-scrollbars',
-  '--window-size=1600,1000', '--remote-debugging-port=0',
+  // headless invents a 800x600 "display", which makes a fullscreen surface
+  // nothing like a real one
+  '--screen-info={1920x1080}',
+  '--window-size=1920,1080', '--remote-debugging-port=0',
   `--user-data-dir=${profile}`, 'about:blank',
 ], { stdio: ['ignore', 'ignore', 'pipe'] });
 
@@ -330,6 +333,56 @@ check('the antidote is drunk, so the command is gone',
       !st.buttons.some((b) => b.label === 'DRINK ANTIDOTE'),
       st.buttons.map((b) => b.label).join(' | '));
 await shot('05-solved');
+
+// ---- fullscreen: the case the resolution set exists for ---------------------
+//
+// Requires a user gesture, so it is driven the way a player drives it — a real
+// click on the page's own control. What is being checked is the ARITHMETIC: at
+// a 1920x1080 surface with no chrome in the way, every blessed internal
+// resolution is a whole-number multiple, so the picture fills the display with
+// no letterbox bars at all.
+{
+  const btn = await evaluate(`(() => {
+    const r = document.getElementById('full').getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  })()`);
+  const at = { x: Math.round(btn.x), y: Math.round(btn.y), button: 'left',
+               buttons: 1, clickCount: 1 };
+  await send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...at, buttons: 0 });
+  await send('Input.dispatchMouseEvent', { type: 'mousePressed', ...at });
+  await send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...at, buttons: 0 });
+  await sleep(700);
+
+  const fs = await evaluate(`(() => {
+    const c = document.getElementById('screen');
+    return { on: !!document.fullscreenElement, bufW: c.width, bufH: c.height,
+             vw: innerWidth, vh: innerHeight,
+             cw: c.clientWidth, ch: c.clientHeight, dpr: devicePixelRatio };
+  })()`);
+  check('the page can go fullscreen', fs.on, JSON.stringify(fs));
+  if (fs.on) {
+    // What the PAGE is responsible for: in fullscreen every pixel of the
+    // viewport belongs to the canvas. Chrome around it does not merely waste
+    // room, it costs integer scale — 46px of caption is the difference between
+    // x2 and x1 at 720p.
+    check('fullscreen gives the canvas the whole viewport',
+          fs.cw === fs.vw && fs.ch === fs.vh,
+          `canvas ${fs.cw}x${fs.ch} in viewport ${fs.vw}x${fs.vh}`);
+    // What the RESOLUTION SET is responsible for, checked as the arithmetic it
+    // is: headless reports a 1920x1080 screen but hands fullscreen a slightly
+    // shorter window, so asserting exactness against this viewport would be
+    // asserting a headless quirk rather than the contract.
+    const bars = RESOLUTIONS.filter(([iw, ih]) => {
+      const b = letterbox(1920, 1080, iw, ih);
+      return b.w !== 1920 || b.h !== 1080;
+    });
+    check('and a 1920x1080 surface is exact for every blessed resolution',
+          bars.length === 0, `letterboxed: ${bars.map((r) => r.join('x')).join(', ')}`);
+    await shot('06-fullscreen');
+    await send('Runtime.evaluate', { expression: 'document.exitFullscreen()' });
+    await sleep(500);
+  }
+}
 
 check('nothing threw during the whole playthrough', problems.length === 0,
       problems.slice(0, 4).join('\n        '));

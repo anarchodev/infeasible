@@ -279,6 +279,27 @@ export function createCanvasBackend(canvas, { resolution = DEFAULT_RESOLUTION } 
       out.drawImage(buf, 0, 0, W, H, box.x, box.y, box.w, box.h);
     },
 
+    /** Fullscreen — a property of the host WINDOW, not of the cart.
+     *
+     *  It is not a frozen op and never reaches a cart: §12's four surfaces are
+     *  what content may call, and "how big is the window" is the platform's
+     *  business on the other side of that line (an offline player would answer
+     *  it with a display mode, not with an API a game invokes). It lives here
+     *  beside the letterbox for the same reason the letterbox does — both are
+     *  how the internal surface reaches a display.
+     *
+     *  Browsers require a user gesture, so the page wires it to a control and
+     *  calls this; `present()` then re-reads the element and the frozen upscale
+     *  does the rest. The payoff is exact: at 1920×1080 with no chrome in the
+     *  way, every blessed resolution is a whole-number multiple with no bars. */
+    fullscreen() {
+      const doc = canvas.ownerDocument;
+      return doc.fullscreenElement
+        ? doc.exitFullscreen()
+        : doc.documentElement.requestFullscreen();
+    },
+    isFullscreen() { return !!canvas.ownerDocument.fullscreenElement; },
+
     /** Attach DOM listeners. Called once by the page; a cart cannot reach it. */
     attach(target = canvas) {
       const move = (e) => {

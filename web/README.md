@@ -42,6 +42,14 @@ web/serve.sh            # builds infeasible.js if missing, then serves
                         # → http://localhost:8000/web/
 ```
 
+The button in the bottom-right corner goes fullscreen, which is the case the
+resolution set exists for: with no chrome in the way, a 1920×1080 display is a
+whole-number multiple of **every** blessed internal resolution (640×360 → ×3,
+320×180 → ×6), so the picture fills the screen with no letterbox bars at all.
+Fullscreen is not a frozen op and never reaches a cart — "how big is the
+window" is the platform's business on the other side of that line — so the page
+owns the gesture and the backend owns the call.
+
 `serve.sh` is a plain static file server; the only thing it really guarantees
 is the root it serves from. The page fetches the `.story` **source** at runtime
 (§12: source is always shipped, the compiled form is a cache), so `examples/`
