@@ -46,7 +46,7 @@ init (
     at(hero)  = cellar
     at(guard) = hall
     on_floor(rusty_key, cellar)
-    on_floor(torch,     cellar)
+    on_floor(torch,     hall)
     on_floor(antidote,  vault)
     door = locked
     poisoned(hero)
@@ -77,12 +77,28 @@ rule can_force(X: actor): at(X) = hall & door = jammed => can_force_door(X)
 rule too_weak(X: actor):  weakened(X)                  => ~can_force_door(X)
 too_weak > can_force
 
-// The cellar is dark without the torch: a judgment the *renderer* reads, not
-// the rules. Presentation asking the world a question is the ordinary case —
-// there is no second, presentation-side notion of "dark".
-rule dark(X: actor):  at(X) = cellar & ~holding(X, torch) => in_dark(X)
-rule lit(X: actor):   holding(X, torch)                   => ~in_dark(X)
-lit > dark
+// The cellar is dark: a judgment the *renderer* reads, not the rules.
+// Presentation asking the world a question is the ordinary case — there is no
+// second, presentation-side notion of "dark".
+//
+// Light belongs to the ROOM, not to whoever is carrying it. `torch_in(R)` is
+// the concept worth naming — there is a torch in this room — and it is
+// established two ways: held by someone standing there, or lying on the floor.
+// So it does not matter who picked it up, and a torch dropped in the cellar
+// goes on lighting it. Writing this the obvious way, as `~holding(X, torch)`,
+// makes darkness a fact about a PERSON rather than about a PLACE, and leaves
+// you standing in the dark beside a friend holding a lit torch.
+rule carried_in(Y: actor, R: room): here(Y, R) & holding(Y, torch) => torch_in(R)
+rule lying_in(R: room):             on_floor(torch, R)             => torch_in(R)
+
+// The cellar is the only room that starts unlit — and judgments are not
+// closed-world, so the lit rooms need saying too, or "is it dark here?" is
+// UNDECIDED rather than no.
+rule gloomy(X: actor):       at(X) = cellar => in_dark(X)
+rule bright_hall(X: actor):  at(X) = hall   => ~in_dark(X)
+rule bright_vault(X: actor): at(X) = vault  => ~in_dark(X)
+rule torchlit(X: actor, R: room): here(X, R) & torch_in(R) => ~in_dark(X)
+torchlit > gloomy
 
 rule downed(X: actor): hp(X) <= 0 -> down(X)
 
@@ -117,8 +133,10 @@ action leave_vault(X: actor):
     requires at(X) = vault
     causes   at(X) = hall & footstep(X)
 
+// You cannot pick up what you cannot see, which is what makes the torch worth
+// fetching rather than scenery.
 action take(X: actor, T: item, R: room):
-    requires here(X, R) & on_floor(T, R)
+    requires here(X, R) & on_floor(T, R) & ~in_dark(X)
     causes   holding(X, T) & ~on_floor(T, R) & pickup(X, T)
 
 action drop(X: actor, T: item, R: room):

@@ -146,7 +146,9 @@ check('the cart drew the map with the tile op', backend.ops('tile').length > 0);
 check('the cellar is dark, drawn with THE composite op',
       backend.ops('shade').length > 0);
 check('the commands are the ones the world allows',
-      offered() === 'GO TO HALL | TAKE RUSTY KEY | TAKE TORCH', offered());
+      offered() === 'GO TO HALL | TAKE RUSTY KEY*', offered());
+check('the key is offered but refused — you cannot pick up what you cannot see',
+      cart.buttons.some((b) => b.label === 'TAKE RUSTY KEY' && !b.ok));
 
 console.log('\nwhat a refused command says');
 click('GO TO HALL');
@@ -163,12 +165,13 @@ check('...naming the exception that beat the norm',
       backend.text().includes('can_force') && backend.text().includes('weakened(hero)'));
 
 console.log('\nthe puzzle');
-click('GO TO CELLAR');
 click('TAKE TORCH');
 check('the hero is holding the torch', world.state.holding('hero', 'torch'));
-rt.advance(1);
+click('GO TO CELLAR');
 check('the fog lifted — a judgment the renderer reads',
       world.q.in_dark('hero') === 'refuted' && backend.ops('shade').length === 0);
+check('...and the key can be picked up now', 
+      cart.buttons.some((b) => b.label === 'TAKE RUSTY KEY' && b.ok), offered());
 click('TAKE RUSTY KEY');
 click('GO TO HALL');
 click('UNLOCK DOOR');
@@ -214,6 +217,31 @@ check('cartdata survives a write and is not part of the log', (() => {
   platform.cart.data.set(3, 42);
   return platform.cart.data.get(3) === 42 && rt.ctx.log.length === 10;
 })());
+
+console.log('\nlight belongs to the room, not to the carrier');
+{
+  // A fresh session, driven straight through the binding: the cart is not the
+  // subject here, the STORY is. Darkness written as "am I holding the torch"
+  // leaves you in the dark beside someone carrying a lit one, which is a
+  // modelling bug no amount of renderer work can fix.
+  const w2 = open(M, src);
+  check('the hero starts in the dark, alone in the cellar',
+        w2.q.in_dark('hero') === 'proved');
+  w2.step(w2.actions().add(w2.a.take('guard', 'torch', 'hall')));
+  w2.step(w2.actions().add(w2.a.go_cellar('guard')));
+  check('a torch carried by SOMEONE ELSE lights the room you share',
+        w2.q.in_dark('hero') === 'refuted', w2.q.in_dark('hero'));
+  w2.step(w2.actions().add(w2.a.drop('guard', 'torch', 'cellar')));
+  w2.step(w2.actions().add(w2.a.go_hall('guard')));
+  check('...and a torch DROPPED there goes on lighting it, carried by nobody',
+        w2.q.in_dark('hero') === 'refuted', w2.q.in_dark('hero'));
+  w2.step(w2.actions().add(w2.a.go_cellar('guard')));
+  w2.step(w2.actions().add(w2.a.take('guard', 'torch', 'cellar')));
+  w2.step(w2.actions().add(w2.a.go_hall('guard')));
+  check('and the dark comes back when it leaves the room',
+        w2.q.in_dark('hero') === 'proved', w2.q.in_dark('hero'));
+  w2.close();
+}
 
 console.log('\nthe two clients meet on one save');
 {

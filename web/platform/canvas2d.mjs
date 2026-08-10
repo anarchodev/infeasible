@@ -224,8 +224,31 @@ export function createCanvasBackend(canvas, { resolution = DEFAULT_RESOLUTION } 
     music_stop() { if (be.track) { be.track.pause(); be.track = null; } },
 
     // ---- input: listeners here, polling out there -------------------------
+    //
+    // The LATCH is the whole subtlety. Input is sampled once per tick at the
+    // tick boundary (§12, for I4), and a tick is 50ms — but a real mouse click
+    // is often shorter than that, so a press and release that both land
+    // between two samples would be a click the game never observed. The
+    // browser saw it; the sampler did not.
+    //
+    // So a press is remembered until the next sample consumes it: `readInput`
+    // reports a button as down if it IS down or if it WENT down since the last
+    // call, then clears the memory. Held buttons still read held, a tap reads
+    // down for exactly one tick, and the determinism rule is untouched — the
+    // cart still gets one frozen snapshot per tick, and `readInput` is called
+    // exactly once per tick by the platform. (Two taps inside one tick collapse
+    // into one, which is what sampling at 20Hz means.)
     raw: { x: 0, y: 0, buttons: [false, false, false], keys: new Set() },
-    readInput() { return be.raw; },
+    latchB: [false, false, false],
+    latchK: new Set(),
+    readInput() {
+      const out = { x: be.raw.x, y: be.raw.y,
+                    buttons: be.raw.buttons.map((b, i) => b || be.latchB[i]),
+                    keys: new Set([...be.raw.keys, ...be.latchK]) };
+      be.latchB = [false, false, false];
+      be.latchK.clear();
+      return out;
+    },
 
     // ---- persistence: the cartdata blob, and nothing else ------------------
     loadCartdata() {
@@ -256,6 +279,27 @@ export function createCanvasBackend(canvas, { resolution = DEFAULT_RESOLUTION } 
       out.drawImage(buf, 0, 0, W, H, box.x, box.y, box.w, box.h);
     },
 
+    /** Fullscreen — a property of the host WINDOW, not of the cart.
+     *
+     *  It is not a frozen op and never reaches a cart: §12's four surfaces are
+     *  what content may call, and "how big is the window" is the platform's
+     *  business on the other side of that line (an offline player would answer
+     *  it with a display mode, not with an API a game invokes). It lives here
+     *  beside the letterbox for the same reason the letterbox does — both are
+     *  how the internal surface reaches a display.
+     *
+     *  Browsers require a user gesture, so the page wires it to a control and
+     *  calls this; `present()` then re-reads the element and the frozen upscale
+     *  does the rest. The payoff is exact: at 1920×1080 with no chrome in the
+     *  way, every blessed resolution is a whole-number multiple with no bars. */
+    fullscreen() {
+      const doc = canvas.ownerDocument;
+      return doc.fullscreenElement
+        ? doc.exitFullscreen()
+        : doc.documentElement.requestFullscreen();
+    },
+    isFullscreen() { return !!canvas.ownerDocument.fullscreenElement; },
+
     /** Attach DOM listeners. Called once by the page; a cart cannot reach it. */
     attach(target = canvas) {
       const move = (e) => {
@@ -268,7 +312,9 @@ export function createCanvasBackend(canvas, { resolution = DEFAULT_RESOLUTION } 
       target.addEventListener('pointermove', move);
       target.addEventListener('pointerdown', (e) => {
         move(e);
-        const b = be.raw.buttons.slice(); b[Math.min(2, e.button)] = true;
+        const i = Math.min(2, e.button);
+        const b = be.raw.buttons.slice(); b[i] = true;
+        be.latchB[i] = true;
         be.raw = { ...be.raw, buttons: b };
       });
       const up = (e) => {
@@ -277,13 +323,18 @@ export function createCanvasBackend(canvas, { resolution = DEFAULT_RESOLUTION } 
       };
       target.addEventListener('pointerup', up);
       window.addEventListener('blur', () => {
+        // a key held when focus left is not held any more, and a latch that
+        // outlives the window would fire on return
         be.raw = { ...be.raw, buttons: [false, false, false], keys: new Set() };
+        be.latchB = [false, false, false];
+        be.latchK.clear();
       });
       window.addEventListener('keydown', (e) => {
         const k = KEYMAP[e.code];
         if (!k) return;
         e.preventDefault();
         const s = new Set(be.raw.keys); s.add(k);
+        be.latchK.add(k);
         be.raw = { ...be.raw, keys: s };
       });
       window.addEventListener('keyup', (e) => {

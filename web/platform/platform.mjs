@@ -122,6 +122,12 @@ function makeData(be) {
  * detail: `sample()` is called ONCE per tick at the tick boundary, and
  * everything a cart reads during that tick is that frozen snapshot. Edge
  * queries (`pressed`, `keyp`) compare it against the previous tick's.
+ *
+ * `readInput` is therefore called exactly once per tick, and a backend may
+ * treat the call as CONSUMING input — a live one has to, since a click can
+ * begin and end between two samples and would otherwise be lost (see the latch
+ * in canvas2d.mjs). A scripted backend has no such problem and just returns
+ * what it was told.
  */
 function makeInput(be) {
   const empty = { x: 0, y: 0, buttons: new Array(BUTTONS).fill(false), keys: new Set() };

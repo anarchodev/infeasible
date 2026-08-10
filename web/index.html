@@ -26,7 +26,10 @@
   :root { color-scheme: dark; }
   html, body { margin: 0; height: 100%; background: #0b0d10; color: #6b7f99;
                font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
-  body { display: flex; flex-direction: column; gap: 8px; padding: 8px; box-sizing: border-box; }
+  /* Chrome around the canvas costs INTEGER SCALE, not just room: 46px of
+     caption is the difference between ×2 and ×1 at 720p. What the player needs
+     to know is in the game's own title bar, at the game's own resolution. */
+  body { display: flex; flex-direction: column; padding: 4px; box-sizing: border-box; }
   /* The canvas fills what is left and the ENGINE letterboxes inside it (§12).
      Constraining the element's aspect ratio too would letterbox twice, and the
      second one only costs integer scale: at 921px the upscale is ×2, at 960 it
@@ -34,13 +37,22 @@
   canvas { flex: 1 1 auto; width: 100%; min-height: 0; display: block;
            image-rendering: pixelated; background: #000; touch-action: none; }
   p { margin: 0; text-align: center; }
+  p:empty { display: none; }
+  /* Fullscreen is where the arithmetic pays off: with no chrome in the way a
+     1920x1080 display is a whole-number multiple of every blessed internal
+     resolution, so the picture fills the screen with no letterbox bars at all.
+     The control is `fixed`, so it costs the canvas no height when unused. */
+  #full { position: fixed; right: 6px; bottom: 6px; z-index: 1;
+          font: inherit; color: #6b7f99; background: #1d2433; border: 1px solid #3b4b63;
+          padding: 2px 8px; cursor: pointer; opacity: .45; }
+  #full:hover { opacity: 1; color: #f2f0e6; }
+  :root:fullscreen body { padding: 0; }
   a { color: #79b8e8; }
   #err { color: #e06666; white-space: pre-wrap; font-size: 11px; max-width: 90vw; }
 </style>
 
 <canvas id="screen" width="960" height="540"></canvas>
-<p>click a command &middot; click an actor or press <b>tab</b> to switch &middot;
-   a greyed command prints the argument that refused it</p>
+<button id="full" title="fullscreen (esc to leave)">&#x26F6;</button>
 <p id="err"></p>
 
 <script src="./infeasible.js"></script>
@@ -58,6 +70,13 @@ try {
   const canvas = document.getElementById('screen');
   const backend = createCanvasBackend(canvas, { resolution: cart.resolution });
   backend.attach();                    // the ONLY place DOM events are touched
+
+  // Fullscreen needs a user gesture, so the PAGE owns the control and the
+  // backend owns the call. Nothing here is reachable from the cart.
+  const full = document.getElementById('full');
+  full.addEventListener('click', () => backend.fullscreen());
+  document.addEventListener('fullscreenchange',
+    () => { full.textContent = backend.isFullscreen() ? '\u2715' : '\u26F6'; });
 
   const platform = createPlatform(backend);
   createRuntime({ platform, backend, cart, world }).start();

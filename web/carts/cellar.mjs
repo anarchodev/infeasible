@@ -23,48 +23,80 @@ import { open, SORTS, STORY, SOURCE_HASH } from '../cellar_play.binding.mjs';
 
 export { STORY, SOURCE_HASH, open };
 
-/** The atlas: one char per pixel, a hex palette index or '.' for transparent.
- *  Eight 8×8 tiles — floor, wall, hero, guard, key, torch, flask, dither. */
-export const SHEET = {
+/** The TILE atlas: one char per pixel, a hex palette index or '.' for
+ *  transparent. Three 8×8 tiles that repeat across a floor — the layer that
+ *  pre-renders and repaints only when a delta touches it (§12). */
+export const TILES = {
   tile: 8,
-  cols: 8,
+  cols: 3,
   pixels: [
-    '11111111' + '22222222' + '..4444..' + '..4444..' + '........' + '...b....' + '..555...' + '15151515',
-    '12111211' + '23333332' + '..4444..' + '..4444..' + '..666...' + '..bab...' + '...5....' + '51515151',
-    '11111111' + '23222232' + '.eeeeee.' + '.aaaaaa.' + '.6..6...' + '..b6b...' + '...5....' + '15151515',
-    '11211121' + '23222232' + 'eee44eee' + 'aaa44aaa' + '.6..6...' + '...8....' + '..ddd...' + '51515151',
-    '11111111' + '23222232' + '.e4444e.' + '.a4444a.' + '..666...' + '...8....' + '.ddccd..' + '15151515',
-    '12111211' + '23333332' + '..e..e..' + '..a..a..' + '...6....' + '...8....' + '.dccccd.' + '51515151',
-    '11111111' + '22222222' + '..4..4..' + '..4..4..' + '...666..' + '...9....' + '.dccccd.' + '15151515',
-    '11121111' + '20000002' + '..4..4..' + '..4..4..' + '...6.6..' + '........' + '..dddd..' + '51515151',
+    '11111111' + '22222222' + '15151515',
+    '12111211' + '23333332' + '51515151',
+    '11111111' + '23222232' + '15151515',
+    '11211121' + '23222232' + '51515151',
+    '11111111' + '23222232' + '15151515',
+    '12111211' + '23333332' + '51515151',
+    '11111111' + '22222222' + '15151515',
+    '11121111' + '20000002' + '51515151',
   ],
 };
 
-const T = { FLOOR: 0, WALL: 1, HERO: 2, GUARD: 3, KEY: 4, TORCH: 5, FLASK: 6, DITHER: 7 };
-const ITEM_TILE = { rusty_key: T.KEY, torch: T.TORCH, antidote: T.FLASK };
+/** The SPRITE atlas: five 16×16 actors and props. A sheet carries its own tile
+ *  size, so bigger art costs a second sheet and not a thirteenth draw op —
+ *  §12's rule that pre-baked variants are an asset-pipeline product, applied to
+ *  scale as well as to colour. */
+export const SPRITES = {
+  tile: 16,
+  cols: 5,
+  pixels: [
+    //  hero              guard             rusty_key         torch             antidote
+    '................' + '................' + '................' + '................' + '................',
+    '.....444444.....' + '....22222222....' + '................' + '.......b........' + '......5555......',
+    '....44444444....' + '...2222222222...' + '.....666666.....' + '......bab.......' + '.......55.......',
+    '....41444414....' + '...2244444422...' + '....66....66....' + '.....baaab......' + '.......55.......',
+    '....44444444....' + '....41444414....' + '...66......66...' + '.....ba6ab......' + '.......55.......',
+    '....94444449....' + '....44444444....' + '...66......66...' + '.....b666b......' + '......5555......',
+    '.....444444.....' + '.....444444.....' + '....66....66....' + '......b6b.......' + '.....d5555d.....',
+    '...eeeeeeeeee...' + '...aaaaaaaaaa...' + '.....666666.....' + '.......8........' + '.....dccccd.....',
+    '..eee444444eee..' + '..aaa444444aaa..' + '.......66.......' + '.......8........' + '....dcccccdd....',
+    '..ee44444444ee..' + '..aa44444444aa..' + '.......66.......' + '.......8........' + '....dcccdccd....',
+    '...e44444444e...' + '...a44444444a...' + '.......66.......' + '.......8........' + '...dccccccccd...',
+    '...eeeeeeeeee...' + '...aaaaaaaaaa...' + '.......6666.....' + '.......9........' + '...dccccccccd...',
+    '....ee....ee....' + '....aa....aa....' + '.......66.......' + '.......9........' + '...dccccccccd...',
+    '....ee....ee....' + '....aa....aa....' + '.......6666.....' + '.......9........' + '....dcccccccd...',
+    '....44....44....' + '....44....44....' + '.......66.......' + '................' + '.....dddddd.....',
+    '...444....444...' + '...444....444...' + '................' + '................' + '................',
+  ],
+};
+
+const T = { FLOOR: 0, WALL: 1, DITHER: 2 };
+const S = { HERO: 0, GUARD: 1, KEY: 2, TORCH: 3, FLASK: 4 };
+const ITEM_SPR = { rusty_key: S.KEY, torch: S.TORCH, antidote: S.FLASK };
 
 const ROOMS = ['cellar', 'hall', 'vault'];
-/** Room boxes in internal pixels — 12×6 floor tiles each. */
+/** Room boxes in internal pixels — 24×22 floor tiles each, three across with
+ *  the vault door in the right-hand gap. */
 const BOX = {
-  cellar: { x: 6,   y: 20, w: 96, h: 48 },
-  hall:   { x: 110, y: 20, w: 96, h: 48 },
-  vault:  { x: 214, y: 20, w: 96, h: 48 },
+  cellar: { x: 8,   y: 36, w: 192, h: 176 },
+  hall:   { x: 224, y: 36, w: 192, h: 176 },
+  vault:  { x: 440, y: 36, w: 192, h: 176 },
 };
-const DOOR = { x: 206, y: 36, w: 8, h: 16 };
+const DOOR = { x: 420, y: 108, w: 16, h: 32 };
 
-const BAR_Y = 76;                      // the command bar's top edge
-const WHY_X = 132;
+const BAR_Y = 224;                     // the command bar's top edge
+const STAT_X = 216;                    // where the status column starts
 
 // palette shorthands
 const INK = 0, DIM = 2, MID = 3, PALE = 4, BONE = 5, GOLD = 6, RED = 10, LIME = 13, SKY = 15;
 
-/** Where an actor or a floor item stands inside its room. */
-const slot = (room, i) => ({ x: BOX[room].x + 8 + (i % 5) * 17,
-                             y: BOX[room].y + 12 + Math.floor(i / 5) * 20 });
+/** Where an actor or a floor item stands inside its room: a 4-wide grid of
+ *  16px sprites, actors on the top row and dropped items on the second. */
+const slot = (room, i) => ({ x: BOX[room].x + 24 + (i % 4) * 40,
+                             y: BOX[room].y + 28 + Math.floor(i / 4) * 44 });
 
 export const cart = {
-  resolution: [320, 180],
-  sheets: { main: SHEET },
+  resolution: [640, 360],
+  sheets: { tiles: TILES, sprites: SPRITES },
 
   init(ctx) {
     this.sel = 'hero';
@@ -95,6 +127,14 @@ export const cart = {
     const { input, world: w } = ctx;
     this.buttons = this.offer(w, this.sel);
 
+    // Keyboard first: the click paths below return early, and a tab pressed in
+    // the same tick as a click would be read by nobody. One snapshot per tick
+    // means every reader of it has to run.
+    if (input.keyp('tab')) {
+      this.sel = this.sel === 'hero' ? 'guard' : 'hero';
+      this.why = '';
+    }
+
     if (input.pressed(0)) {
       const p = input.pointer();
 
@@ -112,10 +152,6 @@ export const cart = {
         this.note = `${b.label}: refused`;
         return null;
       }
-    }
-    if (input.keyp('tab')) {
-      this.sel = this.sel === 'hero' ? 'guard' : 'hero';
-      this.why = '';
     }
     return null;
   },
@@ -183,14 +219,18 @@ export const cart = {
     if (at === 'vault') add('LEAVE VAULT', w.a.leave_vault(who), true);
 
     for (const it of SORTS.item) {
-      if (w.state.on_floor(it, at)) add(`TAKE ${word(it)}`, w.a.take(who, it, at), true);
+      // You cannot pick up what you cannot see — and the cart does not know
+      // that rule either, it asks. A greyed TAKE prints why the room is dark.
+      if (w.state.on_floor(it, at))
+        add(`TAKE ${word(it)}`, w.a.take(who, it, at),
+            w.q.in_dark(who) !== 'proved', w.lit.in_dark(who));
       else if (w.state.holding(who, it)) add(`DROP ${word(it)}`, w.a.drop(who, it, at), true);
     }
     if (w.state.holding(who, 'antidote') && w.state.poisoned(who))
       add('DRINK ANTIDOTE', w.a.drink(who), true);
 
-    let y = BAR_Y + 12;
-    for (const b of out) { b.x = 4; b.y = y; b.w = 120; b.h = 9; y += 10; }
+    let y = BAR_Y + 18;
+    for (const b of out) { b.x = 8; b.y = y; b.w = 176; b.h = 11; y += 13; }
     return out;
   },
 
@@ -198,38 +238,39 @@ export const cart = {
     const room = w.state.at(who);
     if (!room) return null;
     const s = slot(room, who === 'hero' ? 0 : 1);
-    return { ...s, w: 8, h: 8 };
+    return { ...s, w: 16, h: 16 };
   },
 
   // ---- the frame ----------------------------------------------------------
   draw(ctx) {
     const { draw: d, world: w } = ctx;
+    const [W, H] = this.resolution;
     d.cls(INK);
 
     // title
-    d.rectfill(0, 0, 320, 10, DIM);
-    d.print('THE CELLAR', 4, 2, BONE);
-    d.print(`DOOR: ${word(w.state.door())}   TICK ${ctx.tick}`, 120, 2, MID);
-    d.print('TAB SWITCHES', 244, 2, MID);
+    d.rectfill(0, 0, W, 14, DIM);
+    d.print('THE CELLAR', 8, 4, BONE);
+    d.print(`DOOR: ${word(w.state.door())}`, 240, 4, MID);
+    d.print(`TICK ${ctx.tick}`, 360, 4, MID);
+    d.print('CLICK AN ACTOR OR PRESS TAB TO SWITCH', 420, 4, MID);
 
     for (const room of ROOMS) this.drawRoom(ctx, room);
     this.drawDoor(ctx);
 
     // the command bar
-    d.rectfill(0, BAR_Y, 320, 180 - BAR_Y, INK);
-    d.line(0, BAR_Y, 319, BAR_Y, DIM);
-    d.print(`${word(this.sel)} — ${word(w.state.at(this.sel))}`, 4, BAR_Y + 3,
+    d.line(0, BAR_Y, W - 1, BAR_Y, DIM);
+    d.print(`${word(this.sel)} - ${word(w.state.at(this.sel))}`, 8, BAR_Y + 5,
             this.sel === 'hero' ? SKY : RED);
     for (const b of this.buttons) {
       d.rect(b.x, b.y, b.w, b.h, b.ok ? MID : DIM);
-      d.print(b.label, b.x + 3, b.y + 2, b.ok ? BONE : DIM);
+      d.print(b.label, b.x + 4, b.y + 3, b.ok ? BONE : DIM);
     }
 
     this.drawStatus(ctx);
     this.drawWhy(ctx);
 
     // burst cues, animating above the line: presentation state, no fact
-    d.clip(0, 10, 320, BAR_Y - 10);
+    d.clip(0, 14, W, BAR_Y - 14);
     for (const f of this.fx) {
       d.print(f.text, f.x - d.textWidth(f.text) / 2, f.y - (40 - f.life) / 4, f.color);
       f.life--;
@@ -243,68 +284,82 @@ export const cart = {
     const b = BOX[room];
     for (let ty = 0; ty < b.h / 8; ty++)
       for (let tx = 0; tx < b.w / 8; tx++)
-        d.tile('main', T.FLOOR, b.x + tx * 8, b.y + ty * 8);
+        d.tile('tiles', T.FLOOR, b.x + tx * 8, b.y + ty * 8);
     d.rect(b.x - 1, b.y - 1, b.w + 2, b.h + 2, MID);
-    d.print(word(room), b.x, b.y - 8, MID);
+    d.print(word(room), b.x, b.y - 10, MID);
 
-    // items on this floor
-    let i = 5;
+    // items on this floor — the second row of slots
+    let i = 4;
     for (const it of SORTS.item)
       if (w.state.on_floor(it, room)) {
         const s = slot(room, i++);
-        d.spr('main', ITEM_TILE[it], s.x, s.y);
+        d.spr('sprites', ITEM_SPR[it], s.x, s.y);
       }
+
+    // THE composite op, applied BEFORE the actors: the room goes dark, the
+    // people in it do not. Fog is about what you can make out around you, and
+    // a player who cannot see the character they are steering has been given
+    // an atmosphere instead of a game. "Dark" is still the story's judgment;
+    // only the draw order is presentation's business.
+    const anyoneInDark = SORTS.actor.some(
+      (a) => w.state.at(a) === room && w.q.in_dark(a) === 'proved');
+    if (anyoneInDark)
+      for (let ty = 0; ty < b.h / 8; ty++)
+        for (let tx = 0; tx < b.w / 8; tx++)
+          d.shade('tiles', T.DITHER, b.x + tx * 8, b.y + ty * 8);
 
     // actors, and what they carry
     for (const who of SORTS.actor) {
       if (w.state.at(who) !== room) continue;
       const s = slot(room, who === 'hero' ? 0 : 1);
       const down = w.q.down(who) === 'proved';
-      d.spr('main', who === 'hero' ? T.HERO : T.GUARD, s.x, s.y,
+      d.spr('sprites', who === 'hero' ? S.HERO : S.GUARD, s.x, s.y,
             { flipY: down, alpha: down ? 0.5 : 1 });
-      if (who === this.sel) d.rect(s.x - 2, s.y - 2, 12, 12, GOLD);
-      let k = 0;
-      for (const it of SORTS.item)
-        if (w.state.holding(who, it)) d.spr('main', ITEM_TILE[it], s.x + 9, s.y + (k++) * 6,
-                                            { alpha: 0.9 });
-      if (w.state.poisoned(who)) d.circfill(s.x + 4, s.y - 3, 1, LIME);
-    }
+      if (who === this.sel) d.rect(s.x - 3, s.y - 3, 22, 22, GOLD);
+      if (w.state.poisoned(who)) d.circfill(s.x + 8, s.y - 6, 2, LIME);
 
-    // THE composite op: the cellar is dark for whoever is standing in it
-    // without the torch, and "dark" is a judgment the story owns.
-    const anyoneInDark = SORTS.actor.some(
-      (a) => w.state.at(a) === room && w.q.in_dark(a) === 'proved');
-    if (anyoneInDark)
-      for (let ty = 0; ty < b.h / 8; ty++)
-        for (let tx = 0; tx < b.w / 8; tx++)
-          d.shade('main', T.DITHER, b.x + tx * 8, b.y + ty * 8);
+      // carried items, in a row centred under the carrier
+      const held = SORTS.item.filter((it) => w.state.holding(who, it));
+      let k = 0;
+      for (const it of held)
+        d.spr('sprites', ITEM_SPR[it],
+              s.x + 8 - held.length * 7 + (k++) * 14, s.y + 20, { alpha: 0.9 });
+    }
   },
 
   drawDoor(ctx) {
     const { draw: d, world: w } = ctx;
     const v = w.state.door();
-    d.rectfill(DOOR.x, DOOR.y, DOOR.w, DOOR.h, v === 'open' ? INK : 8);
-    d.rect(DOOR.x, DOOR.y, DOOR.w, DOOR.h, v === 'open' ? DIM : MID);
-    if (v === 'locked') d.circfill(DOOR.x + 4, DOOR.y + 8, 1, GOLD);
-    d.line(BOX.hall.x + BOX.hall.w, DOOR.y + 8, DOOR.x, DOOR.y + 8, DIM);
-    d.line(DOOR.x + DOOR.w, DOOR.y + 8, BOX.vault.x, DOOR.y + 8, DIM);
+    const midY = DOOR.y + DOOR.h / 2;
+    d.line(BOX.hall.x + BOX.hall.w, midY, DOOR.x, midY, DIM);
+    d.line(DOOR.x + DOOR.w, midY, BOX.vault.x, midY, DIM);
+    if (v === 'open') {                    // a doorway, with the leaf swung back
+      d.rect(DOOR.x, DOOR.y, DOOR.w, DOOR.h, DIM);
+      d.rectfill(DOOR.x + 1, DOOR.y + 1, 3, DOOR.h - 2, 9);
+      return;
+    }
+    d.rectfill(DOOR.x, DOOR.y, DOOR.w, DOOR.h, v === 'jammed' ? 9 : 8);
+    d.rect(DOOR.x, DOOR.y, DOOR.w, DOOR.h, MID);
+    d.line(DOOR.x + 2, DOOR.y + 4, DOOR.x + DOOR.w - 3, DOOR.y + 4, 8);
+    d.line(DOOR.x + 2, DOOR.y + DOOR.h - 5, DOOR.x + DOOR.w - 3, DOOR.y + DOOR.h - 5, 8);
+    if (v === 'locked') d.circfill(DOOR.x + DOOR.w - 4, midY, 2, GOLD);
   },
 
   drawStatus(ctx) {
     const { draw: d, world: w } = ctx;
-    let y = BAR_Y + 3;
+    let y = BAR_Y + 5;
     for (const who of SORTS.actor) {
       const hp = w.state.hp(who);
-      d.print(word(who), WHY_X, y, who === this.sel ? BONE : MID);
-      d.rectfill(WHY_X + 28, y, 24, 5, DIM);
-      d.rectfill(WHY_X + 28, y, Math.max(0, Math.round(24 * hp / 12)), 5,
+      d.print(word(who), STAT_X, y, who === this.sel ? BONE : MID);
+      d.rectfill(STAT_X + 44, y, 48, 6, DIM);
+      d.rectfill(STAT_X + 44, y, Math.max(0, Math.round(48 * hp / 12)), 6,
                  hp > 6 ? LIME : RED);
-      d.print(`${hp}`, WHY_X + 55, y, MID);
-      d.print(w.q.weakened(who) === 'proved' ? 'WEAK' : '', WHY_X + 68, y, RED);
-      y += 7;
+      d.print(`${hp}`, STAT_X + 98, y, MID);
+      d.print(w.q.weakened(who) === 'proved' ? 'WEAKENED' : '', STAT_X + 118, y, RED);
+      y += 9;
     }
-    if (this.note)  d.print(clamp(this.note, 46), WHY_X, y, GOLD);
-    if (this.event) d.print(clamp(this.event, 46), WHY_X, y + 7, SKY);
+    if (this.note)  d.print(clamp(this.note, 100), STAT_X, y + 4, GOLD);
+    if (this.event) d.print(clamp(this.event, 100), STAT_X, y + 13, SKY);
   },
 
   /** The `why?` debugger, on screen. A refused button is not a dead end — it
@@ -316,9 +371,10 @@ export const cart = {
   drawWhy(ctx) {
     if (!this.why) return;
     const { draw: d } = ctx;
-    d.rectfill(2, 12, 316, BAR_Y - 14, 1);
-    d.rect(2, 12, 316, BAR_Y - 14, DIM);
-    let ly = 15;
+    const [W] = this.resolution;
+    d.rectfill(4, 18, W - 8, BAR_Y - 26, 1);
+    d.rect(4, 18, W - 8, BAR_Y - 26, DIM);
+    let ly = 22;
     // Wrapped, not truncated. A trace line ends in the operands the solve
     // actually compared, so cutting it at the panel edge throws away the half
     // that answers the question. Colour is decided per SOURCE line, so a rule
@@ -326,10 +382,10 @@ export const cart = {
     for (const src of this.why.split('\n')) {
       if (!src.trim()) continue;
       const c = src.includes('-- applicable') ? RED : PALE;
-      for (const line of wrap(src, 77)) {
-        if (ly > BAR_Y - 8) return;
-        d.print(line, 5, ly, c);
-        ly += 6;
+      for (const line of wrap(src, (W - 20) / 4)) {
+        if (ly > BAR_Y - 12) return;
+        d.print(line, 8, ly, c);
+        ly += 8;
       }
     }
   },

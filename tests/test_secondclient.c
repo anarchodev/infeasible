@@ -218,7 +218,7 @@ static int offer(const view *v, int who, char out[][24], bool *ok, int max)
         char lbl[24];
         if (v->at[who] >= 0 && v->onfloor[t][v->at[who]]) {
             snprintf(lbl, sizeof lbl, "TAKE %s", ITEMS[t]);
-            ADD(lbl, true);
+            ADD(lbl, !v->dark[who]);       /* you cannot pick up what you cannot see */
         } else if (v->hold[who][t]) {
             snprintf(lbl, sizeof lbl, "DROP %s", ITEMS[t]);
             ADD(lbl, true);
@@ -302,10 +302,10 @@ int main(void)
     {
         char lbl[8][24]; bool ok[8];
         int n = offer(&c.v, 0, lbl, ok, 8);
-        CHECK(n == 3);
-        CHECK(strcmp(lbl[0], "GO TO HALL") == 0);
-        CHECK(strcmp(lbl[1], "TAKE rusty_key") == 0);
-        CHECK(strcmp(lbl[2], "TAKE torch") == 0);    /* the cart's list, verbatim */
+        CHECK(n == 2);
+        CHECK(strcmp(lbl[0], "GO TO HALL") == 0 && ok[0]);
+        CHECK(strcmp(lbl[1], "TAKE rusty_key") == 0);   /* the cart's list, verbatim */
+        CHECK(!ok[1]);                     /* offered, and refused: the room is dark */
     }
 
     /* ---- replay ---------------------------------------------------------- */
