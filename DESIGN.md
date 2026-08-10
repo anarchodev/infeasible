@@ -3089,10 +3089,50 @@ because it is permanent — is that every evaluation behaviour ever shipped is
 shipped forever. The golden-test discipline already pushes hard against
 semantic churn; this is the reason it must.
 
-The direction is falsifiable, and cheaply: **express `cellar_play` with zero
-host JS.** If the ontology lands it in a few dozen rules, ship the ontology and
-make host code the escape hatch. If placing five buttons takes two hundred
-rules, the boundary has been found in the right place and at the right price.
+**The test has been run, and it passes.** `examples/cellar_pure.story` is the
+cellar with its presentation, played end to end — frame, labels, placement,
+sprites, fog, menu, refusals, cues — with **zero game code**. The renderer
+(`web/platform/scene.mjs`) knows the blessed vocabulary and nothing else; the
+driver (`web/platform/purecart.mjs`) contains no game at all. Together they are
+244 lines of generic JS standing in for 318 lines of game-specific cart, and
+pointing them at a different `.story` draws a different game with no edit. The
+price on the authoring side is 62 presentation rules, 37 enum members of
+vocabulary, and 14 rows of geometry in `init`. Nothing in the compiler had to
+change: the ontology is ordinary judgments over enum constants, and coordinates
+are ordinary numeric fluents.
+
+Six frictions showed up, and they are the shape of the work left:
+
+1. *A rule needs a body*, so the parts of a frame that are simply always there
+   need something to hang on. A `showing` fluent is the honest answer and turns
+   out to be the seam a title screen would use anyway.
+2. *Values are functions, not lookup tables* — at most one unconditional
+   definition, and head arguments must be rule parameters — so geometry is
+   numeric **state** initialized per instance. That is the better model
+   regardless (§5.6 already puts positions in the store), but it is not where an
+   author's hand goes first.
+3. *A predicate is monomorphic in its argument sorts*, first rule wins,
+   silently — so `shows(actor, …)` and `shows(item, …)` cannot be one
+   predicate and the ontology duplicates per sort. This is the ontology's
+   loudest argument for **sort union**, since "everything drawable" is a cover,
+   not a coincidence.
+4. *A judgment can carry an entity but not a quantity*, so a bar's source has to
+   be a fluent blessed **by name** — the one world word the renderer knows.
+   Naming a fluent as an argument is what would close it.
+5. *An action's extra parameters must be recovered by convention.* A menu entry
+   names a command; binding `take_torch(actor, room)` needs the room, and the
+   renderer gets it from the blessed `here(actor, room)` rather than from
+   anything the command said.
+6. *Per-viewer state has no home*, exactly as predicted. Selection is a fluent,
+   so it sits in the shared world and in the action log, and "select one, clear
+   the rest" needs one concrete action per actor because a parameterized action
+   cannot say it. §5.5's scopes remain the answer, and this is the concrete bill
+   for not having them yet.
+
+None of the six is a reason to keep host code as the default. The residue after
+the experiment is exactly what the factoring predicted it would be — the loop,
+the layout arithmetic inside the renderer, and the **assets**, which are pixels
+and are no more expressible as rules than a `.png` is.
 
 **Save compatibility: loading old saves is schema migration, and most
 patches need none.** A production game patches content under players' feet;

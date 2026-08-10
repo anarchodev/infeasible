@@ -1,0 +1,70 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>infeasible — the cellar, with no game code</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8'%3E%3Crect width='8' height='8' fill='%230b0d10'/%3E%3Crect x='2' y='1' width='4' height='6' fill='%238a5a2b'/%3E%3Crect x='4' y='4' width='1' height='1' fill='%23e8c37a'/%3E%3C/svg%3E">
+<!--
+  The same cellar as index.html, drawn WITHOUT A CART (DESIGN.md §12, the
+  infeasible cart). Every decision below the canvas — the frame, the labels,
+  what is where, which commands exist, which sound a cue plays — is a
+  conclusion `examples/cellar_pure.story` reached. The JS that draws it has
+  never heard of a cellar.
+
+  Serve the repo root (web/serve.sh) and open /web/pure.html.
+-->
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #0b0d10; color: #6b7f99;
+               font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  body { display: flex; flex-direction: column; padding: 4px; box-sizing: border-box; }
+  canvas { flex: 1 1 auto; width: 100%; min-height: 0; display: block;
+           image-rendering: pixelated; background: #000; touch-action: none; }
+  p { margin: 0; text-align: center; }
+  p:empty { display: none; }
+  #full { position: fixed; right: 6px; bottom: 6px; z-index: 1;
+          font: inherit; color: #6b7f99; background: #1d2433; border: 1px solid #3b4b63;
+          padding: 2px 8px; cursor: pointer; opacity: .45; }
+  #full:hover { opacity: 1; color: #f2f0e6; }
+  :root:fullscreen body { padding: 0; }
+</style>
+
+<canvas id="screen" width="960" height="540"></canvas>
+<button id="full" title="fullscreen (esc to leave)">&#x26F6;</button>
+<p id="err"></p>
+
+<script src="./infeasible.js"></script>
+<script type="module">
+import { createCanvasBackend } from './platform/canvas2d.mjs';
+import { createPlatform } from './platform/platform.mjs';
+import { createRuntime } from './platform/runtime.mjs';
+import { pureCart } from './platform/purecart.mjs';
+import { open, SORTS, ENUMS, IFACE, STORY } from './cellar_pure.binding.mjs';
+import { TILES, SPRITES } from './carts/cellar.mjs';
+
+try {
+  const M = await createInfeasible();
+  const src = await (await fetch('../' + STORY)).text();
+  const world = open(M, src);
+
+  // Assets, not logic: a sprite atlas is pixels, and pixels are no more
+  // expressible as rules than a .png is. The dither the composite op uses is
+  // the third tile of the shared tile sheet.
+  const FOG = { tile: 8, cols: 1, pixels: TILES.pixels.map((r) => r.slice(16, 24)) };
+  const cart = pureCart({ world, iface: IFACE, doms: { ...SORTS, ...ENUMS },
+                          sheets: { main: SPRITES, main_fog: FOG } });
+
+  const canvas = document.getElementById('screen');
+  const backend = createCanvasBackend(canvas, { resolution: cart.resolution });
+  backend.attach();
+
+  const full = document.getElementById('full');
+  full.addEventListener('click', () => backend.fullscreen());
+  document.addEventListener('fullscreenchange',
+    () => { full.textContent = backend.isFullscreen() ? '✕' : '⛶'; });
+
+  const platform = createPlatform(backend);
+  createRuntime({ platform, backend, cart, world }).start();
+} catch (e) {
+  document.getElementById('err').textContent = e.message;
+  throw e;
+}
+</script>
