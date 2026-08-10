@@ -2871,6 +2871,27 @@ sprites at RTS scale. Nothing in the surface may assume more.
   a weekend to port, and now the whole cart-facing platform rather than only
   its drawing half.
 
+**The freeze is a list, and the list is checked.** The op names, the blessed
+resolution set, the sixteen-entry palette, the frozen key set and the text cell
+are one module (`web/platform/spec.mjs`), and every backend and every cart
+reads them from there. What makes "frozen" a property of the code rather than a
+promise in a document is the *correspondence check*: `web/platform_check.mjs`
+asserts that the cart-facing surfaces expose exactly those names and that each
+backend implements exactly those names, in both directions. A thirteenth draw
+op cannot be added to a renderer and quietly depended on by a cart — it fails
+until it is added to the spec deliberately, and then every backend must grow
+it. That is the same discipline the golden tests apply to semantics, pointed at
+a surface instead of a meaning.
+
+Two consequences of the shape are worth stating because they are easy to
+mis-implement. The text cell is frozen as **metrics, not glyphs** — `print`
+advances a fixed cell width per character on every backend, and the letter
+shapes are the backend's business — so an offline player may substitute its own
+font without any cart's UI shifting by a pixel. And the letterbox *inverse*
+(display point → internal pixel) lives below the line beside the letterbox
+itself: every cart computing it independently is every cart getting the edges
+wrong.
+
 **Burst cues: the one output of a step that is not state.** Those four
 surfaces are what a cart *calls*; what a step *hands back* is the other half of
 the interface, and it is three streams — the fluent delta (§11 M2), the §5.8
@@ -3239,10 +3260,11 @@ semantics. Names are working names.
   migration vs. an authored cull predicate choosing survivors), and a
   fluent moving between scopes/tiers is the migration face of the
   cross-scope-identity question above — decide them together.
-- **Presentation-interface op set** (§12): the frozen surface's exact op
-  list (tile blit, sprite, text, primitives, composite op) is an M2
-  decision, frozen with the client contract. Freezing late is fine;
-  unfreezing is not.
+- **Sound and music assets** (§12): the audio *ops* are frozen, but the
+  format a cart ships its sounds in — and whether a cart may synthesize
+  rather than sample — is open. Sampled assets are one more thing an
+  offline player must decode; a tiny synth spec is more to freeze but
+  decodes to nothing. Decide with the asset pipeline.
 - **Server-authoritative riders** (§12): reconciliation semantics when a
   client-predicted judgment is contradicted by the authoritative delta
   (presentation-side rollback — but the boundary needs stating);

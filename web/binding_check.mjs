@@ -43,7 +43,7 @@ console.log('\nvocabulary');
 check('an unknown action has no constructor', w.a.teleport === undefined);
 check('an unknown judgment has no query', w.q.can_teleport === undefined);
 check('a bad entity is refused where it is written',
-      throws(() => w.a.strike('gruk', 'vera'), "not a member of sort 'actor'"));
+      throws(() => w.a.strike('gruk', 'vera'), "not a member of 'actor'"));
 check('the declared sorts are the ones the story declared',
       SORTS.actor.join(',') === 'grunk,vera');
 

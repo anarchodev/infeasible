@@ -39,7 +39,10 @@
 #define MAX_LADDERS    16          /* priority ladders (`bands …`, §6.2) */
 #define MAX_BANDS      16          /* bands per ladder */
 #define MAX_EXCLS      32          /* `exclusive` groups per file (#159) */
-#define MAX_EXCL_MEMBERS 8         /* member actions per group */
+#define MAX_EXCL_MEMBERS 16        /* member actions per group — a per-actor
+                                    * turn protocol names every action a unit
+                                    * may take, so this scales with the verb
+                                    * count, not with the group's arity */
 #define INT_SORT       (-3)        /* provider-arg sort sentinel for `int` (§5.6) */
 
 /* ---- AST ------------------------------------------------------------ */

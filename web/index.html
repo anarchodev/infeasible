@@ -1,0 +1,62 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>infeasible — the cellar</title>
+<!--
+  The playable cellar in a browser (DESIGN.md §11 M2): the WASM engine, the
+  .story world, the generated typed binding, the frozen presentation interface
+  and one cart — with no build step and nothing fetched from anywhere but this
+  directory (§12's first rot rule).
+
+  Serve the REPO ROOT and open /web/ :
+
+      python3 -m http.server 8000     # from the repo root
+      xdg-open http://localhost:8000/web/
+
+  The root rather than web/, because the page fetches the .story SOURCE. That
+  is deliberate and it is the whole content model: source is always shipped,
+  and the compiled form is a cache, never the artifact (§12).
+
+  Everything below the <script> is chrome — mortal, above the durability line,
+  and replaceable without touching a cart.
+-->
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #0b0d10; color: #6b7f99;
+               font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  body { display: flex; flex-direction: column; align-items: center;
+         justify-content: center; gap: 10px; }
+  canvas { width: min(96vw, 160vh); aspect-ratio: 16 / 9; image-rendering: pixelated;
+           background: #000; touch-action: none; }
+  p { margin: 0; text-align: center; }
+  a { color: #79b8e8; }
+  #err { color: #e06666; white-space: pre-wrap; font-size: 11px; max-width: 90vw; }
+</style>
+
+<canvas id="screen" width="960" height="540"></canvas>
+<p>click a command &middot; click an actor or press <b>tab</b> to switch &middot;
+   a greyed command prints the argument that refused it</p>
+<p id="err"></p>
+
+<script src="./infeasible.cjs"></script>
+<script type="module">
+import { createCanvasBackend } from './platform/canvas2d.mjs';
+import { createPlatform } from './platform/platform.mjs';
+import { createRuntime } from './platform/runtime.mjs';
+import { cart, open, STORY } from './carts/cellar.mjs';
+
+try {
+  const M = await createInfeasible();
+  const src = await (await fetch('../' + STORY)).text();
+  const world = open(M, src);          // throws if the binding is stale (§6.3)
+
+  const canvas = document.getElementById('screen');
+  const backend = createCanvasBackend(canvas, { resolution: cart.resolution });
+  backend.attach();                    // the ONLY place DOM events are touched
+
+  const platform = createPlatform(backend);
+  createRuntime({ platform, backend, cart, world }).start();
+} catch (e) {
+  document.getElementById('err').textContent = e.message;
+  throw e;
+}
+</script>
