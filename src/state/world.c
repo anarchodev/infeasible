@@ -303,13 +303,23 @@ struct world {
      * stored. Each ground provider atom records its predicate + entity args; at
      * solve time it loads as a fact from the registered callback (closed-world),
      * exactly like a numeric guard. Read-only: providers never appear as heads. */
-    struct { uint32_t atom, pred; int nargs; uint32_t args[4]; } *provs;
+    struct { uint32_t atom, pred; int nargs; uint32_t args[4];
+             char *disp; } *provs;              /* #178 render scratch */
     int nprov, capprov;
     world_provider_fn provider_fn; void *provider_ctx;
+    /* Trace-time only (#178): phrases one provider's answer for the why-trace.
+     * Never consulted during a solve, so it sits outside I4. */
+    world_provider_render_fn provider_render_fn; void *provider_render_ctx;
     /* value-returning function providers (§5.6): host functions consulted from
      * the effect-VM (EXPR_CALL), returning a cell handle / int. No ground-atom
      * table — a call carries its function pred + args in the bytecode. */
     world_fn_provider_fn fn_provider_fn; void *fn_provider_ctx;
+    /* #178: the opt-in record of this step's value-provider calls. Held behind
+     * a pointer so the (const world *) evaluator can append to it — the log is
+     * a debugging side-channel, not state the solve reads, and keeping the
+     * evaluator const is what keeps lazy_judgment_verdict's purity honest.
+     * NULL = off, and off is the default. */
+    struct fncall_log { int n, cap; world_fn_call *items; } *fnlog;
 
     /* Seeded randomness (§5.10): a roll is a keyed lookup hash(seed, tick, site),
      * idempotent under re-read and independent across sites — so it can sit inside
@@ -565,6 +575,9 @@ void world_free(world *w)
     for (int i = 0; i < w->neguard; i++)
         free(w->eguards[i].disp);                  /* #132 render scratch */
     free(w->eguards);
+    if (w->fnlog) { free(w->fnlog->items); free(w->fnlog); }
+    for (int i = 0; i < w->nprov; i++)
+        free(w->provs[i].disp);                    /* #178 render scratch */
     free(w->provs);
     free(w->rollsites);
     if (w->rcpt) {
@@ -926,6 +939,7 @@ void world_declare_provider_atom(world *w, uint32_t atom, uint32_t pred,
     w->provs[w->nprov].pred = pred;
     w->provs[w->nprov].nargs = nargs;
     for (int k = 0; k < nargs; k++) w->provs[w->nprov].args[k] = args[k];
+    w->provs[w->nprov].disp = NULL;              /* #178: rendered on demand */
     w->nprov++;
 }
 
@@ -935,6 +949,30 @@ static bool provider_holds(const world *w, int i)
     if (!w->provider_fn) return false;
     return w->provider_fn(w->provider_ctx, w->provs[i].pred,
                           w->provs[i].args, w->provs[i].nargs);
+}
+
+void world_set_fn_call_log(world *w, bool on)
+{
+    if (on && !w->fnlog) {
+        w->fnlog = calloc(1, sizeof *w->fnlog);
+    } else if (!on && w->fnlog) {
+        free(w->fnlog->items);
+        free(w->fnlog);
+        w->fnlog = NULL;
+    }
+}
+
+const world_fn_call *world_fn_calls(const world *w, int *count)
+{
+    if (count) *count = w->fnlog ? w->fnlog->n : 0;
+    return w->fnlog ? w->fnlog->items : NULL;
+}
+
+void world_set_provider_render_fn(world *w, world_provider_render_fn fn,
+                                  void *ctx)
+{
+    w->provider_render_fn = fn;
+    w->provider_render_ctx = ctx;
 }
 
 bool world_provider_holds_at(const world *w, uint32_t pred,
@@ -1088,6 +1126,35 @@ static void name_expr_guards(world *w, dlcol *f, const uint32_t *of, uint32_t ca
                                        * definition (#116): honestly undecided */
             snprintf(w->eguards[i].disp, need, "%s [undefined]", src);
         dlcol_set_atom_name(f, of[ga], w->eguards[i].disp);
+    }
+}
+
+/* Annotate every provider atom in `f` with the host's own account of its answer
+ * (#178) — `los(a,b) [blocked by crate at (3,7)]` — so a trace does not bottom
+ * out at the host boundary and stop explaining. Display only, and only on the
+ * why path: a solve never calls the render hook, and an atom whose host has
+ * nothing to say keeps the name it always had. */
+static void name_providers(world *w, dlcol *f, const uint32_t *of, uint32_t cap)
+{
+    if (!w->provider_render_fn)
+        return;
+    char phrase[192];
+    for (int i = 0; i < w->nprov; i++) {
+        uint32_t pa = w->provs[i].atom;
+        if (pa >= cap || of[pa] == LOC_NONE)
+            continue;
+        phrase[0] = '\0';
+        int n = w->provider_render_fn(w->provider_render_ctx, w->provs[i].pred,
+                                      w->provs[i].args, w->provs[i].nargs,
+                                      provider_holds(w, i), phrase, sizeof phrase);
+        if (n <= 0)
+            continue;                            /* nothing to say: unchanged */
+        phrase[sizeof phrase - 1] = '\0';
+        const char *base = intern_name(w->syms, pa);
+        size_t need = strlen(base) + strlen(phrase) + 8;
+        w->provs[i].disp = realloc(w->provs[i].disp, need);
+        snprintf(w->provs[i].disp, need, "%s [%s]", base, phrase);
+        dlcol_set_atom_name(f, of[pa], w->provs[i].disp);
     }
 }
 
@@ -1760,6 +1827,7 @@ void world_why(world *w, dl_lit q, FILE *out)
     if (!w->jfam_solved)
         solve_judgment_family(w);
     name_expr_guards(w, w->jfam, w->jloc_of, w->jloc_cap);   /* #132 */
+    name_providers(w, w->jfam, w->jloc_of, w->jloc_cap);     /* #178 */
     dl_lit loc = { w->jloc_of[q.atom], q.neg };
     dlcol_why(w->jfam, loc, 0, out);
 }
@@ -2232,6 +2300,7 @@ void world_step_why(world *w, dl_lit q, bool next, FILE *out)
     if (w->last_routed)
         solve_step_family_vals(w, w->step_snap, w->last_actions, w->last_nactions);
     name_expr_guards(w, w->fam, w->aloc_of, w->aloc_cap);    /* #132 */
+    name_providers(w, w->fam, w->aloc_of, w->aloc_cap);      /* #178 */
     dl_lit loc = { w->aloc_of[atom], q.neg };
     dlcol_why(w->fam, loc, 0, out);
 }
@@ -3035,6 +3104,20 @@ static long eval_expr(const world *w, const expr_ins *code, int n, bool *undef)
             long r = w->fn_provider_fn
                 ? w->fn_provider_fn(w->fn_provider_ctx, pred, &st[sp], nargs)
                 : 0;
+            if (w->fnlog) {                        /* #178: an ordered account */
+                struct fncall_log *lg = w->fnlog;
+                if (lg->n == lg->cap) {
+                    lg->cap = lg->cap ? lg->cap * 2 : 32;
+                    lg->items = realloc(lg->items,
+                                        (size_t)lg->cap * sizeof *lg->items);
+                }
+                lg->items[lg->n].pred = pred;
+                lg->items[lg->n].nargs = nargs < 4 ? nargs : 4;
+                for (int k = 0; k < lg->items[lg->n].nargs; k++)
+                    lg->items[lg->n].args[k] = st[sp + k];
+                lg->items[lg->n].result = r;
+                lg->n++;
+            }
             st[sp++] = r;
             break;
         }
@@ -3534,6 +3617,7 @@ int world_step(world *w, const uint32_t *actions, int nactions,
     w->nemitbuf = 0;               /* burst cues are the LAST step's (#11): a
                                     * rejected step below emits nothing */
     w->nbdelta = w->nndelta = 0;   /* and so is the changeset (#88) */
+    if (w->fnlog) w->fnlog->n = 0;                 /* and the call log (#178) */
 
     /* Loud no-op actions (#119): an action atom that triggers ZERO step rules
      * can never do anything in this world — that is a host bug (typo'd atom,
