@@ -1,0 +1,28 @@
+# cellar_play.log — a save, in the only form this engine has one.
+#
+# DESIGN.md §12: a save is (engine-hash, game-hash, ACTION LOG). Not a state
+# dump — state written outside the log is state replay cannot reproduce, which
+# forfeits shareable playthroughs, branching and time travel in one move. So a
+# playthrough is exactly this: the world it was played against, then one line
+# per tick naming the orders submitted in that tick (space-separated; a blank
+# line is a tick that changed nothing).
+#
+# This particular log is the cellar solved. It is also the fixture two
+# different clients are held to: `web/platform_check.mjs` plays the cart by
+# CLICKING and asserts the log it produced is this file, and
+# `tests/test_secondclient.c` replays this file through `world_*` alone and
+# asserts it lands in the same world. Neither client can be quietly special —
+# they meet here.
+
+story examples/cellar_play.story
+
+go_hall(hero)
+go_cellar(hero)
+take(hero,torch,cellar)
+take(hero,rusty_key,cellar)
+go_hall(hero)
+unlock(hero)
+force_door(guard)
+enter_vault(hero)
+take(hero,antidote,vault)
+drink(hero)
