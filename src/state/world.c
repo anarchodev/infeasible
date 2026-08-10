@@ -29,6 +29,11 @@ typedef struct {
 typedef struct {
     const char *name;
     const char *prov;     /* provenance suffix (§6.3), or NULL */
+    /* Source identity (#88): the authored action/rule name and this ground
+     * instance's binding, kept as ids so a contribution's provenance can be
+     * read structurally instead of parsed back out of `name`. */
+    uint32_t pred;        /* INTERN_NONE = none registered */
+    uint32_t *bvars, *bents; int nbind;
     uint32_t action;      /* INTERN_NONE = ramification */
     step_cond *body;
     int nbody;
@@ -42,9 +47,12 @@ typedef struct {
                            * the residue schema omits it. 0 = never covered. */
 } srule;
 
-/* Per-numeric-fluent commit receipt, rebuilt each successful step. */
+/* Per-numeric-fluent commit receipt, rebuilt each successful step: both ends
+ * of the §5.8 pipeline (#88), so a client can render absorption and overkill,
+ * plus the itemized contributions. */
 typedef struct {
-    long base;
+    long base, raw, applied, lo, hi;
+    bool has_range, clamped;
     world_contrib *items;
     int n, cap;
 } num_receipt;
@@ -107,6 +115,11 @@ typedef struct {
         world_numop op;
         long       konst;         /* S1: constant RHS (RHS constant-folds) */
         uint32_t   marker;        /* family-local: the fired marker (readout) */
+        /* provenance for the commit receipt (#88): the AUTHORED rule, since a
+         * laned effect has no ground instance name — the per-lane binding is
+         * (var, lane_ent[e]) instead of a formatted suffix. */
+        const char *name;
+        uint32_t   pred, var;
         /* #165: an RHS reading k test() verdicts is a table of 2^k constants over
          * k bit-columns — the commit indexes it per lane, no per-entity VM. */
         int        ntest;
@@ -122,6 +135,8 @@ typedef struct {
     int     *bcast_of;
     uint32_t bcast_of_cap;
 
+    uint32_t *lane_ent;           /* [nent]: the entity each lane stands for —
+                                   * a receipt's binding, and nothing else */
     int split_value;              /* #121 mixed routing: the split value index
                                    * this per-value family serves, or -1 (the
                                    * classic whole-transition family). */
@@ -150,6 +165,12 @@ struct world {
     uint32_t *emits, *emit_primed; int nemit, capemit;
     int *emit_of; uint32_t emit_of_cap;      /* emit atom -> emits index */
     uint32_t *emitbuf; int nemitbuf, capemitbuf;   /* last step's stream */
+    /* The last step's CHANGESET (#88, the §11 M2 delta's leaf case): the base
+     * facts that actually moved. Filled by the commit — which already walks
+     * both arrays to write them — so enumeration costs the compare, not a
+     * second pass. Cleared at the top of every step, like the emissions. */
+    world_bool_delta *bdelta; int nbdelta, capbdelta;
+    world_num_delta  *ndelta; int nndelta, capndelta;
     int *num_of;    uint32_t num_of_cap;
     int *guard_of;  uint32_t guard_of_cap;   /* guard atom  -> guards index  */
     int *prov_of;   uint32_t prov_of_cap;    /* provider atom -> provs index */
@@ -481,8 +502,11 @@ void world_free(world *w)
         free(w->steplanes[i].fl_of);
         free(w->steplanes[i].act_of);
         free(w->steplanes[i].num_cell);
+        for (int k = 0; k < w->steplanes[i].nnumeff; k++)
+            free(w->steplanes[i].numeff[k].table);   /* one 2^k fold per effect */
         free(w->steplanes[i].numeff);
         free(w->steplanes[i].bcast_of);
+        free(w->steplanes[i].lane_ent);
     }
     free(w->steplanes);
     free(w->step_snap);
@@ -510,6 +534,8 @@ void world_free(world *w)
     free(w->emit_primed);
     free(w->emit_of);
     free(w->emitbuf);
+    free(w->bdelta);
+    free(w->ndelta);
     free(w->watch_of);
     free(w->num_of);
     free(w->guard_of);
@@ -602,6 +628,24 @@ void world_declare_fluent(world *w, uint32_t atom)
     w->nfl++;
     w->struct_ver++;             /* structural edit (#63) */
     w->lanes_ok = false;          /* a structural edit stales the lane families */
+}
+
+/* Record one moved base fact in the step's changeset (#88). */
+static void bdelta_push(world *w, uint32_t atom, bool value)
+{
+    GROW(w->bdelta, w->nbdelta, w->capbdelta);
+    w->bdelta[w->nbdelta].atom = atom;
+    w->bdelta[w->nbdelta].value = value;
+    w->nbdelta++;
+}
+
+static void ndelta_push(world *w, uint32_t atom, long from, long to)
+{
+    GROW(w->ndelta, w->nndelta, w->capndelta);
+    w->ndelta[w->nndelta].atom = atom;
+    w->ndelta[w->nndelta].from = from;
+    w->ndelta[w->nndelta].to = to;
+    w->nndelta++;
 }
 
 static int emit_index(const world *w, uint32_t atom)
@@ -1354,6 +1398,10 @@ int world_add_step_rule(world *w, const char *name, uint32_t action,
     srule *r = &w->srules[w->nsr];
     r->name = arena_strdup(&w->a, name);
     r->prov = NULL;
+    r->pred = INTERN_NONE;                 /* structured identity (#88): unset
+                                            * until world_set_step_binding */
+    r->bvars = r->bents = NULL;
+    r->nbind = 0;
     r->action = action;
     if (action != INTERN_NONE)     /* the loud-no-op trigger set (#119) */
         atom_map_set(&w->trig_of, &w->trig_of_cap, action, 1);
@@ -1796,6 +1844,8 @@ void world_add_step_lane_family(world *w, dlcol *fam, int nloc, int nent,
     sf->covers_numeric = false;
     sf->bcast_of = NULL; sf->bcast_of_cap = 0;     /* broadcast triggers: off unless set */
     sf->split_value = -1;                          /* whole-transition family (#121) */
+    sf->lane_ent = NULL;                           /* receipt provenance (#88): off
+                                                    * unless world_step_lane_set_prov */
     size_t g = (size_t)nloc * (size_t)nent;
     sf->ground = malloc((g ? g : 1) * sizeof *sf->ground);
     memcpy(sf->ground, ground, (g ? g : 1) * sizeof *sf->ground);
@@ -1892,6 +1942,32 @@ void world_step_lane_set_numeric(world *w, int numsc, const uint32_t *num_atom_c
 /* Register broadcast cast triggers on the last-added step lane family: each of the
  * `ncast` ground cast atoms drives the WORLD_STEP_BCAST local `cast_local[i]` — a
  * `for each` binder's cast fans out over every target lane of that local. */
+/* Attach receipt provenance to the last-added step lane family (#88): which
+ * entity each lane stands for, and per numeric effect the authored rule name,
+ * its predicate atom, and the variable the lane binds. A laned effect has no
+ * ground instance name to carry — one schema rule runs for every lane — so a
+ * receipt reconstructs the binding per lane from these instead of formatting a
+ * name per commit. Names are copied, as world_add_step_rule copies its own. */
+void world_step_lane_set_prov(world *w, const uint32_t *lane_ents, int nent,
+                              const char *const *eff_name,
+                              const uint32_t *eff_pred, const uint32_t *eff_var,
+                              int nnumeff)
+{
+    if (w->nsteplanes == 0) return;
+    step_lane_family *sf = &w->steplanes[w->nsteplanes - 1];
+    if (lane_ents && nent == sf->nent) {
+        free(sf->lane_ent);
+        sf->lane_ent = malloc((size_t)(nent ? nent : 1) * sizeof *sf->lane_ent);
+        memcpy(sf->lane_ent, lane_ents, (size_t)nent * sizeof *sf->lane_ent);
+    }
+    for (int k = 0; k < nnumeff && k < sf->nnumeff; k++) {
+        sf->numeff[k].name = eff_name && eff_name[k]
+                             ? arena_strdup(&w->a, eff_name[k]) : NULL;
+        sf->numeff[k].pred = eff_pred ? eff_pred[k] : INTERN_NONE;
+        sf->numeff[k].var  = eff_var  ? eff_var[k]  : INTERN_NONE;
+    }
+}
+
 void world_step_lane_set_bcast(world *w, int ncast, const uint32_t *cast_atom,
                                const int *cast_local)
 {
@@ -2971,14 +3047,24 @@ static inline long num_signed(world_numop op, long k)
 
 /* The fixed commit pipeline for one fluent: base (the winning `:=`, else the
  * carried value) -> the accumulated deltas -> retract onto the declared range.
- * The clamp is outermost because the schema's range is the last word (§5.8). */
+ * The clamp is outermost because the schema's range is the last word (§5.8).
+ *
+ * `raw`/`lo`/`hi` (all nullable) report the pipeline's ends for the receipt
+ * (#88): `raw` is the value BEFORE the retraction, so a client can render the
+ * 7 points of overkill the range swallowed. They are out-params rather than a
+ * second function because there must stay exactly one definition of the
+ * pipeline — the N=1 loop and the routed lane fold both call this. */
 static inline long num_commit(const world *w, int idx, bool have,
-                              long assigned, long delta)
+                              long assigned, long delta,
+                              long *raw, long *lo_out, long *hi_out)
 {
     long v = (have ? assigned : w->nums[idx].value) + delta;
+    if (raw) *raw = v;
     if (w->nums[idx].has_range) {
         long lo, hi;
         num_clamp_bounds(w, idx, &lo, &hi);
+        if (lo_out) *lo_out = lo;
+        if (hi_out) *hi_out = hi;
         if (v < lo) v = lo;
         if (v > hi) v = hi;
     }
@@ -2990,15 +3076,19 @@ static inline long num_commit(const world *w, int idx, bool have,
  * in the commit phase, so their firing is read off the solved columns rather
  * than resolved inside the fixpoint (that is why suppression-by-superiority
  * over numeric effects is a later slice — here every fired effect contributes). */
+static bool action_submitted(uint32_t action, const uint32_t *actions,
+                             int nactions)
+{
+    for (int i = 0; i < nactions; i++)
+        if (actions[i] == action) return true;
+    return false;
+}
+
 static bool srule_fired(const world *w, const srule *r,
                         const uint32_t *actions, int nactions)
 {
-    if (r->action != INTERN_NONE) {
-        bool occurred = false;
-        for (int i = 0; i < nactions; i++)
-            if (actions[i] == r->action) { occurred = true; break; }
-        if (!occurred) return false;
-    }
+    if (r->action != INTERN_NONE && !action_submitted(r->action, actions, nactions))
+        return false;
     for (int i = 0; i < r->nbody; i++) {
         dl_lit l = r->body[i].primed ? primed_lit(w, r->body[i].lit)
                                      : r->body[i].lit;
@@ -3042,16 +3132,46 @@ static bool lit_solved_proved(const world *w, uint32_t atom, bool neg)
     return dlcol_defeasible(f, loc, 0) == DL_PROVED;
 }
 
-static void rcpt_push(num_receipt *rc, const char *rule, world_numop op, long amt)
+/* Record one contribution. `r` supplies the provenance — its name and, when the
+ * front end registered one, the structured (pred, binding) identity (#88); NULL
+ * pushes a placeholder row the caller fills (the assign hoist below). */
+static void rcpt_push(num_receipt *rc, const srule *r, world_numop op, long amt,
+                      bool defeated)
 {
     if (rc->n == rc->cap) {
         rc->cap = rc->cap ? rc->cap * 2 : 4;
         rc->items = realloc(rc->items, (size_t)rc->cap * sizeof *rc->items);
     }
-    rc->items[rc->n].rule = rule;
-    rc->items[rc->n].op = op;
-    rc->items[rc->n].amount = amt;
-    rc->n++;
+    world_contrib *it = &rc->items[rc->n++];
+    it->rule = r ? r->name : NULL;
+    it->pred = r ? r->pred : INTERN_NONE;
+    it->vars = r ? r->bvars : NULL;
+    it->ents = r ? r->bents : NULL;
+    it->nbind = r ? r->nbind : 0;
+    it->op = op;
+    it->amount = amt;
+    it->defeated = defeated;
+}
+
+/* The same row, from the routed lane path, where provenance is the authored
+ * rule and the lane's own entity rather than a ground instance name (#88). */
+static void rcpt_push_lane(num_receipt *rc, const char *name, uint32_t pred,
+                           const uint32_t *var, const uint32_t *ent,
+                           world_numop op, long amt)
+{
+    if (rc->n == rc->cap) {
+        rc->cap = rc->cap ? rc->cap * 2 : 4;
+        rc->items = realloc(rc->items, (size_t)rc->cap * sizeof *rc->items);
+    }
+    world_contrib *it = &rc->items[rc->n++];
+    it->rule = name;
+    it->pred = pred;
+    it->vars = var;
+    it->ents = ent;
+    it->nbind = var && ent ? 1 : 0;
+    it->op = op;
+    it->amount = amt;
+    it->defeated = false;
 }
 
 /* Load a state (closed-world fluents from `vals` + numeric guard atoms) and the
@@ -3138,6 +3258,26 @@ static void save_step_snapshot(world *w, const uint32_t *actions, int nactions)
     w->last_nactions = nactions;
 }
 
+/* Size the per-numeric receipt array to the declared fluents and start a fresh
+ * step's rows. Both commit paths call it: a routed step builds receipts too
+ * (#88), so world_num_receipt never reports a stale N=1 tick as if it were the
+ * one that just ran. */
+static void rcpt_reset(world *w)
+{
+    if (w->nnum > w->caprcpt) {
+        w->rcpt = realloc(w->rcpt, (size_t)w->nnum * sizeof *w->rcpt);
+        memset(&w->rcpt[w->caprcpt], 0,
+               (size_t)(w->nnum - w->caprcpt) * sizeof *w->rcpt);
+        w->caprcpt = w->nnum;
+    }
+    for (int i = 0; i < w->nnum; i++) {
+        w->rcpt[i].n = 0;
+        w->rcpt[i].base = w->rcpt[i].raw = w->rcpt[i].applied = w->nums[i].value;
+        w->rcpt[i].lo = w->rcpt[i].hi = 0;
+        w->rcpt[i].has_range = w->rcpt[i].clamped = false;
+    }
+}
+
 /* Column-parallel numeric commit for a routed step (§5.8, bit-parallel firing).
  * Each numeric effect's `marker` was solved bit-parallel across lanes; read it per
  * lane and sum deltas / take the winning assign into the numeric column. Fills a
@@ -3153,6 +3293,11 @@ static int compute_step_lane_numerics(world *w, step_lane_family *sf,
     long *aval  = calloc(cells ? cells : 1, sizeof *aval);
     bool *have  = calloc(cells ? cells : 1, sizeof *have);
     bool *confl = calloc(cells ? cells : 1, sizeof *confl);
+    /* the winning `:=` per cell, for its receipt row (#88) */
+    const struct num_lane_eff **awin =
+        calloc(cells ? cells : 1, sizeof *awin);
+    int *awin_lane = calloc(cells ? cells : 1, sizeof *awin_lane);
+    rcpt_reset(w);
 
     for (int k = 0; k < sf->nnumeff; k++) {
         struct num_lane_eff *ef = &sf->numeff[k];
@@ -3172,13 +3317,23 @@ static int compute_step_lane_numerics(world *w, step_lane_family *sf,
                 }
                 konst = ef->table[mask];
             }
+            int idx = sf->num_cell[c];
+            const uint32_t *lv = ef->var != INTERN_NONE ? &ef->var : NULL;
+            const uint32_t *le = sf->lane_ent ? &sf->lane_ent[e] : NULL;
             if (ef->op == WORLD_OP_ASSIGN) {
-                world_merge mg = w->nums[sf->num_cell[c]].merge;   /* #85 */
-                if (num_join(mg, have[c], &aval[c], konst) < 0)
+                world_merge mg = w->nums[idx].merge;               /* #85 */
+                int took = num_join(mg, have[c], &aval[c], konst);
+                if (took < 0)
                     confl[c] = true;
+                else if (took > 0)                                 /* the winner:
+                                                * remembered per cell, pushed as
+                                                * row 0 by the commit below */
+                    { awin[c] = ef; awin_lane[c] = e; }
                 have[c] = true;
             } else {
                 delta[c] += num_signed(ef->op, konst);
+                rcpt_push_lane(&w->rcpt[idx], ef->name, ef->pred, lv, le,
+                               ef->op, num_signed(ef->op, konst));
             }
         }
     }
@@ -3196,10 +3351,32 @@ static int compute_step_lane_numerics(world *w, step_lane_family *sf,
                 rc = -1;
                 break;
             }
-            nextcol[c] = num_commit(w, idx, have[c], aval[c], delta[c]);
+            num_receipt *rcp = &w->rcpt[idx];
+            if (have[c] && awin[c]) {          /* the assign leads the receipt */
+                rcpt_push_lane(rcp, NULL, INTERN_NONE, NULL, NULL,
+                               WORLD_OP_ASSIGN, 0);
+                memmove(&rcp->items[1], &rcp->items[0],
+                        (size_t)(rcp->n - 1) * sizeof *rcp->items);
+                const struct num_lane_eff *wf = awin[c];
+                rcp->items[0].rule  = wf->name;
+                rcp->items[0].pred  = wf->pred;
+                rcp->items[0].vars  = wf->var != INTERN_NONE ? &wf->var : NULL;
+                rcp->items[0].ents  = sf->lane_ent ? &sf->lane_ent[awin_lane[c]] : NULL;
+                rcp->items[0].nbind = wf->var != INTERN_NONE && sf->lane_ent ? 1 : 0;
+                rcp->items[0].op = WORLD_OP_ASSIGN;
+                rcp->items[0].amount = aval[c];
+                rcp->items[0].defeated = false;
+            }
+            rcp->base = have[c] ? aval[c] : w->nums[idx].value;
+            rcp->has_range = w->nums[idx].has_range;
+            nextcol[c] = num_commit(w, idx, have[c], aval[c], delta[c],
+                                    &rcp->raw, &rcp->lo, &rcp->hi);
+            rcp->applied = nextcol[c];
+            rcp->clamped = rcp->applied != rcp->raw;
         }
 
     free(delta); free(aval); free(have); free(confl);
+    free(awin); free(awin_lane);
     if (rc != 0) { free(nextcol); *out = NULL; return rc; }
     *out = nextcol;
     return 0;
@@ -3249,13 +3426,20 @@ static int world_step_lanes(world *w, const uint32_t *actions, int nactions,
 
     if (rc == 0) {
         save_step_snapshot(w, actions, nactions);   /* before overwriting vals */
+        for (int i = 0; i < w->nfl; i++)            /* the changeset (#88) */
+            if (next[i] != w->vals[i])
+                bdelta_push(w, w->fluents[i], next[i]);
         reindex_commit(w, next);                     /* index diff (before vals move) */
         if (w->nfl)
             memcpy(w->vals, next, (size_t)w->nfl * sizeof *next);
         for (int s = 0; s < sf->numsc; s++)          /* commit numeric columns */
-            for (int e = 0; e < sf->nent; e++)
-                w->nums[sf->num_cell[(size_t)s * sf->nent + e]].value =
-                    nextcol[(size_t)s * sf->nent + e];
+            for (int e = 0; e < sf->nent; e++) {
+                int idx = sf->num_cell[(size_t)s * sf->nent + e];
+                long to = nextcol[(size_t)s * sf->nent + e];
+                if (to != w->nums[idx].value)
+                    ndelta_push(w, w->nums[idx].atom, w->nums[idx].value, to);
+                w->nums[idx].value = to;
+            }
         invalidate_state_solved(w);
         w->last_routed = true;
     }
@@ -3269,6 +3453,7 @@ int world_step(world *w, const uint32_t *actions, int nactions,
 {
     w->nemitbuf = 0;               /* burst cues are the LAST step's (#11): a
                                     * rejected step below emits nothing */
+    w->nbdelta = w->nndelta = 0;   /* and so is the changeset (#88) */
 
     /* Loud no-op actions (#119): an action atom that triggers ZERO step rules
      * can never do anything in this world — that is a host bug (typo'd atom,
@@ -3478,22 +3663,16 @@ int world_step(world *w, const uint32_t *actions, int nactions,
      * clamped to the declared range. Built into scratch + receipts, committed
      * with the boolean state only if nothing is contested. */
     long *nextnum = malloc((size_t)(w->nnum ? w->nnum : 1) * sizeof *nextnum);
-    if (w->nnum > w->caprcpt) {
-        w->rcpt = realloc(w->rcpt, (size_t)w->nnum * sizeof *w->rcpt);
-        memset(&w->rcpt[w->caprcpt], 0,
-               (size_t)(w->nnum - w->caprcpt) * sizeof *w->rcpt);
-        w->caprcpt = w->nnum;
-    }
+    rcpt_reset(w);
     /* One pass over the step rules per stratum — NOT nnum × nsr (that double
      * scan was the O(N²) crowd wall). Each fired numeric effect routes to its
      * fluent's accumulator via the O(1) num index, at the stratum the fluent
      * settles; a per-fluent pass runs the pipeline (base + Σ deltas, clamp)
      * and finishes the receipts. Accumulators live across the whole tick —
      * each fluent is touched at exactly one stratum. */
-    struct nacc { long delta, assign_val; const char *rule;
+    struct nacc { long delta, assign_val; const srule *win;
                   bool have, conflict; } *acc =
         calloc((size_t)(w->nnum ? w->nnum : 1), sizeof *acc);
-    for (int i = 0; i < w->nnum; i++) w->rcpt[i].n = 0;
 
     for (int st = 0; st < nstrata && rc == 0; st++) {
         w->nn_cur = nextnum;                       /* EXPR_LOADN context (#84) */
@@ -3502,8 +3681,36 @@ int world_step(world *w, const uint32_t *actions, int nactions,
 
         for (int k = 0; k < w->n_neff_rules; k++) {
             const srule *r = &w->srules[w->neff_rules[k]];
-            if (!srule_fired(w, r, actions, nactions))
+            if (!srule_fired(w, r, actions, nactions)) {
+                /* The thwarted attempt (#88): an effect whose ACTION was
+                 * submitted but whose rule failed its guards contributes
+                 * nothing, and a log that omits it cannot render "Immune — 0".
+                 * Record what it would have contributed. Ramifications are
+                 * excluded on purpose — one that does not fire is not an
+                 * attempt, it is every other rule in the world — so this scan
+                 * is bounded by the submitted actions' own rules. An undefined
+                 * RHS (#116) is simply not recorded: the rule never ran, so
+                 * there is no value to report and nothing to trap. Evaluating
+                 * it is read-only — a roll is a keyed lookup (§5.10, no stream
+                 * to advance) and a function provider is pure by contract
+                 * (§5.6), so asking what the attempt would have done cannot
+                 * perturb what actually happened. */
+                if (r->action == INTERN_NONE || !action_submitted(r->action,
+                                                                 actions, nactions))
+                    continue;
+                for (int e = 0; e < r->nneff; e++) {
+                    const num_effect *ef = &r->neffs[e];
+                    int i = num_index(w, ef->num_atom);
+                    if (i < 0 || w->num_stratum[i] != st) continue;
+                    bool und = false;
+                    long v = eval_expr(w, ef->code, ef->ncode, &und);
+                    if (und) continue;
+                    rcpt_push(&w->rcpt[i], r, ef->op,
+                              ef->op == WORLD_OP_ASSIGN ? v : num_signed(ef->op, v),
+                              true);
+                }
                 continue;
+            }
             for (int e = 0; e < r->nneff; e++) {
                 const num_effect *ef = &r->neffs[e];
                 int i = num_index(w, ef->num_atom);
@@ -3530,11 +3737,11 @@ int world_step(world *w, const uint32_t *actions, int nactions,
                     if (took < 0)
                         acc[i].conflict = true;         /* register: contested (§5.8) */
                     else if (took > 0)
-                        acc[i].rule = r->name;          /* the winner's provenance */
+                        acc[i].win = r;                 /* the winner's provenance */
                 } else {
                     long d = num_signed(ef->op, v);
                     acc[i].delta += d;
-                    rcpt_push(&w->rcpt[i], r->name, ef->op, d);
+                    rcpt_push(&w->rcpt[i], r, ef->op, d, false);
                 }
             }
             if (rc != 0) break;                    /* internal undef trap above */
@@ -3549,7 +3756,8 @@ int world_step(world *w, const uint32_t *actions, int nactions,
                  * clamped — copy through. Dynamic bounds still re-clamp (a
                  * bound expression may read fluents that DID change). */
                 nextnum[i] = w->nums[i].value;
-                w->rcpt[i].base = nextnum[i];
+                w->rcpt[i].base = w->rcpt[i].raw = w->rcpt[i].applied = nextnum[i];
+                w->rcpt[i].has_range = w->rcpt[i].clamped = false;
                 continue;
             }
             num_receipt *rcp = &w->rcpt[i];
@@ -3563,16 +3771,25 @@ int world_step(world *w, const uint32_t *actions, int nactions,
             }
             /* receipt order: winning assign first, then the deltas in scan order */
             if (acc[i].have) {
-                rcpt_push(rcp, NULL, WORLD_OP_ASSIGN, 0);   /* grow, then shift */
+                rcpt_push(rcp, NULL, WORLD_OP_ASSIGN, 0, false);  /* grow, then shift */
                 memmove(&rcp->items[1], &rcp->items[0],
                         (size_t)(rcp->n - 1) * sizeof *rcp->items);
-                rcp->items[0].rule = acc[i].rule;
+                rcp->items[0].rule  = acc[i].win ? acc[i].win->name : NULL;
+                rcp->items[0].pred  = acc[i].win ? acc[i].win->pred : INTERN_NONE;
+                rcp->items[0].vars  = acc[i].win ? acc[i].win->bvars : NULL;
+                rcp->items[0].ents  = acc[i].win ? acc[i].win->bents : NULL;
+                rcp->items[0].nbind = acc[i].win ? acc[i].win->nbind : 0;
                 rcp->items[0].op = WORLD_OP_ASSIGN;
                 rcp->items[0].amount = acc[i].assign_val;
+                rcp->items[0].defeated = false;
             }
             rcp->base = acc[i].have ? acc[i].assign_val : w->nums[i].value;
+            rcp->has_range = w->nums[i].has_range;
+            rcp->lo = rcp->hi = 0;
             nextnum[i] = num_commit(w, i, acc[i].have, acc[i].assign_val,
-                                    acc[i].delta);
+                                    acc[i].delta, &rcp->raw, &rcp->lo, &rcp->hi);
+            rcp->applied = nextnum[i];
+            rcp->clamped = rcp->applied != rcp->raw;
         }
 
         /* mint this stratum's primed-guard facts (§5.8 #87): strict inputs
@@ -3647,6 +3864,14 @@ int world_step(world *w, const uint32_t *actions, int nactions,
     }
 
     if (rc == 0) {
+        for (int i = 0; i < w->nfl; i++)             /* the changeset (#88): the
+                                                      * compare the commit makes
+                                                      * anyway, recorded */
+            if (next[i] != w->vals[i])
+                bdelta_push(w, w->fluents[i], next[i]);
+        for (int i = 0; i < w->nnum; i++)
+            if (nextnum[i] != w->nums[i].value)
+                ndelta_push(w, w->nums[i].atom, w->nums[i].value, nextnum[i]);
         reindex_commit(w, next);                     /* index diff (before vals move) */
         if (w->nfl)
             memcpy(w->vals, next, (size_t)w->nfl * sizeof *next);
@@ -3666,17 +3891,55 @@ int world_step(world *w, const uint32_t *actions, int nactions,
     return rc;
 }
 
-int world_num_receipt(const world *w, uint32_t atom, long *base,
-                      world_contrib *out, int cap)
+bool world_num_receipt(const world *w, uint32_t atom, world_receipt *out)
 {
     int i = num_index(w, atom);
-    if (i < 0 || !w->rcpt) {
-        if (base) *base = 0;
-        return 0;
+    if (i < 0 || !w->rcpt || i >= w->caprcpt) {
+        if (out) memset(out, 0, sizeof *out);
+        return false;
     }
     const num_receipt *rcp = &w->rcpt[i];
-    if (base) *base = rcp->base;
-    for (int k = 0; k < rcp->n && k < cap; k++)
-        out[k] = rcp->items[k];
-    return rcp->n;
+    if (out) {
+        out->base      = rcp->base;
+        out->raw       = rcp->raw;
+        out->applied   = rcp->applied;
+        out->lo        = rcp->lo;
+        out->hi        = rcp->hi;
+        out->has_range = rcp->has_range;
+        out->clamped   = rcp->clamped;
+        out->items     = rcp->items;
+        out->n         = rcp->n;
+    }
+    return true;
+}
+
+const world_bool_delta *world_bool_deltas(const world *w, int *count)
+{
+    if (count) *count = w->nbdelta;
+    return w->bdelta;
+}
+
+const world_num_delta *world_num_deltas(const world *w, int *count)
+{
+    if (count) *count = w->nndelta;
+    return w->ndelta;
+}
+
+/* The state tier keeps the binding as ids and never learns the term grammar —
+ * the same dependency inversion as the provider and schema hooks (#88). */
+void world_set_step_binding(world *w, int rule, uint32_t pred,
+                            const uint32_t *vars, const uint32_t *ents, int n)
+{
+    if (rule < 0 || rule >= w->nsr) return;
+    srule *r = &w->srules[rule];
+    r->pred = pred;
+    r->nbind = n;
+    r->bvars = r->bents = NULL;
+    if (n > 0) {
+        arena *a = w->in_matched ? &w->matched_a : &w->a;
+        r->bvars = arena_alloc(a, (size_t)n * sizeof *r->bvars);
+        r->bents = arena_alloc(a, (size_t)n * sizeof *r->bents);
+        memcpy(r->bvars, vars, (size_t)n * sizeof *r->bvars);
+        memcpy(r->bents, ents, (size_t)n * sizeof *r->bents);
+    }
 }

@@ -213,11 +213,14 @@ static int test_commit_receipt(void)
     CHECK(world_step(w, acts, 1, err, sizeof err) == 0);
     CHECK(world_get_num(w, hp) == 43);         /* 50 - 3 - 4 */
 
-    long base;
-    world_contrib items[8];
-    int n = world_num_receipt(w, hp, &base, items, 8);
-    CHECK(base == 50);
-    CHECK(n == 3);
+    world_receipt rp;
+    CHECK(world_num_receipt(w, hp, &rp));
+    const world_contrib *items = rp.items;
+    CHECK(rp.base == 50);
+    CHECK(rp.n == 3);
+    /* both ends of the pipeline (#88): 50 - 3 - 4 lands inside 0..100 */
+    CHECK(rp.raw == 43 && rp.applied == 43 && !rp.clamped);
+    CHECK(rp.has_range && rp.lo == 0 && rp.hi == 100);
     /* assign first */
     CHECK(items[0].op == WORLD_OP_ASSIGN);
     CHECK(items[0].amount == 50);
@@ -233,8 +236,8 @@ static int test_commit_receipt(void)
     world_declare_num(w, mp, 0, 0, false);
     world_set_num(w, mp, 7);
     CHECK(world_step(w, acts, 1, err, sizeof err) == 0);
-    n = world_num_receipt(w, mp, &base, items, 8);
-    CHECK(n == 0 && base == 7);
+    CHECK(world_num_receipt(w, mp, &rp));
+    CHECK(rp.n == 0 && rp.base == 7 && rp.applied == 7);
     world_free(w);
     intern_free(sy);
     return 0;

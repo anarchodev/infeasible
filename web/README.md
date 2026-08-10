@@ -39,6 +39,11 @@ from JS.`
   separate M2 work over the same `world_subscribe` delta seam.
 - `inf_step` marshals an action array through the WASM heap; `inf_step1` is the
   single-action convenience the cellar uses.
+- The step log (#88) marshals into a caller-provided `long` buffer and returns
+  the size the FULL answer needs, so a short buffer is a grow-and-retry rather
+  than a silent truncation: `inf_bool_deltas` / `inf_num_deltas` (the
+  changeset) and `inf_num_receipt` (a header, then one variable-length row per
+  contribution). The `wf_*` shim carries the same three.
 - Burst cues (#11, §12) cross the boundary the way the delta will:
   `inf_emit_count` + `inf_emits` hand back the step's emission buffer as a
   pointer into WASM memory, read as a zero-copy

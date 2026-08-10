@@ -86,6 +86,64 @@ API int wf_step(world *w, const uint32_t *actions, int nactions,
     return world_step(w, actions, nactions, err, (size_t) errsz);
 }
 
+/* --- the step log (#88): the changeset and the commit receipt ---
+ *
+ * Both marshal into a caller-provided buffer of `long` and return the number of
+ * cells the FULL answer needs — so a host that guessed too small grows and asks
+ * again rather than being handed a silently truncated log (the same
+ * loud-failure rule the engine's own caps follow). One crossing per readout.
+ *
+ * wf_bool_deltas: pairs   [atom, value]
+ * wf_num_deltas:  triples [atom, from, to]
+ * wf_num_receipt: a header [base, raw, applied, lo, hi, flags, nrows] — flags
+ *   bit 0 = has_range, bit 1 = clamped — then per contribution a
+ *   variable-length row [op, amount, defeated, pred, nbind, (var, ent) * nbind],
+ *   which the host walks with a cursor. Rows are variable rather than padded
+ *   because a binding is 1-2 pairs in practice and a fixed stride would either
+ *   waste the common case or cap the general one. */
+API int wf_bool_deltas(world *w, long *out, int cap) {
+    int n;
+    const world_bool_delta *d = world_bool_deltas(w, &n);
+    for (int i = 0; i < n && 2 * i + 1 < cap; i++) {
+        out[2 * i]     = (long) d[i].atom;
+        out[2 * i + 1] = d[i].value ? 1 : 0;
+    }
+    return 2 * n;
+}
+
+API int wf_num_deltas(world *w, long *out, int cap) {
+    int n;
+    const world_num_delta *d = world_num_deltas(w, &n);
+    for (int i = 0; i < n && 3 * i + 2 < cap; i++) {
+        out[3 * i]     = (long) d[i].atom;
+        out[3 * i + 1] = d[i].from;
+        out[3 * i + 2] = d[i].to;
+    }
+    return 3 * n;
+}
+
+API int wf_num_receipt(world *w, uint32_t atom, long *out, int cap) {
+    world_receipt r;
+    if (!world_num_receipt(w, atom, &r)) return 0;
+    int k = 0;
+#define PUT(v) do { if (k < cap) out[k] = (long)(v); k++; } while (0)
+    PUT(r.base); PUT(r.raw); PUT(r.applied); PUT(r.lo); PUT(r.hi);
+    PUT((r.has_range ? 1 : 0) | (r.clamped ? 2 : 0));
+    PUT(r.n);
+    for (int i = 0; i < r.n; i++) {
+        const world_contrib *c = &r.items[i];
+        PUT(c->op); PUT(c->amount); PUT(c->defeated ? 1 : 0);
+        PUT(c->pred); PUT(c->nbind);
+        for (int b = 0; b < c->nbind; b++) { PUT(c->vars[b]); PUT(c->ents[b]); }
+    }
+#undef PUT
+    return k;
+}
+
+/* The name behind any atom id a readout returns (a rule's pred, a delta's
+ * fluent) — the JS side holds ids, not strings, until it renders. */
+API const char *wf_name(intern *t, uint32_t atom) { return intern_name(t, atom); }
+
 /* --- burst cues (#11, §12): the transient emission channel ---
  *
  * The per-tick stream crosses the boundary the way §12's delta buffer does:

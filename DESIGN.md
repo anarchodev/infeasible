@@ -1069,6 +1069,34 @@ alternative — re-asking `why?` after each step and parsing the trace — would
 make the trace load-bearing as a *string format*, the wrong coupling.
 Cross-step tallies (a multi-attack sequence's running total) are
 renderer-side arithmetic over successive receipts and touch no semantics.
+
+The receipt therefore reports **both ends of the pipeline**, not the committed
+number alone: `base` (the winning `:=`, else the carried value), `raw` (base
+plus the undefeated deltas) and `applied` (what the declared range retracted
+that to). A 12-damage hit on a 5 HP target is raw −7, applied 0 — the overkill
+is the difference, and absorption at a floor reads the same way. Recovering
+that from the committed value alone is impossible, and a client that
+subtracts to guess it is wrong the moment a dynamic bound moves.
+
+Provenance is **structured, never a formatted name**: a contribution carries
+the authored rule's predicate and its binding as ids (`fireball`, `C=vera`,
+`T=grik`), so a client composes its own sentence. Handing back only the ground
+instance name `fireball[C=vera,T=grik]` would make a rendering choice the
+interchange format and force every host to parse it back apart.
+
+A **defeated contribution is a row too**. An effect whose action was submitted
+but whose rule failed its guards contributes nothing and would vanish from a
+log of winners — yet "Immune — 0" is exactly the line a player needs, and its
+absence is indistinguishable from the attack never happening. It is recorded
+with what it would have contributed, flagged. Ramifications are excluded on
+purpose: a ramification that did not fire is not a thwarted attempt, it is
+every other rule in the world.
+
+Alongside the receipts a step reports its **changeset** — the base facts that
+actually moved, enumerated rather than polled. It is the leaf case of the §11
+M2 subscription delta, available now because the commit already compares old
+against new to write it; a client asking "what happened?" should not have to
+know which atoms to ask about first.
 And the tempting alternative is deliberately rejected: an accumulating
 damage *buffer* that rules append to and a later phase drains is mutable
 intermediate state with an ordering — the Osiris disease wearing a queue

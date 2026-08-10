@@ -82,12 +82,19 @@ static int test_combat(void)
 
     /* the receipt itemizes the delta with its ground source rule */
     {
-        long base;
-        world_contrib items[4];
-        int n = world_num_receipt(w, hp_gob, &base, items, 4);
-        CHECK(base == 7 && n == 1);
-        CHECK(items[0].op == WORLD_OP_SUB && items[0].amount == -4);
-        CHECK(strcmp(items[0].rule, "strike[A=hero,T=goblin]") == 0);
+        world_receipt rp;
+        CHECK(world_num_receipt(w, hp_gob, &rp));
+        CHECK(rp.base == 7 && rp.n == 1);
+        CHECK(rp.items[0].op == WORLD_OP_SUB && rp.items[0].amount == -4);
+        CHECK(strcmp(rp.items[0].rule, "strike[A=hero,T=goblin]") == 0);
+        /* the same provenance, structured (#88): pred + binding, not a name to
+         * parse back apart */
+        CHECK(rp.items[0].pred == intern_id(sy, "strike"));
+        CHECK(rp.items[0].nbind == 2);
+        CHECK(rp.items[0].vars[0] == intern_id(sy, "A"));
+        CHECK(rp.items[0].ents[0] == intern_id(sy, "hero"));
+        CHECK(rp.items[0].vars[1] == intern_id(sy, "T"));
+        CHECK(rp.items[0].ents[1] == intern_id(sy, "goblin"));
     }
 
     /* another strike crosses the `<= 0` guard: 3 -> -1 clamps to 0, dead fires */

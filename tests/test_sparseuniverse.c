@@ -154,7 +154,7 @@ static int world_api_half(void)
 
     world_free(w);
     intern_free(sy);
-    return 1;
+    return 0;
 }
 
 /* ---- Part 2: story-driven, tick-time matcher vs eager ---- */
@@ -173,7 +173,8 @@ static const char *STORY =
     ")\n"
     "rule link(X: actor, Y: actor): rel(X, Y) & awake(X) => linked(X, Y)\n"
     "action wake(X: actor): causes awake(X)\n"
-    "action sleep(X: actor): causes ~awake(X)\n";
+    "action sleep(X: actor): causes ~awake(X)\n"
+    "exclusive wake(X), sleep(X)\n";   /* #159: the two contest `awake` (#160) */
 
 static int story_half(void)
 {
@@ -250,13 +251,13 @@ static int story_half(void)
     story_matcher_free(M);
     world_free(A); world_free(B);
     intern_free(sy);
-    return 1;
+    return 0;
 }
 
 int main(void)
 {
-    if (!world_api_half()) return 1;
-    if (!story_half()) return 1;
+    if (world_api_half()) return 1;
+    if (story_half()) return 1;
     printf("test_sparseuniverse: all passed\n");
     return 0;
 }
