@@ -520,6 +520,28 @@ typedef enum {
     WORLD_ACTION_UNKNOWN,     /* no step rule is triggered by this atom */
 } world_action_status;
 
+/* ---- Derived values, readable (#82) ---------------------------------------
+ *
+ * The engine has derived BOOLEANS (judgments, queryable) and stored NUMBERS
+ * (numeric fluents, readable but never derived — I1). What it did not have is
+ * a derived NUMBER a client can read: a value's chain is inlined into the
+ * bytecode of whatever reads it, so a value nothing in the world reads has
+ * nowhere to be read FROM.
+ *
+ * That gap is what forces arithmetic into a client. A health bar's width is
+ * `48 * hp / hp_max`, and with no derived number to ask for, the only place
+ * that expression can live is inside whatever widget draws it — which freezes
+ * one formula, one source fluent and one look for every game that ever uses
+ * it. Registering the ground instances makes the number the WORLD's answer and
+ * leaves the drawing to the client, which is the split the presentation
+ * interface wants everywhere else.
+ *
+ * `world_get_value` evaluates the registered program against current state.
+ * It returns false for an unregistered atom and for a partial value with no
+ * applicable definition (#116) — genuinely undefined, never a sentinel. */
+void world_add_value(world *w, uint32_t atom, const expr_ins *code, int ncode);
+bool world_get_value(const world *w, uint32_t atom, long *out);
+
 int  world_actions(const world *w, uint32_t *out, int cap);
 world_action_status world_action_status_of(world *w, uint32_t action);
 bool world_action_applies(world *w, uint32_t action);

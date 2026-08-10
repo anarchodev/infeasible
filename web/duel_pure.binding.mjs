@@ -17,11 +17,11 @@
 /** @typedef {"snd_thud" | "snd_ring" | "snd_chime"} T_sound */
 
 export const STORY = "examples/duel_pure.story";
-export const SOURCE_HASH = "09c2f3c0";
+export const SOURCE_HASH = "61a85111";
 export const SORTS = {"fighter":["you","gnoll","imp"],"card":["edge_a","edge_b","spark","salve"]};
 export const ENUMS = {"zone":["z_hand","z_spent"],"sprite":["s_you","s_gnoll","s_imp","s_strike","s_bolt","s_mend"],"style":["st_room","st_bar","st_title","st_button","st_button_off"],"anchor":["a_title","a_foes","a_self","a_hand","a_bar","a_who","a_note","a_menu","a_status"],"word":["w_the_duel","w_foes","w_you","w_hand","w_energy","w_downed","w_aimed","w_end_turn"],"cue":["q_hit","q_ward","q_heal"],"sound":["snd_thud","snd_ring","snd_chime"]};
 
-export const IFACE = {"judgments":[{"name":"down","args":["fighter"]},{"name":"in_hand","args":["card"]},{"name":"enemy","args":["fighter"]},{"name":"ally","args":["fighter"]},{"name":"target","args":["fighter"]},{"name":"picked","args":["fighter"]},{"name":"aimed","args":["fighter"]},{"name":"panel","args":["anchor","style"]},{"name":"caption","args":["anchor","word"]},{"name":"shows","args":["fighter","sprite"]},{"name":"prop_shows","args":["card","sprite"]},{"name":"in_anchor","args":["fighter","anchor"]},{"name":"prop_in","args":["card","anchor"]},{"name":"gauge","args":["anchor","fighter"]},{"name":"cue_sound","args":["cue","sound"]}],"state":[{"name":"in_zone","args":["card"],"type":"enum","values":["z_hand","z_spent"]},{"name":"is_strike","args":["card"],"type":"bool"},{"name":"is_bolt","args":["card"],"type":"bool"},{"name":"is_mend","args":["card"],"type":"bool"},{"name":"hostile","args":["fighter"],"type":"bool"},{"name":"alive","args":["fighter"],"type":"bool"},{"name":"hp","args":["fighter"],"type":"int"},{"name":"hp_max","args":["fighter"],"type":"int"},{"name":"energy","args":[],"type":"int"},{"name":"selected","args":["fighter"],"type":"bool"},{"name":"aiming","args":["fighter"],"type":"bool"},{"name":"showing","args":[],"type":"bool"},{"name":"ax","args":["anchor"],"type":"int"},{"name":"ay","args":["anchor"],"type":"int"},{"name":"aw","args":["anchor"],"type":"int"},{"name":"ah","args":["anchor"],"type":"int"}],"actions":[{"name":"strike","params":["card","fighter"]},{"name":"bolt","params":["card","fighter"]},{"name":"mend","params":["card","fighter"]},{"name":"end_turn","params":[]},{"name":"aim_gnoll","params":[]},{"name":"aim_imp","params":[]},{"name":"aim_you","params":[]}]};
+export const IFACE = {"judgments":[{"name":"down","args":["fighter"]},{"name":"in_hand","args":["card"]},{"name":"enemy","args":["fighter"]},{"name":"ally","args":["fighter"]},{"name":"target","args":["fighter"]},{"name":"picked","args":["fighter"]},{"name":"aimed","args":["fighter"]},{"name":"panel","args":["anchor","style"]},{"name":"caption","args":["anchor","word"]},{"name":"shows","args":["fighter","sprite"]},{"name":"prop_shows","args":["card","sprite"]},{"name":"in_anchor","args":["fighter","anchor"]},{"name":"prop_in","args":["card","anchor"]},{"name":"gauge","args":["anchor","fighter"]},{"name":"gauge_low","args":["fighter"]},{"name":"cue_sound","args":["cue","sound"]}],"state":[{"name":"in_zone","args":["card"],"type":"enum","values":["z_hand","z_spent"]},{"name":"is_strike","args":["card"],"type":"bool"},{"name":"is_bolt","args":["card"],"type":"bool"},{"name":"is_mend","args":["card"],"type":"bool"},{"name":"hostile","args":["fighter"],"type":"bool"},{"name":"alive","args":["fighter"],"type":"bool"},{"name":"hp","args":["fighter"],"type":"int"},{"name":"hp_max","args":["fighter"],"type":"int"},{"name":"energy","args":[],"type":"int"},{"name":"selected","args":["fighter"],"type":"bool"},{"name":"aiming","args":["fighter"],"type":"bool"},{"name":"showing","args":[],"type":"bool"},{"name":"ax","args":["anchor"],"type":"int"},{"name":"ay","args":["anchor"],"type":"int"},{"name":"aw","args":["anchor"],"type":"int"},{"name":"ah","args":["anchor"],"type":"int"}],"actions":[{"name":"strike","params":["card","fighter"]},{"name":"bolt","params":["card","fighter"]},{"name":"mend","params":["card","fighter"]},{"name":"end_turn","params":[]},{"name":"aim_gnoll","params":[]},{"name":"aim_imp","params":[]},{"name":"aim_you","params":[]}]};
 
 // #159 exclusive groups, exactly as world_step checks them: a step admits at
 // most one member per (group, key). The builder below refuses the second at
@@ -70,6 +70,7 @@ export function open(M, src) {
     unsubscribe: c('inf_unsubscribe', null, ['number', 'number']),
     subVerdict: c('inf_sub_verdict', 'number', ['number', 'number']),
     subEdges: c('inf_sub_edges', 'number', ['number', 'number', 'number']),
+    getValue: c('inf_get_value', 'number', ['number', 'number', 'number']),
     actions_: c('inf_actions', 'number', ['number', 'number', 'number']),
     actionStatus: c('inf_action_status', 'number', ['number', 'number']),
     actionBlockers: c('inf_action_blockers', 'number', ['number', 'number', 'number', 'number']),
@@ -203,6 +204,13 @@ export function open(M, src) {
 
     gauge: (a0, a1) => { chk("anchor", a0); chk("fighter", a1);
       return VERDICT[api.query(s, id(`gauge(${a0},${a1})`), 0)]; },
+    /**
+     * @param {T_fighter} a0
+     * @returns {'undecided'|'proved'|'refuted'}
+     */
+
+    gauge_low: (a0) => { chk("fighter", a0);
+      return VERDICT[api.query(s, id(`gauge_low(${a0})`), 0)]; },
     /**
      * @param {T_cue} a0
      * @param {T_sound} a1
@@ -473,6 +481,13 @@ export function open(M, src) {
     gauge: (a0, a1) => { chk("anchor", a0); chk("fighter", a1);
       return `gauge(${a0},${a1})`; },
     /**
+     * @param {T_fighter} a0
+     * @returns {string}
+     */
+
+    gauge_low: (a0) => { chk("fighter", a0);
+      return `gauge_low(${a0})`; },
+    /**
      * @param {T_cue} a0
      * @param {T_sound} a1
      * @returns {string}
@@ -590,6 +605,25 @@ export function open(M, src) {
       return `ah(${a0})`; },
   };
 
+  /** Derived numbers (#82), evaluated against current state. `undefined`
+   *  means the value has no applicable definition (#116), not zero. */
+  const val = {
+    /**
+     * @param {T_fighter} a0
+     * @returns {number|undefined}
+     */
+
+    gauge_value: (a0) => { chk("fighter", a0);
+      return readValue(id(`gauge_value(${a0})`)); },
+    /**
+     * @param {T_fighter} a0
+     * @returns {number|undefined}
+     */
+
+    gauge_max: (a0) => { chk("fighter", a0);
+      return readValue(id(`gauge_max(${a0})`)); },
+  };
+
   /** Action constructors. An unknown or misspelled action is unconstructible
    *  — there is no function to call — which is #119's loud no-op retired at
    *  the interface rather than caught at the step. */
@@ -648,6 +682,15 @@ export function open(M, src) {
     get length() { return this.items.length; }
   }
 
+  /** One number out of WASM: a scratch double the shim fills. */
+  const readValue = (atom) => {
+    const p = M._malloc(8);
+    const ok = api.getValue(s, atom, p);
+    const v = ok ? new Float64Array(M.HEAPF64.buffer, p, 1)[0] : undefined;
+    M._free(p);
+    return v;
+  };
+
   const readCells = (fn, cap) => {
     const p = M._malloc(cap * 4);
     const need = fn(s, p, cap);
@@ -658,7 +701,7 @@ export function open(M, src) {
   };
 
   const world = {
-    q, state: st, set, a, lit,
+    q, state: st, set, a, lit, value: val,
     /** A fresh action set for the next step. */
     actions: () => new ActionSet(),
     /** Advance one step. Throws on a rejected step: with the builder

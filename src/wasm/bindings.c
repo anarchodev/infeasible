@@ -166,6 +166,14 @@ API int  wf_sub_edges(world *w, long *out, int cap) {
     return 5 * n;
 }
 
+/* --- a derived number (#82), evaluated against current state --- */
+API int wf_get_value(world *w, uint32_t atom, double *out) {
+    long v = 0;
+    if (!world_get_value(w, atom, &v)) return 0;
+    *out = (double) v;
+    return 1;
+}
+
 /* --- applicable actions (§6.3): the menu the engine already knows --- */
 API int wf_actions(world *w, uint32_t *out, int cap) { return world_actions(w, out, cap); }
 API int wf_action_status(world *w, uint32_t a) { return (int) world_action_status_of(w, a); }

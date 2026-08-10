@@ -189,6 +189,7 @@ w(`    subscribe: c('inf_subscribe', 'number', ['number', 'number', 'number']),`
 w(`    unsubscribe: c('inf_unsubscribe', null, ['number', 'number']),`);
 w(`    subVerdict: c('inf_sub_verdict', 'number', ['number', 'number']),`);
 w(`    subEdges: c('inf_sub_edges', 'number', ['number', 'number', 'number']),
+    getValue: c('inf_get_value', 'number', ['number', 'number', 'number']),
     actions_: c('inf_actions', 'number', ['number', 'number', 'number']),
     actionStatus: c('inf_action_status', 'number', ['number', 'number']),
     actionBlockers: c('inf_action_blockers', 'number', ['number', 'number', 'number', 'number']),`);
@@ -310,6 +311,24 @@ for (const f of iface.state) {
 w(`  };`);
 w();
 
+// --- derived values (#82): numbers the WORLD computed
+//
+// The engine has derived booleans and stored numbers; this is the third thing,
+// and it is what lets arithmetic stay in the story instead of migrating into
+// whichever client draws it. `undefined` means genuinely undefined — a partial
+// value with no applicable definition (#116) — never a sentinel.
+w(`  /** Derived numbers (#82), evaluated against current state. \`undefined\``);
+w(`   *  means the value has no applicable definition (#116), not zero. */`);
+w(`  const val = {`);
+for (const v of iface.values ?? []) {
+  const chks = v.args.map((sort, i) => `chk(${JSON.stringify(sort)}, a${i});`).join(' ');
+  w(jsdoc(v.args, 'number|undefined').replace(/^ {2}/gm, '    '));
+  w(`    ${jsName(v.name)}: (${params(v.args).join(', ')}) => { ${chks}`);
+  w(`      return readValue(id(${term(v.name, v.args)})); },`);
+}
+w(`  };`);
+w();
+
 // --- action constructors
 w(`  /** Action constructors. An unknown or misspelled action is unconstructible`);
 w(`   *  — there is no function to call — which is #119's loud no-op retired at`);
@@ -364,7 +383,16 @@ w(`  }`);
 w();
 
 // --- step + readouts
-w(`  const readCells = (fn, cap) => {`);
+w(`  /** One number out of WASM: a scratch double the shim fills. */
+  const readValue = (atom) => {
+    const p = M._malloc(8);
+    const ok = api.getValue(s, atom, p);
+    const v = ok ? new Float64Array(M.HEAPF64.buffer, p, 1)[0] : undefined;
+    M._free(p);
+    return v;
+  };
+
+  const readCells = (fn, cap) => {`);
 w(`    const p = M._malloc(cap * 4);`);
 w(`    const need = fn(s, p, cap);`);
 w(`    const view = new Int32Array(M.HEAP32.buffer, p, Math.min(need, cap)).slice();`);
@@ -374,7 +402,7 @@ w(`    return view;`);
 w(`  };`);
 w();
 w(`  const world = {`);
-w(`    q, state: st, set, a, lit,`);
+w(`    q, state: st, set, a, lit, value: val,`);
 w(`    /** A fresh action set for the next step. */`);
 w(`    actions: () => new ActionSet(),`);
 w(`    /** Advance one step. Throws on a rejected step: with the builder`);

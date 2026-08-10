@@ -7970,6 +7970,47 @@ static void ground_sup(parser *p, ast_sup *s)
     emit_sup_edges(p, ra, rb, s->bline, s->bcol);
 }
 
+/* #82: make every ground value instance READABLE.
+ *
+ * A value's chain is inlined into the bytecode of whatever reads it, so a value
+ * nothing in the world reads has nowhere to be read from — which is exactly the
+ * case presentation cares about, since a bar's width is computed for a client
+ * and for nobody else. Compiling each instance once more and registering it
+ * under its ground atom costs one arena copy per instance and turns "the number
+ * behind this bar" into the world's answer instead of arithmetic frozen inside
+ * whatever widget draws it.
+ *
+ * The enumeration domain is the value's BASE definition's parameters, which
+ * bind its head arguments by construction (#94: exactly one unconditional
+ * base, each head argument a distinct rule parameter). */
+static void register_value_reads(parser *p)
+{
+    for (int i = 0; i < p->npreds; i++) {
+        pred_info *pi = &p->preds[i];
+        if (!pi->is_value) continue;
+        int vi = find_value(p, pi->pred);
+        if (vi < 0 || p->nvdefs[vi] == 0) continue;
+        ast_rule *base = &p->rules[p->vdefs[vi][0]];
+        bool of = false;
+        long total = instance_count(p, base->vars, base->nvars, &of);
+        if (of || total <= 0) continue;          /* errored elsewhere, or empty */
+
+        uint32_t binding[MAX_ARGS], args[MAX_ARGS];
+        for (long idx = 0; idx < total; idx++) {
+            decode_binding(p, base->vars, base->nvars, idx, binding);
+            for (int k = 0; k < base->head.nargs; k++)
+                args[k] = resolve_arg(base->vars, base->nvars, binding,
+                                      base->head.args[k]);
+            expr_ins code[MAX_CODE];
+            int pos = 0;
+            emit_value_inline(p, pi->pred, args, code, &pos);
+            if (pos <= 0 || pos >= MAX_CODE) continue;
+            world_add_value(p->w, ground_pred(p, pi->pred, args, base->head.nargs),
+                            code, pos);
+        }
+    }
+}
+
 /* #159: ground the `exclusive` groups. Per group: the KEY is the named vars
  * in first-appearance order; per member, every ground action instance
  * registers under (group, key-odometer-index) — instances sharing a key
@@ -10859,6 +10900,7 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
             for (int i = 0; i < p->nactions; i++) ground_action(p, &p->actions[i]);
             for (int i = 0; i < p->nsups; i++)    ground_sup(p, &p->sups[i]);
             ground_exclusives(p);                 /* #159 exclusivity groups */
+            register_value_reads(p);              /* #82 values, readable */
             {   /* #109 (§5.2): an attacked support cycle is a located error —
                  * the Datalog completion is only sound where defeat cannot
                  * reach, so the compiler refuses the overlap outright */

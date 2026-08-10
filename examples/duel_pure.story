@@ -166,6 +166,17 @@ rule pin_card(C: card):    in_zone(C) = z_hand    => prop_in(C, a_hand)
 rule g_you(F: fighter):   ~hostile(F) => gauge(a_status, F)
 rule g_foe(F: fighter):    hostile(F) => gauge(a_status, F)
 
+// THE NUMBERS ARE THE STORY'S, not the renderer's. A gauge used to read a
+// fluent the renderer knew by name, which froze one source, one maximum and
+// one colour rule into the widget. These are ordinary derived values (#82) —
+// so a bar can show hp, or hp plus a ward, or anything else — and the colour
+// is an ordinary judgment, which is the sort of thing defeasible logic should
+// be deciding.
+value ( gauge_value(fighter) : int   gauge_max(fighter) : int )
+rule gv(F: fighter): => gauge_value(F) = hp(F)
+rule gm(F: fighter): => gauge_max(F)   = hp_max(F)
+rule glow(F: fighter): hp(F) * 2 <= hp_max(F) => gauge_low(F)
+
 rule note_down(F: fighter): down(F) => caption(a_note, w_downed)
 
 rule cue_hit:  showing => cue_sound(q_hit, snd_thud)

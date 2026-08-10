@@ -3149,9 +3149,17 @@ and all three were invisible until the second:
 And three things *neither* could say, which is the more useful list because an
 item demanded by two independent games is no longer a matter of taste:
 
-1. **A number that is not the blessed one.** Energy, a card's cost — a judgment
-   carries an entity, never a quantity, so the only number a gauge can read is
-   one the renderer knows by name. Naming a fluent as an argument closes it.
+1. **A number that is not the blessed one** — *closed*. The engine had derived
+   BOOLEANS (judgments) and stored NUMBERS (fluents, never derived — I1), and
+   no derived number a client could read: a value's chain is inlined into
+   whatever reads it, so a value nothing in the world reads had nowhere to be
+   read from — which is exactly the presentation case, since a bar's width is
+   computed for a client and for nobody else. `world_get_value` registers each
+   ground instance and evaluates it against current state, so the arithmetic
+   stays in the story. A gauge no longer knows `hp`: it reads `gauge_value` and
+   `gauge_max`, which the story defines, and its colour is an ordinary
+   judgment. Naming a fluent *as an argument* is still open and is the general
+   form (#124's `value` meta-sort is the mechanism).
 2. **A label on a THING rather than on a region.** `caption` takes an anchor;
    cards and fighters have no anchor of their own, so they cannot be named.
 3. **"Select one, clear the rest."** Both games paid one concrete action per

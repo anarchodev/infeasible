@@ -15,7 +15,8 @@
 //   prop_in(item, anchor)    props packed into a region
 //   held(item, actor)        ...or carried beside a holder
 //   shaded(anchor)           the composite op over a region
-//   gauge(anchor, actor)     a bar, filled by the blessed hp / hp_max
+//   gauge(anchor, E)         a bar; the STORY supplies gauge_value/gauge_max
+//                            (derived values) and gauge_low (a judgment)
 //   picked(E)                the SUBJECT — whose menu this is
 //   aimed(E)                 the OBJECT — what a command is aimed at
 //   surfaced(judgment)       a guard worth showing a refused command for
@@ -288,14 +289,18 @@ export function createScene(w, iface, doms) {
     m.gauges.forEach(([a, who], i) => {
       const b = m.geom[a];
       if (!b) return;
-      // the one world word this renderer knows: a gauge reads `hp`/`hp_max`,
-      // because a judgment can carry an entity but not a quantity
-      const v = w.state.hp?.(who) ?? 0, max = w.state.hp_max?.(who) ?? 1;
+      // The numbers are the STORY's. `gauge_value`/`gauge_max` are derived
+      // values (#82) it defines and the engine evaluates, so nothing here knows
+      // what a bar is measuring — and the colour is a judgment, not a threshold
+      // frozen in this file.
+      const v = w.value?.gauge_value?.(who) ?? 0;
+      const max = w.value?.gauge_max?.(who) || 1;
+      const low = isProved('gauge_low', who);
       const y = b.y + i * 11;
       d.print(say(who), b.x, y, who === m.picked ? 5 : 3, BIG);
       d.rectfill(b.x + 44, y + 1, 48, 6, 2);
-      d.rectfill(b.x + 44, y + 1, Math.max(0, Math.round(48 * v / Math.max(1, max))), 6,
-                 v > max / 2 ? 13 : 10);
+      d.rectfill(b.x + 44, y + 1, Math.max(0, Math.round(48 * v / max)), 6,
+                 low ? 10 : 13);
       d.print(`${v}`, b.x + 98, y, 3, BIG);
     });
 

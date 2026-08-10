@@ -70,6 +70,7 @@ export function open(M, src) {
     unsubscribe: c('inf_unsubscribe', null, ['number', 'number']),
     subVerdict: c('inf_sub_verdict', 'number', ['number', 'number']),
     subEdges: c('inf_sub_edges', 'number', ['number', 'number', 'number']),
+    getValue: c('inf_get_value', 'number', ['number', 'number', 'number']),
     actions_: c('inf_actions', 'number', ['number', 'number', 'number']),
     actionStatus: c('inf_action_status', 'number', ['number', 'number']),
     actionBlockers: c('inf_action_blockers', 'number', ['number', 'number', 'number', 'number']),
@@ -621,6 +622,25 @@ export function open(M, src) {
       return `ah(${a0})`; },
   };
 
+  /** Derived numbers (#82), evaluated against current state. `undefined`
+   *  means the value has no applicable definition (#116), not zero. */
+  const val = {
+    /**
+     * @param {T_actor} a0
+     * @returns {number|undefined}
+     */
+
+    gauge_value: (a0) => { chk("actor", a0);
+      return readValue(id(`gauge_value(${a0})`)); },
+    /**
+     * @param {T_actor} a0
+     * @returns {number|undefined}
+     */
+
+    gauge_max: (a0) => { chk("actor", a0);
+      return readValue(id(`gauge_max(${a0})`)); },
+  };
+
   /** Action constructors. An unknown or misspelled action is unconstructible
    *  — there is no function to call — which is #119's loud no-op retired at
    *  the interface rather than caught at the step. */
@@ -728,6 +748,15 @@ export function open(M, src) {
     get length() { return this.items.length; }
   }
 
+  /** One number out of WASM: a scratch double the shim fills. */
+  const readValue = (atom) => {
+    const p = M._malloc(8);
+    const ok = api.getValue(s, atom, p);
+    const v = ok ? new Float64Array(M.HEAPF64.buffer, p, 1)[0] : undefined;
+    M._free(p);
+    return v;
+  };
+
   const readCells = (fn, cap) => {
     const p = M._malloc(cap * 4);
     const need = fn(s, p, cap);
@@ -738,7 +767,7 @@ export function open(M, src) {
   };
 
   const world = {
-    q, state: st, set, a, lit,
+    q, state: st, set, a, lit, value: val,
     /** A fresh action set for the next step. */
     actions: () => new ActionSet(),
     /** Advance one step. Throws on a rejected step: with the builder

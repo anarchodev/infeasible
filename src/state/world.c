@@ -235,6 +235,11 @@ struct world {
     world_schema_fn schema_fn; void *schema_ctx;
 
     srule *srules; int nsr, capsr;
+    /* #82 values, registered per ground instance so a client can read a
+     * derived number instead of recomputing it (world_get_value). */
+    struct vread { uint32_t atom; const expr_ins *code; int ncode; } *vreads;
+    int nvread, capvread;
+    int *vread_of; uint32_t vread_of_cap;
 
     /* numeric value store + comparison guards (§5.8, read side). A clamp bound
      * may be dynamic (`int in 0 .. hp_max(X)`): lo_code/hi_code hold effect-VM
@@ -564,6 +569,7 @@ void world_free(world *w)
     free(w->guard_of);
     free(w->prov_of);
     free(w->eguard_of);
+    free(w->vread_of);
     free(w->trig_of);
     free(w->views);
     free(w->vrows);
@@ -584,6 +590,7 @@ void world_free(world *w)
     for (int i = 0; i < w->neguard; i++)
         free(w->eguards[i].disp);                  /* #132 render scratch */
     free(w->eguards);
+    free(w->vreads);
     if (w->fnlog) { free(w->fnlog->items); free(w->fnlog); }
     for (int i = 0; i < w->nprov; i++)
         free(w->provs[i].disp);                    /* #178 render scratch */
@@ -1770,6 +1777,37 @@ dl_verdict world_query(world *w, dl_lit q)
         return dlcol_defeasible(lf->fam, la, r.e);
     }
     return query_jfam(w, q);
+}
+
+/* ---- Derived values, readable (#82) --------------------------------------- */
+
+static int vread_index(const world *w, uint32_t atom)
+{
+    return atom < w->vread_of_cap ? w->vread_of[atom] : -1;
+}
+
+void world_add_value(world *w, uint32_t atom, const expr_ins *code, int ncode)
+{
+    if (vread_index(w, atom) >= 0) return;      /* one entry per ground atom */
+    atom_map_set(&w->vread_of, &w->vread_of_cap, atom, w->nvread);
+    GROW(w->vreads, w->nvread, w->capvread);
+    expr_ins *copy = arena_alloc(&w->a, sizeof *copy * (size_t)ncode);
+    memcpy(copy, code, sizeof *copy * (size_t)ncode);
+    w->vreads[w->nvread].atom  = atom;
+    w->vreads[w->nvread].code  = copy;
+    w->vreads[w->nvread].ncode = ncode;
+    w->nvread++;
+}
+
+bool world_get_value(const world *w, uint32_t atom, long *out)
+{
+    int i = vread_index(w, atom);
+    if (i < 0) return false;
+    bool undef = false;
+    long v = eval_expr(w, w->vreads[i].code, w->vreads[i].ncode, &undef);
+    if (undef) return false;                    /* partial, no definition (#116) */
+    if (out) *out = v;
+    return true;
 }
 
 /* ---- Applicable actions (§6.3): what a client may offer, and why not ------
