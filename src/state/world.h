@@ -264,6 +264,15 @@ void world_add_expr_guard(world *w, uint32_t guard,
                           const expr_ins *lhs, int nlhs,
                           const expr_ins *rhs, int nrhs, world_cmp op);
 
+/* The author's spelling of an expression guard (#132), for the why-trace: a
+ * guard compiles to a synthetic marker atom, and a trace that names the marker
+ * ("eg14[A=grunk,T=vera]") tells the reader nothing about the comparison that
+ * failed. With a source string set, world_why / world_step_why render the guard
+ * as it was written, followed by the operands THIS solve evaluated —
+ * `atk_die(grunk) + atk_mod(grunk) >= ac(vera) [19 >= 19]` — which is the
+ * difference between a debugger and an invitation to go digging. Copied. */
+void world_set_expr_guard_src(world *w, uint32_t guard, const char *src);
+
 /* Attach dynamic clamp bounds to a numeric fluent (§5.8): `int in 0..hp_max(X)`
  * compiles each bound to effect-VM bytecode, evaluated per-commit against the
  * value store. NULL/0 on a side leaves it on the constant min/max from

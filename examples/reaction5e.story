@@ -92,7 +92,7 @@ rule atk_bless(X: actor): blessed(X)  => atk(X) = prior + roll(4)   // Bless d4
 
 // the LOCKED roll vs the LIVE ac — Shield retroactively swings this
 rule incoming(A: actor, T: actor):
-    pending(A, T) & (atk_die(A) + atk_mod(A)) >= ac(T) => incoming_hit(A, T)
+    pending(A, T) & atk_die(A) + atk_mod(A) >= ac(T) => incoming_hit(A, T)
 
 rule crit(A: actor, T: actor): pending(A, T) & atk_die(A) >= 20 => crit(A)
 

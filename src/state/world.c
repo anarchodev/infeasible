@@ -277,7 +277,11 @@ struct world {
      * (the guard atom stays UNDECIDED in the solve). */
     struct { uint32_t guard; const expr_ins *lhs; int nlhs;
              const expr_ins *rhs; int nrhs; world_cmp op;
-             bool has_test; int8_t tval; } *eguards;
+             bool has_test; int8_t tval;
+             /* the author's spelling + the operands the last evaluation saw,
+              * for the why-trace (#132) */
+             const char *src; long lval, rval; bool evaluated;
+             char *disp; } *eguards;
     int neguard, capeguard;
     /* #159 exclusivity groups: per ground action atom, a chain of (group,
      * key) memberships; groups carry a label + declaration prov for the
@@ -558,6 +562,8 @@ void world_free(world *w)
     free(w->pguards);
     free(w->pg_cur);
     free(w->num_stratum);
+    for (int i = 0; i < w->neguard; i++)
+        free(w->eguards[i].disp);                  /* #132 render scratch */
     free(w->eguards);
     free(w->provs);
     free(w->rollsites);
@@ -1028,8 +1034,61 @@ void world_add_expr_guard(world *w, uint32_t guard,
     for (int k = 0; k < nrhs && !ht; k++) ht = r[k].op == EXPR_TEST;
     w->eguards[w->neguard].has_test = ht;
     w->eguards[w->neguard].tval = 0;
+    w->eguards[w->neguard].src = NULL;             /* #132: set separately */
+    w->eguards[w->neguard].disp = NULL;
+    w->eguards[w->neguard].evaluated = false;
     if (ht) w->n_teg++;
     w->neguard++;
+}
+
+static const char *cmp_spelling(world_cmp op)
+{
+    switch (op) {
+    case WORLD_CMP_LE: return "<=";
+    case WORLD_CMP_LT: return "<";
+    case WORLD_CMP_GE: return ">=";
+    case WORLD_CMP_GT: return ">";
+    case WORLD_CMP_EQ: return "=";
+    }
+    return "?";
+}
+
+/* The author's spelling of an expression guard, for the why-trace (#132). */
+void world_set_expr_guard_src(world *w, uint32_t guard, const char *src)
+{
+    int i = eguard_index(w, guard);
+    if (i >= 0)
+        w->eguards[i].src = src ? arena_strdup(&w->a, src) : NULL;
+}
+
+/* Name every expression guard in `f` the way its author wrote it, followed by
+ * the operands the last solve compared (#132):
+ *
+ *   atk_die(grunk) + atk_mod(grunk) >= ac(vera) [19 >= 19]
+ *
+ * instead of the synthetic marker `eg14[A=grunk,T=vera]`. Display only — the
+ * atom's identity is unchanged — and only on the why path, so a solve pays
+ * nothing for it. The operand values come from the solve's own evaluation
+ * rather than a fresh read of the value store, which after a committed step
+ * holds the NEXT state and would show numbers the trace never saw. */
+static void name_expr_guards(world *w, dlcol *f, const uint32_t *of, uint32_t cap)
+{
+    for (int i = 0; i < w->neguard; i++) {
+        const char *src = w->eguards[i].src;
+        uint32_t ga = w->eguards[i].guard;
+        if (!src || ga >= cap || of[ga] == LOC_NONE)
+            continue;
+        size_t need = strlen(src) + 64;
+        w->eguards[i].disp = realloc(w->eguards[i].disp, need);
+        if (w->eguards[i].evaluated)
+            snprintf(w->eguards[i].disp, need, "%s [%ld %s %ld]", src,
+                     w->eguards[i].lval, cmp_spelling(w->eguards[i].op),
+                     w->eguards[i].rval);
+        else                          /* a partial value with no applicable
+                                       * definition (#116): honestly undecided */
+            snprintf(w->eguards[i].disp, need, "%s [undefined]", src);
+        dlcol_set_atom_name(f, of[ga], w->eguards[i].disp);
+    }
 }
 
 int world_new_excl_group(world *w, const char *label, const char *prov)
@@ -1057,13 +1116,32 @@ void world_add_excl_member(world *w, int group, uint32_t action_atom,
  * and compares. Rolls read the current tick — idempotent within a solve.
  * Tri-valued (#116): 1 holds, 0 fails, -1 UNDEFINED (a side read a partial
  * value with no applicable definition — the comparison does not apply). */
-static int guard_holds_expr(const world *w, int i)
+/* `lval`/`rval` (nullable) report the operands this evaluation saw. The
+ * evaluator itself stays pure — lazy_judgment_verdict's contract depends on it
+ * — so the callers that own a mutable world are the ones that stash them for
+ * the why-trace (#132). */
+static int guard_holds_expr(const world *w, int i, long *lval, long *rval)
 {
     bool und = false;
     long l = eval_expr(w, w->eguards[i].lhs, w->eguards[i].nlhs, &und);
     long r = eval_expr(w, w->eguards[i].rhs, w->eguards[i].nrhs, &und);
+    if (lval) *lval = l;
+    if (rval) *rval = r;
     if (und) return -1;
     return cmp_ok(l, r, w->eguards[i].op) ? 1 : 0;
+}
+
+/* Evaluate guard `i` and remember what the solve saw, so a trace rendered later
+ * shows the numbers THIS solve compared rather than re-reading a store that has
+ * since committed (#132). */
+static int guard_holds_expr_rec(world *w, int i)
+{
+    long l = 0, r = 0;
+    int v = guard_holds_expr(w, i, &l, &r);
+    w->eguards[i].lval = l;
+    w->eguards[i].rval = r;
+    w->eguards[i].evaluated = v >= 0;
+    return v;
 }
 
 /* Load every ground expression guard as a closed-world fact (like numeric
@@ -1082,7 +1160,7 @@ static void load_eguards(world *w, dlcol *f, const uint32_t *of, uint32_t cap)
             if (!w->teg_ready) continue;           /* pass A: undecided */
             v = w->eguards[i].tval;
         } else {
-            v = guard_holds_expr(w, i);
+            v = guard_holds_expr_rec(w, i);
         }
         if (v < 0) {           /* #116 partial value undefined: NEITHER fact —
                                 * marked OPEN so the guard atom (a located,
@@ -1104,7 +1182,7 @@ static void eval_test_guards(world *w, dlcol *tf, const uint32_t *of, uint32_t c
     w->tctx_fam = tf; w->tctx_of = of; w->tctx_cap = cap;
     for (int i = 0; i < w->neguard; i++)
         if (w->eguards[i].has_test)
-            w->eguards[i].tval = (int8_t)guard_holds_expr(w, i);
+            w->eguards[i].tval = (int8_t)guard_holds_expr_rec(w, i);
     w->tctx_fam = NULL;
     w->teg_ready = true;
 }
@@ -1561,7 +1639,7 @@ static dl_verdict lazy_judgment_verdict(const world *w, dl_lit q)
         return q.neg != provider_holds(w, p) ? DL_PROVED : DL_REFUTED;
     int e = eguard_index(w, q.atom);
     if (e >= 0) {
-        int v = guard_holds_expr(w, e);
+        int v = guard_holds_expr(w, e, NULL, NULL);
         if (v < 0) return DL_UNDECIDED;    /* #116: partial value undefined —
                                             * the comparison does not apply */
         return q.neg != (v != 0) ? DL_PROVED : DL_REFUTED;
@@ -1681,6 +1759,7 @@ void world_why(world *w, dl_lit q, FILE *out)
     }
     if (!w->jfam_solved)
         solve_judgment_family(w);
+    name_expr_guards(w, w->jfam, w->jloc_of, w->jloc_cap);   /* #132 */
     dl_lit loc = { w->jloc_of[q.atom], q.neg };
     dlcol_why(w->jfam, loc, 0, out);
 }
@@ -2152,6 +2231,7 @@ void world_step_why(world *w, dl_lit q, bool next, FILE *out)
      * transition — replay it from the snapshot so the trace is the real one. */
     if (w->last_routed)
         solve_step_family_vals(w, w->step_snap, w->last_actions, w->last_nactions);
+    name_expr_guards(w, w->fam, w->aloc_of, w->aloc_cap);    /* #132 */
     dl_lit loc = { w->aloc_of[atom], q.neg };
     dlcol_why(w->fam, loc, 0, out);
 }
