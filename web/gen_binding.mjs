@@ -32,7 +32,7 @@ const out = outPath ??
           import.meta.url).pathname;
 
 // ---- compile, and take the artifact -----------------------------------------
-const createInfeasible = require('./infeasible.cjs');
+const createInfeasible = require('./infeasible.js');
 const M = await createInfeasible();
 const inf = {
   compile: M.cwrap('inf_compile', 'number', ['string']),

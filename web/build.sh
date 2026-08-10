@@ -6,16 +6,34 @@
 # SINGLE_FILE embeds the wasm as base64 in the .mjs so there is one vendored
 # container with nothing fetched at runtime (§12 rot-rule #1).
 #
-# Usage:  web/build.sh        (from the repo root)
+# Usage:  web/build.sh        (from anywhere)
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
+
+# Bootstrap the repo-local pinned emsdk if emcc is not already on PATH — the
+# same toolchain scripts/build_wasm.sh uses, so the two builds cannot drift
+# onto different compilers. Nothing system-wide is installed.
+if ! command -v emcc >/dev/null 2>&1; then
+    "$root/scripts/bootstrap_emsdk.sh"
+    # shellcheck disable=SC1091
+    . "$root/.emsdk/emsdk_env.sh" >/dev/null 2>&1
+fi
 # CommonJS module (MODULARIZE, no EXPORT_ES6): emscripten 3.1.6's ES6 output
 # references __dirname, which is undefined under Node ESM. The CJS module loads
-# cleanly in Node (via createRequire in the .mjs host) and, once packaged for
-# the browser, the WEB path never touches __dirname. Revisit to a native ESM
-# module with a newer emcc when the browser build lands (M2).
-out="$root/web/infeasible.cjs"
+# cleanly in Node (via createRequire in the .mjs host) and the browser's classic
+# <script> path never touches __dirname. Revisit to a native ESM module with a
+# newer emcc.
+#
+# The extension is `.js` and that is load-bearing, not cosmetic. The browser
+# loads this as a CLASSIC script, and a static host that serves an unknown
+# extension as application/octet-stream alongside `X-Content-Type-Options:
+# nosniff` — GitHub Pages does exactly this — makes the browser REFUSE to
+# execute it. `.js` is the one extension every host maps to a JavaScript MIME
+# type. Node needs no help either way: with no package.json declaring
+# `"type": "module"` above this directory, `.js` is CommonJS, which is what
+# `createRequire` here expects.
+out="$root/web/infeasible.js"
 
 emcc -O2 -I"$root/src" \
     "$root/src/core/arena.c" \

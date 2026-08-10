@@ -22,7 +22,7 @@ import { createRequire } from 'node:module';
 import { open, SORTS, STORY, SOURCE_HASH } from './reaction5e.binding.mjs';
 
 const require = createRequire(import.meta.url);
-const createInfeasible = require('./infeasible.cjs');
+const createInfeasible = require('./infeasible.js');
 
 const M = await createInfeasible();
 const src = readFileSync(new URL('../' + STORY, import.meta.url), 'utf8');

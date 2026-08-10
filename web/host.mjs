@@ -10,7 +10,7 @@
 // so every ground term is spelled once, by the compiler, and a rename in the
 // .story breaks regeneration and the typecheck instead of quietly never firing.
 //
-// Run:  web/build.sh                                  (emits web/infeasible.cjs)
+// Run:  web/build.sh                                  (emits web/infeasible.js)
 //       node web/gen_binding.mjs examples/cellar_ground.story
 //       node web/host.mjs
 //
@@ -22,7 +22,7 @@ import { createRequire } from 'node:module';
 import { open, SORTS, STORY } from './cellar_ground.binding.mjs';
 
 const require = createRequire(import.meta.url);
-const createInfeasible = require('./infeasible.cjs');
+const createInfeasible = require('./infeasible.js');
 
 const M = await createInfeasible();
 const src = readFileSync(new URL('../' + STORY, import.meta.url), 'utf8');

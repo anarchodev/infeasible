@@ -27,10 +27,10 @@ Default build type is `Debug`; core compiles with `-Wall -Wextra` under **C17**.
 
 ```sh
 scripts/build_wasm.sh   # bootstraps a repo-local pinned emsdk, emits build-wasm/ (git-ignored)
-web/build.sh            # emcc → web/infeasible.cjs (self-contained, base64-embedded .wasm)
+web/build.sh            # emcc → web/infeasible.js (bootstraps emsdk itself; base64-embedded .wasm)
+web/serve.sh            # build if needed + serve the REPO ROOT → localhost:8000/web/ (the cart)
 node web/host.mjs       # drives cellar_ground.story end-to-end from JS; prints "boundary OK: …"
 node web/platform_check.mjs   # the §12 interface freeze + the cellar cart, played headless
-python3 -m http.server 8000   # from the repo root, then open /web/ to play it
 ```
 
 ## Architecture
