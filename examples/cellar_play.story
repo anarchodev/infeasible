@@ -77,12 +77,21 @@ rule can_force(X: actor): at(X) = hall & door = jammed => can_force_door(X)
 rule too_weak(X: actor):  weakened(X)                  => ~can_force_door(X)
 too_weak > can_force
 
-// The cellar is dark without the torch: a judgment the *renderer* reads, not
-// the rules. Presentation asking the world a question is the ordinary case —
-// there is no second, presentation-side notion of "dark".
-rule dark(X: actor):  at(X) = cellar & ~holding(X, torch) => in_dark(X)
-rule lit(X: actor):   holding(X, torch)                   => ~in_dark(X)
-lit > dark
+// The cellar is dark: a judgment the *renderer* reads, not the rules.
+// Presentation asking the world a question is the ordinary case — there is no
+// second, presentation-side notion of "dark".
+//
+// Light belongs to the ROOM, not to whoever happens to be carrying it, which
+// is why the exception quantifies over a SECOND actor: a torch in the cellar
+// lights it for everyone standing there. `Y = X` is the case where you are
+// carrying it yourself, so the one rule covers both. Writing this as
+// `~holding(X, torch)` — the obvious version — makes darkness a fact about a
+// person rather than about a place, and leaves you standing in the dark beside
+// a friend holding a lit torch.
+rule gloomy(X: actor): at(X) = cellar => in_dark(X)
+rule torchlit(X: actor, Y: actor, R: room):
+    here(X, R) & here(Y, R) & holding(Y, torch) => ~in_dark(X)
+torchlit > gloomy
 
 rule downed(X: actor): hp(X) <= 0 -> down(X)
 

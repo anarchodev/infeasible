@@ -215,6 +215,25 @@ check('cartdata survives a write and is not part of the log', (() => {
   return platform.cart.data.get(3) === 42 && rt.ctx.log.length === 10;
 })());
 
+console.log('\nlight belongs to the room, not to the carrier');
+{
+  // A fresh session, driven straight through the binding: the cart is not the
+  // subject here, the STORY is. Darkness written as "am I holding the torch"
+  // leaves you in the dark beside someone carrying a lit one, which is a
+  // modelling bug no amount of renderer work can fix.
+  const w2 = open(M, src);
+  check('the hero starts in the dark, alone in the cellar',
+        w2.q.in_dark('hero') === 'proved');
+  w2.step(w2.actions().add(w2.a.go_cellar('guard')));
+  w2.step(w2.actions().add(w2.a.take('guard', 'torch', 'cellar')));
+  check('a torch carried by SOMEONE ELSE lights the room you share',
+        w2.q.in_dark('hero') === 'refuted', w2.q.in_dark('hero'));
+  w2.step(w2.actions().add(w2.a.go_hall('guard')));
+  check('and it goes with them when they leave',
+        w2.q.in_dark('hero') === 'proved', w2.q.in_dark('hero'));
+  w2.close();
+}
+
 console.log('\nthe two clients meet on one save');
 {
   // `examples/cellar_play.log` is the fixture `tests/test_secondclient.c`

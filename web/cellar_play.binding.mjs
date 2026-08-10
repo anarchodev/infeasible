@@ -11,7 +11,7 @@
 /** @typedef {"cellar" | "hall" | "vault"} T_room */
 
 export const STORY = "examples/cellar_play.story";
-export const SOURCE_HASH = "a576566f";
+export const SOURCE_HASH = "d80d0e7f";
 export const SORTS = {"actor":["hero","guard"],"item":["rusty_key","torch","antidote"]};
 export const ENUMS = {"room":["cellar","hall","vault"]};
 
