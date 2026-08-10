@@ -56,6 +56,10 @@ export function open(M, src) {
     boolDeltas: c('inf_bool_deltas', 'number', ['number', 'number', 'number']),
     numDeltas: c('inf_num_deltas', 'number', ['number', 'number', 'number']),
     receipt: c('inf_num_receipt', 'number', ['number', 'number', 'number', 'number']),
+    subscribe: c('inf_subscribe', 'number', ['number', 'number', 'number']),
+    unsubscribe: c('inf_unsubscribe', null, ['number', 'number']),
+    subVerdict: c('inf_sub_verdict', 'number', ['number', 'number']),
+    subEdges: c('inf_sub_edges', 'number', ['number', 'number', 'number']),
   };
   if (hash(src) !== SOURCE_HASH)
     throw new Error('this binding was generated from a different ' + STORY +
@@ -235,6 +239,24 @@ export function open(M, src) {
       }
       return { base, raw, applied, lo, hi, hasRange: !!(flags & 1),
                clamped: !!(flags & 2), items };
+    },
+    /** Register interest in a literal (§11 M2) — one call shape for a base
+     *  fact and for a judgment, because a subscription names a conclusion,
+     *  not a storage decision. Returns a stable handle. */
+    subscribe: (term, neg = false) => api.subscribe(s, id(term), neg ? 1 : 0),
+    unsubscribe: (sub) => api.unsubscribe(s, sub),
+    /** The LEVEL: what a subscription says right now. */
+    verdict: (sub) => VERDICT[api.subVerdict(s, sub)],
+    /** The EDGES: which subscriptions flipped in the last step — the `btnp`
+     *  to level's `btn`. Decide from the level, react to these. */
+    edges() {
+      const cells = readCells(api.subEdges, 64);
+      const out = [];
+      for (let i = 0; i + 4 < cells.length; i += 5)
+        out.push({ sub: cells[i], atom: nameOf(cells[i + 1]), neg: !!cells[i + 2],
+                   from: VERDICT[cells[i + 3]], to: VERDICT[cells[i + 4]],
+                   rose: cells[i + 4] === 1, fell: cells[i + 3] === 1 });
+      return out;
     },
     /** The proof/defeat trace for a ground literal — the debugger (§5.1). */
     why: (term, neg = false) => api.why(s, id(term), neg ? 1 : 0),

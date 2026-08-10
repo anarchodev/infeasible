@@ -144,6 +144,28 @@ API int wf_num_receipt(world *w, uint32_t atom, long *out, int cap) {
  * fluent) — the JS side holds ids, not strings, until it renders. */
 API const char *wf_name(intern *t, uint32_t atom) { return intern_name(t, atom); }
 
+/* --- subscriptions (§11 M2): the reactive channel ---
+ * A stable handle per subscribed literal; the last step's flips marshal as
+ * quintuples [sub, atom, neg, from, to]. Verdict codes match dl_verdict. */
+API int wf_subscribe(world *w, uint32_t atom, int neg) {
+    dl_lit q = { atom, neg != 0 };
+    return world_subscribe(w, q);
+}
+API void wf_unsubscribe(world *w, int sub) { world_unsubscribe(w, sub); }
+API int  wf_sub_verdict(world *w, int sub) { return (int) world_sub_verdict(w, sub); }
+API int  wf_sub_edges(world *w, long *out, int cap) {
+    int n;
+    const world_sub_edge *e = world_sub_edges(w, &n);
+    for (int i = 0; i < n && 5 * i + 4 < cap; i++) {
+        out[5 * i]     = e[i].sub;
+        out[5 * i + 1] = (long) e[i].lit.atom;
+        out[5 * i + 2] = e[i].lit.neg ? 1 : 0;
+        out[5 * i + 3] = (long) e[i].from;
+        out[5 * i + 4] = (long) e[i].to;
+    }
+    return 5 * n;
+}
+
 /* --- burst cues (#11, §12): the transient emission channel ---
  *
  * The per-tick stream crosses the boundary the way §12's delta buffer does:

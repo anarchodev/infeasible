@@ -136,6 +136,41 @@ EXPORT int inf_step1(inf_session *s, unsigned action)
     return world_step(s->w, &action, 1, g_err, sizeof g_err);
 }
 
+/* Subscriptions (§11 M2): the reactive channel. `inf_subscribe` returns a
+ * stable handle; `inf_sub_edges` marshals the last step's flips as quadruples
+ * [sub, atom, neg, from, to] — five cells each — and returns the size the FULL
+ * answer needs, so a short buffer is a grow-and-retry. Verdicts are dl_verdict:
+ * 0 undecided, 1 proved, 2 refuted. */
+EXPORT int inf_subscribe(inf_session *s, unsigned atom, int neg)
+{
+    dl_lit q = neg ? dl_neg(atom) : dl_pos(atom);
+    return world_subscribe(s->w, q);
+}
+
+EXPORT void inf_unsubscribe(inf_session *s, int sub)
+{
+    world_unsubscribe(s->w, sub);
+}
+
+EXPORT int inf_sub_verdict(inf_session *s, int sub)
+{
+    return (int)world_sub_verdict(s->w, sub);
+}
+
+EXPORT int inf_sub_edges(inf_session *s, long *out, int cap)
+{
+    int n;
+    const world_sub_edge *e = world_sub_edges(s->w, &n);
+    for (int i = 0; i < n && 5 * i + 4 < cap; i++) {
+        out[5 * i]     = e[i].sub;
+        out[5 * i + 1] = (long)e[i].lit.atom;
+        out[5 * i + 2] = e[i].lit.neg ? 1 : 0;
+        out[5 * i + 3] = (long)e[i].from;
+        out[5 * i + 4] = (long)e[i].to;
+    }
+    return 5 * n;
+}
+
 /* The step log (#88): the changeset and the commit receipt, marshalled into a
  * caller-provided buffer of `long`. Each returns the number of cells the FULL
  * answer needs, so a short buffer is a grow-and-retry rather than a silent

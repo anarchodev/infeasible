@@ -56,6 +56,11 @@ enforced at `add`, naming the order already in the set, so a host collecting
 orders from remote clients rejects one order instead of losing the tick.
 `binding_check.mjs` pins that behaviour against `examples/reaction5e.story`.
 
+The binding also carries the reactive channel (§11 M2): `w.subscribe(term)`
+registers interest in a literal — base fact or judgment, same call — `w.verdict(h)`
+is the level, and `w.edges()` is what flipped in the last step, each entry
+carrying `rose`/`fell` alongside the from/to verdicts.
+
 ## Known rough edges (M2 to smooth)
 
 - The module is **CommonJS**, loaded from the ESM host via `createRequire`:
