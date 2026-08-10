@@ -16,7 +16,8 @@
 //   held(item, actor)        ...or carried beside a holder
 //   shaded(anchor)           the composite op over a region
 //   gauge(anchor, actor)     a bar, filled by the blessed hp / hp_max
-//   picked(actor)            whose menu is showing
+//   picked(E)                the SUBJECT — whose menu this is
+//   aimed(E)                 the OBJECT — what a command is aimed at
 //   surfaced(judgment)       a guard worth showing a refused command for
 //   cue_sound(cue, sound)    an emission plays a sound
 //   cue_word(cue, word)      ...and floats a word
@@ -46,8 +47,6 @@ const verb = (term) => term.replace(/\(.*/, '');
  *  §6.3 artifact publishes. */
 const args = (term) =>
   (term.includes('(') ? term.slice(term.indexOf('(') + 1, -1).split(',') : []);
-/** Is this ground action about that entity? */
-const mentions = (term, e) => args(term).includes(e);
 
 /** Cross an argument list's domains into every ground tuple. */
 function tuples(domains) {
@@ -73,6 +72,37 @@ export function createScene(w, iface, doms) {
   const isProved = (name, ...t) => !!w.q[name] && w.q[name](...t) === 'proved';
 
   const spriteIndex = (s) => (doms.sprite ?? []).indexOf(s);
+
+  /** Which declared domain a ground argument belongs to. Sorts hold entities;
+   *  enums hold values. Telling them apart is what lets a menu reason about
+   *  "something of the subject's own kind" without knowing any kind's name. */
+  const sortMap = new Map(Object.entries(doms).flatMap(([k, v]) => v.map((e) => [e, k])));
+  const sortOf = (e) => sortMap.get(e) ?? null;
+  const isEntity = (a) => sortMap.has(a);
+
+  /** What clicking a thing does.
+   *
+   *  Selection is per-viewer state, and per-viewer state has no home until
+   *  §5.5's scopes exist — so for now it lives in the shared world, which means
+   *  it has to be an ACTION. `pick_<entity>` sets the subject and
+   *  `aim_<entity>` sets the object; both games arrived at that shape
+   *  independently, for the same reason ("select one, clear the rest" is not
+   *  something a parameterized action can say).
+   *
+   *  So this is a NAMING CONVENTION standing in for a language feature, and it
+   *  should die when scopes arrive. It is written out rather than inferred
+   *  because inferring it — "any applicable action with one entity argument" —
+   *  swallowed `go_hall(hero)` and hid half the cellar's menu. A convention
+   *  that is wrong is worse than one that is merely temporary. */
+  const CLICK = ['pick_', 'aim_'];
+  const pickTerm = (e) => {
+    for (const item of w.menu()) {
+      if (item.status !== 'applies' || args(item.term).length) continue;
+      if (CLICK.some((p) => verb(item.term) === p + e)) return item.term;
+    }
+    return null;
+  };
+
   const box = (a) => ({ x: w.state.ax(a), y: w.state.ay(a),
                         w: w.state.aw(a), h: w.state.ah(a) });
 
@@ -95,6 +125,7 @@ export function createScene(w, iface, doms) {
 
     const held = proved('held');                       // [item, actor]
     const picked = proved('picked').map((t) => t[0])[0] ?? null;
+    const aimed = proved('aimed').map((t) => t[0])[0] ?? null;
 
     // THE MENU IS THE ENGINE'S ANSWER. It used to be an `offers`/`blocked`
     // pair of judgments the story wrote beside every action — the `requires`
@@ -116,7 +147,25 @@ export function createScene(w, iface, doms) {
     // is two rows), but a verb with no applicable instance contributes at most
     // ONE refused row — the reason you cannot drop the torch is not three
     // different reasons.
-    const rows = picked ? w.menu().filter((item) => mentions(item.term, picked)) : [];
+    // WHICH ROWS BELONG TO THIS MENU. The first version filtered by "the term
+    // mentions the subject", which was the first game's shape talking: every
+    // cellar action carried its actor as an argument. A duel's does not —
+    // `strike(bolt_a, gnoll)` never names who is striking — so that filter hid
+    // the entire game.
+    //
+    // The rule that serves both is about SORT, not position: hide a row that
+    // names something of the SUBJECT'S OWN KIND which is neither the subject
+    // nor the object. `go_hall(guard)` is the guard's business,
+    // `strike(bolt_a, imp)` is aimed at someone you are not aiming at, and an
+    // action naming nothing of that kind (`end_turn`) is nobody's and
+    // everybody's, so it is always offered.
+    const clickable = new Set([...sortMap.keys()].map(pickTerm).filter(Boolean));
+    const kin = picked ? sortOf(picked) : null;
+    const rows = picked
+      ? w.menu().filter((item) => !clickable.has(item.term) &&
+          args(item.term).filter((a) => sortOf(a) === kin)
+                         .every((a) => a === picked || a === aimed))
+      : [];
     const byVerb = new Map();
     for (const r of rows) {
       const g = byVerb.get(verb(r.term)) ?? { ok: [], blocked: [] };
@@ -130,19 +179,27 @@ export function createScene(w, iface, doms) {
       if (best) visible.push(best);
     }
 
-    // ...and where one verb DOES leave several rows, the label has to say
-    // which is which, so the distinguishing arguments come back into it.
-    const many = new Set(visible.map((r) => verb(r.term))
-                                .filter((v, i, a) => a.indexOf(v) !== i));
+    // ...and where one verb DOES leave several rows, the label has to say which
+    // is which — but only by what actually DIFFERS between them. Appending
+    // every argument gives "STRIKE EDGE A GNOLL" when the target is the same
+    // in both, and the noise is the part a player has to read past.
     const menu = [];
     if (picked) {
       const m = geom.a_menu ?? { x: 8, y: 244, w: 176, h: 12 };
+      const group = new Map();
+      for (const r of visible) {
+        const g = group.get(verb(r.term)) ?? [];
+        g.push(r);
+        group.set(verb(r.term), g);
+      }
       visible.forEach((item, i) => {
-        const rest = args(item.term).filter((a) => a !== picked);
+        const peers = group.get(verb(item.term));
+        const mine = args(item.term);
+        const differs = peers.length < 2 ? []
+          : mine.filter((a, k) => peers.some((p) => args(p.term)[k] !== a));
         menu.push({
           term: item.term, ok: item.ok, blockers: item.blockers ?? [],
-          label: say(verb(item.term)) +
-                 (many.has(verb(item.term)) && rest.length ? ' ' + rest.map(say).join(' ') : ''),
+          label: say(verb(item.term)) + (differs.length ? ' ' + differs.map(say).join(' ') : ''),
           x: m.x, y: m.y + i * (m.h + 3), w: m.w, h: m.h,
         });
       });
@@ -154,7 +211,7 @@ export function createScene(w, iface, doms) {
       captions: proved('caption'),
       shaded: proved('shaded').map((t) => t[0]),
       gauges: proved('gauge'),
-      slots, held, picked, menu,
+      slots, held, picked, aimed, menu,
       sprite: (e) => {
         const a = proved('shows').find((t) => t[0] === e);
         const p = proved('prop_shows').find((t) => t[0] === e);
@@ -200,6 +257,7 @@ export function createScene(w, iface, doms) {
         const idx = m.sprite(o.e);
         if (idx >= 0) d.spr(sheet, idx, x, y);
         if (o.e === m.picked) d.rect(x - 3, y - 3, 22, 22, 6);
+        if (o.e === m.aimed && o.e !== m.picked) d.rect(x - 3, y - 3, 22, 22, 10);
         o.at = { x, y, w: 16, h: 16 };
         // whatever this occupant carries rides beside it
         const mine = m.held.filter(([, by]) => by === o.e);
@@ -291,8 +349,8 @@ export function createScene(w, iface, doms) {
     },
     /** Every proved ground instance of a judgment, as tuples. */
     pairs: proved,
-    /** The `pick_<entity>` action, if the story declares one. */
-    pick: (e) => (w.a[`pick_${e}`] ? w.a[`pick_${e}`]() : null),
+    /** What clicking an entity submits — see pickTerm. */
+    pickAction: pickTerm,
     isProved,
     model: () => model,
     say,

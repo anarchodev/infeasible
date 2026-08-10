@@ -45,8 +45,9 @@ export function pureCart({ world, iface, doms, sheets, resolution = [640, 360] }
 
       if (target.kind === 'entity') {
         this.why = ctx.why = '';
-        const act = scene.pick(target.entity);
-        return act ? ctx.world.actions().add(act) : null;
+        const term = scene.pickAction(target.entity);
+        return term ? ctx.world.actions().add({ action: verb(term), args: {}, term })
+                    : null;
       }
       if (target.ok) {
         this.why = ctx.why = '';

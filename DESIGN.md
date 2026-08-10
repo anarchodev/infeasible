@@ -3117,7 +3117,51 @@ between a refusal and a typo, and from *speculative* — a rule whose remaining
 conditions are about the next state, which cannot be decided without taking the
 step and so is reported rather than silently judged.
 
-Five frictions remain, and they are the shape of the work left (a sixth — an
+**A second game says which of that was universal.** `examples/duel_pure.story`
+is a card duel drawn by the same renderer with no edit between them — chosen to
+be as far from the cellar as a game can be and still be drawn at all: no space,
+so things live in zones rather than rooms; you act ON a target, so a command
+needs a subject *and* an object; numbers are the game rather than scenery; and
+the menu is a hand that changes every turn. `web/skins_check.mjs` measures the
+overlap rather than asserting it.
+
+Nine of the fourteen blessed predicates were needed by both — `panel`,
+`caption`, `shows`/`prop_shows`, `in_anchor`/`prop_in`, `gauge`, `picked`,
+`cue_sound`, and the geometry table. That is the shared core, and it is most of
+the vocabulary rather than a coincidence. Five turned out to be one game's
+furniture: `held`, `shaded`, `here` and `cue_word` are the cellar's, `aimed` is
+the duel's.
+
+Three things the *renderer* believed turned out to be the first game's shape,
+and all three were invisible until the second:
+
+- **Filtering a menu by "the term mentions the subject"** worked only because
+  every cellar action carried its actor as an argument. A duel's does not —
+  `strike(edge_a, gnoll)` never names who is striking — and that filter hid the
+  entire game. The rule that serves both is about SORT: hide a row naming
+  something of the subject's own kind that is neither the subject nor the
+  object.
+- **An action with no arguments was unreachable**, because a filter keyed on
+  the subject can never match one. `end_turn` is nobody's and everybody's.
+- **Subject and object are two selections, not one.** The cellar needed only
+  the first, so one game could not have told us.
+
+And three things *neither* could say, which is the more useful list because an
+item demanded by two independent games is no longer a matter of taste:
+
+1. **A number that is not the blessed one.** Energy, a card's cost — a judgment
+   carries an entity, never a quantity, so the only number a gauge can read is
+   one the renderer knows by name. Naming a fluent as an argument closes it.
+2. **A label on a THING rather than on a region.** `caption` takes an anchor;
+   cards and fighters have no anchor of their own, so they cannot be named.
+3. **"Select one, clear the rest."** Both games paid one concrete action per
+   entity for it — `pick_hero`/`pick_guard`, `aim_gnoll`/`aim_imp`/`aim_you` —
+   because a parameterized action cannot say "the others". Until §5.5's scopes
+   exist this is also why selection is world state at all, and the renderer
+   routes clicks by a `pick_`/`aim_` NAMING CONVENTION that should die with it.
+
+Five frictions remain from the first experiment, and they are the shape of the
+work left (a sixth — an
 action's extra parameters needing recovery by convention — went away with the
 menu, since the engine names a GROUND action and the term carries its own
 arguments):
