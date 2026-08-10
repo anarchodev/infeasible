@@ -99,9 +99,13 @@ another `.story` and it draws another game. `platform/purecart.mjs` is the
 driver that ties it to the runtime and contains no game at all.
 
 `pure_check.mjs` plays it to the end headlessly and then prints the price,
-which is the actual result of the experiment: 62 presentation rules, 37 enum
-members, 14 rows of geometry, zero game JS, and 244 lines of *generic* renderer
-standing in for a 318-line cart. DESIGN.md §12 records the six frictions.
+which is the actual result of the experiment: 43 presentation rules, 24 enum
+members, 14 rows of geometry, zero game JS, and 248 lines of *generic* renderer
+standing in for a 318-line cart. DESIGN.md §12 records the frictions.
+
+The menu is not in the story: `w.menu()` asks the engine which ground actions
+apply right now and, for the rest, which guard refused them — so no client
+writes a judgment mirroring an action's own `requires`.
 
 The cart is worth reading for how little it decides. It does not know when the
 door may be forced (`q.can_force_door(who)`); it does not compute what a click

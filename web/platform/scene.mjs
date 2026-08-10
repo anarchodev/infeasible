@@ -17,9 +17,7 @@
 //   shaded(anchor)           the composite op over a region
 //   gauge(anchor, actor)     a bar, filled by the blessed hp / hp_max
 //   picked(actor)            whose menu is showing
-//   offers(actor, cmd)       a command, in `cmd` declaration order
-//   blocked(actor, cmd)      ...offered but refused; clicking prints `why`
-//   here(actor, room)        also fills a room-sorted action parameter
+//   surfaced(judgment)       a guard worth showing a refused command for
 //   cue_sound(cue, sound)    an emission plays a sound
 //   cue_word(cue, word)      ...and floats a word
 //
@@ -41,6 +39,12 @@ const BIG = { big: true };
 /** `w_the_cellar` -> "THE CELLAR". Strips the vocabulary prefix an author uses
  *  to keep enum members from colliding, then reads the atom as English. */
 const say = (atom) => String(atom).replace(/^[a-z]_/, '').replace(/_/g, ' ').toUpperCase();
+
+/** `take_torch(hero,hall)` -> `take_torch`; the label a menu row shows. */
+const verb = (term) => term.replace(/\(.*/, '');
+/** Is this ground action about that entity? Its arguments are in its name. */
+const mentions = (term, e) =>
+  term.slice(term.indexOf('(') + 1, -1).split(',').includes(e);
 
 /** Cross an argument list's domains into every ground tuple. */
 function tuples(domains) {
@@ -89,18 +93,21 @@ export function createScene(w, iface, doms) {
     const held = proved('held');                       // [item, actor]
     const picked = proved('picked').map((t) => t[0])[0] ?? null;
 
+    // THE MENU IS THE ENGINE'S ANSWER. It used to be an `offers`/`blocked`
+    // pair of judgments the story wrote beside every action — the `requires`
+    // clause restated, free to drift from the original. `w.menu()` asks the
+    // world instead: every ground action it has a rule for, whether it applies
+    // now, and the guards that refused it. Filtered to the picked actor by the
+    // one thing a client legitimately knows — the actor is in the term.
     const menu = [];
     if (picked) {
-      const order = doms.cmd ?? [];
-      const offered = new Set(proved('offers').filter((t) => t[0] === picked)
-                                              .map((t) => t[1]));
-      const blocked = new Set(proved('blocked').filter((t) => t[0] === picked)
-                                               .map((t) => t[1]));
-      const m = geom[anchorOf('a_menu')] ?? { x: 8, y: 244, w: 176, h: 12 };
+      const m = geom.a_menu ?? { x: 8, y: 244, w: 176, h: 12 };
       let i = 0;
-      for (const c of order) {
-        if (!offered.has(c)) continue;
-        menu.push({ cmd: c, ok: !blocked.has(c), label: say(c),
+      for (const item of w.menu()) {
+        if (!mentions(item.term, picked)) continue;
+        if (item.status !== 'applies' && !offerable(item)) continue;
+        menu.push({ term: item.term, ok: item.ok, label: say(verb(item.term)),
+                    blockers: item.blockers ?? [],
                     x: m.x, y: m.y + i * (m.h + 3), w: m.w, h: m.h });
         i++;
       }
@@ -218,16 +225,17 @@ export function createScene(w, iface, doms) {
 
   // ---- input: a click is a command, and a command is an action ---------
 
-  /** Fill an action's declared parameters from the picked actor and its room. */
-  function bind(cmdAtom) {
-    const name = cmdAtom.replace(/^c_/, '');
-    const params = actionParams.get(name);
-    if (!params || !model?.picked) return null;
-    const room = (proved('here').find((t) => t[0] === model.picked) ?? [])[1];
-    const args = params.map((p) => (p === 'room' ? room : model.picked));
-    if (args.some((a) => a === undefined)) return null;
-    return w.a[name](...args);
-  }
+  /** A blocked row is worth SHOWING when its refusal is an argument rather
+   *  than an absence. One blocker means everything holds but one thing — the
+   *  row is one step away — and a blocker that is a JUDGMENT means there is a
+   *  `why` worth reading, where a base fact ("you are not there", "you are not
+   *  holding it") is merely absent and has no trace to print. Both halves come
+   *  from the artifact, so no story declares which of its guards are
+   *  interesting. */
+  const isJudgment = new Set(iface.judgments.map((j) => j.name));
+  const predOf = (atom) => atom.replace(/[(=].*/, '');
+  const offerable = (item) =>
+    item.blockers?.length === 1 && isJudgment.has(predOf(item.blockers[0].atom));
 
   return {
     rebuild,
@@ -238,7 +246,7 @@ export function createScene(w, iface, doms) {
       if (!m) return null;
       for (const b of m.menu)
         if (p.x >= b.x && p.x < b.x + b.w && p.y >= b.y && p.y < b.y + b.h)
-          return { kind: 'cmd', cmd: b.cmd, ok: b.ok };
+          return { kind: 'cmd', term: b.term, ok: b.ok, blockers: b.blockers };
       for (const list of Object.values(m.slots))
         for (const o of list)
           if (o.at && p.x >= o.at.x - 3 && p.x < o.at.x + 19 &&
@@ -246,7 +254,6 @@ export function createScene(w, iface, doms) {
             return { kind: 'entity', entity: o.e };
       return null;
     },
-    bind,
     /** Every proved ground instance of a judgment, as tuples. */
     pairs: proved,
     /** The `pick_<entity>` action, if the story declares one. */

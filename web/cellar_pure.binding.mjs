@@ -13,16 +13,15 @@
 /** @typedef {"st_room" | "st_bar" | "st_title" | "st_button" | "st_button_off"} T_style */
 /** @typedef {"a_title" | "a_cellar" | "a_hall" | "a_vault" | "a_door" | "a_bar" | "a_who" | "a_note" | "a_menu" | "a_status"} T_anchor */
 /** @typedef {"w_the_cellar" | "w_cellar" | "w_hall" | "w_vault" | "w_hero" | "w_guard" | "w_locked" | "w_jammed" | "w_open" | "w_weakened" | "w_oof" | "w_aah" | "w_got_it" | "w_tab_switches"} T_word */
-/** @typedef {"c_go_hall" | "c_go_cellar" | "c_enter_vault" | "c_leave_vault" | "c_take_torch" | "c_take_key" | "c_take_antidote" | "c_drop_torch" | "c_drop_key" | "c_drop_antidote" | "c_unlock" | "c_force_door" | "c_drink"} T_cmd */
 /** @typedef {"q_footstep" | "q_pickup" | "q_clunk" | "q_heave" | "q_sip"} T_cue */
 /** @typedef {"snd_step" | "snd_chime" | "snd_lock" | "snd_thud" | "snd_gulp"} T_sound */
 
 export const STORY = "examples/cellar_pure.story";
-export const SOURCE_HASH = "534545f8";
+export const SOURCE_HASH = "6ff426c2";
 export const SORTS = {"actor":["hero","guard"],"item":["rusty_key","torch","antidote"]};
-export const ENUMS = {"room":["cellar","hall","vault"],"sprite":["s_hero","s_guard","s_key","s_torch","s_flask"],"style":["st_room","st_bar","st_title","st_button","st_button_off"],"anchor":["a_title","a_cellar","a_hall","a_vault","a_door","a_bar","a_who","a_note","a_menu","a_status"],"word":["w_the_cellar","w_cellar","w_hall","w_vault","w_hero","w_guard","w_locked","w_jammed","w_open","w_weakened","w_oof","w_aah","w_got_it","w_tab_switches"],"cmd":["c_go_hall","c_go_cellar","c_enter_vault","c_leave_vault","c_take_torch","c_take_key","c_take_antidote","c_drop_torch","c_drop_key","c_drop_antidote","c_unlock","c_force_door","c_drink"],"cue":["q_footstep","q_pickup","q_clunk","q_heave","q_sip"],"sound":["snd_step","snd_chime","snd_lock","snd_thud","snd_gulp"]};
+export const ENUMS = {"room":["cellar","hall","vault"],"sprite":["s_hero","s_guard","s_key","s_torch","s_flask"],"style":["st_room","st_bar","st_title","st_button","st_button_off"],"anchor":["a_title","a_cellar","a_hall","a_vault","a_door","a_bar","a_who","a_note","a_menu","a_status"],"word":["w_the_cellar","w_cellar","w_hall","w_vault","w_hero","w_guard","w_locked","w_jammed","w_open","w_weakened","w_oof","w_aah","w_got_it","w_tab_switches"],"cue":["q_footstep","q_pickup","q_clunk","q_heave","q_sip"],"sound":["snd_step","snd_chime","snd_lock","snd_thud","snd_gulp"]};
 
-export const IFACE = {"judgments":[{"name":"weakened","args":["actor"]},{"name":"here","args":["actor","room"]},{"name":"torch_in","args":["room"]},{"name":"in_dark","args":["actor"]},{"name":"can_enter_vault","args":["actor"]},{"name":"can_unlock_door","args":["actor"]},{"name":"can_force_door","args":["actor"]},{"name":"down","args":["actor"]},{"name":"panel","args":["anchor","style"]},{"name":"caption","args":["anchor","word"]},{"name":"in_anchor","args":["actor","anchor"]},{"name":"prop_in","args":["item","anchor"]},{"name":"held","args":["item","actor"]},{"name":"shows","args":["actor","sprite"]},{"name":"prop_shows","args":["item","sprite"]},{"name":"shaded","args":["anchor"]},{"name":"gauge","args":["anchor","actor"]},{"name":"picked","args":["actor"]},{"name":"offers","args":["actor","cmd"]},{"name":"blocked","args":["actor","cmd"]},{"name":"cue_sound","args":["cue","sound"]},{"name":"cue_word","args":["cue","word"]}],"state":[{"name":"at","args":["actor"],"type":"enum","values":["cellar","hall","vault"]},{"name":"on_floor","args":["item","room"],"type":"bool"},{"name":"holding","args":["actor","item"],"type":"bool"},{"name":"door","args":[],"type":"enum","values":["locked","jammed","open"]},{"name":"poisoned","args":["actor"],"type":"bool"},{"name":"hp","args":["actor"],"type":"int"},{"name":"hp_max","args":["actor"],"type":"int"},{"name":"selected","args":["actor"],"type":"bool"},{"name":"showing","args":[],"type":"bool"},{"name":"ax","args":["anchor"],"type":"int"},{"name":"ay","args":["anchor"],"type":"int"},{"name":"aw","args":["anchor"],"type":"int"},{"name":"ah","args":["anchor"],"type":"int"}],"actions":[{"name":"go_hall","params":["actor"]},{"name":"go_cellar","params":["actor"]},{"name":"enter_vault","params":["actor"]},{"name":"leave_vault","params":["actor"]},{"name":"take_torch","params":["actor","room"]},{"name":"take_key","params":["actor","room"]},{"name":"take_antidote","params":["actor","room"]},{"name":"drop_torch","params":["actor","room"]},{"name":"drop_key","params":["actor","room"]},{"name":"drop_antidote","params":["actor","room"]},{"name":"unlock","params":["actor"]},{"name":"force_door","params":["actor"]},{"name":"drink","params":["actor"]},{"name":"pick_hero","params":[]},{"name":"pick_guard","params":[]}]};
+export const IFACE = {"judgments":[{"name":"weakened","args":["actor"]},{"name":"here","args":["actor","room"]},{"name":"torch_in","args":["room"]},{"name":"in_dark","args":["actor"]},{"name":"can_enter_vault","args":["actor"]},{"name":"can_unlock_door","args":["actor"]},{"name":"can_force_door","args":["actor"]},{"name":"down","args":["actor"]},{"name":"panel","args":["anchor","style"]},{"name":"caption","args":["anchor","word"]},{"name":"in_anchor","args":["actor","anchor"]},{"name":"prop_in","args":["item","anchor"]},{"name":"held","args":["item","actor"]},{"name":"shows","args":["actor","sprite"]},{"name":"prop_shows","args":["item","sprite"]},{"name":"shaded","args":["anchor"]},{"name":"gauge","args":["anchor","actor"]},{"name":"picked","args":["actor"]},{"name":"cue_sound","args":["cue","sound"]},{"name":"cue_word","args":["cue","word"]}],"state":[{"name":"at","args":["actor"],"type":"enum","values":["cellar","hall","vault"]},{"name":"on_floor","args":["item","room"],"type":"bool"},{"name":"holding","args":["actor","item"],"type":"bool"},{"name":"door","args":[],"type":"enum","values":["locked","jammed","open"]},{"name":"poisoned","args":["actor"],"type":"bool"},{"name":"hp","args":["actor"],"type":"int"},{"name":"hp_max","args":["actor"],"type":"int"},{"name":"selected","args":["actor"],"type":"bool"},{"name":"showing","args":[],"type":"bool"},{"name":"ax","args":["anchor"],"type":"int"},{"name":"ay","args":["anchor"],"type":"int"},{"name":"aw","args":["anchor"],"type":"int"},{"name":"ah","args":["anchor"],"type":"int"}],"actions":[{"name":"go_hall","params":["actor"]},{"name":"go_cellar","params":["actor"]},{"name":"enter_vault","params":["actor"]},{"name":"leave_vault","params":["actor"]},{"name":"take_torch","params":["actor","room"]},{"name":"take_key","params":["actor","room"]},{"name":"take_antidote","params":["actor","room"]},{"name":"drop_torch","params":["actor","room"]},{"name":"drop_key","params":["actor","room"]},{"name":"drop_antidote","params":["actor","room"]},{"name":"unlock","params":["actor"]},{"name":"force_door","params":["actor"]},{"name":"drink","params":["actor"]},{"name":"pick_hero","params":[]},{"name":"pick_guard","params":[]}]};
 
 // #159 exclusive groups, exactly as world_step checks them: a step admits at
 // most one member per (group, key). The builder below refuses the second at
@@ -71,6 +70,9 @@ export function open(M, src) {
     unsubscribe: c('inf_unsubscribe', null, ['number', 'number']),
     subVerdict: c('inf_sub_verdict', 'number', ['number', 'number']),
     subEdges: c('inf_sub_edges', 'number', ['number', 'number', 'number']),
+    actions_: c('inf_actions', 'number', ['number', 'number', 'number']),
+    actionStatus: c('inf_action_status', 'number', ['number', 'number']),
+    actionBlockers: c('inf_action_blockers', 'number', ['number', 'number', 'number', 'number']),
   };
   if (hash(src) !== SOURCE_HASH)
     throw new Error('this binding was generated from a different ' + STORY +
@@ -231,22 +233,6 @@ export function open(M, src) {
 
     picked: (a0) => { chk("actor", a0);
       return VERDICT[api.query(s, id(`picked(${a0})`), 0)]; },
-    /**
-     * @param {T_actor} a0
-     * @param {T_cmd} a1
-     * @returns {'undecided'|'proved'|'refuted'}
-     */
-
-    offers: (a0, a1) => { chk("actor", a0); chk("cmd", a1);
-      return VERDICT[api.query(s, id(`offers(${a0},${a1})`), 0)]; },
-    /**
-     * @param {T_actor} a0
-     * @param {T_cmd} a1
-     * @returns {'undecided'|'proved'|'refuted'}
-     */
-
-    blocked: (a0, a1) => { chk("actor", a0); chk("cmd", a1);
-      return VERDICT[api.query(s, id(`blocked(${a0},${a1})`), 0)]; },
     /**
      * @param {T_cue} a0
      * @param {T_sound} a1
@@ -529,22 +515,6 @@ export function open(M, src) {
 
     picked: (a0) => { chk("actor", a0);
       return `picked(${a0})`; },
-    /**
-     * @param {T_actor} a0
-     * @param {T_cmd} a1
-     * @returns {string}
-     */
-
-    offers: (a0, a1) => { chk("actor", a0); chk("cmd", a1);
-      return `offers(${a0},${a1})`; },
-    /**
-     * @param {T_actor} a0
-     * @param {T_cmd} a1
-     * @returns {string}
-     */
-
-    blocked: (a0, a1) => { chk("actor", a0); chk("cmd", a1);
-      return `blocked(${a0},${a1})`; },
     /**
      * @param {T_cue} a0
      * @param {T_sound} a1
@@ -833,6 +803,31 @@ export function open(M, src) {
         out.push({ sub: cells[i], atom: nameOf(cells[i + 1]), neg: !!cells[i + 2],
                    from: VERDICT[cells[i + 3]], to: VERDICT[cells[i + 4]],
                    rose: cells[i + 4] === 1, fell: cells[i + 3] === 1 });
+      return out;
+    },
+    /** THE MENU, answered by the engine (§6.3): every ground action the
+     *  world has a rule for, with whether it applies now and — when it does
+     *  not — the guards that refused it, each an ordinary literal so
+     *  `why` on one prints the argument. A client that writes a judgment
+     *  beside every action to mirror its own `requires` has written the
+     *  rule twice and may drift; this is the engine's own answer. */
+    menu(all = false) {
+      const ids = readCells(api.actions_, 64);
+      const STATUS = ['applies', 'blocked', 'speculative', 'unknown'];
+      const out = [];
+      for (const id of ids) {
+        const status = STATUS[api.actionStatus(s, id)];
+        if (!all && status === 'unknown') continue;
+        const term = nameOf(id);
+        const item = { term, status, ok: status === 'applies' };
+        if (status === 'blocked') {
+          const cells = readCells((sess, p, cap) => api.actionBlockers(sess, id, p, cap), 16);
+          item.blockers = [];
+          for (let i = 0; i + 1 < cells.length; i += 2)
+            item.blockers.push({ atom: nameOf(cells[i]), neg: !!cells[i + 1] });
+        }
+        out.push(item);
+      }
       return out;
     },
     /** The proof/defeat trace for a ground literal — the debugger (§5.1). */

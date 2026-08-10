@@ -29,8 +29,7 @@
 //     cue_sound(cue, sound)   an emission plays a sound
 //     cue_word(cue, word)     ...and floats a word
 //
-//   ENUM ORDER IS MEANING: `sprite` order is the atlas index and `cmd` order
-//   is menu order. Declaration order is already the
+//   ENUM ORDER IS MEANING: a `sprite` member's position is its atlas index. Declaration order is already the
 //   engine's tie-break for emissions (I4); the renderer inherits it, so two
 //   clients cannot disagree about what is on top.
 
@@ -52,12 +51,6 @@ enum word {
     w_the_cellar, w_cellar, w_hall, w_vault,
     w_hero, w_guard, w_locked, w_jammed, w_open,
     w_weakened, w_oof, w_aah, w_got_it, w_tab_switches
-}
-enum cmd {
-    c_go_hall, c_go_cellar, c_enter_vault, c_leave_vault,
-    c_take_torch, c_take_key, c_take_antidote,
-    c_drop_torch, c_drop_key, c_drop_antidote,
-    c_unlock, c_force_door, c_drink
 }
 enum cue { q_footstep, q_pickup, q_clunk, q_heave, q_sip }
 enum sound { snd_step, snd_chime, snd_lock, snd_thud, snd_gulp }
@@ -257,30 +250,14 @@ rule who_h: selected(hero)  => caption(a_who, w_hero)
 rule who_g: selected(guard) => caption(a_who, w_guard)
 rule sel(X: actor): selected(X) => picked(X)
 
-// ---- the menu: a command is offered when its judgment says so --------------
-
-rule m_go_hall(X: actor):    at(X) = cellar => offers(X, c_go_hall)
-rule m_go_cellar(X: actor):  at(X) = hall   => offers(X, c_go_cellar)
-rule m_leave(X: actor):      at(X) = vault  => offers(X, c_leave_vault)
-
-rule m_enter(X: actor):      at(X) = hall   => offers(X, c_enter_vault)
-rule m_enter_no(X: actor):   at(X) = hall & ~can_enter_vault(X) => blocked(X, c_enter_vault)
-rule m_unlock(X: actor):     at(X) = hall   => offers(X, c_unlock)
-rule m_unlock_no(X: actor):  at(X) = hall & ~can_unlock_door(X) => blocked(X, c_unlock)
-rule m_force(X: actor):      at(X) = hall   => offers(X, c_force_door)
-rule m_force_no(X: actor):   at(X) = hall & ~can_force_door(X)  => blocked(X, c_force_door)
-
-rule m_tk(X: actor, R: room): here(X, R) & on_floor(torch, R)     => offers(X, c_take_torch)
-rule m_tk_no(X: actor):       in_dark(X)                          => blocked(X, c_take_torch)
-rule m_ky(X: actor, R: room): here(X, R) & on_floor(rusty_key, R) => offers(X, c_take_key)
-rule m_ky_no(X: actor):       in_dark(X)                          => blocked(X, c_take_key)
-rule m_an(X: actor, R: room): here(X, R) & on_floor(antidote, R)  => offers(X, c_take_antidote)
-rule m_an_no(X: actor):       in_dark(X)                          => blocked(X, c_take_antidote)
-
-rule m_dt(X: actor): holding(X, torch)     => offers(X, c_drop_torch)
-rule m_dk(X: actor): holding(X, rusty_key) => offers(X, c_drop_key)
-rule m_da(X: actor): holding(X, antidote)  => offers(X, c_drop_antidote)
-rule m_drink(X: actor): holding(X, antidote) & poisoned(X) => offers(X, c_drink)
+// ---- the menu is not here any more ----------------------------------------
+//
+// It used to be a `cmd` enum mirroring the actions plus ~20 rules restating
+// each action's `requires` as an `offers`/`blocked` judgment — the rule written
+// twice, free to drift. The engine answers it directly now
+// (`world_actions` / `world_action_status_of` / `world_action_blockers`), so
+// the vocabulary and the rules are simply gone. What the story still says is
+// which actions a client should SURFACE, and it says it by declaring them.
 
 // ---- cues: the sound and the floating word, declared not coded -------------
 

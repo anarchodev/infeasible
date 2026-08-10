@@ -1772,6 +1772,85 @@ dl_verdict world_query(world *w, dl_lit q)
     return query_jfam(w, q);
 }
 
+/* ---- Applicable actions (§6.3): what a client may offer, and why not ------
+ *
+ * The question every client asks about every choice it presents. The engine
+ * already evaluates an action's guards as step-rule body conditions each step,
+ * so answering here deletes the mirror judgment a client would otherwise write
+ * beside every action — a second copy of the `requires` clause, free to drift
+ * from the first. */
+
+/* Unsatisfied current-state conditions of one rule; primed ones are not
+ * decidable without taking the step, so they are counted separately. */
+static int rule_failures(world *w, const srule *r, dl_lit *out, int cap, int *nprimed)
+{
+    int bad = 0;
+    *nprimed = 0;
+    for (int i = 0; i < r->nbody; i++) {
+        if (r->body[i].primed) { (*nprimed)++; continue; }
+        if (world_query(w, r->body[i].lit) == DL_PROVED) continue;
+        if (out && bad < cap) out[bad] = r->body[i].lit;
+        bad++;
+    }
+    return bad;
+}
+
+int world_actions(const world *w, uint32_t *out, int cap)
+{
+    int n = 0;
+    for (int i = 0; i < w->nsr; i++) {
+        uint32_t a = w->srules[i].action;
+        if (a == INTERN_NONE) continue;            /* a ramification is not offered */
+        bool seen = false;                         /* several rules may share one */
+        for (int j = 0; j < i && !seen; j++)
+            if (w->srules[j].action == a) seen = true;
+        if (seen) continue;
+        if (out && n < cap) out[n] = a;
+        n++;
+    }
+    return n;
+}
+
+world_action_status world_action_status_of(world *w, uint32_t action)
+{
+    bool any = false, any_current = false;
+    for (int i = 0; i < w->nsr; i++) {
+        const srule *r = &w->srules[i];
+        if (r->action != action) continue;
+        any = true;
+        int nprimed = 0;
+        int bad = rule_failures(w, r, NULL, 0, &nprimed);
+        if (nprimed > 0) continue;                 /* speculative: needs the step */
+        any_current = true;
+        if (bad == 0) return WORLD_ACTION_APPLIES;
+    }
+    if (!any) return WORLD_ACTION_UNKNOWN;
+    return any_current ? WORLD_ACTION_BLOCKED : WORLD_ACTION_SPECULATIVE;
+}
+
+bool world_action_applies(world *w, uint32_t action)
+{
+    return world_action_status_of(w, action) == WORLD_ACTION_APPLIES;
+}
+
+int world_action_blockers(world *w, uint32_t action, dl_lit *out, int cap)
+{
+    int best = -1, best_bad = 0;
+    for (int i = 0; i < w->nsr; i++) {
+        const srule *r = &w->srules[i];
+        if (r->action != action) continue;
+        int nprimed = 0;
+        int bad = rule_failures(w, r, NULL, 0, &nprimed);
+        if (nprimed > 0) continue;
+        if (bad == 0) return 0;                    /* it applies: nothing blocks it */
+        /* the rule that came closest is the one an author meant */
+        if (best < 0 || bad < best_bad) { best = i; best_bad = bad; }
+    }
+    if (best < 0) return 0;
+    int nprimed = 0;
+    return rule_failures(w, &w->srules[best], out, cap, &nprimed);
+}
+
 void world_why(world *w, dl_lit q, FILE *out)
 {
     /* Never-touched schema fluent (#92): DECLARE it — a jloc alone is not
