@@ -238,6 +238,35 @@ EXPORT const unsigned *inf_emits(inf_session *s)
     return world_emits(s->w, &n);
 }
 
+/* Applicable actions (§6.3): the menu, answered by the engine rather than by a
+ * judgment a client wrote beside every action. `inf_actions` marshals the
+ * ground action atoms; `inf_action_status` is the verdict (0 applies, 1
+ * blocked, 2 speculative, 3 unknown); `inf_action_blockers` fills the literals
+ * of the rule that came closest to firing, as pairs [atom, neg], so `inf_why`
+ * on one prints the argument that refused it. Each returns the size the FULL
+ * answer needs — grow and retry, never a silent truncation. */
+EXPORT int inf_actions(inf_session *s, unsigned *out, int cap)
+{
+    return world_actions(s->w, out, cap);
+}
+
+EXPORT int inf_action_status(inf_session *s, unsigned action)
+{
+    return (int)world_action_status_of(s->w, action);
+}
+
+EXPORT int inf_action_blockers(inf_session *s, unsigned action, long *out, int cap)
+{
+    dl_lit ls[32];
+    int n = world_action_blockers(s->w, action, ls, 32);
+    int k = n < 32 ? n : 32;
+    for (int i = 0; i < k && 2 * i + 1 < cap; i++) {
+        out[2 * i]     = (long)ls[i].atom;
+        out[2 * i + 1] = ls[i].neg ? 1 : 0;
+    }
+    return 2 * n;
+}
+
 EXPORT const char *inf_last_err(void)  { return g_err; }
 EXPORT const char *inf_last_diag(void) { return g_diag; }
 

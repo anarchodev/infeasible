@@ -491,6 +491,40 @@ const uint32_t *world_emits(const world *w, int *count);
 dl_verdict world_query(world *w, dl_lit q);
 void       world_why(world *w, dl_lit q, FILE *out);
 
+/* ---- Applicable actions: what a client may offer, and why not -------------
+ *
+ * Every client that presents choices asks the same question — which of these
+ * actions can be taken right now, and for the ones that cannot, why? Without
+ * this the client re-derives it: a judgment per action mirroring the action's
+ * own `requires`, which is a second copy of the rule that can drift from the
+ * first. The engine already knows: an action's guards are step-rule body
+ * conditions it evaluates every step anyway.
+ *
+ * `world_actions` enumerates the GROUND action atoms the world has step rules
+ * for (`force_door(hero)` and `force_door(guard)` are two), in rule order.
+ *
+ * `world_action_applies` is true when some step rule triggered by that action
+ * has all of its current-state conditions satisfied — i.e. submitting it alone
+ * would move something. Conditions about the NEXT state (`primed`) are not
+ * decidable without taking the step, so a rule carrying one is reported
+ * through `world_action_status` rather than being silently judged.
+ *
+ * `world_action_blockers` fills the unsatisfied conditions of the rule that
+ * came CLOSEST to firing — the fewest failures — because that is the one an
+ * author meant when they ask why a command is greyed out. Each is an ordinary
+ * literal, so `world_why` on it prints the argument that refused it. */
+typedef enum {
+    WORLD_ACTION_APPLIES,     /* some rule's conditions all hold */
+    WORLD_ACTION_BLOCKED,     /* every rule has an unsatisfied condition */
+    WORLD_ACTION_SPECULATIVE, /* only rules with primed conditions remain */
+    WORLD_ACTION_UNKNOWN,     /* no step rule is triggered by this atom */
+} world_action_status;
+
+int  world_actions(const world *w, uint32_t *out, int cap);
+world_action_status world_action_status_of(world *w, uint32_t action);
+bool world_action_applies(world *w, uint32_t action);
+int  world_action_blockers(world *w, uint32_t action, dl_lit *out, int cap);
+
 /* Lane families (the DoD thesis: entities as bit-parallel lanes, not named
  * atoms). A per-sort N-lane dl_col family for the homogeneous single-variable
  * judgment rules over that sort — the same rules run once across 64 entities per

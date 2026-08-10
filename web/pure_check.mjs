@@ -60,10 +60,16 @@ check('the captions are atoms read as English',
 check('the map drew sprites for whatever the rules placed',
       backend.ops('spr').length >= 3, `${backend.ops('spr').length} sprites`);
 check('the dark cellar shaded itself', backend.ops('shade').length > 0);
-check('the menu is the world\'s command list, in cmd declaration order',
-      labels() === 'GO HALL | TAKE KEY*', labels());
-check('...and the refusal is the world\'s too',
-      scene.model().menu.some((b) => b.label === 'TAKE KEY' && !b.ok));
+// No `cmd` vocabulary, no `offers`/`blocked` rules: this list is the engine's
+// own answer about its own actions, filtered to rows that are one step away
+// with a judgment refusing them — a refusal that is an argument, not an absence.
+check('the menu is the engine\'s answer, with no rule written per action',
+      labels() === 'GO HALL | ENTER VAULT* | TAKE KEY* | UNLOCK* | FORCE DOOR*',
+      labels());
+check('...and every greyed row is refused by a JUDGMENT, so `why` has something to say',
+      scene.model().menu.filter((b) => !b.ok)
+           .every((b) => b.blockers.length === 1),
+      JSON.stringify(scene.model().menu.filter((b) => !b.ok).map((b) => b.blockers)));
 
 console.log('\nplaying it — the renderer never learns what a torch is');
 const clickCmd = (label) => {
@@ -79,8 +85,8 @@ const clickEntity = (e) => {
 };
 
 clickCmd('TAKE KEY');
-check('a refused command printed the world\'s own argument',
-      backend.text().includes('in_dark') || backend.text().includes('blocked'),
+check('a refused command printed the guard that refused it',
+      backend.text().includes('in_dark'),
       backend.text().split('\n').slice(0, 3).join(' / '));
 
 clickCmd('GO HALL');
@@ -128,6 +134,7 @@ const handSrc = readFileSync(new URL('./carts/cellar.mjs', import.meta.url), 'ut
 
 console.log('\nthe price');
 console.log(`  presentation rules in .story        ${rules(presentation, /^rule /gm)}`);
+console.log(`  menu rules                          0  (the engine answers it)`);
 console.log(`  presentation vocabulary (enums)     ${rules(story, /^enum /gm)} enums, ` +
             `${(ENUMS.anchor?.length ?? 0) + (ENUMS.word?.length ?? 0) + (ENUMS.cmd?.length ?? 0)} members`);
 console.log(`  geometry rows in init               ${rules(story, /^ *a[xywh]\(/gm)}`);

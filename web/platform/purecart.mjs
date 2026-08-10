@@ -13,6 +13,8 @@
 
 import { createScene } from './scene.mjs';
 
+const verb = (term) => term.replace(/\(.*/, '');
+
 /**
  * @param {object} o
  * @param {object} o.world   the generated binding session
@@ -48,14 +50,15 @@ export function pureCart({ world, iface, doms, sheets, resolution = [640, 360] }
       }
       if (target.ok) {
         this.why = ctx.why = '';
-        const act = scene.bind(target.cmd);
-        return act ? ctx.world.actions().add(act) : null;
+        // the ground action IS the term the engine named; nothing to bind
+        return ctx.world.actions().add({ action: verb(target.term),
+                                         args: {}, term: target.term });
       }
-      // A refused command explains itself. The literal to explain is the one
-      // the story blocked it with — `blocked(who, cmd)` — so the trace is the
-      // world's own argument, not a message this file invented.
-      const who = scene.model()?.picked;
-      this.why = ctx.why = who ? ctx.world.why(`blocked(${who},${target.cmd})`) : '';
+      // A refused command explains itself, and the literal to explain is the
+      // GUARD the engine says refused it — the world's own argument, not a
+      // message this file invented or a judgment the story wrote to mirror it.
+      this.why = ctx.why = target.blockers?.length
+        ? ctx.world.why(target.blockers[0].atom, target.blockers[0].neg) : '';
       return null;
     },
 

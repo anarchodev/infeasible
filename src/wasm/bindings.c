@@ -166,6 +166,20 @@ API int  wf_sub_edges(world *w, long *out, int cap) {
     return 5 * n;
 }
 
+/* --- applicable actions (§6.3): the menu the engine already knows --- */
+API int wf_actions(world *w, uint32_t *out, int cap) { return world_actions(w, out, cap); }
+API int wf_action_status(world *w, uint32_t a) { return (int) world_action_status_of(w, a); }
+API int wf_action_blockers(world *w, uint32_t a, long *out, int cap) {
+    dl_lit ls[32];
+    int n = world_action_blockers(w, a, ls, 32);
+    int k = n < 32 ? n : 32;
+    for (int i = 0; i < k && 2 * i + 1 < cap; i++) {
+        out[2 * i]     = (long) ls[i].atom;
+        out[2 * i + 1] = ls[i].neg ? 1 : 0;
+    }
+    return 2 * n;
+}
+
 /* --- burst cues (#11, §12): the transient emission channel ---
  *
  * The per-tick stream crosses the boundary the way §12's delta buffer does:

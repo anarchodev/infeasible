@@ -63,6 +63,9 @@ export function open(M, src) {
     unsubscribe: c('inf_unsubscribe', null, ['number', 'number']),
     subVerdict: c('inf_sub_verdict', 'number', ['number', 'number']),
     subEdges: c('inf_sub_edges', 'number', ['number', 'number', 'number']),
+    actions_: c('inf_actions', 'number', ['number', 'number', 'number']),
+    actionStatus: c('inf_action_status', 'number', ['number', 'number']),
+    actionBlockers: c('inf_action_blockers', 'number', ['number', 'number', 'number', 'number']),
   };
   if (hash(src) !== SOURCE_HASH)
     throw new Error('this binding was generated from a different ' + STORY +
@@ -309,6 +312,31 @@ export function open(M, src) {
         out.push({ sub: cells[i], atom: nameOf(cells[i + 1]), neg: !!cells[i + 2],
                    from: VERDICT[cells[i + 3]], to: VERDICT[cells[i + 4]],
                    rose: cells[i + 4] === 1, fell: cells[i + 3] === 1 });
+      return out;
+    },
+    /** THE MENU, answered by the engine (§6.3): every ground action the
+     *  world has a rule for, with whether it applies now and — when it does
+     *  not — the guards that refused it, each an ordinary literal so
+     *  `why` on one prints the argument. A client that writes a judgment
+     *  beside every action to mirror its own `requires` has written the
+     *  rule twice and may drift; this is the engine's own answer. */
+    menu(all = false) {
+      const ids = readCells(api.actions_, 64);
+      const STATUS = ['applies', 'blocked', 'speculative', 'unknown'];
+      const out = [];
+      for (const id of ids) {
+        const status = STATUS[api.actionStatus(s, id)];
+        if (!all && status === 'unknown') continue;
+        const term = nameOf(id);
+        const item = { term, status, ok: status === 'applies' };
+        if (status === 'blocked') {
+          const cells = readCells((sess, p, cap) => api.actionBlockers(sess, id, p, cap), 16);
+          item.blockers = [];
+          for (let i = 0; i + 1 < cells.length; i += 2)
+            item.blockers.push({ atom: nameOf(cells[i]), neg: !!cells[i + 1] });
+        }
+        out.push(item);
+      }
       return out;
     },
     /** The proof/defeat trace for a ground literal — the debugger (§5.1). */

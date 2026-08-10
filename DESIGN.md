@@ -3094,14 +3094,33 @@ cellar with its presentation, played end to end — frame, labels, placement,
 sprites, fog, menu, refusals, cues — with **zero game code**. The renderer
 (`web/platform/scene.mjs`) knows the blessed vocabulary and nothing else; the
 driver (`web/platform/purecart.mjs`) contains no game at all. Together they are
-244 lines of generic JS standing in for 318 lines of game-specific cart, and
+248 lines of generic JS standing in for 318 lines of game-specific cart, and
 pointing them at a different `.story` draws a different game with no edit. The
-price on the authoring side is 62 presentation rules, 37 enum members of
+price on the authoring side is 43 presentation rules, 24 enum members of
 vocabulary, and 14 rows of geometry in `init`. Nothing in the compiler had to
 change: the ontology is ordinary judgments over enum constants, and coordinates
 are ordinary numeric fluents.
 
-Six frictions showed up, and they are the shape of the work left:
+**The menu is the engine's answer, not the story's.** The first version of this
+cost a `cmd` enum mirroring the actions and twenty rules restating each
+action's `requires` as an `offers`/`blocked` judgment — the rule written twice,
+free to drift from the original, and reconstructing something the solver had
+already computed and thrown away. So the engine answers it: `world_actions`
+enumerates the ground action atoms, `world_action_status_of` says whether one
+applies right now, and `world_action_blockers` returns the unsatisfied
+conditions of the rule that came CLOSEST to firing — ordinary literals, so
+`world_why` on one prints the argument that refused it. That deleted the
+vocabulary and the twenty rules outright, and it is worth every client, not
+only a pure one: any UI that greys a button was writing that mirror judgment.
+The status distinguishes *blocked* from *unknown*, which is the difference
+between a refusal and a typo, and from *speculative* — a rule whose remaining
+conditions are about the next state, which cannot be decided without taking the
+step and so is reported rather than silently judged.
+
+Five frictions remain, and they are the shape of the work left (a sixth — an
+action's extra parameters needing recovery by convention — went away with the
+menu, since the engine names a GROUND action and the term carries its own
+arguments):
 
 1. *A rule needs a body*, so the parts of a frame that are simply always there
    need something to hang on. A `showing` fluent is the honest answer and turns
@@ -3119,17 +3138,13 @@ Six frictions showed up, and they are the shape of the work left:
 4. *A judgment can carry an entity but not a quantity*, so a bar's source has to
    be a fluent blessed **by name** — the one world word the renderer knows.
    Naming a fluent as an argument is what would close it.
-5. *An action's extra parameters must be recovered by convention.* A menu entry
-   names a command; binding `take_torch(actor, room)` needs the room, and the
-   renderer gets it from the blessed `here(actor, room)` rather than from
-   anything the command said.
-6. *Per-viewer state has no home*, exactly as predicted. Selection is a fluent,
+5. *Per-viewer state has no home*, exactly as predicted. Selection is a fluent,
    so it sits in the shared world and in the action log, and "select one, clear
    the rest" needs one concrete action per actor because a parameterized action
    cannot say it. §5.5's scopes remain the answer, and this is the concrete bill
    for not having them yet.
 
-None of the six is a reason to keep host code as the default. The residue after
+None of the five is a reason to keep host code as the default. The residue after
 the experiment is exactly what the factoring predicted it would be — the loop,
 the layout arithmetic inside the renderer, and the **assets**, which are pixels
 and are no more expressible as rules than a `.png` is.
@@ -3460,10 +3475,22 @@ semantics. Names are working names.
   migration vs. an authored cull predicate choosing survivors), and a
   fluent moving between scopes/tiers is the migration face of the
   cross-scope-identity question above — decide them together.
-- **The presentation ontology** (§12's infeasible cart): the blessed
-  vocabulary a zero-host-code cart concludes into — how a rule says "this
-  entity draws as that sprite, in that layer" — is undecided, and so is where
-  a transition's *declaration* lives. A cart-side table keeps presentation
+- **The presentation ontology** (§12's infeasible cart): the vocabulary that
+  experiment used is a working existence proof and probably the wrong
+  primitives. Two things are suspect. It declares the DRAWING rather than the
+  world — `panel(anchor, style)` is a widget constructor with `rule` in front
+  of it, and most such rules carry no inference at all, which is the sign that
+  nothing about them wanted to be a rule. And the vocabulary is PER-GAME: an
+  `anchor`/`word`/`style` set re-declared by every story is a callback
+  interface with extra steps, not a language. The shape that would fix both is
+  a world model with no presentation in it and a separate declarative *skin*
+  quantifying over relations that are actually universal — kind → appearance,
+  containment → layout, state → modifier — with layout stated relationally
+  (`inside`, `below`, `stack`) rather than as absolute anchors, since the
+  database is good at relations and bad at arithmetic. But one game cannot
+  say what is universal: the intersection of a rooms-and-menu game, a tactics
+  grid and a card game is what deserves blessing, and only the first exists.
+  Undecided with it: where a transition's *declaration* lives. A cart-side table keeps presentation
   above the durability line; an inert annotation in `.story`, riding the §6.3
   artifact and never read by a rule, makes a cart's look travel with the world
   so a second client animates it identically. Decide with the layout built-ins,

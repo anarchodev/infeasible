@@ -188,7 +188,10 @@ w(`    receipt: c('inf_num_receipt', 'number', ['number', 'number', 'number', 'n
 w(`    subscribe: c('inf_subscribe', 'number', ['number', 'number', 'number']),`);
 w(`    unsubscribe: c('inf_unsubscribe', null, ['number', 'number']),`);
 w(`    subVerdict: c('inf_sub_verdict', 'number', ['number', 'number']),`);
-w(`    subEdges: c('inf_sub_edges', 'number', ['number', 'number', 'number']),`);
+w(`    subEdges: c('inf_sub_edges', 'number', ['number', 'number', 'number']),
+    actions_: c('inf_actions', 'number', ['number', 'number', 'number']),
+    actionStatus: c('inf_action_status', 'number', ['number', 'number']),
+    actionBlockers: c('inf_action_blockers', 'number', ['number', 'number', 'number', 'number']),`);
 w(`  };`);
 w(`  if (hash(src) !== SOURCE_HASH)`);
 w(`    throw new Error('this binding was generated from a different ' + STORY +`);
@@ -436,6 +439,31 @@ w(`      for (let i = 0; i + 4 < cells.length; i += 5)`);
 w(`        out.push({ sub: cells[i], atom: nameOf(cells[i + 1]), neg: !!cells[i + 2],`);
 w(`                   from: VERDICT[cells[i + 3]], to: VERDICT[cells[i + 4]],`);
 w(`                   rose: cells[i + 4] === 1, fell: cells[i + 3] === 1 });`);
+w(`      return out;`);
+w(`    },`);
+w(`    /** THE MENU, answered by the engine (§6.3): every ground action the`);
+w(`     *  world has a rule for, with whether it applies now and — when it does`);
+w(`     *  not — the guards that refused it, each an ordinary literal so`);
+w(`     *  \`why\` on one prints the argument. A client that writes a judgment`);
+w(`     *  beside every action to mirror its own \`requires\` has written the`);
+w(`     *  rule twice and may drift; this is the engine's own answer. */`);
+w(`    menu(all = false) {`);
+w(`      const ids = readCells(api.actions_, 64);`);
+w(`      const STATUS = ['applies', 'blocked', 'speculative', 'unknown'];`);
+w(`      const out = [];`);
+w(`      for (const id of ids) {`);
+w(`        const status = STATUS[api.actionStatus(s, id)];`);
+w(`        if (!all && status === 'unknown') continue;`);
+w(`        const term = nameOf(id);`);
+w(`        const item = { term, status, ok: status === 'applies' };`);
+w(`        if (status === 'blocked') {`);
+w(`          const cells = readCells((sess, p, cap) => api.actionBlockers(sess, id, p, cap), 16);`);
+w(`          item.blockers = [];`);
+w(`          for (let i = 0; i + 1 < cells.length; i += 2)`);
+w(`            item.blockers.push({ atom: nameOf(cells[i]), neg: !!cells[i + 1] });`);
+w(`        }`);
+w(`        out.push(item);`);
+w(`      }`);
 w(`      return out;`);
 w(`    },`);
 w(`    /** The proof/defeat trace for a ground literal — the debugger (§5.1). */`);
