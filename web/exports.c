@@ -24,7 +24,7 @@
 #define EXPORT
 #endif
 
-typedef struct { intern *syms; world *w; } inf_session;
+typedef struct { intern *syms; world *w; char *iface; } inf_session;
 
 /* Reused across calls; the cwrap 'string' return type copies into a JS string
  * immediately, so a single owned buffer per kind is safe. */
@@ -41,7 +41,8 @@ EXPORT inf_session *inf_compile(const char *src)
 
     story_diag items[64];
     story_diags diags = { items, 64, 0, 0 };
-    world *w = story_compile(src, "<host>", syms, &diags);
+    char *iface = NULL;
+    world *w = story_compile_iface(src, "<host>", syms, &diags, &iface);
 
     /* surface every diagnostic (errors and warnings) to the host */
     size_t off = 0;
@@ -51,11 +52,12 @@ EXPORT inf_session *inf_compile(const char *src)
                                 items[i].sev == STORY_ERROR ? "error" : "warning",
                                 items[i].line, items[i].col, items[i].msg);
 
-    if (!w) { intern_free(syms); return NULL; }
+    if (!w) { intern_free(syms); free(iface); return NULL; }
 
     inf_session *s = malloc(sizeof *s);
     s->syms = syms;
     s->w = w;
+    s->iface = iface;
     return s;
 }
 
@@ -64,7 +66,16 @@ EXPORT void inf_free(inf_session *s)
     if (!s) return;
     world_free(s->w);
     intern_free(s->syms);
+    free(s->iface);
     free(s);
+}
+
+/* The §6.3 interface artifact for this session's story: the declared
+ * vocabulary as JSON. web/gen_binding.mjs reads it and emits the typed host
+ * binding, so a client never hand-spells a ground atom. */
+EXPORT const char *inf_interface(inf_session *s)
+{
+    return s->iface ? s->iface : "{}";
 }
 
 /* name -> atom id; interns if absent (a fresh id is a fresh always-false atom,
@@ -95,6 +106,18 @@ EXPORT int inf_get(inf_session *s, unsigned atom)
 EXPORT void inf_set(inf_session *s, unsigned atom, int value)
 {
     world_set(s->w, atom, value != 0);
+}
+
+/* The value store (§5.8): numeric fluents never become atoms, so they are read
+ * and written by value rather than through a verdict. */
+EXPORT double inf_get_num(inf_session *s, unsigned atom)
+{
+    return (double)world_get_num(s->w, atom);
+}
+
+EXPORT void inf_set_num(inf_session *s, unsigned atom, double value)
+{
+    world_set_num(s->w, atom, (long)value);
 }
 
 /* Step with an array of occurring action atom ids (a pointer into WASM heap the

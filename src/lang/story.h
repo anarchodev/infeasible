@@ -333,6 +333,24 @@ world *story_compile_kinds_why(const char *src, const char *srcname,
 world *story_compile_matched(const char *src, const char *srcname, intern *syms,
                              story_diags *diags);
 
+/* Same compile, plus the §6.3 INTERFACE ARTIFACT: the declared vocabulary as
+ * JSON — sorts and their entities, enums, state with its domains, providers,
+ * functions, derived values, emissions, judgment heads, action signatures with
+ * parameter names, and the protocol declarations a client must honour
+ * (`exclusive` groups). It states the ground-atom spelling explicitly, because
+ * that is the one thing a client cannot infer and must not guess: intern the
+ * wrong string and you get a fresh always-false atom, the silent failure this
+ * whole surface exists to kill.
+ *
+ * It is the compile-time twin of world.h's runtime contract and the extension
+ * point every client checks against — the typed JS binding is the first
+ * backend, and any future front end fact-checks against this rather than
+ * reaching into the compiler. `*iface_out` is heap-allocated and owned by the
+ * caller; it is NULL when the compile failed (there is no vocabulary to
+ * publish for a story that does not compile). Pass NULL to skip it. */
+world *story_compile_iface(const char *src, const char *srcname, intern *syms,
+                           story_diags *diags, char **iface_out);
+
 /* Same compile, but also harvest the symbol/occurrence model (story_model.h)
  * from the parser tables into `*out` — the source-span index navigation, hover,
  * and the interface artifact read (§6.1 item 7, §6.3). The world is returned as

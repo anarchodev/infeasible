@@ -1,65 +1,66 @@
-// host.mjs — a hand-written plain-JS host driving the grounded cellar over the
-// WASM core (DESIGN.md §4.2 driver, §12 web target). No renderer, no codegen:
-// this is the raw JS↔WASM boundary, proving a game loop can query judgments,
-// propose actions, step, and read `why?` traces entirely from JavaScript
-// against `world_*`. A typed binding (§6.3) would sit on top of exactly this.
+// host.mjs — a plain-JS host driving the grounded cellar over the WASM core
+// (DESIGN.md §4.2 driver, §12 web target), through the GENERATED TYPED BINDING
+// (§6.3) rather than by hand-interning atom names.
 //
-// Run: node web/host.mjs   (after web/build.sh produces web/infeasible.mjs)
+// That is the point of this file. The engine's own boundary is atom ids, and an
+// id comes from a string: `query(intern("can_force_dor(guard)"))` interns a
+// fresh, always-false atom and answers REFUTED forever — the silent failure the
+// orphan pass exists to kill, reappearing on the host side. The binding is
+// generated from the compiler's own vocabulary (the §6.3 interface artifact),
+// so every ground term is spelled once, by the compiler, and a rename in the
+// .story breaks regeneration and the typecheck instead of quietly never firing.
+//
+// Run:  web/build.sh                                  (emits web/infeasible.cjs)
+//       node web/gen_binding.mjs examples/cellar_ground.story
+//       node web/host.mjs
+//
+// The binding ships as plain ES-module JS with JSDoc types — `tsc --checkJs`
+// and any editor check this file against it with no build step (§12).
 
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { open, SORTS, STORY } from './cellar_ground.binding.mjs';
 
-// The WASM module is CommonJS (see web/build.sh); load it from ESM via
-// createRequire. SINGLE_FILE means the .wasm is embedded — nothing is fetched.
 const require = createRequire(import.meta.url);
 const createInfeasible = require('./infeasible.cjs');
 
 const M = await createInfeasible();
+const src = readFileSync(new URL('../' + STORY, import.meta.url), 'utf8');
+const w = open(M, src);
 
-// cwrap the flat shim (exports.c). This hand-wiring is what the generated
-// binding will one day replace — but the boundary is identical either way.
-const inf = {
-  compile:  M.cwrap('inf_compile',   'number', ['string']),
-  free:     M.cwrap('inf_free',       null,    ['number']),
-  intern:   M.cwrap('inf_intern',    'number', ['number', 'string']),
-  query:    M.cwrap('inf_query',     'number', ['number', 'number', 'number']),
-  get:      M.cwrap('inf_get',       'number', ['number', 'number']),
-  step1:    M.cwrap('inf_step1',     'number', ['number', 'number']),
-  lastErr:  M.cwrap('inf_last_err',  'string', []),
-  lastDiag: M.cwrap('inf_last_diag', 'string', []),
-  why:      M.cwrap('inf_why',       'string', ['number', 'number', 'number']),
-};
+console.log('=== grounded cellar over WASM, through the typed binding ===');
+console.log(`story: ${STORY}   actors: ${SORTS.actor.join(', ')}\n`);
 
-const VERDICT = ['undecided', 'PROVED', 'REFUTED'];
-
-const src = readFileSync(new URL('../examples/cellar_ground.story', import.meta.url), 'utf8');
-const s = inf.compile(src);
-if (!s) {
-  console.error('compile failed:\n' + inf.lastDiag());
-  process.exit(1);
-}
-const diag = inf.lastDiag();
-if (diag) process.stdout.write(diag);   // warnings, if any
-
-// query a ground judgment by its interned name — same id a C client would hit
-const q = (name) => VERDICT[inf.query(s, inf.intern(s, name), 0)];
-const fluent = (name) => (inf.get(s, inf.intern(s, name)) ? 'true' : 'false');
-
-console.log('=== grounded cellar over WASM ===');
-console.log('the guard holds the antidote; the hero does not\n');
-for (const who of ['hero', 'guard']) {
-  console.log(`${who}:  weakened=${q(`weakened(${who})`)}` +
-              `  can_force_door=${q(`can_force_door(${who})`)}`);
+// Judgments, by name and arity — `w.q.can_force_door('guard')`, not a string.
+// A typo is a missing property; a bad entity is a TypeError at the call, not a
+// REFUTED verdict three screens later.
+for (const who of SORTS.actor) {
+  console.log(`${who}:  weakened=${w.q.weakened(who)}` +
+              `  can_force_door=${w.q.can_force_door(who)}`);
 }
 
 console.log('\n--- why can_force_door(guard)? ---');
-process.stdout.write(inf.why(s, inf.intern(s, 'can_force_door(guard)'), 0));
+process.stdout.write(w.why('can_force_door(guard)'));
 
-// propose the guard's force_door and step; the shared door fluent should flip
-console.log(`\ndoor_closed before: ${fluent('door_closed')}`);
-const rc = inf.step1(s, inf.intern(s, 'force_door(guard)'));
-if (rc !== 0) { console.error('step failed on fluent: ' + inf.lastErr()); process.exit(1); }
-console.log(`door_closed after force_door(guard): ${fluent('door_closed')}`);
+// The action set is assembled through the builder (§6.3): an action that does
+// not exist is unconstructible, and the protocol checks happen at `add`.
+console.log(`\ndoor_closed before: ${w.state.door_closed()}`);
+const orders = w.actions().add(w.a.force_door('guard'));
+w.step(orders);
+console.log(`door_closed after force_door(guard): ${w.state.door_closed()}`);
 
-inf.free(s);
-console.log('\nboundary OK: .story in, judgments/why/step out — all from JS.');
+// What the step changed, enumerated by the engine (#88) — the host does not
+// diff, and does not need to know which atoms to ask about.
+for (const d of w.changed())
+  console.log(`  changed: ${d.atom} = ${'value' in d ? d.value : `${d.from} -> ${d.to}`}`);
+
+// The vocabulary check is real, not decorative:
+try {
+  w.q.can_force_door('goblin');            // not an actor in this story
+} catch (e) {
+  console.log(`\nvocabulary check: ${e.message}`);
+}
+console.log(`unknown action is unconstructible: ${w.a.pick_lock === undefined}`);
+
+w.close();
+console.log('\nboundary OK: .story in, typed judgments/why/step/changeset out — all from JS.');
