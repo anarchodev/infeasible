@@ -73,12 +73,6 @@ state (
     // the honest body for the parts of the frame that are simply always there
     // — the seam a title screen or a menu would later hang off.
     showing
-    // Geometry is a numeric table, not derived. Positions are store-backed
-    // fluents (§5.6), so a coordinate costs nothing to represent.
-    ax(anchor) : int in 0 .. 640
-    ay(anchor) : int in 0 .. 360
-    aw(anchor) : int in 0 .. 640
-    ah(anchor) : int in 0 .. 360
 )
 
 emit (
@@ -99,17 +93,59 @@ init (
     showing
 
     // the layout, once
-    ax(a_title)  = 0    ay(a_title)  = 0    aw(a_title)  = 640  ah(a_title)  = 14
-    ax(a_cellar) = 8    ay(a_cellar) = 36   aw(a_cellar) = 192  ah(a_cellar) = 176
-    ax(a_hall)   = 224  ay(a_hall)   = 36   aw(a_hall)   = 192  ah(a_hall)   = 176
-    ax(a_vault)  = 440  ay(a_vault)  = 36   aw(a_vault)  = 192  ah(a_vault)  = 176
-    ax(a_door)   = 418  ay(a_door)   = 120  aw(a_door)   = 20   ah(a_door)   = 8
-    ax(a_bar)    = 0    ay(a_bar)    = 224  aw(a_bar)    = 640  ah(a_bar)    = 1
-    ax(a_who)    = 0    ay(a_who)    = 229  aw(a_who)    = 200  ah(a_who)    = 12
-    ax(a_menu)   = 8    ay(a_menu)   = 244  aw(a_menu)   = 176  ah(a_menu)   = 12
-    ax(a_status) = 216  ay(a_status) = 229  aw(a_status) = 200  ah(a_status) = 8
-    ax(a_note)   = 208  ay(a_note)   = 253  aw(a_note)   = 400  ah(a_note)   = 12
 )
+
+// ---- the layout, as a VALUE TABLE rather than as state ----------------------
+//
+// These are constants: `init` set them and no action ever moves them. Left in
+// the fact store they were configuration masquerading as state — carried in
+// every save, and *removing* an anchor became a schema migration for a purely
+// cosmetic edit. As value rows (#94) they leave the EDB entirely, so a layout
+// change is a rule change, which §12 already says is free, and a year-old
+// action log replays under a new skin and gets the same world with a new look.
+value ( ax(anchor) : int   ay(anchor) : int
+        aw(anchor) : int   ah(anchor) : int )
+
+rule g_title_x: => ax(a_title) = 0
+rule g_title_y: => ay(a_title) = 0
+rule g_title_w: => aw(a_title) = 640
+rule g_title_h: => ah(a_title) = 14
+rule g_cellar_x: => ax(a_cellar) = 8
+rule g_cellar_y: => ay(a_cellar) = 36
+rule g_cellar_w: => aw(a_cellar) = 192
+rule g_cellar_h: => ah(a_cellar) = 176
+rule g_hall_x: => ax(a_hall) = 224
+rule g_hall_y: => ay(a_hall) = 36
+rule g_hall_w: => aw(a_hall) = 192
+rule g_hall_h: => ah(a_hall) = 176
+rule g_vault_x: => ax(a_vault) = 440
+rule g_vault_y: => ay(a_vault) = 36
+rule g_vault_w: => aw(a_vault) = 192
+rule g_vault_h: => ah(a_vault) = 176
+rule g_door_x: => ax(a_door) = 418
+rule g_door_y: => ay(a_door) = 120
+rule g_door_w: => aw(a_door) = 20
+rule g_door_h: => ah(a_door) = 8
+rule g_bar_x: => ax(a_bar) = 0
+rule g_bar_y: => ay(a_bar) = 224
+rule g_bar_w: => aw(a_bar) = 640
+rule g_bar_h: => ah(a_bar) = 1
+rule g_who_x: => ax(a_who) = 0
+rule g_who_y: => ay(a_who) = 229
+rule g_who_w: => aw(a_who) = 200
+rule g_who_h: => ah(a_who) = 12
+rule g_menu_x: => ax(a_menu) = 8
+rule g_menu_y: => ay(a_menu) = 244
+rule g_menu_w: => aw(a_menu) = 176
+rule g_menu_h: => ah(a_menu) = 12
+rule g_status_x: => ax(a_status) = 216
+rule g_status_y: => ay(a_status) = 229
+rule g_status_w: => aw(a_status) = 200
+rule g_status_h: => ah(a_status) = 8
+rule g_note_x: => ax(a_note) = 208
+rule g_note_y: => ay(a_note) = 253
+rule g_note_w: => aw(a_note) = 400
+rule g_note_h: => ah(a_note) = 12
 
 // ---- the world: judgments, unchanged in spirit from cellar_play ------------
 

@@ -137,6 +137,7 @@ w(`export const IFACE = ${JSON.stringify({
                                    values: f.values })),
   actions: iface.actions.map((a) => ({ name: a.name,
                                        params: a.params.map((p) => p.sort) })),
+  values: (iface.values ?? []).map((v) => ({ name: v.name, args: v.args })),
 })};`);
 w();
 
@@ -405,6 +406,19 @@ w(`  const world = {`);
 w(`    q, state: st, set, a, lit, value: val,`);
 w(`    /** A fresh action set for the next step. */`);
 w(`    actions: () => new ActionSet(),`);
+w(`    /** Advance one step from already-validated TERMS — the replay and`);
+w(`     *  network path. The builder's protocol checks (#159) ran when the`);
+w(`     *  orders were first collected; re-running them against a log whose`);
+w(`     *  argument bindings are gone would compare undefined keys and refuse`);
+w(`     *  a set the world already accepted. */`);
+w(`    stepTerms(terms) {`);
+w(`      const p = M._malloc(Math.max(1, terms.length) * 4);`);
+w(`      terms.forEach((t, i) => { M.HEAPU32[(p >> 2) + i] = id(t); });`);
+w(`      const rc = api.step(s, p, terms.length);`);
+w(`      M._free(p);`);
+w(`      if (rc !== 0) throw new Error('step rejected: ' + api.lastErr());`);
+w(`      return world;`);
+w(`    },`);
 w(`    /** Advance one step. Throws on a rejected step: with the builder`);
 w(`     *  consuming the protocol class, a -1 reaching a bound host is a bug. */`);
 w(`    step(set) {`);

@@ -13,7 +13,7 @@ export const SOURCE_HASH = "7471681b";
 export const SORTS = {"actor":["grunk","vera"]};
 export const ENUMS = {};
 
-export const IFACE = {"judgments":[{"name":"incoming_hit","args":["actor","actor"]},{"name":"crit","args":["actor"]},{"name":"can_react","args":["actor"]},{"name":"down","args":["actor"]}],"state":[{"name":"phase","args":[],"type":"enum","values":["declare","react","resolve","cleanup"]},{"name":"alive","args":["actor"],"type":"bool"},{"name":"hp","args":["actor"],"type":"int"},{"name":"acb","args":["actor"],"type":"int"},{"name":"atkb","args":["actor"],"type":"int"},{"name":"dmgb","args":["actor"],"type":"int"},{"name":"pending","args":["actor","actor"],"type":"bool"},{"name":"atk_die","args":["actor"],"type":"int"},{"name":"atk_mod","args":["actor"],"type":"int"},{"name":"has_shield","args":["actor"],"type":"bool"},{"name":"window_due","args":[],"type":"bool"},{"name":"shielded","args":["actor"],"type":"bool"},{"name":"reacted","args":["actor"],"type":"bool"},{"name":"blessed","args":["actor"],"type":"bool"},{"name":"bless_left","args":["actor"],"type":"int"}],"actions":[{"name":"strike","params":["actor","actor"]},{"name":"cast_shield","params":["actor"]},{"name":"pass","params":["actor"]}]};
+export const IFACE = {"judgments":[{"name":"incoming_hit","args":["actor","actor"]},{"name":"crit","args":["actor"]},{"name":"can_react","args":["actor"]},{"name":"down","args":["actor"]}],"state":[{"name":"phase","args":[],"type":"enum","values":["declare","react","resolve","cleanup"]},{"name":"alive","args":["actor"],"type":"bool"},{"name":"hp","args":["actor"],"type":"int"},{"name":"acb","args":["actor"],"type":"int"},{"name":"atkb","args":["actor"],"type":"int"},{"name":"dmgb","args":["actor"],"type":"int"},{"name":"pending","args":["actor","actor"],"type":"bool"},{"name":"atk_die","args":["actor"],"type":"int"},{"name":"atk_mod","args":["actor"],"type":"int"},{"name":"has_shield","args":["actor"],"type":"bool"},{"name":"window_due","args":[],"type":"bool"},{"name":"shielded","args":["actor"],"type":"bool"},{"name":"reacted","args":["actor"],"type":"bool"},{"name":"blessed","args":["actor"],"type":"bool"},{"name":"bless_left","args":["actor"],"type":"int"}],"actions":[{"name":"strike","params":["actor","actor"]},{"name":"cast_shield","params":["actor"]},{"name":"pass","params":["actor"]}],"values":[{"name":"ac","args":["actor"]},{"name":"atk","args":["actor"]}]};
 
 // #159 exclusive groups, exactly as world_step checks them: a step admits at
 // most one member per (group, key). The builder below refuses the second at
@@ -492,6 +492,19 @@ export function open(M, src) {
     q, state: st, set, a, lit, value: val,
     /** A fresh action set for the next step. */
     actions: () => new ActionSet(),
+    /** Advance one step from already-validated TERMS — the replay and
+     *  network path. The builder's protocol checks (#159) ran when the
+     *  orders were first collected; re-running them against a log whose
+     *  argument bindings are gone would compare undefined keys and refuse
+     *  a set the world already accepted. */
+    stepTerms(terms) {
+      const p = M._malloc(Math.max(1, terms.length) * 4);
+      terms.forEach((t, i) => { M.HEAPU32[(p >> 2) + i] = id(t); });
+      const rc = api.step(s, p, terms.length);
+      M._free(p);
+      if (rc !== 0) throw new Error('step rejected: ' + api.lastErr());
+      return world;
+    },
     /** Advance one step. Throws on a rejected step: with the builder
      *  consuming the protocol class, a -1 reaching a bound host is a bug. */
     step(set) {

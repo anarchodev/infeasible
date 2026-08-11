@@ -294,9 +294,81 @@ static int test_readable_value(void)
     return 0;
 }
 
+/* --- a value as a LOOKUP TABLE (#94) --------------------------------------
+ *
+ * A value's head argument may be a CONSTANT instead of a parameter, and then
+ * the definition speaks for that instance alone. Without it a value is only
+ * ever a function — one formula for every instance — which is fine for
+ * `damage(W)` and useless for the thing presentation actually needs, where
+ * each shape has its own geometry and there is no formula relating them.
+ *
+ * "Exactly one unconditional base" (#94) then means one PER INSTANCE: rows
+ * never collide with each other, and a catch-all is the default beneath them. */
+static int test_value_table(void)
+{
+    static const char *SRC =
+        "enum shape { sh_bar, sh_icon, sh_panel }\n"
+        "sort actor\n"
+        "entity hero : actor\n"
+        "state ( hp(actor) : int in 0 .. 40 )\n"
+        "init  ( hp(hero) = 30 )\n"
+        "value ( sx(shape) : int   sw(shape) : int )\n"
+        "rule x_bar:   => sx(sh_bar)   = 8\n"
+        "rule x_icon:  => sx(sh_icon)  = 40\n"
+        "rule x_panel: => sx(sh_panel) = 0\n"
+        "rule w_any(S: shape): => sw(S) = 16\n"
+        "rule w_bar:           => sw(sh_bar) = 48 * hp(hero) / 40\n";
+
+    intern *sy = intern_new();
+    world *w = compile_ok(SRC, sy);
+    CHECK(w != NULL);
+
+    long v = 0;
+    /* every row is its own instance's base */
+    CHECK(world_get_value(w, intern_id(sy, "sx(sh_bar)"), &v)   && v == 8);
+    CHECK(world_get_value(w, intern_id(sy, "sx(sh_icon)"), &v)  && v == 40);
+    CHECK(world_get_value(w, intern_id(sy, "sx(sh_panel)"), &v) && v == 0);
+
+    /* a catch-all is the default, and a row overrides it for its instance */
+    CHECK(world_get_value(w, intern_id(sy, "sw(sh_icon)"), &v)  && v == 16);
+    CHECK(world_get_value(w, intern_id(sy, "sw(sh_panel)"), &v) && v == 16);
+    CHECK(world_get_value(w, intern_id(sy, "sw(sh_bar)"), &v)   && v == 36);
+
+    /* a row is still a value: it reads state, so it follows it */
+    world_set_num(w, intern_id(sy, "hp(hero)"), 10);
+    CHECK(world_get_value(w, intern_id(sy, "sw(sh_bar)"), &v) && v == 12);
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
+/* A table with no catch-all is PARTIAL in the honest sense: defined exactly
+ * where a row speaks. Two definitions that both apply to one instance are the
+ * collision #94 has always refused. */
+static int test_value_table_errors(void)
+{
+    static const char *DUP =
+        "enum shape { sh_a, sh_b }\n"
+        "value ( q(shape) : int )\n"
+        "rule d1(S: shape): => q(S) = 1\n"
+        "rule d2(S: shape): => q(S) = 2\n";
+    intern *sy = intern_new();
+    story_diag di[8];
+    story_diags d = { di, 8, 0, 0 };
+    world *w = story_compile(DUP, "t.story", sy, &d);
+    CHECK(w == NULL || d.nerrors > 0);
+    CHECK(d.count > 0 && strstr(d.items[0].msg, "two unconditional definitions"));
+    if (w) world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
 int main(void)
 {
     if (test_readable_value()) return 1;
+    if (test_value_table()) return 1;
+    if (test_value_table_errors()) return 1;
     if (test_shared_d20()) return 1;
     if (test_guard_effect_coherence()) return 1;
     if (test_nested_and_folded()) return 1;

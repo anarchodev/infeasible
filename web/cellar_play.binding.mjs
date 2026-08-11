@@ -15,7 +15,7 @@ export const SOURCE_HASH = "6c654bd8";
 export const SORTS = {"actor":["hero","guard"],"item":["rusty_key","torch","antidote"]};
 export const ENUMS = {"room":["cellar","hall","vault"]};
 
-export const IFACE = {"judgments":[{"name":"weakened","args":["actor"]},{"name":"can_enter_vault","args":["actor"]},{"name":"can_unlock_door","args":["actor"]},{"name":"can_force_door","args":["actor"]},{"name":"torch_in","args":["room"]},{"name":"in_dark","args":["actor"]},{"name":"down","args":["actor"]},{"name":"here","args":["actor","room"]}],"state":[{"name":"at","args":["actor"],"type":"enum","values":["cellar","hall","vault"]},{"name":"on_floor","args":["item","room"],"type":"bool"},{"name":"holding","args":["actor","item"],"type":"bool"},{"name":"door","args":[],"type":"enum","values":["locked","jammed","open"]},{"name":"poisoned","args":["actor"],"type":"bool"},{"name":"hp","args":["actor"],"type":"int"}],"actions":[{"name":"go_hall","params":["actor"]},{"name":"go_cellar","params":["actor"]},{"name":"enter_vault","params":["actor"]},{"name":"leave_vault","params":["actor"]},{"name":"take","params":["actor","item","room"]},{"name":"drop","params":["actor","item","room"]},{"name":"unlock","params":["actor"]},{"name":"force_door","params":["actor"]},{"name":"drink","params":["actor"]}]};
+export const IFACE = {"judgments":[{"name":"weakened","args":["actor"]},{"name":"can_enter_vault","args":["actor"]},{"name":"can_unlock_door","args":["actor"]},{"name":"can_force_door","args":["actor"]},{"name":"torch_in","args":["room"]},{"name":"in_dark","args":["actor"]},{"name":"down","args":["actor"]},{"name":"here","args":["actor","room"]}],"state":[{"name":"at","args":["actor"],"type":"enum","values":["cellar","hall","vault"]},{"name":"on_floor","args":["item","room"],"type":"bool"},{"name":"holding","args":["actor","item"],"type":"bool"},{"name":"door","args":[],"type":"enum","values":["locked","jammed","open"]},{"name":"poisoned","args":["actor"],"type":"bool"},{"name":"hp","args":["actor"],"type":"int"}],"actions":[{"name":"go_hall","params":["actor"]},{"name":"go_cellar","params":["actor"]},{"name":"enter_vault","params":["actor"]},{"name":"leave_vault","params":["actor"]},{"name":"take","params":["actor","item","room"]},{"name":"drop","params":["actor","item","room"]},{"name":"unlock","params":["actor"]},{"name":"force_door","params":["actor"]},{"name":"drink","params":["actor"]}],"values":[]};
 
 // #159 exclusive groups, exactly as world_step checks them: a step admits at
 // most one member per (group, key). The builder below refuses the second at
@@ -426,6 +426,19 @@ export function open(M, src) {
     q, state: st, set, a, lit, value: val,
     /** A fresh action set for the next step. */
     actions: () => new ActionSet(),
+    /** Advance one step from already-validated TERMS — the replay and
+     *  network path. The builder's protocol checks (#159) ran when the
+     *  orders were first collected; re-running them against a log whose
+     *  argument bindings are gone would compare undefined keys and refuse
+     *  a set the world already accepted. */
+    stepTerms(terms) {
+      const p = M._malloc(Math.max(1, terms.length) * 4);
+      terms.forEach((t, i) => { M.HEAPU32[(p >> 2) + i] = id(t); });
+      const rc = api.step(s, p, terms.length);
+      M._free(p);
+      if (rc !== 0) throw new Error('step rejected: ' + api.lastErr());
+      return world;
+    },
     /** Advance one step. Throws on a rejected step: with the builder
      *  consuming the protocol class, a -1 reaching a bound host is a bug. */
     step(set) {

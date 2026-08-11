@@ -27,7 +27,28 @@
  * @param {object} o.world     the generated typed binding's session
  * @param {number} [o.tps]     world ticks per second
  */
-export function createRuntime({ platform, backend, cart, world, tps = 20 }) {
+/** The LIVE source: what the cart proposed is what happens. */
+export const live = () => ({ orders: (proposed) => proposed, done: () => false });
+
+/** The REPLAY source: the log decides, and the cart's proposal is discarded.
+ *  A log entry is a list of ground action terms — the save format — so replay
+ *  needs no binding-time argument structure and cannot re-run protocol checks
+ *  that were already passed when the orders were first collected. */
+export const replay = (log) => {
+  let i = 0;
+  return {
+    orders: () => (i < log.length ? { terms: log[i++] } : null),
+    done: () => i >= log.length,
+  };
+};
+
+/**
+ * @param {object} o
+ * @param {object} [o.source]    an action source: live (default) or replay(log)
+ * @param {object} [o.identity]  { story, game } — the save's compatibility key
+ */
+export function createRuntime({ platform, backend, cart, world, tps = 20,
+                               source = live(), identity = {} }) {
   const ctx = {
     ...platform.cart,
     world,
@@ -53,12 +74,17 @@ export function createRuntime({ platform, backend, cart, world, tps = 20 }) {
     platform.sampleInput();
     ctx.step = { emits: [], changed: [], edges: [], rejected: null };
 
-    const orders = cart.tick(ctx);
-    const items = orders && orders.length ? orders : null;
-    if (items) {
+    // The cart PROPOSES; the source DISPOSES. Live, that is the same thing.
+    // Replaying, the log decides and the proposal is thrown away — which is
+    // what makes a save loadable rather than merely recorded, and it is the
+    // seat a network source takes for lockstep.
+    const proposed = cart.tick(ctx);
+    const orders = source.orders(proposed, ctx.tick);
+    const terms = orders?.items ? orders.items.map((a) => a.term) : orders?.terms;
+    if (terms && terms.length) {
       try {
-        world.step(orders);
-        ctx.log.push(orders.items.map((a) => a.term));
+        world.stepTerms(terms);
+        ctx.log.push(terms);
         ctx.step.emits = world.emits();
         ctx.step.changed = world.changed();
         ctx.step.edges = world.edges();
@@ -74,6 +100,29 @@ export function createRuntime({ platform, backend, cart, world, tps = 20 }) {
     cart.after?.(ctx);
   }
 
+  /** A save is (engine-hash, game-hash, action-log) — §12. Not a state dump:
+   *  state written outside the log is state replay cannot reproduce, which
+   *  forfeits shareable playthroughs, branching and time travel in one move. */
+  function save() {
+    return { format: 1, story: identity.story ?? null,
+             game: identity.game ?? null, engine: identity.engine ?? null,
+             log: ctx.log.map((t) => [...t]) };
+  }
+
+  /** Replay a save into THIS world, which must be freshly opened: the log is
+   *  from genesis, so loading into a played world would append a second
+   *  history to the first. Refuses a save from a different story rather than
+   *  replaying orders whose atoms mean something else now. */
+  function load(saved) {
+    if (saved.game && identity.game && saved.game !== identity.game)
+      throw new Error('this save is from a different version of ' +
+        (saved.story ?? 'the story') + ' — its action log names atoms this one may not have');
+    if (ctx.tick !== 0 || ctx.log.length)
+      throw new Error('load into a fresh world: a log is a history from genesis');
+    source = replay(saved.log);
+    return saved.log.length;
+  }
+
   /** Repaint once. Never mutates the world. */
   function render() {
     backend.beginFrame?.();
@@ -85,6 +134,10 @@ export function createRuntime({ platform, backend, cart, world, tps = 20 }) {
     ctx,
     step,
     render,
+    save,
+    load,
+    /** Has the current source run out? True once a replay reaches its end. */
+    replaying: () => !source.done(),
     /** Run n ticks with a repaint after each — the headless/test driver. */
     advance(n = 1) { for (let i = 0; i < n; i++) { step(); render(); } },
     /** The browser loop: rAF for frames, an accumulator for ticks. */

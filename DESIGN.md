@@ -3146,6 +3146,31 @@ and all three were invisible until the second:
 - **Subject and object are two selections, not one.** The cellar needed only
   the first, so one game could not have told us.
 
+**What a save means, now that a story is the whole cart.** Mostly what it
+always meant, because presentation here is overwhelmingly *derived*: `panel`,
+`caption`, `in_anchor`, `shows`, `offers` and the gauge's colour are judgments,
+recomputed and never stored, so I1 holds and §12's "rule changes are free"
+already covers rewriting a game's entire look. The property that buys is worth
+naming: **a replay survives a re-skin** — a year-old action log loads under a
+rewritten skin and gives the same world with a new face.
+
+Two things did leak into the fact store, and they are different problems. The
+**layout table** was constants masquerading as state: `init` set it and no
+action ever moved it, so it rode in every save and *removing* an anchor was a
+schema migration for a cosmetic edit. As value rows (#94) it leaves the EDB
+entirely and a layout change becomes a rule change, which is free. What remains
+is **per-viewer state** — selection, aim, and a screen — which is mutable, not
+derived, and must not be in a shared save at all; §5.5's scopes are its home,
+and until they exist the action log records who you were looking at.
+
+That makes §12's save taxonomy short by one. It has *base facts* (saved) and
+*derived conclusions* (recomputed); the pure cart shows a third kind that is
+neither, and naming it as a category is more useful than treating it as an
+exception. A related consequence: the game-hash now covers presentation, so a
+cosmetic edit segments the log for no semantic reason — the hash wants to split
+the way the durability line does, into a semantic hash governing replay
+compatibility and a separate one for cache invalidation.
+
 And three things *neither* could say, which is the more useful list because an
 item demanded by two independent games is no longer a matter of taste:
 
@@ -3177,11 +3202,15 @@ arguments):
 1. *A rule needs a body*, so the parts of a frame that are simply always there
    need something to hang on. A `showing` fluent is the honest answer and turns
    out to be the seam a title screen would use anyway.
-2. *Values are functions, not lookup tables* — at most one unconditional
-   definition, and head arguments must be rule parameters — so geometry is
-   numeric **state** initialized per instance. That is the better model
-   regardless (§5.6 already puts positions in the store), but it is not where an
-   author's hand goes first.
+2. *Values are functions, not lookup tables* — **closed**. A head argument may
+   now be a constant, and then the definition is a ROW speaking for that ground
+   instance alone (`sx(sh_bar) = 8`), with a catch-all as the default beneath
+   the rows. #94's "exactly one unconditional base" becomes one *per instance*:
+   rows never collide with each other, and a table with no catch-all is partial
+   (#116) exactly where no row speaks. Without this a value is only ever a
+   function — one formula for every instance — which suits `damage(W)` and is
+   useless for per-shape geometry, where each shape's numbers are its own and no
+   formula relates them.
 3. *A predicate is monomorphic in its argument sorts*, first rule wins,
    silently — so `shows(actor, …)` and `shows(item, …)` cannot be one
    predicate and the ontology duplicates per sort. This is the ontology's

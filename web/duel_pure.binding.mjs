@@ -17,11 +17,11 @@
 /** @typedef {"snd_thud" | "snd_ring" | "snd_chime"} T_sound */
 
 export const STORY = "examples/duel_pure.story";
-export const SOURCE_HASH = "61a85111";
+export const SOURCE_HASH = "81236a04";
 export const SORTS = {"fighter":["you","gnoll","imp"],"card":["edge_a","edge_b","spark","salve"]};
 export const ENUMS = {"zone":["z_hand","z_spent"],"sprite":["s_you","s_gnoll","s_imp","s_strike","s_bolt","s_mend"],"style":["st_room","st_bar","st_title","st_button","st_button_off"],"anchor":["a_title","a_foes","a_self","a_hand","a_bar","a_who","a_note","a_menu","a_status"],"word":["w_the_duel","w_foes","w_you","w_hand","w_energy","w_downed","w_aimed","w_end_turn"],"cue":["q_hit","q_ward","q_heal"],"sound":["snd_thud","snd_ring","snd_chime"]};
 
-export const IFACE = {"judgments":[{"name":"down","args":["fighter"]},{"name":"in_hand","args":["card"]},{"name":"enemy","args":["fighter"]},{"name":"ally","args":["fighter"]},{"name":"target","args":["fighter"]},{"name":"picked","args":["fighter"]},{"name":"aimed","args":["fighter"]},{"name":"panel","args":["anchor","style"]},{"name":"caption","args":["anchor","word"]},{"name":"shows","args":["fighter","sprite"]},{"name":"prop_shows","args":["card","sprite"]},{"name":"in_anchor","args":["fighter","anchor"]},{"name":"prop_in","args":["card","anchor"]},{"name":"gauge","args":["anchor","fighter"]},{"name":"gauge_low","args":["fighter"]},{"name":"cue_sound","args":["cue","sound"]}],"state":[{"name":"in_zone","args":["card"],"type":"enum","values":["z_hand","z_spent"]},{"name":"is_strike","args":["card"],"type":"bool"},{"name":"is_bolt","args":["card"],"type":"bool"},{"name":"is_mend","args":["card"],"type":"bool"},{"name":"hostile","args":["fighter"],"type":"bool"},{"name":"alive","args":["fighter"],"type":"bool"},{"name":"hp","args":["fighter"],"type":"int"},{"name":"hp_max","args":["fighter"],"type":"int"},{"name":"energy","args":[],"type":"int"},{"name":"selected","args":["fighter"],"type":"bool"},{"name":"aiming","args":["fighter"],"type":"bool"},{"name":"showing","args":[],"type":"bool"},{"name":"ax","args":["anchor"],"type":"int"},{"name":"ay","args":["anchor"],"type":"int"},{"name":"aw","args":["anchor"],"type":"int"},{"name":"ah","args":["anchor"],"type":"int"}],"actions":[{"name":"strike","params":["card","fighter"]},{"name":"bolt","params":["card","fighter"]},{"name":"mend","params":["card","fighter"]},{"name":"end_turn","params":[]},{"name":"aim_gnoll","params":[]},{"name":"aim_imp","params":[]},{"name":"aim_you","params":[]}]};
+export const IFACE = {"judgments":[{"name":"down","args":["fighter"]},{"name":"in_hand","args":["card"]},{"name":"enemy","args":["fighter"]},{"name":"ally","args":["fighter"]},{"name":"target","args":["fighter"]},{"name":"picked","args":["fighter"]},{"name":"aimed","args":["fighter"]},{"name":"panel","args":["anchor","style"]},{"name":"caption","args":["anchor","word"]},{"name":"shows","args":["fighter","sprite"]},{"name":"prop_shows","args":["card","sprite"]},{"name":"in_anchor","args":["fighter","anchor"]},{"name":"prop_in","args":["card","anchor"]},{"name":"gauge","args":["anchor","fighter"]},{"name":"gauge_low","args":["fighter"]},{"name":"cue_sound","args":["cue","sound"]}],"state":[{"name":"in_zone","args":["card"],"type":"enum","values":["z_hand","z_spent"]},{"name":"is_strike","args":["card"],"type":"bool"},{"name":"is_bolt","args":["card"],"type":"bool"},{"name":"is_mend","args":["card"],"type":"bool"},{"name":"hostile","args":["fighter"],"type":"bool"},{"name":"alive","args":["fighter"],"type":"bool"},{"name":"hp","args":["fighter"],"type":"int"},{"name":"hp_max","args":["fighter"],"type":"int"},{"name":"energy","args":[],"type":"int"},{"name":"selected","args":["fighter"],"type":"bool"},{"name":"aiming","args":["fighter"],"type":"bool"},{"name":"showing","args":[],"type":"bool"}],"actions":[{"name":"strike","params":["card","fighter"]},{"name":"bolt","params":["card","fighter"]},{"name":"mend","params":["card","fighter"]},{"name":"end_turn","params":[]},{"name":"aim_gnoll","params":[]},{"name":"aim_imp","params":[]},{"name":"aim_you","params":[]}],"values":[{"name":"ax","args":["anchor"]},{"name":"ay","args":["anchor"]},{"name":"aw","args":["anchor"]},{"name":"ah","args":["anchor"]},{"name":"gauge_value","args":["fighter"]},{"name":"gauge_max","args":["fighter"]}]};
 
 // #159 exclusive groups, exactly as world_step checks them: a step admits at
 // most one member per (group, key). The builder below refuses the second at
@@ -304,34 +304,6 @@ export function open(M, src) {
 
     showing: () => { 
       return !!api.get(s, id("showing")); },
-    /**
-     * @param {T_anchor} a0
-     * @returns {number}
-     */
-
-    ax: (a0) => { chk("anchor", a0);
-      return api.getNum(s, id(`ax(${a0})`)); },
-    /**
-     * @param {T_anchor} a0
-     * @returns {number}
-     */
-
-    ay: (a0) => { chk("anchor", a0);
-      return api.getNum(s, id(`ay(${a0})`)); },
-    /**
-     * @param {T_anchor} a0
-     * @returns {number}
-     */
-
-    aw: (a0) => { chk("anchor", a0);
-      return api.getNum(s, id(`aw(${a0})`)); },
-    /**
-     * @param {T_anchor} a0
-     * @returns {number}
-     */
-
-    ah: (a0) => { chk("anchor", a0);
-      return api.getNum(s, id(`ah(${a0})`)); },
   };
 
   const set = {
@@ -360,14 +332,6 @@ export function open(M, src) {
       api.set(s, id(`aiming(${a0})`), a1 === false ? 0 : 1); },
     showing: (a0) => { 
       api.set(s, id("showing"), a0 === false ? 0 : 1); },
-    ax: (a0, a1) => { chk("anchor", a0);
-      api.setNum(s, id(`ax(${a0})`), a1); },
-    ay: (a0, a1) => { chk("anchor", a0);
-      api.setNum(s, id(`ay(${a0})`), a1); },
-    aw: (a0, a1) => { chk("anchor", a0);
-      api.setNum(s, id(`aw(${a0})`), a1); },
-    ah: (a0, a1) => { chk("anchor", a0);
-      api.setNum(s, id(`ah(${a0})`), a1); },
   };
 
   /** Ground terms, spelled the way the interface artifact says (§6.3) —
@@ -575,39 +539,39 @@ export function open(M, src) {
 
     showing: () => { 
       return "showing"; },
-    /**
-     * @param {T_anchor} a0
-     * @returns {string}
-     */
-
-    ax: (a0) => { chk("anchor", a0);
-      return `ax(${a0})`; },
-    /**
-     * @param {T_anchor} a0
-     * @returns {string}
-     */
-
-    ay: (a0) => { chk("anchor", a0);
-      return `ay(${a0})`; },
-    /**
-     * @param {T_anchor} a0
-     * @returns {string}
-     */
-
-    aw: (a0) => { chk("anchor", a0);
-      return `aw(${a0})`; },
-    /**
-     * @param {T_anchor} a0
-     * @returns {string}
-     */
-
-    ah: (a0) => { chk("anchor", a0);
-      return `ah(${a0})`; },
   };
 
   /** Derived numbers (#82), evaluated against current state. `undefined`
    *  means the value has no applicable definition (#116), not zero. */
   const val = {
+    /**
+     * @param {T_anchor} a0
+     * @returns {number|undefined}
+     */
+
+    ax: (a0) => { chk("anchor", a0);
+      return readValue(id(`ax(${a0})`)); },
+    /**
+     * @param {T_anchor} a0
+     * @returns {number|undefined}
+     */
+
+    ay: (a0) => { chk("anchor", a0);
+      return readValue(id(`ay(${a0})`)); },
+    /**
+     * @param {T_anchor} a0
+     * @returns {number|undefined}
+     */
+
+    aw: (a0) => { chk("anchor", a0);
+      return readValue(id(`aw(${a0})`)); },
+    /**
+     * @param {T_anchor} a0
+     * @returns {number|undefined}
+     */
+
+    ah: (a0) => { chk("anchor", a0);
+      return readValue(id(`ah(${a0})`)); },
     /**
      * @param {T_fighter} a0
      * @returns {number|undefined}
@@ -704,6 +668,19 @@ export function open(M, src) {
     q, state: st, set, a, lit, value: val,
     /** A fresh action set for the next step. */
     actions: () => new ActionSet(),
+    /** Advance one step from already-validated TERMS — the replay and
+     *  network path. The builder's protocol checks (#159) ran when the
+     *  orders were first collected; re-running them against a log whose
+     *  argument bindings are gone would compare undefined keys and refuse
+     *  a set the world already accepted. */
+    stepTerms(terms) {
+      const p = M._malloc(Math.max(1, terms.length) * 4);
+      terms.forEach((t, i) => { M.HEAPU32[(p >> 2) + i] = id(t); });
+      const rc = api.step(s, p, terms.length);
+      M._free(p);
+      if (rc !== 0) throw new Error('step rejected: ' + api.lastErr());
+      return world;
+    },
     /** Advance one step. Throws on a rejected step: with the builder
      *  consuming the protocol class, a -1 reaching a bound host is a bug. */
     step(set) {

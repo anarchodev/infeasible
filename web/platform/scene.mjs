@@ -6,7 +6,7 @@
 // no cellar, no door, no torch — so pointing it at a different story draws a
 // different game with no edit here.
 //
-//   ax/ay/aw/ah(anchor)      geometry, as a numeric state table
+//   ax/ay/aw/ah(anchor)      geometry, as derived VALUES (not stored facts)
 //   panel(anchor, style)     a box
 //   caption(anchor, word)    text; the ATOM IS THE LABEL (`w_the_cellar`)
 //   shows(actor, sprite)     an actor's sprite
@@ -104,8 +104,11 @@ export function createScene(w, iface, doms) {
     return null;
   };
 
-  const box = (a) => ({ x: w.state.ax(a), y: w.state.ay(a),
-                        w: w.state.aw(a), h: w.state.ah(a) });
+  /** An anchor's geometry, read as DERIVED VALUES rather than stored facts:
+   *  a layout is constants, and constants in the fact store are configuration
+   *  carried in every save. */
+  const box = (a) => ({ x: w.value.ax(a) ?? 0, y: w.value.ay(a) ?? 0,
+                        w: w.value.aw(a) ?? 0, h: w.value.ah(a) ?? 0 });
 
   /** The scene model: what a frame draws, derived once per tick. */
   let model = null;
