@@ -49,6 +49,12 @@ static const char *SRC =
     "emit spark(actor)\n"
     "init ( door = locked  poisoned(hero)  hp(hero) = 10  hp(guard) = 12 )\n"
     "rule weak(X: actor): poisoned(X) => weakened(X)\n"
+    /* #205: a judgment concluded by several rules, one binding a typed
+     * parameter and one naming a ground entity — the published signature is
+     * what they AGREE on, and disagreeing is a compile error, not a silent
+     * first-rule-wins that publishes a smaller world than the engine has */
+    "rule seen(X: actor, K: item): holding(X, K) => visible(X, K)\n"
+    "rule seen_key: poisoned(hero) => visible(guard, key)\n"
     "rule ac_base(X: actor): => ac(X) = 10\n"
     "action unlock(X: actor, K: item):\n"
     "  requires holding(X, K) & door = locked\n"
@@ -200,6 +206,7 @@ int main(void)
         { "state", "at", 1 },      { "state", "poisoned", 1 },
         { "providers", "near", 2 }, { "values", "ac", 1 },
         { "emits", "spark", 1 },    { "judgments", "weakened", 1 },
+        { "judgments", "visible", 2 },
     };
     for (size_t i = 0; i < sizeof expect / sizeof expect[0]; i++) {
         const json *sec = json_get(iface, expect[i].sec);
@@ -215,6 +222,22 @@ int main(void)
                     expect[i].name, expect[i].sec);
             return 1;
         }
+    }
+
+    /* #205: a judgment's argument SORTS, not just its arity. A judgment has no
+     * declaration, so the compiler infers the signature from the rules that
+     * conclude it; a client crossing the published domains to decide what to
+     * ask about sees every sort the engine concludes over, or none of it. */
+    {
+        const json *js = json_get(iface, "judgments");
+        const json *vis = NULL;
+        for (size_t i = 0; i < json_arr_len(js); i++)
+            if (strcmp(json_str(json_get(json_arr_at(js, i), "name")), "visible") == 0)
+                vis = json_arr_at(js, i);
+        CHECK(vis != NULL);
+        const json *args = json_get(vis, "args");
+        CHECK(strcmp(json_str(json_arr_at(args, 0)), "actor") == 0);
+        CHECK(strcmp(json_str(json_arr_at(args, 1)), "item") == 0);
     }
 
     /* domains: the range a client clamps its UI to, and the values it renders */

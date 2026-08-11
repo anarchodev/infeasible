@@ -320,6 +320,11 @@ typedef struct {
     bool     is_kindpred;         /* #124: a kind predicate — build-time-only,
                                    * populated by `fact`s, erased at grounding */
     int      kval_pos;            /* its `value`-sorted argument position */
+    int      headsort[MAX_ARGS];  /* #205: a JUDGMENT's argument sorts, inferred
+                                   * from the rules concluding it (a head has no
+                                   * declaration site); -1 = not yet known */
+    int      headrule[MAX_ARGS];  /* the rule that fixed each one, for the
+                                   * diagnostic that names the other site */
 } pred_info;
 
 /* A value-returning function provider (§5.6): `function f(t1,…) : ret`. Unlike a
@@ -2595,6 +2600,18 @@ static int find_sort(parser *p, uint32_t name_atom)
     return -1;
 }
 
+static const char *sort_name(parser *p, int sidx)
+{
+    return (sidx >= 0 && sidx < p->nsorts) ? p->sorts[sidx].name : "?";
+}
+
+/* An argument position's sort as a name: a declared sort, the `int` sentinel,
+ * or "?" for a slot no rule pinned down. */
+static const char *arg_sort_name(parser *p, int sidx)
+{
+    return sidx == INT_SORT ? "int" : sort_name(p, sidx);
+}
+
 /* All O(1) via the maps built in resolve_entities (was linear — the source of
  * the O(n^2) grounding wall, since decode_binding hits these per instance). */
 static int find_entity(parser *p, uint32_t atom)
@@ -2635,6 +2652,7 @@ static pred_info *intern_pred(parser *p, uint32_t pred, int arity)
     pi->pred = pred;
     pi->arity = arity;
     pi->val_sort = -1;
+    for (int k = 0; k < MAX_ARGS; k++) { pi->headsort[k] = -1; pi->headrule[k] = -1; }
     return pi;
 }
 
@@ -5849,6 +5867,56 @@ static void desugar_kind_sups(parser *p)
     }
 }
 
+/* The sort of one head argument: a rule parameter carries its own, a ground
+ * entity its declaration's, an integer literal the `int` sentinel. */
+static int head_arg_sort(parser *p, ast_rule *r, const ast_arg *a)
+{
+    if (a->is_int) return INT_SORT;
+    int vi = var_index(r->vars, r->nvars, a->name);
+    if (vi >= 0) return r->vars[vi].sort;
+    int ei = find_entity(p, a->name);
+    return ei >= 0 ? p->ents[ei].sort : -1;
+}
+
+/* #205: a judgment has no declaration site, so its argument sorts are INFERRED
+ * from the rules that conclude it — and a predicate has ONE signature. Rules
+ * concluding `shows(hero, …)` and `shows(rusty_key, …)` are a located error
+ * rather than a narrowing to whichever came first, because the signature
+ * settled here is what the §6.3 artifact publishes: a generic client crossing
+ * the published domains would never ask about the sort that got dropped, and
+ * every atom it skips reads as "not proved" rather than "never asked" — the
+ * silent-always-false failure the artifact exists to end. The two predicates
+ * the author writes instead are explicit; a smaller published world is not. */
+static void infer_head_sorts(parser *p)
+{
+    for (int i = 0; i < p->nrules; i++) {
+        ast_rule *r = &p->rules[i];
+        if (r->head.is_valuedef || r->head.is_kinddef || rule_is_kind(p, r))
+            continue;                              /* not a boolean conclusion */
+        pred_info *pi = find_pred(p, r->head.pred);
+        if (!pi || !pi->is_head || pi->arity != r->head.nargs) continue;
+        if (pi->is_fluent || pi->is_provider || pi->is_emit || pi->is_value ||
+            pi->is_kindpred) continue;             /* declared: it has a schema */
+        for (int k = 0; k < r->head.nargs; k++) {
+            int s = head_arg_sort(p, r, &r->head.args[k]);
+            if (s < 0 && s != INT_SORT) continue;  /* unresolved: reported already */
+            if (pi->headsort[k] == -1) {           /* first rule to pin it */
+                pi->headsort[k] = s;
+                pi->headrule[k] = i;
+            } else if (pi->headsort[k] != s) {
+                ast_rule *first = &p->rules[pi->headrule[k]];
+                serr(p, r->head.args[k].line, r->head.args[k].col,
+                     "argument %d of '%s' is '%s' here but '%s' at line %d — a "
+                     "predicate has one signature; conclude the other sort "
+                     "under its own predicate",
+                     k + 1, intern_name(p->syms, r->head.pred),
+                     arg_sort_name(p, s), arg_sort_name(p, pi->headsort[k]),
+                     first->head.args[k].line);
+            }
+        }
+    }
+}
+
 static void semantic_pass(parser *p)
 {
     synthesize_enum_sorts(p);          /* #96: before entities resolve */
@@ -5945,6 +6013,7 @@ static void semantic_pass(parser *p)
                      "duplicate rule label '%s'", r->label);
     }
 
+    infer_head_sorts(p);               /* #205: one signature per judgment */
     order_value_layers(p);             /* #82/#94: base + chain + commute checks */
 
     /* #82: cyclic value definitions are infinite inline regress — reject */
@@ -10367,11 +10436,6 @@ static void sm_atom(story_model *m, parser *p, const ast_atom *a,
     }
 }
 
-static const char *sort_name(parser *p, int sidx)
-{
-    return (sidx >= 0 && sidx < p->nsorts) ? p->sorts[sidx].name : "?";
-}
-
 /* "(sort1, sort2)" from a var-binding list (entities/params carry sort indices,
  * unlike fluent argsorts which are name atoms). */
 static void dapp_varsorts(char *buf, size_t *off, size_t cap, parser *p,
@@ -10457,33 +10521,16 @@ static void sb_argsorts(sbuf *s, parser *p, const pred_info *pi)
     sb_raw(s, "]");
 }
 
-/* Argument sorts for a JUDGMENT head. The registry records arity for a
- * conclusion but not its argument sorts — a head is not a declaration — so read
- * them off the first rule that concludes it: a head argument is either one of
- * the rule's typed variables or a ground entity, and both know their sort.
- * (Rules concluding one predicate with different sorts would already be a
- * vocabulary error at their body atoms; first-writer-wins here is a reporting
- * choice, not a semantic one.) */
-static void sb_head_argsorts(sbuf *s, parser *p, uint32_t pred, int arity)
+/* Argument sorts for a JUDGMENT head — the signature `infer_head_sorts` (#205)
+ * settled from the rules that conclude it, since a head is not a declaration.
+ * A slot no rule pinned down (arity known, sorts not) stays "?". */
+static void sb_head_argsorts(sbuf *s, parser *p, const pred_info *pi)
 {
-    for (int i = 0; i < p->nrules; i++) {
-        ast_rule *r = &p->rules[i];
-        if (r->head.is_valuedef || r->head.is_kinddef) continue;
-        if (r->head.pred != pred || r->head.nargs != arity) continue;
-        sb_raw(s, "[");
-        for (int k = 0; k < arity; k++) {
-            if (k) sb_raw(s, ", ");
-            int vi = var_index(r->vars, r->nvars, r->head.args[k].name);
-            int ei = vi < 0 ? find_entity(p, r->head.args[k].name) : -1;
-            int sidx = vi >= 0 ? r->vars[vi].sort
-                     : ei >= 0 ? p->ents[ei].sort : -1;
-            sb_str(s, sidx >= 0 ? sort_name(p, sidx) : "?");
-        }
-        sb_raw(s, "]");
-        return;
+    sb_raw(s, "[");
+    for (int k = 0; k < pi->arity; k++) {
+        if (k) sb_raw(s, ", ");
+        sb_str(s, arg_sort_name(p, pi->headsort[k]));
     }
-    sb_raw(s, "[");                                   /* no rule found: arity only */
-    for (int k = 0; k < arity; k++) { if (k) sb_raw(s, ", "); sb_str(s, "?"); }
     sb_raw(s, "]");
 }
 
@@ -10600,7 +10647,7 @@ static char *harvest_iface(parser *p)
             sb_raw(&s, "{ ");
             sb_kv(&s, "name", intern_name(p->syms, pi->pred));
             sb_raw(&s, ", \"args\": ");
-            if (sec == 4) sb_head_argsorts(&s, p, pi->pred, pi->arity);
+            if (sec == 4) sb_head_argsorts(&s, p, pi);
             else          sb_argsorts(&s, p, pi);
             if (sec == 2) { sb_raw(&s, ", "); sb_kv(&s, "type", "int"); }
             sb_raw(&s, " }");

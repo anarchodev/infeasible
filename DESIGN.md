@@ -3211,9 +3211,13 @@ arguments):
    function — one formula for every instance — which suits `damage(W)` and is
    useless for per-shape geometry, where each shape's numbers are its own and no
    formula relates them.
-3. *A predicate is monomorphic in its argument sorts*, first rule wins,
-   silently — so `shows(actor, …)` and `shows(item, …)` cannot be one
-   predicate and the ontology duplicates per sort. This is the ontology's
+3. *A predicate is monomorphic in its argument sorts.* A judgment has no
+   declaration site, so its signature is **inferred** from the rules that
+   conclude it, and rules that disagree are a located error (#205) rather than
+   a silently narrower artifact — a client crossing the published domains must
+   see every sort the engine concludes over, or the atoms it never asks about
+   read as "not proved". So `shows(actor, …)` and `shows(item, …)` cannot be
+   one predicate and the ontology duplicates per sort. This is the ontology's
    loudest argument for **sort union**, since "everything drawable" is a cover,
    not a coincidence.
 4. *A judgment can carry an entity but not a quantity*, so a bar's source has to
