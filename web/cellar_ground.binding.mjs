@@ -265,6 +265,19 @@ export function open(M, src) {
     q, state: st, set, a, lit, value: val,
     /** A fresh action set for the next step. */
     actions: () => new ActionSet(),
+    /** Advance one step from already-validated TERMS — the replay and
+     *  network path. The builder's protocol checks (#159) ran when the
+     *  orders were first collected; re-running them against a log whose
+     *  argument bindings are gone would compare undefined keys and refuse
+     *  a set the world already accepted. */
+    stepTerms(terms) {
+      const p = M._malloc(Math.max(1, terms.length) * 4);
+      terms.forEach((t, i) => { M.HEAPU32[(p >> 2) + i] = id(t); });
+      const rc = api.step(s, p, terms.length);
+      M._free(p);
+      if (rc !== 0) throw new Error('step rejected: ' + api.lastErr());
+      return world;
+    },
     /** Advance one step. Throws on a rejected step: with the builder
      *  consuming the protocol class, a -1 reaching a bound host is a bug. */
     step(set) {

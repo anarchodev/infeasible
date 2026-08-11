@@ -33,6 +33,7 @@ node web/platform_check.mjs                   # the interface + the cart, headle
 node web/browser_check.mjs                    # the cart in real Chromium (skips without one)
 node web/pure_check.mjs                       # the same cellar, played with NO game code
 node web/skins_check.mjs                      # a SECOND game through the same renderer
+node web/save_check.mjs                       # play, save, load into a fresh world, compare
 node web/host.mjs                             # the data boundary alone
 node web/binding_check.mjs                    # generated from reaction5e.story
 ```
