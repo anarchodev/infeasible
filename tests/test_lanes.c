@@ -88,6 +88,55 @@ static int test_homogeneous_agrees(void)
     return 0;
 }
 
+/* #220: lane eligibility must not depend on the ORDER sorts were declared in.
+ * A judgment carries no declaration, so the gate asks for the signature the
+ * rules concluding it settled (#205); reading the unpopulated schema slot made
+ * a judgment look like it was over sort index 0, and the same program laned or
+ * did not depending on which sort came first in the file. HOMO's sort is
+ * declared first, as every other case here is — this one is deliberately the
+ * mirror image, and the family it forms must still agree with N=1.
+ *
+ * (`item` exists only to be declared ahead of `actor`; it holds no atoms.) */
+static const char *SORT_LAST =
+    "sort item, actor\n"
+    "entity (guard, thug : actor  rope : item)\n"
+    "state (poisoned(actor) alert(actor) danger)\n"
+    "rule weakens(X: actor):  poisoned(X)       => weak(X)\n"
+    "rule staggers(X: actor): weak(X)           => slow(X)\n"
+    "rule engages(X: actor):  alert(X) & danger => acts(X)\n"
+    "init (poisoned(guard) alert(thug) danger)\n";
+
+static int test_lane_sort_declared_last(void)
+{
+    intern *sy = intern_new();
+    story_diag di[16];
+    story_diags d = { di, 16, 0, 0 };
+    world *w = story_compile(SORT_LAST, "sortlast.story", sy, &d);
+    if (!w) {
+        fprintf(stderr, "FAIL compile: %s\n", d.count ? d.items[0].msg : "?");
+        intern_free(sy);
+        return 1;
+    }
+    CHECK(d.nerrors == 0);
+
+    /* the judgments (weak, slow, acts) are over `actor` whatever its index */
+    CHECK(world_lane_family_count(w) == 1);
+
+    bool ok = false;
+    CHECK(world_lanes_check(w, &ok) > 0);
+    CHECK(ok);
+
+    /* and the two-level chain still derives through the family */
+    CHECK(world_query(w, dl_pos(intern_id(sy, "weak(guard)"))) == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "slow(guard)"))) == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "acts(thug)")))  == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "acts(guard)"))) != DL_PROVED);
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
 /* Partial coverage: a mixed program lanes the clean part and leaves the rest on
  * the N=1 path. `weak` is lane-clean (a plain defeasible rule over a base
  * fluent); `dead` depends on a numeric guard, so it taints and stays on jfam.
@@ -555,6 +604,7 @@ static int test_step_lanes_global(void)
 int main(void)
 {
     if (test_homogeneous_agrees()) return 1;
+    if (test_lane_sort_declared_last()) return 1;
     if (test_mixed_partial()) return 1;
     if (test_unless_lanes()) return 1;
     if (test_join_matcher()) return 1;
