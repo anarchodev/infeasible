@@ -142,11 +142,59 @@ static int test_ground_errors(void)
     if (expect_error("sort actor, item\nstate ( awake(actor)  broken(item) )\n"
                      "rule a(X: actor): awake(X)  => shows(X)\n"
                      "rule b(T: item):  broken(T) => shows(T)\n", "one signature")) return 1;
+    /* #217: the READ side of that signature. `shows` is concluded over actors,
+     * so `shows(K)` with `K : item` names an atom no rule can conclude — the
+     * rule silently never fires, which is #205's failure pointing the other
+     * way, at the author instead of at the client. */
+    if (expect_error("sort actor, item\nstate ( awake(actor)  on_floor(item) )\n"
+                     "rule lit(X: actor): awake(X) => shows(X)\n"
+                     "rule draw(K: item): on_floor(K) & shows(K) => glow(K)\n",
+                     "expects sort 'actor'")) return 1;
+    /* the read may precede the rule that settles the signature — the check is
+     * deferred, not order-dependent */
+    if (expect_error("sort actor, item\nstate ( awake(actor)  on_floor(item) )\n"
+                     "rule draw(K: item): on_floor(K) & shows(K) => glow(K)\n"
+                     "rule lit(X: actor): awake(X) => shows(X)\n",
+                     "expects sort 'actor'")) return 1;
+    /* an entity read in a `requires` is the same check in another scope */
+    if (expect_error("sort actor, item\nentity ( hero : actor  key : item )\n"
+                     "state ( awake(actor)  hp(actor) : int in 0..10 )\n"
+                     "rule lit(X: actor): awake(X) => shows(X)\n"
+                     "action poke(X: actor): requires shows(key) causes hp(X) -= 1\n",
+                     "expects sort 'actor'")) return 1;
+    /* and so is a test(…) reifying the judgment inside an effect expression */
+    if (expect_error("sort actor, item\nentity ( hero : actor  key : item )\n"
+                     "state ( awake(actor)  hp(actor) : int in 0..10 )\n"
+                     "rule lit(X: actor): awake(X) => shows(X)\n"
+                     "action poke(X: actor): causes hp(X) := 10 - test(shows(key))\n",
+                     "expects sort 'actor'")) return 1;
     return 0;
 }
 
-/* #205, the other side: rules that agree on a judgment's sorts compile clean,
- * whether each argument arrives as a typed parameter or as a ground entity. */
+/* #217: a judgment NOTHING concludes has no signature to check a read against,
+ * and that case belongs to the orphan pass — which warns rather than failing
+ * the compile, because a condition may legitimately await a rule. */
+static int test_head_read_orphan(void)
+{
+    intern *sy = intern_new();
+    story_diag di[8];
+    story_diags d = { di, 8, 0, 0 };
+    world *w = story_compile(
+        "sort actor, item\nstate awake(actor)\n"
+        "rule r(K: item): awake(hero) & unheard_of(K) => noticed(K)\n"
+        "entity hero : actor\n",
+        NULL, sy, &d);
+    CHECK(w != NULL);
+    CHECK(d.nerrors == 0);
+    CHECK(d.count == 1 && d.items[0].sev == STORY_WARNING);
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
+/* #205/#217, the other side: rules that agree on a judgment's sorts compile
+ * clean — where it is concluded and where it is read alike, whether each
+ * argument arrives as a typed parameter or as a ground entity. */
 static int test_head_sorts_agree(void)
 {
     intern *sy = intern_new();
@@ -157,7 +205,9 @@ static int test_head_sorts_agree(void)
         "entity ( hero, guard : actor  key : item )\n"
         "state ( showing  holding(actor, item) )\n"
         "rule a(X: actor, K: item): holding(X, K) => visible(X, K)\n"
-        "rule b: showing => visible(hero, key)\n",
+        "rule b: showing => visible(hero, key)\n"
+        "rule c(X: actor, K: item): visible(X, K) => noticed(X)\n"
+        "rule d: visible(hero, key) => alerted\n",
         NULL, sy, &d);
     CHECK(w != NULL);
     CHECK(d.nerrors == 0);
@@ -188,6 +238,7 @@ int main(void)
     if (test_cellar_ground())    return 1;
     if (test_ground_errors())    return 1;
     if (test_head_sorts_agree()) return 1;
+    if (test_head_read_orphan()) return 1;
     if (test_empty_sort())       return 1;
     printf("test_ground: all passed\n");
     return 0;
