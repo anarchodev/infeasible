@@ -3216,7 +3216,9 @@ arguments):
    conclude it, and rules that disagree are a located error (#205) rather than
    a silently narrower artifact — a client crossing the published domains must
    see every sort the engine concludes over, or the atoms it never asks about
-   read as "not proved". So `shows(actor, …)` and `shows(item, …)` cannot be
+   read as "not proved". Reads are checked against that same signature (#217),
+   so a body naming the wrong sort is an error rather than a rule that never
+   fires. So `shows(actor, …)` and `shows(item, …)` cannot be
    one predicate and the ontology duplicates per sort. This is the ontology's
    loudest argument for **sort union**, since "everything drawable" is a cover,
    not a coincidence.

@@ -327,6 +327,20 @@ typedef struct {
                                    * diagnostic that names the other site */
 } pred_info;
 
+/* #217: one deferred sort check for an argument READING a judgment. A judgment
+ * has no declaration, so its signature is not settled until every rule that
+ * concludes it has been seen — which is after the pass that walks the reads.
+ * What is recorded is the sort the reading scope already resolved, never the
+ * scope itself: the binding rules (which variables are in scope where, domain
+ * parameters, binder scopes) stay in one place and this pass cannot drift from
+ * them. */
+typedef struct {
+    int      pred;                /* index into parser.preds (a fixed array) */
+    int      arg;                 /* 0-based argument position */
+    int      got;                 /* the sort the argument resolved to */
+    int      line, col;
+} head_read;
+
 /* A value-returning function provider (§5.6): `function f(t1,…) : ret`. Unlike a
  * boolean provider (a relation), a function returns a value used in effect
  * expressions (EX_CALL) — e.g. `neighbor(cell, dir) : cell` for movement. Arg and
@@ -463,6 +477,10 @@ typedef struct {
     int nladders;
     ast_atom   *inits;                  /* grown geometrically (§ loud failures) */
     int ninits, capinits;
+
+    head_read  *hreads;                 /* #217: judgment reads awaiting their
+                                         * predicate's signature; grown to fit */
+    int nhreads, caphreads;
 
     ex_node    *exprs;            /* heap; MAX_EXPRS effect-expression nodes */
     int nexprs;
@@ -3006,14 +3024,36 @@ static int var_index(var_bind *vars, int nvars, uint32_t name)
     return -1;
 }
 
+/* #217: a judgment read here cannot be sort-checked yet — its signature is not
+ * settled until every rule concluding it has been seen — so the resolved sort
+ * is parked for `check_head_reads`. Declared vocabulary is checked in place
+ * below; only a conclusion has to wait. */
+static void defer_head_read(parser *p, const pred_info *pi, int k, int got,
+                            int line, int col)
+{
+    if (k >= MAX_ARGS || (got < 0 && got != INT_SORT)) return;
+    if (p->nhreads == p->caphreads) {
+        p->caphreads = p->caphreads ? p->caphreads * 2 : 64;
+        p->hreads = realloc(p->hreads, (size_t)p->caphreads * sizeof *p->hreads);
+    }
+    head_read *hr = &p->hreads[p->nhreads++];
+    hr->pred = (int)(pi - p->preds);
+    hr->arg = k; hr->got = got; hr->line = line; hr->col = col;
+}
+
 /* Every argument is a bound variable or a declared entity, with a sort check
  * against the fluent schema. Shared by atoms, effect targets, and fluent reads
- * inside effect expressions. */
+ * inside effect expressions. `is_read` distinguishes a position that CONSULTS
+ * the predicate from one that concludes or writes it — only a read defers a
+ * judgment's sort check (#217); a conclusion IS the signature (#205). */
 static void check_pred_args(parser *p, uint32_t pred, pred_info *pi,
                             const ast_arg *args, int nargs,
-                            var_bind *vars, int nvars, const char *ctx)
+                            var_bind *vars, int nvars, bool is_read,
+                            const char *ctx)
 {
     bool schema = pi && (pi->is_fluent || pi->is_provider || pi->is_emit);
+    bool judgment = is_read && !schema && pi && pi->is_head &&
+                    !pi->is_value && !pi->is_kindpred;
     for (int k = 0; k < nargs; k++) {
         const ast_arg *arg = &args[k];
         int want = schema ? pi->argsort[k] : -1;
@@ -3022,6 +3062,8 @@ static void check_pred_args(parser *p, uint32_t pred, pred_info *pi,
                 serr(p, arg->line, arg->col,
                      "argument %d of '%s' is the integer %ld, but that position is "
                      "not declared `int`", k + 1, intern_name(p->syms, pred), arg->ival);
+            else if (judgment)
+                defer_head_read(p, pi, k, INT_SORT, arg->line, arg->col);
             continue;
         }
         int vi = var_index(vars, nvars, arg->name);
@@ -3032,6 +3074,9 @@ static void check_pred_args(parser *p, uint32_t pred, pred_info *pi,
                  intern_name(p->syms, arg->name), ctx);
             continue;
         }
+        if (judgment)
+            defer_head_read(p, pi, k, vi >= 0 ? vars[vi].sort : p->ents[ei].sort,
+                            arg->line, arg->col);
         if (schema) {                           /* sort-check against schema */
             int got = vi >= 0 ? vars[vi].sort : p->ents[ei].sort;
             if (want == INT_SORT)
@@ -3135,7 +3180,7 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
                 return;
             }
             check_pred_args(p, n->pred, pi, n->args, n->nargs, vars, nvars,
-                            "a value read");
+                            true, "a value read");
             return;
         }
         if (!pi || !pi->is_fluent || !pi->is_num) {
@@ -3152,7 +3197,7 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
             return;
         }
         check_pred_args(p, n->pred, pi, n->args, n->nargs, vars, nvars,
-                        "an effect expression");
+                        true, "an effect expression");
         return;
     }
     case EX_CALL: {
@@ -3208,7 +3253,7 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
                 return;
             }
             check_pred_args(p, n->pred, ti, n->args, n->nargs, vars, nvars,
-                            "a test(…)");
+                            true, "a test(…)");
             return;
         }
         if (ti && (ti->is_num || ti->is_mv || ti->is_cell || ti->is_value))
@@ -3504,7 +3549,7 @@ static void check_defined_read(parser *p, ast_atom *at, var_bind *vars,
              "value's definedness (#116)", nm);
         return;
     }
-    check_pred_args(p, at->pred, pi, at->args, at->nargs, vars, nvars, ctx);
+    check_pred_args(p, at->pred, pi, at->args, at->nargs, vars, nvars, true, ctx);
     for (int d = 0; d < p->nvdefs[vi]; d++) {
         ast_rule *r = &p->rules[p->vdefs[vi][d]];
         if (r->nbody == 0 && !r->has_guard) {
@@ -3579,7 +3624,8 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
                      epi->arity == 1 ? "" : "s", at->nargs);
                 return;
             }
-            check_pred_args(p, at->pred, epi, at->args, at->nargs, vars, nvars, ctx);
+            check_pred_args(p, at->pred, epi, at->args, at->nargs, vars, nvars,
+                            false, ctx);
             return;
         }
     }
@@ -3652,7 +3698,8 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
                      intern_name(p->syms, at->pred), intern_name(p->syms, at->pred));
                 return;
             }
-            check_pred_args(p, at->pred, pg, at->args, at->nargs, vars, nvars, ctx);
+            check_pred_args(p, at->pred, pg, at->args, at->nargs, vars, nvars,
+                            true, ctx);
             return;
         }
         pred_info *pf = find_pred(p, at->pred);
@@ -3711,7 +3758,8 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
                      "not an arithmetic or literal expression",
                      intern_name(p->syms, at->pred));
         }
-        check_pred_args(p, at->pred, pi, at->args, at->nargs, vars, nvars, ctx);
+        check_pred_args(p, at->pred, pi, at->args, at->nargs, vars, nvars,
+                        false, ctx);
         check_expr(p, at->expr_root, vars, nvars);
         return;
     }
@@ -3800,7 +3848,9 @@ static void check_atom(parser *p, ast_atom *at, var_bind *vars, int nvars,
              n, n, at->nargs ? "(…)" : "", n, at->nargs ? "(…)" : "");
         return;
     }
-    check_pred_args(p, at->pred, pi, at->args, at->nargs, vars, nvars, ctx);
+    /* `note` marks the CONDITION positions — a body, an `unless`, a
+     * `requires`, a binder's `where`/`when` — which are exactly the reads */
+    check_pred_args(p, at->pred, pi, at->args, at->nargs, vars, nvars, note, ctx);
 }
 
 /* Does expression tree e contain a `roll()` (an EX_ROLL draw)? */
@@ -5917,6 +5967,42 @@ static void infer_head_sorts(parser *p)
     }
 }
 
+/* Does an argument of sort `got` satisfy a signature position of sort `want`?
+ * One predicate rather than an `==` at each site, because sort union (a cover:
+ * `union drawable = actor | item`) makes admission a question with a real
+ * answer — "is `got` covered by `want`" — and this is the place it grows. */
+static bool sort_admits(parser *p, int want, int got)
+{
+    (void)p;
+    return want == got;
+}
+
+/* #217: settle the judgment reads parked by `check_pred_args`, now that every
+ * rule has been seen and each judgment's signature is fixed. Reading a
+ * judgment at the wrong sort names an atom no rule can conclude, so the
+ * condition never holds and the rule never fires — the same always-false
+ * silence #205 closed on the concluding side, pointing the other way: there it
+ * was the artifact seeing a smaller world than the engine, here it is a rule
+ * the author believes is live. Nothing concludes the predicate at all is the
+ * ORPHAN pass's business (it warns), not this one's. */
+static void check_head_reads(parser *p)
+{
+    for (int i = 0; i < p->nhreads; i++) {
+        head_read *hr = &p->hreads[i];
+        pred_info *pi = &p->preds[hr->pred];
+        if (hr->arg >= pi->arity) continue;
+        int want = pi->headsort[hr->arg];
+        if (want == -1) continue;                  /* no rule pinned this slot */
+        if (!sort_admits(p, want, hr->got))
+            serr(p, hr->line, hr->col,
+                 "argument %d of '%s' expects sort '%s' (from the rules that "
+                 "conclude it) but got '%s' — nothing concludes the atom this "
+                 "names, so the condition never holds",
+                 hr->arg + 1, intern_name(p->syms, hr->pred),
+                 arg_sort_name(p, want), arg_sort_name(p, hr->got));
+    }
+}
+
 static void semantic_pass(parser *p)
 {
     synthesize_enum_sorts(p);          /* #96: before entities resolve */
@@ -6114,6 +6200,10 @@ static void semantic_pass(parser *p)
                      intern_name(p->syms, a->args[k].name));
     }
 
+    /* every read has been walked by now (rules above, actions and binders just
+     * past them), so the deferred judgment reads can be settled against the
+     * signatures — #205 fixes those, #217 checks the reads against them */
+    check_head_reads(p);
     check_partial_arith(p);            /* #116 static safety rule */
     check_exclusives(p);               /* #159 exclusivity groups */
     check_bands(p);
@@ -11096,6 +11186,7 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
     free(p->binders);
     free(p->exprs);
     free(p->inits);
+    free(p->hreads);
     free(p->ents);
     free(p->ent_of);
     free(p->ent_pos);
