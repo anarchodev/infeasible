@@ -131,6 +131,38 @@ static int test_ground_errors(void)
     /* a sort mismatch between a variable and a fluent's declared argument */
     if (expect_error("sort actor, item\nstate strong(actor)\n"
                      "rule r(T: item): strong(T) => q(T)", "sort")) return 1;
+    /* #205: a judgment has no declaration site, so its argument sorts come from
+     * the rules concluding it — and a predicate has ONE signature. Keeping the
+     * first sort silently would publish a smaller world than the engine has. */
+    if (expect_error("sort actor, item\nentity hero : actor\nentity key : item\n"
+                     "state showing\n"
+                     "rule a: showing => shows(hero)\n"
+                     "rule b: showing => shows(key)\n", "one signature")) return 1;
+    /* the variable case is the same check: it is the SORT that must agree */
+    if (expect_error("sort actor, item\nstate ( awake(actor)  broken(item) )\n"
+                     "rule a(X: actor): awake(X)  => shows(X)\n"
+                     "rule b(T: item):  broken(T) => shows(T)\n", "one signature")) return 1;
+    return 0;
+}
+
+/* #205, the other side: rules that agree on a judgment's sorts compile clean,
+ * whether each argument arrives as a typed parameter or as a ground entity. */
+static int test_head_sorts_agree(void)
+{
+    intern *sy = intern_new();
+    story_diag di[8];
+    story_diags d = { di, 8, 0, 0 };
+    world *w = story_compile(
+        "sort actor, item\n"
+        "entity ( hero, guard : actor  key : item )\n"
+        "state ( showing  holding(actor, item) )\n"
+        "rule a(X: actor, K: item): holding(X, K) => visible(X, K)\n"
+        "rule b: showing => visible(hero, key)\n",
+        NULL, sy, &d);
+    CHECK(w != NULL);
+    CHECK(d.nerrors == 0);
+    world_free(w);
+    intern_free(sy);
     return 0;
 }
 
@@ -153,9 +185,10 @@ static int test_empty_sort(void)
 
 int main(void)
 {
-    if (test_cellar_ground())  return 1;
-    if (test_ground_errors())  return 1;
-    if (test_empty_sort())     return 1;
+    if (test_cellar_ground())    return 1;
+    if (test_ground_errors())    return 1;
+    if (test_head_sorts_agree()) return 1;
+    if (test_empty_sort())       return 1;
     printf("test_ground: all passed\n");
     return 0;
 }
