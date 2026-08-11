@@ -9050,6 +9050,20 @@ static void synchronize(parser *p)
  * either way. Per-sort axis, forced (one variable = one axis): no plan, no cost
  * model — the plan is a pure local function of each rule's text. */
 
+/* What sort is this atom over? A DECLARED predicate carries its schema in
+ * `argsort`; a judgment has no declaration, so its argument sorts are the
+ * signature inferred from the rules that conclude it (#205, `headsort`) —
+ * reading `argsort` there gets whatever memset left, which is sort index 0 and
+ * a real sort, so eligibility would turn on declaration order (#220). Every
+ * lane gate asks the question here: when sort union lands, this equality
+ * becomes admission ("does the lane sort satisfy the atom's"), in one place. */
+static int pred_arg_sort(const pred_info *pi, int k)
+{
+    bool declared = pi->is_fluent || pi->is_provider || pi->is_emit ||
+                    pi->is_value || pi->is_kindpred;
+    return declared ? pi->argsort[k] : pi->headsort[k];
+}
+
 static bool lane_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var,
                          bool is_head)
 {
@@ -9064,7 +9078,7 @@ static bool lane_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var,
         return false;                              /* providers are host-answered, not laned */
     if (pi->arity == 0)
         return !is_head;                           /* globals: broadcast body only */
-    if (pi->arity != 1 || pi->argsort[0] != S)
+    if (pi->arity != 1 || pred_arg_sort(pi, 0) != S)
         return false;
     return a->nargs == 1 && a->args[0].name == var; /* arg is the quantified var */
 }
@@ -9520,7 +9534,7 @@ static bool step_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var,
                                                     * and the world steps N=1 */
     if (pi->arity == 0)
         return !is_effect;                         /* global: read-only broadcast */
-    if (pi->arity != 1 || pi->argsort[0] != S)
+    if (pi->arity != 1 || pred_arg_sort(pi, 0) != S)
         return false;
     return a->nargs == 1 && a->args[0].name == var;
 }
@@ -9550,7 +9564,7 @@ static bool collect_lane_tests(parser *p, int e, int S, uint32_t var,
     case EX_TEST: {
         pred_info *ti = find_pred(p, n->pred);
         if (!ti || !ti->is_fluent || ti->is_mv || ti->is_num) return false;
-        if (ti->arity != 1 || ti->argsort[0] != S) return false;
+        if (ti->arity != 1 || pred_arg_sort(ti, 0) != S) return false;
         if (n->nargs != 1 || n->args[0].name != var) return false;
         bool neg = n->konst != 0;
         for (int i = 0; i < *nts; i++)
@@ -9619,7 +9633,7 @@ static bool num_eff_ok(parser *p, const ast_atom *e, int S, uint32_t var,
 {
     pred_info *pi = find_pred(p, e->pred);
     if (!pi || !pi->is_fluent || !pi->is_num) return false;
-    if (pi->arity != 1 || pi->argsort[0] != S) return false;
+    if (pi->arity != 1 || pred_arg_sort(pi, 0) != S) return false;
     if (e->nargs != 1 || e->args[0].name != var) return false;
     *nts = 0;
     if (!collect_lane_tests(p, e->expr_root, S, var, ts, nts)) return false;
@@ -9662,8 +9676,8 @@ static void emit_step_lanes(parser *p)
         }
         if (pi->arity != 1)
             return;
-        if (S < 0) S = pi->argsort[0];
-        else if (pi->argsort[0] != S) return;      /* multi-sort: bail */
+        if (S < 0) S = pred_arg_sort(pi, 0);
+        else if (pred_arg_sort(pi, 0) != S) return;   /* multi-sort: bail */
         if (pi->is_num) numpred[nnp++] = i;
         else fpred[nf++] = i;
     }
@@ -10127,8 +10141,8 @@ static void emit_step_lanes_split(parser *p)
             return;                                /* a non-split MV: not laned yet */
         if (pi->arity != 1 || pi->is_num || pi->is_cell)
             continue;                              /* global / numeric / n-ary: residue */
-        if (S < 0) S = pi->argsort[0];
-        if (pi->argsort[0] != S)
+        if (S < 0) S = pred_arg_sort(pi, 0);
+        if (pred_arg_sort(pi, 0) != S)
             continue;                              /* other-sort fluent: residue */
         fpred[nf++] = i;
     }
