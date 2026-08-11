@@ -88,6 +88,12 @@ add_executable(bench_complexity tests/bench_complexity.c)
 target_link_libraries(bench_complexity PRIVATE infeasible_core)
 target_compile_options(bench_complexity PRIVATE -O2)
 
+# Multi-variable ("island") lane family: which higher-arity shapes reach it,
+# what it buys against N=1, and where the dense outer loop stops scaling.
+add_executable(bench_join tests/bench_join.c)
+target_link_libraries(bench_join PRIVATE infeasible_core)
+target_compile_options(bench_join PRIVATE -O2)
+
 # Step-lane frontier benchmark (#75/#165, 5.8/8.1): which authoring shapes reach
 # the lanes, and what each bail costs. Doubles as a marker when a bail retires.
 add_executable(bench_lanes tests/bench_lanes.c)
