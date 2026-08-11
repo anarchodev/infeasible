@@ -137,6 +137,7 @@ w(`export const IFACE = ${JSON.stringify({
                                    values: f.values })),
   actions: iface.actions.map((a) => ({ name: a.name,
                                        params: a.params.map((p) => p.sort) })),
+  values: (iface.values ?? []).map((v) => ({ name: v.name, args: v.args })),
 })};`);
 w();
 

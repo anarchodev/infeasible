@@ -57,8 +57,6 @@ state (
     aiming(fighter)
 
     showing
-    ax(anchor) : int in 0 .. 640   ay(anchor) : int in 0 .. 360
-    aw(anchor) : int in 0 .. 640   ah(anchor) : int in 0 .. 360
 )
 
 emit ( hit(fighter)  ward(fighter)  heal(fighter) )
@@ -78,16 +76,55 @@ init (
     aiming(gnoll)
     showing
 
-    ax(a_title)  = 0    ay(a_title)  = 0    aw(a_title)  = 640  ah(a_title)  = 14
-    ax(a_foes)   = 8    ay(a_foes)   = 36   aw(a_foes)   = 400  ah(a_foes)   = 96
-    ax(a_self)   = 424  ay(a_self)   = 36   aw(a_self)   = 208  ah(a_self)   = 96
-    ax(a_hand)   = 8    ay(a_hand)   = 152  aw(a_hand)   = 624  ah(a_hand)   = 64
-    ax(a_bar)    = 0    ay(a_bar)    = 224  aw(a_bar)    = 640  ah(a_bar)    = 1
-    ax(a_who)    = 0    ay(a_who)    = 229  aw(a_who)    = 200  ah(a_who)    = 12
-    ax(a_menu)   = 8    ay(a_menu)   = 244  aw(a_menu)   = 200  ah(a_menu)   = 12
-    ax(a_status) = 240  ay(a_status) = 229  aw(a_status) = 200  ah(a_status) = 8
-    ax(a_note)   = 240  ay(a_note)   = 268  aw(a_note)   = 380  ah(a_note)   = 12
 )
+
+// ---- the layout, as a VALUE TABLE rather than as state ----------------------
+//
+// These are constants: `init` set them and no action ever moves them. Left in
+// the fact store they were configuration masquerading as state — carried in
+// every save, and *removing* an anchor became a schema migration for a purely
+// cosmetic edit. As value rows (#94) they leave the EDB entirely, so a layout
+// change is a rule change, which §12 already says is free, and a year-old
+// action log replays under a new skin and gets the same world with a new look.
+value ( ax(anchor) : int   ay(anchor) : int
+        aw(anchor) : int   ah(anchor) : int )
+
+rule g_title_x: => ax(a_title) = 0
+rule g_title_y: => ay(a_title) = 0
+rule g_title_w: => aw(a_title) = 640
+rule g_title_h: => ah(a_title) = 14
+rule g_foes_x: => ax(a_foes) = 8
+rule g_foes_y: => ay(a_foes) = 36
+rule g_foes_w: => aw(a_foes) = 400
+rule g_foes_h: => ah(a_foes) = 96
+rule g_self_x: => ax(a_self) = 424
+rule g_self_y: => ay(a_self) = 36
+rule g_self_w: => aw(a_self) = 208
+rule g_self_h: => ah(a_self) = 96
+rule g_hand_x: => ax(a_hand) = 8
+rule g_hand_y: => ay(a_hand) = 152
+rule g_hand_w: => aw(a_hand) = 624
+rule g_hand_h: => ah(a_hand) = 64
+rule g_bar_x: => ax(a_bar) = 0
+rule g_bar_y: => ay(a_bar) = 224
+rule g_bar_w: => aw(a_bar) = 640
+rule g_bar_h: => ah(a_bar) = 1
+rule g_who_x: => ax(a_who) = 0
+rule g_who_y: => ay(a_who) = 229
+rule g_who_w: => aw(a_who) = 200
+rule g_who_h: => ah(a_who) = 12
+rule g_menu_x: => ax(a_menu) = 8
+rule g_menu_y: => ay(a_menu) = 244
+rule g_menu_w: => aw(a_menu) = 200
+rule g_menu_h: => ah(a_menu) = 12
+rule g_status_x: => ax(a_status) = 240
+rule g_status_y: => ay(a_status) = 229
+rule g_status_w: => aw(a_status) = 200
+rule g_status_h: => ah(a_status) = 8
+rule g_note_x: => ax(a_note) = 240
+rule g_note_y: => ay(a_note) = 268
+rule g_note_w: => aw(a_note) = 380
+rule g_note_h: => ah(a_note) = 12
 
 // ---- the world -------------------------------------------------------------
 

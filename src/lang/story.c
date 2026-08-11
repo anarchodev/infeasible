@@ -18,6 +18,12 @@
 #define MAX_ENTS       (1 << 20)   /* sanity ceiling; entities grow on the heap */
 #define MAX_MEMPOOL    1024    /* membership-list values across a file (#95) */
 #define MAX_LAYERS     8       /* guarded definitions per value (#82/#94) */
+#define MAX_VDEFS      272     /* definitions per value: the layer chain plus its
+                                * lookup-table ROWS (#94). Rows are not layers —
+                                * each speaks for one instance and none blends
+                                * with another — so they are bounded by how many
+                                * instances a value has, not by the register
+                                * depth the chain costs. */
 #define MAX_FLUENTS    256     /* fluent *predicate* schemas */
 #define MAX_PREDS      512     /* predicate registry (fluents + heads) */
 #define MAX_RULES      256
@@ -410,14 +416,14 @@ typedef struct {
     uint32_t split_pred;          /* the ONE `split` fluent (#121), 0 = none */
     int value_def[MAX_FLUENTS];           /* per value: the BASE definition (the one
                                            * unconditional rule), -1 = none yet */
-    int vdefs[MAX_FLUENTS][MAX_LAYERS + 1];   /* all defs, declaration order (#82/#94) */
+    int vdefs[MAX_FLUENTS][MAX_VDEFS];        /* all defs, declaration order (#82/#94) */
     int nvdefs[MAX_FLUENTS];
     int value_layers[MAX_FLUENTS][MAX_LAYERS];/* guarded defs, CHAIN order (bottom->top) */
     int value_nlayers[MAX_FLUENTS];
     /* Lookup-table ROWS: unconditional definitions that pin a constant head
      * argument, so each speaks for one ground instance. The base is the
      * catch-all beneath them, if there is one. */
-    int value_rows[MAX_FLUENTS][MAX_LAYERS];
+    int value_rows[MAX_FLUENTS][MAX_VDEFS];
     int value_nrows[MAX_FLUENTS];
     int *vmark_of; uint32_t vmark_cap;    /* marker atom -> grounded flag (dedup) */
     bool in_valuedef_expr;                /* `prior` legality context */
@@ -4124,10 +4130,11 @@ static void register_valuedef(parser *p, int ri)
     ast_rule *r = &p->rules[ri];
     int vi = find_value(p, r->head.pred);          /* parse gated on this */
     if (vi < 0) return;
-    if (p->nvdefs[vi] >= MAX_LAYERS + 1) {
+    if (p->nvdefs[vi] >= MAX_VDEFS) {
         serr(p, r->line, r->col,
-             "'%s' has too many definitions (max %d — one base + %d layers)",
-             intern_name(p->syms, r->head.pred), MAX_LAYERS + 1, MAX_LAYERS);
+             "'%s' has too many definitions (max %d — one base, up to %d "
+             "guarded layers, and lookup-table rows)",
+             intern_name(p->syms, r->head.pred), MAX_VDEFS, MAX_LAYERS);
         return;
     }
     p->vdefs[vi][p->nvdefs[vi]++] = ri;
@@ -4356,7 +4363,7 @@ static void order_value_layers(parser *p)
         /* the base: exactly one unconditional, prior-free definition */
         int base = -1;
         int gl[MAX_LAYERS], ngl = 0;               /* guarded defs, decl order */
-        int rows[MAX_LAYERS], nrows = 0;           /* per-instance rows (#94) */
+        int rows[MAX_VDEFS], nrows = 0;            /* per-instance rows (#94) */
         for (int d = 0; d < nds; d++) {
             int ri = p->vdefs[vi][d];
             ast_rule *r = &p->rules[ri];
