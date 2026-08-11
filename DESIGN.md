@@ -2563,6 +2563,95 @@ programmer's. So the tradeoff is made *local, explicit, and visible*.
   broadphase") already refuses: the provider is itself the first author-supplied
   physical-design decision; these levers are the second.
 
+### 8.2 Layout selection: the rules are the access pattern
+
+§8.1 says who chooses between strategies. This says what the engine is choosing
+*among*, and why that choice is a compiler pass rather than a collection of
+opportunistic tests.
+
+**The layers that got a layout are no longer the cost.** Measured on the
+vertical slice (`bench_slice`, 10 000 units, 600 ticks): provider 0.637 ms,
+judge 0.025 ms, act/step 0.041 ms per tick. The columnar judgment solve — SoA
+bit columns, 64 entities per word, a schedule compiled once with the schema —
+is **3.5%** of the tick; the host boundary is **90.6%**. The lift is real
+where it was applied (`bench_col`: 234× at N=1000, 558× at N=100 000;
+`bench_join`: two orders of magnitude for multi-variable rules) and the
+remaining cost has moved to the seams between representations, not inside
+any of them.
+
+**The thesis: a rule *is* an access-pattern declaration.** Data-oriented
+layout is hand-work everywhere else because the access pattern lives in
+imperative code, where it cannot be recovered. Here it is written down.
+`near(X, Y) & awake(Y) => threat(X, Y)` states: walk `near` X-major, probe
+`awake` by Y, write `threat` per pair. Which arguments are keys, which are
+iterated, which relations are read together, and which conclusions are read at
+all (§4.1's demand cone) are all statically enumerable. So the engine can
+*derive* a physical design instead of profiling for one — the same move §5.2
+makes for evaluation order, where the SCC schedule compiles once with the
+schema, applied to representation instead of order.
+
+**The menu, and what a relation's shape selects.** Unary over a sort → a bit
+vector, one word per 64 entities. Binary dense → a row-major bit matrix keyed
+by the lane axis. Binary sparse → CSR of bitsets or sorted pair runs, the
+representation the eager path lacks and the §5.2 matcher approximates by
+grounding only satisfied instances. Read by exactly one key → a dense array on
+that argument. Numeric over a sort → an SoA value column. Hot/cold → the fluents
+that move per tick are enumerated by the step log's changeset (§5.8), so
+placement can follow mutation frequency rather than declaration order. A
+predicate read two incompatible ways is the interesting case, and the answer is
+the ordinary one: materialize both and let the selection pass account for the
+duplication, or pick by read frequency and pay a transpose at the minority site.
+
+**One pass, one IR.** Eligibility decided by several independent predicates over
+the same facts is a choice nobody can state, test, or report; it also has no
+place to hold a cost model. The layer this section names is a relation-and-layout
+IR between the grounder and the engine, with a single selection pass over it —
+the natural home for lane eligibility, the eager/matcher split, the dense/sparse
+outer loop of a multi-variable family, and the §8.1 overrides that direct any of
+them. The pass reports its result per rule (§9), because a representation choice
+that nothing prints is a cliff an author finds by accident.
+
+Three constraints bound it, and they are what make the pass safe rather than
+clever:
+
+- **Equivalence is the license, again.** Every layout is differentially pinned
+  against N=1 (`world_lanes_check`, `world_step_lanes_check`) before it is
+  routed. A new representation is admissible exactly when it derives the same
+  verdicts and renders the same trace, so the selection pass can be as
+  aggressive as the checks are thorough — and a wrong choice is slow, never
+  wrong.
+- **Layout is a pure function of the program (I4).** Declared cardinalities,
+  the rule set, and the init extension decide it; wall-clock measurements never
+  do, because a layout chosen from a profile makes two machines diverge in what
+  they materialize, and replay is not a property one can hold approximately.
+  Layout is semantically invisible, so it does not enter the game hash (§12) —
+  but two builds of one source must choose identically.
+- **No silent spill.** A relation that changes representation when the 1025th
+  entity arrives changes its tail behaviour as a function of content, which is
+  the §8.1 density argument verbatim: content is what a mod edits. Thresholds
+  belong to *routing* (which pass runs), never to a guarantee an author was
+  given.
+
+**The frontier is the boundary, not the solver.** A provider answers one ground
+atom per indirect call, and by measurement that path is nine tenths of the tick
+while the bit-parallel solve it feeds is a thirtieth. The batched form — hand
+the host a run of entities and a bitset to fill — costs nothing semantically
+(the provider contract is already deterministic and trace-time-inert, §5.6) and
+lets both sides work in the layout they already have, instead of transposing one
+bit at a time across a function pointer. That is the first item of work this
+section implies, and it is ahead of anything deeper in the solver.
+
+**Retractions** (each closes a plausible path):
+
+- *Profile-guided layout*: forbidden by I4 above, not merely undesirable.
+- *Layout annotations as the primary mechanism*: they are §8.1 overrides — the
+  scalpel, for the parts an author has reasoned about — and cannot be the
+  default without making every author a physical-design DBA, which §8.1 already
+  refuses on the same grounds as the provider mechanism.
+- *A runtime query planner*: the plan search is a tail nobody can see, and the
+  engine still cannot know the frame budget. The choice is made statically and
+  stated; adaptivity, where wanted, is the existing pinned-vs-adaptive lever.
+
 ## 9. Tooling (first-class, built early)
 
 - `why <literal>?` — proof/defeat trace: which rules supported, which
