@@ -156,7 +156,15 @@
  *                                          -- args (V(A) = roller, V(A,T) adds
  *                                          -- the target); expanded labels `L.value`
  *                                          -- value definition (#82/#94): AT MOST
- *                                          -- ONE unconditional base per value,
+ *                                          -- ONE unconditional base per ground
+ *                                          -- INSTANCE — a head argument may be a
+ *                                          -- CONSTANT instead of a parameter, and
+ *                                          -- then the definition is a lookup-table
+ *                                          -- ROW speaking for that instance alone
+ *                                          -- (`sx(sh_bar) = 8`); a catch-all is the
+ *                                          -- default beneath the rows, and a table
+ *                                          -- with no catch-all is partial (#116)
+ *                                          -- exactly where no row speaks,
  *                                          -- plus guarded overrides/layers ordered
  *                                          -- by `>`; `prior` in the expr layers on
  *                                          -- the chain below (prior+e / max / min

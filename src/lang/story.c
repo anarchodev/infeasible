@@ -414,6 +414,11 @@ typedef struct {
     int nvdefs[MAX_FLUENTS];
     int value_layers[MAX_FLUENTS][MAX_LAYERS];/* guarded defs, CHAIN order (bottom->top) */
     int value_nlayers[MAX_FLUENTS];
+    /* Lookup-table ROWS: unconditional definitions that pin a constant head
+     * argument, so each speaks for one ground instance. The base is the
+     * catch-all beneath them, if there is one. */
+    int value_rows[MAX_FLUENTS][MAX_LAYERS];
+    int value_nrows[MAX_FLUENTS];
     int *vmark_of; uint32_t vmark_cap;    /* marker atom -> grounded flag (dedup) */
     bool in_valuedef_expr;                /* `prior` legality context */
     bool in_ramif_eff;                    /* primed-read legality context (#84) */
@@ -4171,6 +4176,16 @@ static int valuedef_class(parser *p, int e)
  * judgment (`body => label(binding)`) on first read, and its expression is
  * inlined into the chain program at every read site; the whole rules pipeline
  * skips the definition itself. */
+/* Is this ground symbol a member of sort index `s`? A value definition's head
+ * argument may be one, which makes the definition speak for that instance
+ * alone — a lookup table rather than a function. */
+static bool value_arg_is_member(parser *p, int s, uint32_t sym)
+{
+    for (int e = 0; e < domain_size(p, s); e++)
+        if (domain_at(p, s, e) == sym) return true;
+    return false;
+}
+
 static void check_valuedef(parser *p, int ri)
 {
     ast_rule *r = &p->rules[ri];
@@ -4208,21 +4223,30 @@ static void check_valuedef(parser *p, int ri)
     int vi = find_value(p, h->pred);
     ast_fluent *v = &p->valuedecls[vi];
     pred_info *pi = find_pred(p, h->pred);
-    if (h->nargs != v->nargs || r->nvars != v->nargs) {
+    if (h->nargs != v->nargs) {
         serr(p, h->line, h->col,
-             "the definition of '%s' must bind exactly its %d declared "
-             "argument%s (each head argument a distinct rule parameter)",
-             nm, v->nargs, v->nargs == 1 ? "" : "s");
+             "the definition of '%s' takes %d argument%s, not %d",
+             nm, v->nargs, v->nargs == 1 ? "" : "s", h->nargs);
         return;
     }
+    /* A head argument is either a rule PARAMETER — the definition speaks for
+     * every instance — or a CONSTANT, and then it speaks only for that one.
+     * The second is how a value becomes a lookup table (`sw(a_wide) = 200`),
+     * which is what per-instance geometry needs and what a single all-parameter
+     * definition cannot say. Applicability is then per ground instance, and so
+     * is "exactly one unconditional base" (#94). */
     bool used[MAX_ARGS] = { false };
+    int nparam = 0;
     for (int k = 0; k < h->nargs; k++) {
         int f = var_index(r->vars, r->nvars, h->args[k].name);
+        if (f < 0 && pi && pi->argsort[k] >= 0 &&
+            value_arg_is_member(p, pi->argsort[k], h->args[k].name)) continue;
+        nparam++;
         if (f < 0 || used[f]) {
             serr(p, h->args[k].line, h->args[k].col,
                  "value-definition argument %d of '%s' must be a distinct rule "
-                 "parameter, got '%s'", k + 1, nm,
-                 intern_name(p->syms, h->args[k].name));
+                 "parameter or a member of its declared sort, got '%s'",
+                 k + 1, nm, intern_name(p->syms, h->args[k].name));
             return;
         }
         used[f] = true;
@@ -4297,6 +4321,31 @@ static bool value_cycle_dfs(parser *p, int vi, bool *onstack, bool *done)
  * or a general prior use must be comparable to every other guarded def, since
  * its result depends on position. Ties fall back to declaration order, which
  * by then is semantically irrelevant. */
+/* Does this definition speak for this ground instance? A head argument that is
+ * a rule parameter matches anything; one that is a constant matches only
+ * itself. `rargs` may be NULL, meaning "any instance" — the shape the
+ * declaration-time checks use. */
+static bool vdef_applies(const ast_rule *r, const uint32_t *rargs)
+{
+    if (!rargs) return true;
+    for (int k = 0; k < r->head.nargs; k++)
+        if (var_index((var_bind *)r->vars, r->nvars, r->head.args[k].name) < 0 &&
+            r->head.args[k].name != rargs[k])
+            return false;
+    return true;
+}
+
+/* Is this definition a lookup-table row — does any head argument pin a
+ * constant? Such a definition is unconditional for its own instance only, so
+ * it does not collide with another row's base. */
+static bool vdef_is_row(const ast_rule *r)
+{
+    for (int k = 0; k < r->head.nargs; k++)
+        if (var_index((var_bind *)r->vars, r->nvars, r->head.args[k].name) < 0)
+            return true;
+    return false;
+}
+
 static void order_value_layers(parser *p)
 {
     for (int vi = 0; vi < p->nvaluedecls; vi++) {
@@ -4307,15 +4356,23 @@ static void order_value_layers(parser *p)
         /* the base: exactly one unconditional, prior-free definition */
         int base = -1;
         int gl[MAX_LAYERS], ngl = 0;               /* guarded defs, decl order */
+        int rows[MAX_LAYERS], nrows = 0;           /* per-instance rows (#94) */
         for (int d = 0; d < nds; d++) {
             int ri = p->vdefs[vi][d];
             ast_rule *r = &p->rules[ri];
             if (r->nbody == 0 && !r->has_guard) {
+                /* A lookup-table row (`sw(a_wide) = 200`) is unconditional for
+                 * ONE instance, so rows never collide with each other. What
+                 * still collides is two definitions that both apply to the
+                 * same instance — a catch-all beside a row, or two catch-alls
+                 * (#94's rule, restated per instance). */
+                if (vdef_is_row(r)) { rows[nrows++ < MAX_LAYERS ? nrows - 1 : 0] = ri; continue; }
                 if (base >= 0) {
                     serr(p, r->line, r->col,
                          "'%s' has two unconditional definitions ('%s' and "
                          "'%s') — exactly one is the base; give the other a "
-                         "body (#94)", vn, p->rules[base].label, r->label);
+                         "body, or pin an argument to make it a row (#94)",
+                         vn, p->rules[base].label, r->label);
                     return;
                 }
                 base = ri;
@@ -4334,9 +4391,14 @@ static void order_value_layers(parser *p)
              * the value PARTIAL (no keyword; the static safety rule keeps a
              * forgotten base loud at the first arithmetic consumer). At least
              * one prior-free definition must exist, or no layer can ever
-             * ground the chain and the value could never be defined. */
-            p->value_partial[vi] = true;
+             * ground the chain and the value could never be defined. A table
+             * of rows with no catch-all is partial in the same honest sense:
+             * defined exactly where a row speaks, undefined elsewhere. */
+            p->value_partial[vi] = nrows == 0;
             bool grounding = false;
+            for (int i = 0; i < nrows && !grounding; i++)
+                if (!expr_has_prior(p, p->rules[rows[i]].head.lhs_root))
+                    grounding = true;
             for (int i = 0; i < ngl && !grounding; i++)
                 if (!expr_has_prior(p, p->rules[gl[i]].head.lhs_root))
                     grounding = true;
@@ -4349,6 +4411,8 @@ static void order_value_layers(parser *p)
             }
         }
         p->value_def[vi] = base;
+        p->value_nrows[vi] = nrows;
+        for (int i = 0; i < nrows; i++) p->value_rows[vi][i] = rows[i];
 
         /* superiority among the guarded defs: above[i][j] = i beats j */
         bool above[MAX_LAYERS][MAX_LAYERS] = { { false } };
@@ -6454,8 +6518,16 @@ static void emit_value_inline(parser *p, uint32_t pred, const uint32_t *rargs,
 {
     int vi = find_value(p, pred);
     if (vi < 0 || p->nvdefs[vi] == 0) return;  /* no defs: reported in check pass */
+    /* A lookup-table row speaks for one instance and beats the catch-all
+     * beneath it; with no row and no catch-all this instance is genuinely
+     * undefined, which is what the partial epilogue is for (#116). */
     int base = p->value_def[vi];
-    bool partial = p->value_partial[vi];
+    for (int i = 0; i < p->value_nrows[vi]; i++)
+        if (vdef_applies(&p->rules[p->value_rows[vi][i]], rargs)) {
+            base = p->value_rows[vi][i];
+            break;
+        }
+    bool partial = p->value_partial[vi] || (base < 0 && p->value_nrows[vi] > 0);
     if (base < 0 && !partial) return;          /* reported in the check pass */
     if (++p->vdepth > MAX_ARGS * 2) { p->vdepth--; return; }   /* cycle backstop */
 #define VEMIT(o, a) do { if (*pos < MAX_CODE) {         code[*pos].op = (o); code[(*pos)++].arg = (a); } else p->code_of = true; } while (0)
@@ -6472,6 +6544,7 @@ static void emit_value_inline(parser *p, uint32_t pred, const uint32_t *rargs,
     for (int L = 0; L < p->value_nlayers[vi]; L++) {
         int ri = p->value_layers[vi][L];
         ast_rule *ld = &p->rules[ri];
+        if (!vdef_applies(ld, rargs)) continue;
         uint32_t lsub[MAX_ARGS] = { 0 };
         emit_valuedef_sub(p, ld, rargs, lsub);
         long targ = (long)ensure_marker_grounded(p, ri, rargs) << 1;
@@ -7990,23 +8063,33 @@ static void register_value_reads(parser *p)
         if (!pi->is_value) continue;
         int vi = find_value(p, pi->pred);
         if (vi < 0 || p->nvdefs[vi] == 0) continue;
-        ast_rule *base = &p->rules[p->vdefs[vi][0]];
-        bool of = false;
-        long total = instance_count(p, base->vars, base->nvars, &of);
-        if (of || total <= 0) continue;          /* errored elsewhere, or empty */
+        int nargs = p->valuedecls[vi].nargs;
 
-        uint32_t binding[MAX_ARGS], args[MAX_ARGS];
+        /* Enumerate over the value's DECLARED argument sorts, not over any one
+         * definition's parameters: a lookup table's rows each bind a constant,
+         * so no single definition's parameter list covers the instances. */
+        long total = 1;
+        for (int k = 0; k < nargs; k++) {
+            int sz = pi->argsort[k] >= 0 ? domain_size(p, pi->argsort[k]) : 0;
+            if (sz <= 0) { total = 0; break; }
+            if (total > MAX_INSTANCES / sz) { total = 0; break; }   /* no silent cap */
+            total *= sz;
+        }
+        if (total <= 0) continue;
+
+        uint32_t args[MAX_ARGS];
         for (long idx = 0; idx < total; idx++) {
-            decode_binding(p, base->vars, base->nvars, idx, binding);
-            for (int k = 0; k < base->head.nargs; k++)
-                args[k] = resolve_arg(base->vars, base->nvars, binding,
-                                      base->head.args[k]);
+            long rest = idx;
+            for (int k = nargs - 1; k >= 0; k--) {
+                int sz = domain_size(p, pi->argsort[k]);
+                args[k] = domain_at(p, pi->argsort[k], (int)(rest % sz));
+                rest /= sz;
+            }
             expr_ins code[MAX_CODE];
             int pos = 0;
             emit_value_inline(p, pi->pred, args, code, &pos);
             if (pos <= 0 || pos >= MAX_CODE) continue;
-            world_add_value(p->w, ground_pred(p, pi->pred, args, base->head.nargs),
-                            code, pos);
+            world_add_value(p->w, ground_pred(p, pi->pred, args, nargs), code, pos);
         }
     }
 }

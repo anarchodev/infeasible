@@ -3177,11 +3177,15 @@ arguments):
 1. *A rule needs a body*, so the parts of a frame that are simply always there
    need something to hang on. A `showing` fluent is the honest answer and turns
    out to be the seam a title screen would use anyway.
-2. *Values are functions, not lookup tables* — at most one unconditional
-   definition, and head arguments must be rule parameters — so geometry is
-   numeric **state** initialized per instance. That is the better model
-   regardless (§5.6 already puts positions in the store), but it is not where an
-   author's hand goes first.
+2. *Values are functions, not lookup tables* — **closed**. A head argument may
+   now be a constant, and then the definition is a ROW speaking for that ground
+   instance alone (`sx(sh_bar) = 8`), with a catch-all as the default beneath
+   the rows. #94's "exactly one unconditional base" becomes one *per instance*:
+   rows never collide with each other, and a table with no catch-all is partial
+   (#116) exactly where no row speaks. Without this a value is only ever a
+   function — one formula for every instance — which suits `damage(W)` and is
+   useless for per-shape geometry, where each shape's numbers are its own and no
+   formula relates them.
 3. *A predicate is monomorphic in its argument sorts*, first rule wins,
    silently — so `shows(actor, …)` and `shows(item, …)` cannot be one
    predicate and the ontology duplicates per sort. This is the ontology's
