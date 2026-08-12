@@ -62,15 +62,20 @@ typedef struct {
  * once); for a two-variable rule it is the size of the non-lane sort, and the
  * family is re-solved per iteration against a different fact slice (lane one
  * axis, iterate the other). `ground[(a*niter + it)*nent + e]` is the named
- * ground atom for predicate-local `a` at iteration `it`, lane `e`; `is_fluent[a]`
- * flags locals that take base facts. */
+ * ground atom for predicate-local `a` at iteration `it`, lane `e`; `kind[a]`
+ * says where local `a`'s column comes from (WORLD_LANE_*). */
 typedef struct {
     dlcol   *fam;
     int      natoms, nent, niter;
     uint32_t *ground;             /* [natoms*niter*nent] */
-    bool    *is_fluent;           /* [natoms]: local takes closed-world base facts */
-    bool    *is_import;           /* [natoms]: local is derived elsewhere, its
-                                   * per-cell verdict queried and injected (§5.5) */
+    uint8_t *kind;                /* [natoms]: WORLD_LANE_{DERIVED,FLUENT,
+                                   * IMPORT,PROVIDER} */
+    int8_t  *prov_slot;           /* [natoms*niter] or NULL: for a PROVIDER local,
+                                   * which argument its column varies along —
+                                   * static (it is the lane axis), so it is
+                                   * decided on first load and kept. -2 not yet
+                                   * decided, -1 not a run (load it cell by
+                                   * cell), else the slot. */
     bool     solved;              /* fam currently holds iteration cur_it, and
                                    * that solve reflects the live base facts */
     int      cur_it;              /* which iteration is loaded/solved in fam
@@ -523,8 +528,8 @@ void world_free(world *w)
     for (int i = 0; i < w->nlanes; i++) {
         dlcol_free(w->lanes[i].fam);
         free(w->lanes[i].ground);
-        free(w->lanes[i].is_fluent);
-        free(w->lanes[i].is_import);
+        free(w->lanes[i].kind);
+        free(w->lanes[i].prov_slot);
     }
     free(w->lanes);
     for (int i = 0; i < w->nsteplanes; i++) {
@@ -1126,6 +1131,59 @@ static void load_providers(world *w, dlcol *f, const uint32_t *of, uint32_t cap)
         return;
     }
     provider_runs(w, of, cap, load_run, f);
+}
+
+/* Fill one LANE column from the provider callback (#233). `pos` takes a bit per
+ * cell that holds and `neg` the complement — closed-world, exactly as the N=1
+ * load asserts f or ~f for every provider atom — both masked to `nent` bits.
+ *
+ * Where the cells form a run (same predicate, differing in exactly one argument,
+ * which is what a lane axis IS) a batched host answers the whole column in one
+ * call, straight into the row the solve reads. Otherwise — no fill callback, or
+ * a provider atom that does not vary along this axis — it is one call per cell
+ * into that same row, still without the per-atom scatter the N=1 path pays. */
+static void load_provider_column(world *w, const uint32_t *cells, int nent,
+                                 int8_t *slotp, uint64_t *pos, uint64_t *neg)
+{
+    int words = (nent + 63) / 64;
+    memset(pos, 0, (size_t)words * sizeof *pos);
+
+    bool batched = false;
+    if (w->provider_fill_fn && w->provider_fn && nent > 1 && *slotp != -1) {
+        fill_reserve(w, nent);
+        batched = true;
+        int slot = *slotp;
+        int first = prov_index(w, cells[0]);
+        if (first < 0)
+            batched = false;
+        w->fill_idx[0] = first;
+        for (int e = 1; e < nent && batched; e++) {
+            int i = prov_index(w, cells[e]);
+            /* Decide the run once: which argument the column varies along is a
+             * property of the ground map, not of the state, so re-deriving it
+             * every solve is the batched path paying for its own bookkeeping. */
+            if (i < 0 || (*slotp == -2 && !run_extends(w, first, i, &slot)) ||
+                (*slotp >= 0 && w->provs[i].pred != w->provs[first].pred))
+                batched = false;
+            else
+                w->fill_idx[e] = i;
+        }
+        *slotp = (int8_t)(batched ? slot : -1);
+        if (batched) {
+            run_answers(w, slot, nent);
+            memcpy(pos, w->fill_out, (size_t)words * sizeof *pos);
+        }
+    }
+    if (!batched)
+        for (int e = 0; e < nent; e++) {
+            int i = prov_index(w, cells[e]);
+            if (i >= 0 && provider_holds(w, i))
+                pos[e / 64] |= 1ull << (e % 64);
+        }
+
+    uint64_t tail = nent % 64 ? (1ull << (nent % 64)) - 1 : ~0ull;
+    for (int k = 0; k < words; k++)
+        neg[k] = ~pos[k] & (k == words - 1 ? tail : ~0ull);
 }
 
 static void check_run(world *w, void *u, int slot, int n)
@@ -2101,8 +2159,7 @@ void world_why(world *w, dl_lit q, FILE *out)
 /* ---- lane families (DoD thesis) ---- */
 
 void world_add_lane_family(world *w, dlcol *fam, int natoms, int nent, int niter,
-                           const uint32_t *ground, const bool *is_fluent,
-                           const bool *is_import)
+                           const uint32_t *ground, const uint8_t *kind)
 {
     GROW(w->lanes, w->nlanes, w->caplanes);
     int fi = w->nlanes;
@@ -2116,11 +2173,16 @@ void world_add_lane_family(world *w, dlcol *fam, int natoms, int nent, int niter
     size_t g = (size_t)natoms * (size_t)niter * (size_t)nent;
     lf->ground = malloc((g ? g : 1) * sizeof *lf->ground);
     memcpy(lf->ground, ground, (g ? g : 1) * sizeof *lf->ground);
-    lf->is_fluent = malloc((size_t)(natoms ? natoms : 1) * sizeof *lf->is_fluent);
-    memcpy(lf->is_fluent, is_fluent, (size_t)(natoms ? natoms : 1) * sizeof *lf->is_fluent);
-    lf->is_import = calloc((size_t)(natoms ? natoms : 1), sizeof *lf->is_import);
-    if (is_import)
-        memcpy(lf->is_import, is_import, (size_t)(natoms ? natoms : 1) * sizeof *lf->is_import);
+    lf->kind = malloc((size_t)(natoms ? natoms : 1) * sizeof *lf->kind);
+    memcpy(lf->kind, kind, (size_t)(natoms ? natoms : 1) * sizeof *lf->kind);
+    lf->prov_slot = NULL;
+    for (int a = 0; a < natoms; a++)
+        if (kind[a] == WORLD_LANE_PROVIDER) {
+            size_t ns = (size_t)natoms * (size_t)(niter ? niter : 1);
+            lf->prov_slot = malloc(ns * sizeof *lf->prov_slot);
+            memset(lf->prov_slot, -2, ns * sizeof *lf->prov_slot);  /* undecided */
+            break;
+        }
 
     /* Index each ground atom back to its lane cell so world_query can route —
      * for join families (niter>1) as well as single-variable ones. A join
@@ -2141,8 +2203,14 @@ void world_add_lane_family(world *w, dlcol *fam, int natoms, int nent, int niter
         if (mult[ground[k]] < 2) mult[ground[k]]++;
 
     for (int a = 0; a < natoms; a++) {
-        if (is_import && is_import[a])
-            continue;                          /* not concluded here: never route */
+        if (kind[a] == WORLD_LANE_IMPORT || kind[a] == WORLD_LANE_PROVIDER)
+            continue;                          /* not concluded here: never route.
+                                                * A provider cell has an answer
+                                                * without a solve (the N=1 lazy
+                                                * path reads the callback), so
+                                                * routing one would make a query
+                                                * pay for a family it does not
+                                                * need. */
         for (int it = 0; it < niter; it++)
             for (int e = 0; e < nent; e++) {
                 uint32_t at = ground[((size_t)a * niter + it) * nent + e];
@@ -2183,13 +2251,23 @@ static void solve_lane_iter(world *w, lane_family *lf, int it)
 {
     dlcol_clear_facts(lf->fam);
     for (int a = 0; a < lf->natoms; a++) {
-        if (lf->is_fluent[a]) {
+        const uint32_t *cells = &lf->ground[((size_t)a * lf->niter + it) * lf->nent];
+        if (lf->kind[a] == WORLD_LANE_FLUENT) {
             for (int e = 0; e < lf->nent; e++) {
-                uint32_t g = lf->ground[((size_t)a * lf->niter + it) * lf->nent + e];
-                dl_lit l = { (uint32_t)a, !world_get(w, g) };  /* a if true, ~a else */
+                dl_lit l = { (uint32_t)a, !world_get(w, cells[e]) };  /* a or ~a */
                 dlcol_add_fact(lf->fam, l, e);
             }
-        } else if (lf->is_import[a]) {
+        } else if (lf->kind[a] == WORLD_LANE_PROVIDER) {
+            /* A host-answered relation is a column, not a cell at a time (#233).
+             * The family's fact rows are the bitsets the provider fills, so the
+             * answers land where they are read — no transpose, and with a
+             * batched host (#229) one call for the whole row. Closed-world, like
+             * every other provider load: the negative row is the complement. */
+            load_provider_column(w, cells, lf->nent,
+                                 &lf->prov_slot[(size_t)a * lf->niter + it],
+                                 dlcol_fact_row(lf->fam, (dl_lit){ (uint32_t)a, false }),
+                                 dlcol_fact_row(lf->fam, (dl_lit){ (uint32_t)a, true }));
+        } else if (lf->kind[a] == WORLD_LANE_IMPORT) {
             /* a derived body atom, concluded elsewhere: query it and inject the
              * conclusion for each cell. Inject a literal ONLY when it is genuinely
              * proved (+∂): +a if a is PROVED, ~a if the complement is PROVED. Do
@@ -2202,10 +2280,9 @@ static void solve_lane_iter(world *w, lane_family *lf, int it)
              * way — the differential oracle would flag it; the compiler rejects
              * cycles.) */
             for (int e = 0; e < lf->nent; e++) {
-                uint32_t g = lf->ground[((size_t)a * lf->niter + it) * lf->nent + e];
-                if (world_query(w, (dl_lit){ g, false }) == DL_PROVED)
+                if (world_query(w, (dl_lit){ cells[e], false }) == DL_PROVED)
                     dlcol_add_fact(lf->fam, (dl_lit){ (uint32_t)a, false }, e);
-                else if (world_query(w, (dl_lit){ g, true }) == DL_PROVED)
+                else if (world_query(w, (dl_lit){ cells[e], true }) == DL_PROVED)
                     dlcol_add_fact(lf->fam, (dl_lit){ (uint32_t)a, true }, e);
             }
         }

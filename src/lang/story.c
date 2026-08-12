@@ -9074,8 +9074,10 @@ static bool lane_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var,
                                                     * marker-disjunction rules
                                                     * live in the N=1 family */
     pred_info *pi = find_pred(p, a->pred);
-    if (!pi || pi->is_mv || pi->is_num || pi->is_provider)
-        return false;                              /* providers are host-answered, not laned */
+    if (!pi || pi->is_mv || pi->is_num)
+        return false;
+    if (pi->is_provider && is_head)
+        return false;                              /* read-only: never concluded */
     if (pi->arity == 0)
         return !is_head;                           /* globals: broadcast body only */
     if (pi->arity != 1 || pred_arg_sort(pi, 0) != S)
@@ -9181,7 +9183,7 @@ static void emit_sort_lanes(parser *p, int S, const bool *taint)
 
     /* distinct predicates (head + bodies) as family-local atoms */
     uint32_t preds[MAX_PREDS];
-    bool pf[MAX_PREDS];
+    uint8_t pkind[MAX_PREDS];
     int npred = 0;
     for (int li = 0; li < nlaned; li++) {
         ast_rule *r = &p->rules[laned[li]];
@@ -9196,8 +9198,11 @@ static void emit_sort_lanes(parser *p, int S, const bool *taint)
             for (int j = 0; j < npred; j++) if (preds[j] == pr) { found = j; break; }
             if (found < 0) {
                 if (npred >= MAX_PREDS) return;
+                pred_info *pri = find_pred(p, pr);
                 preds[npred] = pr;
-                pf[npred] = find_pred(p, pr)->is_fluent;
+                pkind[npred] = pri->is_fluent   ? WORLD_LANE_FLUENT
+                             : pri->is_provider ? WORLD_LANE_PROVIDER
+                                                : WORLD_LANE_DERIVED;
                 npred++;
             }
         }
@@ -9261,7 +9266,7 @@ static void emit_sort_lanes(parser *p, int S, const bool *taint)
                 pi->arity == 0 ? preds[a] : ground_pred(p, preds[a], &ent, 1);
         }
     }
-    world_add_lane_family(p->w, f, npred, nent, 1, ground, pf, NULL);
+    world_add_lane_family(p->w, f, npred, nent, 1, ground, pkind);
     free(ground);
 }
 
@@ -9290,9 +9295,12 @@ static bool join_atom_ok(parser *p, const ast_atom *a, const var_bind *vars,
     if (a->value != INTERN_NONE || a->is_guard || a->is_num_effect || a->is_expr_guard)
         return false;
     pred_info *pi = find_pred(p, a->pred);
-    if (!pi || pi->is_mv || pi->is_num || pi->is_provider || pi->arity != a->nargs)
-        return false;                              /* providers are host-answered, not laned */
-    (void)is_head;   /* a derived body/guard pred is allowed: it imports (§5.5) */
+    if (!pi || pi->is_mv || pi->is_num || pi->arity != a->nargs)
+        return false;
+    if (pi->is_provider && is_head)
+        return false;                              /* read-only: never concluded */
+    /* a derived body/guard pred is allowed: it imports (§5.5); a provider one is
+     * allowed too and becomes a host-filled column (#233) */
     for (int k = 0; k < a->nargs; k++) {
         int rho = -1;
         for (int v = 0; v < nvars; v++)
@@ -9411,7 +9419,7 @@ static void emit_join_family(parser *p, ast_rule *r)
 
     /* distinct predicates -> family-local atoms (arg pattern from first use) */
     uint32_t preds[MAX_PREDS];
-    bool pf[MAX_PREDS];
+    uint8_t pkind[MAX_PREDS];
     int prole[MAX_PREDS][MAX_ARGS], pnarg[MAX_PREDS], npred = 0;
     for (int k = 0; k < nat; k++) {
         uint32_t pr = ats[k]->pred;
@@ -9419,8 +9427,11 @@ static void emit_join_family(parser *p, ast_rule *r)
         for (int j = 0; j < npred; j++) if (preds[j] == pr) { found = j; break; }
         if (found < 0) {
             if (npred >= MAX_PREDS) return;
+            pred_info *pri = find_pred(p, pr);
             preds[npred] = pr;
-            pf[npred] = find_pred(p, pr)->is_fluent;
+            pkind[npred] = pri->is_fluent   ? WORLD_LANE_FLUENT
+                         : pri->is_provider ? WORLD_LANE_PROVIDER
+                                            : WORLD_LANE_DERIVED;
             pnarg[npred] = ats[k]->nargs;
             for (int m = 0; m < ats[k]->nargs; m++) prole[npred][m] = roleslot[k][m];
             npred++;
@@ -9432,12 +9443,12 @@ static void emit_join_family(parser *p, ast_rule *r)
         for (int j = 0; j < npred; j++)
             if (preds[j] == ats[k]->pred) { local_of[k] = j; break; }
 
-    /* classify locals: the head (local_of[0]) is concluded here; a non-fluent
-     * body/guard pred is DERIVED elsewhere and imported (its verdict injected
-     * per cell at solve time); everything else is a base fluent. */
-    bool pimport[MAX_PREDS];
+    /* classify locals: the head (local_of[0]) is concluded here; a body/guard
+     * pred that is neither a base fluent nor a provider is DERIVED elsewhere and
+     * imported (its verdict injected per cell at solve time). */
     for (int j = 0; j < npred; j++)
-        pimport[j] = !pf[j] && j != local_of[0];
+        if (pkind[j] == WORLD_LANE_DERIVED && j != local_of[0])
+            pkind[j] = WORLD_LANE_IMPORT;
 
     dlcol *f = dlcol_new(npred, nent);
     for (int a = 0; a < npred; a++)
@@ -9486,7 +9497,7 @@ static void emit_join_family(parser *p, ast_rule *r)
                     ground_pred(p, preds[a], args, pnarg[a]);
             }
         }
-    world_add_lane_family(p->w, f, npred, nent, (int)niter, ground, pf, pimport);
+    world_add_lane_family(p->w, f, npred, nent, (int)niter, ground, pkind);
     free(ground);
 }
 
