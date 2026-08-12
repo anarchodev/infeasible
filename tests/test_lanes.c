@@ -601,6 +601,48 @@ static int test_step_lanes_global(void)
     return 0;
 }
 
+/* ---- #235: one predicate at TWO argument patterns is two columns ----------
+ *
+ * A family-local is a predicate at an argument pattern, not a predicate.
+ * `near(X, Y)` and `near(Y, X)` read two different columns of one relation, and
+ * keying locals by predicate alone made the second read the first's ground map:
+ * the rule body became `near(X, Y) & near(X, Y)` and concluded on one fact where
+ * the source asked for both directions.
+ *
+ * `near` here is deliberately asymmetric — a0 sees a1 but not back — so a
+ * collapsed local is a WRONG ANSWER and not merely a coincidence. */
+static const char *TWO_PATTERNS =
+    "sort actor\n"
+    "entity (a0, a1, a2 : actor)\n"
+    "state (near(actor, actor))\n"
+    "init (near(a0,a1) near(a1,a2) near(a2,a1))\n"
+    "rule mutual(X: actor, Y: actor): near(X, Y) & near(Y, X) => pair(X, Y)\n";
+
+static int test_two_arg_patterns(void)
+{
+    intern *sy = intern_new();
+    story_diag di[16];
+    story_diags dg = { di, 16, 0, 0 };
+    world *w = story_compile(TWO_PATTERNS, "twopat.story", sy, &dg);
+    CHECK(w);
+    CHECK(world_lane_family_count(w) == 1);
+
+    bool ok = false;
+    CHECK(world_lanes_check(w, &ok) > 0);
+    CHECK(ok);
+
+    /* one-way: near(a0,a1) holds, near(a1,a0) does not */
+    CHECK(world_query(w, dl_pos(intern_id(sy, "pair(a0,a1)"))) == DL_REFUTED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "pair(a1,a0)"))) == DL_REFUTED);
+    /* mutual: near(a1,a2) and near(a2,a1) both hold */
+    CHECK(world_query(w, dl_pos(intern_id(sy, "pair(a1,a2)"))) == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "pair(a2,a1)"))) == DL_PROVED);
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
 /* ---- #233: a provider read is a lane COLUMN, not a bail -------------------
  *
  * A host-answered relation used to disqualify its rule from the lane path, on
@@ -725,6 +767,7 @@ int main(void)
     if (test_derived_body_join_neg()) return 1;
     if (test_step_lanes()) return 1;
     if (test_step_lanes_global()) return 1;
+    if (test_two_arg_patterns()) return 1;
     if (test_provider_lanes()) return 1;
     printf("test_lanes: all passed\n");
     return 0;

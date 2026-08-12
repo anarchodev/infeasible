@@ -99,6 +99,9 @@ static const struct shape SHAPES[] = {
       "rule r(X: actor, Y: actor, K: item): near(X, Y) & holding(Y, K) "
       "=> steal(X, Y, K)", 1,
       "niter is the product of the K-1 non-lane sorts" },
+    { "one pred, TWO arg patterns", "state ( near(actor, actor) )",
+      "rule r(X: actor, Y: actor): near(X, Y) & near(Y, X) => pair(X, Y)", 1,
+      "a local is a pred AT A PATTERN — two columns of one relation (#235)" },
     { "PROVIDER body atom", "state ( awake(actor) )\nprovider near(actor, actor)",
       "rule r(X: actor, Y: actor): near(X, Y) & awake(Y) => threat(X, Y)", 1,
       "a host-answered relation is a column the provider fills (#233)" },
