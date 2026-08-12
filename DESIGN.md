@@ -2573,7 +2573,9 @@ opportunistic tests.
 vertical slice (`bench_slice`, 10 000 units, 600 ticks): provider 0.637 ms,
 judge 0.025 ms, act/step 0.041 ms per tick. The columnar judgment solve — SoA
 bit columns, 64 entities per word, a schedule compiled once with the schema —
-is **3.5%** of the tick; the host boundary is **90.6%**. The lift is real
+is **3.5%** of the tick; the host's own spatial phase is **90.6%** — that phase
+writes fact columns directly and does not cross the §5.6 provider interface, so
+it prices an index, not a boundary. The lift is real
 where it was applied (`bench_col`: 234× at N=1000, 558× at N=100 000;
 `bench_join`: two orders of magnitude for multi-variable rules) and the
 remaining cost has moved to the seams between representations, not inside
@@ -2632,14 +2634,28 @@ clever:
   belong to *routing* (which pass runs), never to a guarantee an author was
   given.
 
-**The frontier is the boundary, not the solver.** A provider answers one ground
-atom per indirect call, and by measurement that path is nine tenths of the tick
-while the bit-parallel solve it feeds is a thirtieth. The batched form — hand
-the host a run of entities and a bitset to fill — costs nothing semantically
-(the provider contract is already deterministic and trace-time-inert, §5.6) and
-lets both sides work in the layout they already have, instead of transposing one
-bit at a time across a function pointer. That is the first item of work this
-section implies, and it is ahead of anything deeper in the solver.
+**The frontier is which rules got a layout, not the boundary.** A provider
+answers one ground atom per indirect call. That is an ugly interface and not an
+expensive one: measured (`bench_provider`), the same N² answers computed with no
+engine in the middle are under 1% of the tick, and the batched form — hand the
+host a run of atoms differing in one argument and a bitset to fill,
+`world_set_provider_fill_fn` — collapses the call count by a factor of N and
+moves the tick by nothing. It is still the right interface (both sides work in
+the layout they already have, it costs nothing semantically, and
+`world_providers_check` pins it against the per-atom form), but it is not the
+lever.
+
+The cost is one level up: **reading a provider disqualifies its rule from the
+lane path**, so `near(X, Y) & awake(Y) => threat(X, Y)` solves N² ground rules
+one at a time. The identical rule with `near` stored as a fluent lanes and runs
+an order of magnitude faster — and forced back onto N=1 by an unrelated
+disqualifier it costs exactly what the provider version costs, which is the
+measurement that locates the whole gap in the gate rather than the crossing. A
+provider column is a bitset the host already knows how to fill, which is exactly
+what the batched form hands it, so the first item of work this section implies
+is giving a provider read a lane column. The host phase in `bench_slice` is a
+third thing again: it writes fact columns directly and never crosses this
+interface at all.
 
 **Retractions** (each closes a plausible path):
 
