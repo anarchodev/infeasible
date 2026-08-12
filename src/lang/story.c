@@ -9064,8 +9064,19 @@ static int pred_arg_sort(const pred_info *pi, int k)
     return declared ? pi->argsort[k] : pi->headsort[k];
 }
 
+/* An argument that names an entity rather than binding a variable (#226). A
+ * constant is a FIXED index into the ground map, known at compile time, in a
+ * builder that is already substituting a different entity per role — it carries
+ * no soundness content, so it disqualifies nothing. What it does do is make one
+ * predicate reachable at several patterns (`holding(X, key1)` beside
+ * `holding(X, key2)`), which is why a family-local is keyed by its whole
+ * pattern (#235) and not by its predicate. */
+enum { ROLE_CONST = -1 };
+
+/* `roles[k]`/`consts[k]` describe argument k: a variable role (0 = the lane
+ * axis), or ROLE_CONST plus the entity the source named. */
 static bool lane_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var,
-                         bool is_head)
+                         bool is_head, int *roles, uint32_t *consts)
 {
     if (a->value != INTERN_NONE || a->is_guard || a->is_num_effect || a->is_expr_guard)
         return false;                              /* MV / numeric / expr guard: out */
@@ -9080,28 +9091,50 @@ static bool lane_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var,
         return false;                              /* read-only: never concluded */
     if (pi->arity == 0)
         return !is_head;                           /* globals: broadcast body only */
-    if (pi->arity != 1 || pred_arg_sort(pi, 0) != S)
+    if (pi->arity != a->nargs)
         return false;
-    return a->nargs == 1 && a->args[0].name == var; /* arg is the quantified var */
+    bool binds = false;
+    for (int k = 0; k < a->nargs; k++) {
+        if (a->args[k].name == var) {
+            if (pred_arg_sort(pi, k) != S)
+                return false;
+            roles[k] = 0;
+            consts[k] = INTERN_NONE;
+            binds = true;
+        } else if (entity_pos(p, pred_arg_sort(pi, k), a->args[k].name) >= 0) {
+            roles[k] = ROLE_CONST;                 /* a named entity of that sort */
+            consts[k] = a->args[k].name;
+        } else {
+            return false;                          /* another variable, or not an
+                                                    * entity of the declared sort */
+        }
+    }
+    /* A head has to vary along the lane axis: one that names only constants
+     * concludes the same atom from every lane, which is the arity-0 case and is
+     * refused for the same reason. */
+    return binds || !is_head;
 }
 
 /* A rule can lane iff it is single-variable and every atom — body, head, and any
- * `unless` guard — is unary over that one sort (arg = the variable) or an
- * arity-0 global input. An `unless` guard lowers to a defeater `guard ~> ~head`
- * (§6), emitted as its own schema rule, so its atoms must lane too. */
+ * `unless` guard — is over that one sort with each argument either the variable
+ * or a named entity, or is an arity-0 global input. An `unless` guard lowers to
+ * a defeater `guard ~> ~head` (§6), emitted as its own schema rule, so its atoms
+ * must lane too. */
 static bool rule_eligible(parser *p, ast_rule *r)
 {
     if (r->nvars != 1)
         return false;
     int S = r->vars[0].sort;
     uint32_t var = r->vars[0].name;
-    if (!lane_atom_ok(p, &r->head, S, var, true))
+    int roles[MAX_ARGS];
+    uint32_t consts[MAX_ARGS];
+    if (!lane_atom_ok(p, &r->head, S, var, true, roles, consts))
         return false;
     for (int b = 0; b < r->nbody; b++)
-        if (!lane_atom_ok(p, &r->body[b], S, var, false))
+        if (!lane_atom_ok(p, &r->body[b], S, var, false, roles, consts))
             return false;
     for (int g = 0; g < r->nguard; g++)
-        if (!lane_atom_ok(p, &r->guard[g], S, var, false))
+        if (!lane_atom_ok(p, &r->guard[g], S, var, false, roles, consts))
             return false;
     return true;
 }
@@ -9110,6 +9143,92 @@ static int pred_idx(parser *p, uint32_t pred)
 {
     pred_info *pi = find_pred(p, pred);
     return pi ? (int)(pi - p->preds) : -1;
+}
+
+/* The family-local table, shared by both lane emitters. A local is a predicate
+ * AT AN ARGUMENT PATTERN, never a predicate: `near(X, Y)` and `near(Y, X)` read
+ * two different columns of one relation, and so do `holding(X, key1)` and
+ * `holding(X, key2)`. Keying by predicate alone made the second read the first's
+ * ground map (#235). `vname` is the display spelling of each slot — a variable's
+ * name, or the entity a constant named — kept so a trace can say WHICH column. */
+typedef struct {
+    uint32_t pred[MAX_PREDS];
+    uint8_t  kind[MAX_PREDS];
+    int      nargs[MAX_PREDS];
+    int      role[MAX_PREDS][MAX_ARGS];
+    uint32_t konst[MAX_PREDS][MAX_ARGS];
+    uint32_t vname[MAX_PREDS][MAX_ARGS];
+    int      n;
+} lane_locals;
+
+/* Find or add the local for one atom's pattern; -1 if the table is full. */
+static int lane_local_of(parser *p, lane_locals *L, const ast_rule *r,
+                         uint32_t pred, int nargs, const int *roles,
+                         const uint32_t *consts)
+{
+    for (int j = 0; j < L->n; j++) {
+        if (L->pred[j] != pred || L->nargs[j] != nargs) continue;
+        bool same = true;
+        for (int m = 0; m < nargs && same; m++)
+            same = L->role[j][m] == roles[m] &&
+                   (roles[m] != ROLE_CONST || L->konst[j][m] == consts[m]);
+        if (same) return j;
+    }
+    if (L->n >= MAX_PREDS) return -1;
+    int j = L->n++;
+    pred_info *pi = find_pred(p, pred);
+    L->pred[j] = pred;
+    L->kind[j] = pi->is_fluent   ? WORLD_LANE_FLUENT
+               : pi->is_provider ? WORLD_LANE_PROVIDER
+                                 : WORLD_LANE_DERIVED;
+    L->nargs[j] = nargs;
+    for (int m = 0; m < nargs; m++) {
+        L->role[j][m] = roles[m];
+        L->konst[j][m] = roles[m] == ROLE_CONST ? consts[m] : INTERN_NONE;
+        L->vname[j][m] = roles[m] == ROLE_CONST ? consts[m]
+                                                : r->vars[roles[m]].name;
+    }
+    return j;
+}
+
+/* Local `j`'s ground atom for one cell: role 0 takes the lane entity, role v>0
+ * the iterated entity for var v (`vidx`, NULL for a single-variable family), and
+ * ROLE_CONST the entity the source named. */
+static uint32_t lane_cell_atom(parser *p, const lane_locals *L, int j,
+                               const ast_rule *r, int Sl, int e, const int *vidx)
+{
+    if (L->nargs[j] == 0)
+        return L->pred[j];                         /* arity-0 global: broadcast */
+    uint32_t args[MAX_ARGS];
+    for (int m = 0; m < L->nargs[j]; m++) {
+        int rho = L->role[j][m];
+        args[m] = rho == ROLE_CONST ? L->konst[j][m]
+                : rho == 0          ? domain_at(p, Sl, e)
+                                    : domain_at(p, r->vars[rho].sort, vidx[rho]);
+    }
+    return ground_pred(p, L->pred[j], args, L->nargs[j]);
+}
+
+/* A predicate at ONE pattern keeps its bare name, so every trace written before
+ * locals split by pattern reads exactly as it did. A predicate at two has to say
+ * which — `near(X,Y)` against `near(Y,X)` — or the trace shows one atom
+ * concluding and failing at once. */
+static void lane_local_name(parser *p, const lane_locals *L, int j,
+                            char *buf, size_t cap)
+{
+    int same = 0;
+    for (int b = 0; b < L->n; b++)
+        if (L->pred[b] == L->pred[j]) same++;
+    if (same == 1 || L->nargs[j] == 0) {
+        snprintf(buf, cap, "%s", intern_name(p->syms, L->pred[j]));
+        return;
+    }
+    int o = snprintf(buf, cap, "%s(", intern_name(p->syms, L->pred[j]));
+    for (int m = 0; m < L->nargs[j] && o > 0 && o < (int)cap; m++)
+        o += snprintf(buf + o, cap - (size_t)o, "%s%s", m ? "," : "",
+                      intern_name(p->syms, L->vname[j][m]));
+    if (o > 0 && o < (int)cap)
+        snprintf(buf + o, cap - (size_t)o, ")");
 }
 
 static int rule_index(parser *p, const char *label)
@@ -9181,51 +9300,55 @@ static void emit_sort_lanes(parser *p, int S, const bool *taint)
     if (nlaned == 0)
         return;
 
-    /* distinct predicates (head + bodies) as family-local atoms */
-    uint32_t preds[MAX_PREDS];
-    uint8_t pkind[MAX_PREDS];
-    int npred = 0;
+    /* Family-local atoms, one per (predicate, argument pattern). Two rules using
+     * one predicate with different constants — `holding(X, key1)` beside
+     * `holding(X, key2)` — read two columns, and must not share a local. */
+    lane_locals L;
+    L.n = 0;
+    int local_head[MAX_RULES], local_body[MAX_RULES][MAX_BODY];
+    int local_guard[MAX_RULES][MAX_BODY];
     for (int li = 0; li < nlaned; li++) {
         ast_rule *r = &p->rules[laned[li]];
+        int roles[MAX_ARGS];
+        uint32_t consts[MAX_ARGS];
         const ast_atom *atoms[1 + 2 * MAX_BODY];
-        int na = 0;
+        int slot[1 + 2 * MAX_BODY], na = 0;
         atoms[na++] = &r->head;
         for (int b = 0; b < r->nbody; b++)  atoms[na++] = &r->body[b];
         for (int g = 0; g < r->nguard; g++) atoms[na++] = &r->guard[g];
         for (int k = 0; k < na; k++) {
-            uint32_t pr = atoms[k]->pred;
-            int found = -1;
-            for (int j = 0; j < npred; j++) if (preds[j] == pr) { found = j; break; }
-            if (found < 0) {
-                if (npred >= MAX_PREDS) return;
-                pred_info *pri = find_pred(p, pr);
-                preds[npred] = pr;
-                pkind[npred] = pri->is_fluent   ? WORLD_LANE_FLUENT
-                             : pri->is_provider ? WORLD_LANE_PROVIDER
-                                                : WORLD_LANE_DERIVED;
-                npred++;
-            }
+            /* re-derive the pattern the eligibility gate already accepted */
+            if (!lane_atom_ok(p, atoms[k], S, r->vars[0].name, k == 0,
+                              roles, consts))
+                return;
+            int j = lane_local_of(p, &L, r, atoms[k]->pred, atoms[k]->nargs,
+                                  roles, consts);
+            if (j < 0)
+                return;                            /* local table full: no family */
+            slot[k] = j;
         }
+        local_head[li] = slot[0];
+        for (int b = 0; b < r->nbody; b++)  local_body[li][b] = slot[1 + b];
+        for (int g = 0; g < r->nguard; g++) local_guard[li][g] = slot[1 + r->nbody + g];
     }
+    int npred = L.n;
 
     dlcol *f = dlcol_new(npred, nent);
-    for (int a = 0; a < npred; a++)
-        dlcol_set_atom_name(f, (uint32_t)a, intern_name(p->syms, preds[a]));
+    for (int a = 0; a < npred; a++) {
+        char nbuf[MAX_NAME * 2 + 8];
+        lane_local_name(p, &L, a, nbuf, sizeof nbuf);
+        dlcol_set_atom_name(f, (uint32_t)a, nbuf);
+    }
 
     int schema_id[MAX_RULES];                      /* rule index -> schema id */
     for (int i = 0; i < p->nrules; i++) schema_id[i] = -1;
     for (int li = 0; li < nlaned; li++) {
         ast_rule *r = &p->rules[laned[li]];
-        int hl = -1;
-        for (int j = 0; j < npred; j++) if (preds[j] == r->head.pred) { hl = j; break; }
+        int hl = local_head[li];
         dl_lit head = { (uint32_t)hl, r->head.neg };
         dl_lit body[MAX_BODY];
-        for (int b = 0; b < r->nbody; b++) {
-            int bl = -1;
-            for (int j = 0; j < npred; j++)
-                if (preds[j] == r->body[b].pred) { bl = j; break; }
-            body[b] = (dl_lit){ (uint32_t)bl, r->body[b].neg };
-        }
+        for (int b = 0; b < r->nbody; b++)
+            body[b] = (dl_lit){ (uint32_t)local_body[li][b], r->body[b].neg };
         char pbuf[MAX_NAME + 24];
         prov_str(p, r->line, pbuf, sizeof pbuf);
         int h = dlcol_add_rule(f, r->label, r->kind, head, body, r->nbody);
@@ -9237,12 +9360,8 @@ static void emit_sort_lanes(parser *p, int S, const bool *taint)
         if (r->has_guard) {
             dl_lit dhead = { (uint32_t)hl, !r->head.neg };
             dl_lit guard[MAX_BODY];
-            for (int g = 0; g < r->nguard; g++) {
-                int gl = -1;
-                for (int j = 0; j < npred; j++)
-                    if (preds[j] == r->guard[g].pred) { gl = j; break; }
-                guard[g] = (dl_lit){ (uint32_t)gl, r->guard[g].neg };
-            }
+            for (int g = 0; g < r->nguard; g++)
+                guard[g] = (dl_lit){ (uint32_t)local_guard[li][g], r->guard[g].neg };
             char gname[MAX_NAME + 8];
             snprintf(gname, sizeof gname, "%s.unless", r->label);
             int gh = dlcol_add_rule(f, gname, DL_DEFEATER, dhead, guard, r->nguard);
@@ -9255,18 +9374,14 @@ static void emit_sort_lanes(parser *p, int S, const bool *taint)
             dlcol_add_sup(f, schema_id[wi], schema_id[li]);
     }
 
-    /* (predicate-local, lane) -> named ground atom, for facts + the differential
-     * check; a global (arity 0) broadcasts the same atom to every lane */
+    /* (local, lane) -> named ground atom, for facts + the differential check. A
+     * global (arity 0) broadcasts the same atom to every lane, and so does an
+     * atom whose arguments are all constants. */
     uint32_t *ground = malloc((size_t)npred * (size_t)nent * sizeof *ground);
-    for (int a = 0; a < npred; a++) {
-        pred_info *pi = find_pred(p, preds[a]);
-        for (int e = 0; e < nent; e++) {
-            uint32_t ent = domain_at(p, S, e);
-            ground[(size_t)a * nent + e] =
-                pi->arity == 0 ? preds[a] : ground_pred(p, preds[a], &ent, 1);
-        }
-    }
-    world_add_lane_family(p->w, f, npred, nent, 1, ground, pkind);
+    for (int a = 0; a < npred; a++)
+        for (int e = 0; e < nent; e++)
+            ground[(size_t)a * nent + e] = lane_cell_atom(p, &L, a, NULL, S, e, NULL);
+    world_add_lane_family(p->w, f, npred, nent, 1, ground, L.kind);
     free(ground);
 }
 
@@ -9290,7 +9405,7 @@ static void emit_sort_lanes(parser *p, int S, const bool *taint)
  * (global). `roles[k]` receives the variable index the k-th arg binds — 0 for
  * the lane var, 1..nvars-1 for an iterated var. */
 static bool join_atom_ok(parser *p, const ast_atom *a, const var_bind *vars,
-                         int nvars, bool is_head, int *roles)
+                         int nvars, bool is_head, int *roles, uint32_t *consts)
 {
     if (a->value != INTERN_NONE || a->is_guard || a->is_num_effect || a->is_expr_guard)
         return false;
@@ -9301,14 +9416,27 @@ static bool join_atom_ok(parser *p, const ast_atom *a, const var_bind *vars,
         return false;                              /* read-only: never concluded */
     /* a derived body/guard pred is allowed: it imports (§5.5); a provider one is
      * allowed too and becomes a host-filled column (#233) */
+    bool binds = false;
     for (int k = 0; k < a->nargs; k++) {
         int rho = -1;
         for (int v = 0; v < nvars; v++)
             if (a->args[k].name == vars[v].name) { rho = v; break; }
-        if (rho < 0) return false;                 /* constant / other variable */
-        roles[k] = rho;
+        if (rho >= 0) {
+            roles[k] = rho;                        /* a variable of this rule */
+            consts[k] = INTERN_NONE;
+            binds = true;
+        } else if (entity_pos(p, pred_arg_sort(pi, k), a->args[k].name) >= 0) {
+            roles[k] = ROLE_CONST;                 /* a named entity (#226) */
+            consts[k] = a->args[k].name;
+        } else {
+            return false;                          /* not a variable of this rule,
+                                                    * and not an entity of the
+                                                    * declared argument sort */
+        }
     }
-    return true;
+    /* as in the single-variable gate: a head of constants alone concludes one
+     * atom from every cell, so there is nothing to read out of the family */
+    return binds || !is_head;
 }
 
 /* Does predicate `from`'s derivation transitively READ predicate `to`?
@@ -9402,78 +9530,51 @@ static void emit_join_family(parser *p, ast_rule *r)
     /* every atom (body, head, guard) must reduce to a lane column */
     const ast_atom *ats[1 + 2 * MAX_BODY];
     int roleslot[1 + 2 * MAX_BODY][MAX_ARGS];
+    uint32_t constslot[1 + 2 * MAX_BODY][MAX_ARGS];
     int nat = 0;
     ats[nat] = &r->head;
-    if (!join_atom_ok(p, &r->head, r->vars, r->nvars, true, roleslot[nat])) return;
+    if (!join_atom_ok(p, &r->head, r->vars, r->nvars, true, roleslot[nat],
+                      constslot[nat])) return;
     nat++;
     for (int b = 0; b < r->nbody; b++) {
         ats[nat] = &r->body[b];
-        if (!join_atom_ok(p, &r->body[b], r->vars, r->nvars, false, roleslot[nat])) return;
+        if (!join_atom_ok(p, &r->body[b], r->vars, r->nvars, false, roleslot[nat],
+                          constslot[nat])) return;
         nat++;
     }
     for (int g = 0; g < r->nguard; g++) {
         ats[nat] = &r->guard[g];
-        if (!join_atom_ok(p, &r->guard[g], r->vars, r->nvars, false, roleslot[nat])) return;
+        if (!join_atom_ok(p, &r->guard[g], r->vars, r->nvars, false, roleslot[nat],
+                          constslot[nat])) return;
         nat++;
     }
 
-    /* Family-local atoms. A local is a predicate AT AN ARGUMENT PATTERN, not a
-     * predicate: `near(X, Y)` and `near(Y, X)` read two different columns of one
-     * relation, and collapsing them onto the first pattern seen makes the second
-     * read the first's ground map (#235 — it answered PROVED where the source
-     * asked for both directions). Same pred, same roles = same local. */
-    uint32_t preds[MAX_PREDS];
-    uint8_t pkind[MAX_PREDS];
-    int prole[MAX_PREDS][MAX_ARGS], pnarg[MAX_PREDS], npred = 0;
+    /* Family-local atoms, one per (predicate, argument pattern) — see
+     * lane_locals: near(X,Y) and near(Y,X) are two columns, and so are
+     * holding(X, key1) and holding(X, key2). */
+    lane_locals L;
+    L.n = 0;
     int local_of[1 + 2 * MAX_BODY];
     for (int k = 0; k < nat; k++) {
-        uint32_t pr = ats[k]->pred;
-        int found = -1;
-        for (int j = 0; j < npred && found < 0; j++) {
-            if (preds[j] != pr || pnarg[j] != ats[k]->nargs) continue;
-            found = j;
-            for (int m = 0; m < pnarg[j]; m++)
-                if (prole[j][m] != roleslot[k][m]) { found = -1; break; }
-        }
-        if (found < 0) {
-            if (npred >= MAX_PREDS) return;
-            pred_info *pri = find_pred(p, pr);
-            preds[npred] = pr;
-            pkind[npred] = pri->is_fluent   ? WORLD_LANE_FLUENT
-                         : pri->is_provider ? WORLD_LANE_PROVIDER
-                                            : WORLD_LANE_DERIVED;
-            pnarg[npred] = ats[k]->nargs;
-            for (int m = 0; m < ats[k]->nargs; m++) prole[npred][m] = roleslot[k][m];
-            found = npred++;
-        }
-        local_of[k] = found;
+        int j = lane_local_of(p, &L, r, ats[k]->pred, ats[k]->nargs,
+                              roleslot[k], constslot[k]);
+        if (j < 0)
+            return;                                /* local table full: no family */
+        local_of[k] = j;
     }
+    int npred = L.n;
 
     /* classify locals: the head (local_of[0]) is concluded here; a body/guard
      * pred that is neither a base fluent nor a provider is DERIVED elsewhere and
      * imported (its verdict injected per cell at solve time). */
     for (int j = 0; j < npred; j++)
-        if (pkind[j] == WORLD_LANE_DERIVED && j != local_of[0])
-            pkind[j] = WORLD_LANE_IMPORT;
+        if (L.kind[j] == WORLD_LANE_DERIVED && j != local_of[0])
+            L.kind[j] = WORLD_LANE_IMPORT;
 
     dlcol *f = dlcol_new(npred, nent);
     for (int a = 0; a < npred; a++) {
-        /* A predicate at one pattern keeps its bare name, so every trace written
-         * before locals split by pattern reads exactly as it did. A predicate at
-         * two patterns has to say WHICH — `near(X,Y)` against `near(Y,X)` — or
-         * the trace shows the same atom concluding and failing at once. */
-        int same = 0;
-        for (int b = 0; b < npred; b++) if (preds[b] == preds[a]) same++;
-        if (same == 1) {
-            dlcol_set_atom_name(f, (uint32_t)a, intern_name(p->syms, preds[a]));
-            continue;
-        }
         char nbuf[MAX_NAME * 2 + 8];
-        int o = snprintf(nbuf, sizeof nbuf, "%s(", intern_name(p->syms, preds[a]));
-        for (int m = 0; m < pnarg[a] && o < (int)sizeof nbuf; m++)
-            o += snprintf(nbuf + o, sizeof nbuf - (size_t)o, "%s%s", m ? "," : "",
-                          intern_name(p->syms, r->vars[prole[a][m]].name));
-        snprintf(nbuf + o, sizeof nbuf - (size_t)o, ")");
+        lane_local_name(p, &L, a, nbuf, sizeof nbuf);
         dlcol_set_atom_name(f, (uint32_t)a, nbuf);
     }
 
@@ -9497,8 +9598,9 @@ static void emit_join_family(parser *p, ast_rule *r)
     }
 
     /* ground[(local*niter + it)*nent + e]: substitute the lane entity for role-0
-     * args, and for each iterated role v the entity picked out of var v's domain
-     * by the iteration `it` (decoded mixed-radix over the non-lane sorts). */
+     * args, for each iterated role v the entity picked out of var v's domain by
+     * the iteration `it` (decoded mixed-radix over the non-lane sorts), and for
+     * a constant slot the entity the source named. */
     uint32_t *ground = malloc((size_t)npred * (size_t)niter * nent * sizeof *ground);
     for (int a = 0; a < npred; a++)
         for (long it = 0; it < niter; it++) {
@@ -9509,18 +9611,11 @@ static void emit_join_family(parser *p, ast_rule *r)
                 vidx[v] = (int)(rem % vsize[v]);
                 rem /= vsize[v];
             }
-            for (int e = 0; e < nent; e++) {
-                uint32_t args[MAX_ARGS];
-                for (int m = 0; m < pnarg[a]; m++) {
-                    int rho = prole[a][m];
-                    args[m] = rho == 0 ? domain_at(p, Sl, e)
-                                       : domain_at(p, r->vars[rho].sort, vidx[rho]);
-                }
+            for (int e = 0; e < nent; e++)
                 ground[((size_t)a * niter + it) * nent + e] =
-                    ground_pred(p, preds[a], args, pnarg[a]);
-            }
+                    lane_cell_atom(p, &L, a, r, Sl, e, vidx);
         }
-    world_add_lane_family(p->w, f, npred, nent, (int)niter, ground, pkind);
+    world_add_lane_family(p->w, f, npred, nent, (int)niter, ground, L.kind);
     free(ground);
 }
 
