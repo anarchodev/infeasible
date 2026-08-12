@@ -9417,14 +9417,24 @@ static void emit_join_family(parser *p, ast_rule *r)
         nat++;
     }
 
-    /* distinct predicates -> family-local atoms (arg pattern from first use) */
+    /* Family-local atoms. A local is a predicate AT AN ARGUMENT PATTERN, not a
+     * predicate: `near(X, Y)` and `near(Y, X)` read two different columns of one
+     * relation, and collapsing them onto the first pattern seen makes the second
+     * read the first's ground map (#235 — it answered PROVED where the source
+     * asked for both directions). Same pred, same roles = same local. */
     uint32_t preds[MAX_PREDS];
     uint8_t pkind[MAX_PREDS];
     int prole[MAX_PREDS][MAX_ARGS], pnarg[MAX_PREDS], npred = 0;
+    int local_of[1 + 2 * MAX_BODY];
     for (int k = 0; k < nat; k++) {
         uint32_t pr = ats[k]->pred;
         int found = -1;
-        for (int j = 0; j < npred; j++) if (preds[j] == pr) { found = j; break; }
+        for (int j = 0; j < npred && found < 0; j++) {
+            if (preds[j] != pr || pnarg[j] != ats[k]->nargs) continue;
+            found = j;
+            for (int m = 0; m < pnarg[j]; m++)
+                if (prole[j][m] != roleslot[k][m]) { found = -1; break; }
+        }
         if (found < 0) {
             if (npred >= MAX_PREDS) return;
             pred_info *pri = find_pred(p, pr);
@@ -9434,14 +9444,10 @@ static void emit_join_family(parser *p, ast_rule *r)
                                             : WORLD_LANE_DERIVED;
             pnarg[npred] = ats[k]->nargs;
             for (int m = 0; m < ats[k]->nargs; m++) prole[npred][m] = roleslot[k][m];
-            npred++;
+            found = npred++;
         }
+        local_of[k] = found;
     }
-
-    int local_of[1 + 2 * MAX_BODY];
-    for (int k = 0; k < nat; k++)
-        for (int j = 0; j < npred; j++)
-            if (preds[j] == ats[k]->pred) { local_of[k] = j; break; }
 
     /* classify locals: the head (local_of[0]) is concluded here; a body/guard
      * pred that is neither a base fluent nor a provider is DERIVED elsewhere and
@@ -9451,8 +9457,25 @@ static void emit_join_family(parser *p, ast_rule *r)
             pkind[j] = WORLD_LANE_IMPORT;
 
     dlcol *f = dlcol_new(npred, nent);
-    for (int a = 0; a < npred; a++)
-        dlcol_set_atom_name(f, (uint32_t)a, intern_name(p->syms, preds[a]));
+    for (int a = 0; a < npred; a++) {
+        /* A predicate at one pattern keeps its bare name, so every trace written
+         * before locals split by pattern reads exactly as it did. A predicate at
+         * two patterns has to say WHICH — `near(X,Y)` against `near(Y,X)` — or
+         * the trace shows the same atom concluding and failing at once. */
+        int same = 0;
+        for (int b = 0; b < npred; b++) if (preds[b] == preds[a]) same++;
+        if (same == 1) {
+            dlcol_set_atom_name(f, (uint32_t)a, intern_name(p->syms, preds[a]));
+            continue;
+        }
+        char nbuf[MAX_NAME * 2 + 8];
+        int o = snprintf(nbuf, sizeof nbuf, "%s(", intern_name(p->syms, preds[a]));
+        for (int m = 0; m < pnarg[a] && o < (int)sizeof nbuf; m++)
+            o += snprintf(nbuf + o, sizeof nbuf - (size_t)o, "%s%s", m ? "," : "",
+                          intern_name(p->syms, r->vars[prole[a][m]].name));
+        snprintf(nbuf + o, sizeof nbuf - (size_t)o, ")");
+        dlcol_set_atom_name(f, (uint32_t)a, nbuf);
+    }
 
     dl_lit head = { (uint32_t)local_of[0], r->head.neg };
     dl_lit body[MAX_BODY];
