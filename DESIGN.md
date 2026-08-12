@@ -2577,7 +2577,9 @@ is **3.5%** of the tick; the host's own spatial phase is **90.6%** — that phas
 writes fact columns directly and does not cross the §5.6 provider interface, so
 it prices an index, not a boundary. The lift is real
 where it was applied (`bench_col`: 234× at N=1000, 558× at N=100 000;
-`bench_join`: two orders of magnitude for multi-variable rules) and the
+`bench_join`: 250× at N=40 to 11 000× at N=640 for multi-variable rules,
+widening with N because the laned side solves one iteration's slice on demand
+while N=1 re-solves the whole ground theory) and the
 remaining cost has moved to the seams between representations, not inside
 any of them.
 

@@ -601,6 +601,68 @@ static int test_step_lanes_global(void)
     return 0;
 }
 
+/* ---- #226: a constant argument is an ordinary argument --------------------
+ *
+ * `holding(X, master_key)` is how a rule refers to THE named thing in a scene,
+ * and naming one used to take the rule off the lane path entirely — a constant
+ * is a fixed index into the ground map, so there was never anything to protect.
+ * Both gates widen together (single-variable and join), and both shapes are here
+ * because they reach the ground map through different builders.
+ *
+ * The second half of this case is the collision the widening creates:
+ * `holding(X, key1)` and `holding(X, key2)` are one predicate at two patterns,
+ * which is #235's bug with entities instead of variables. */
+static const char *CONST_ARGS =
+    "sort actor, item\n"
+    "entity (a0, a1, a2 : actor)\n"
+    "entity (key1, key2 : item)\n"
+    "state (holding(actor, item)  awake(actor)  near(actor, actor))\n"
+    "init (holding(a0,key1) holding(a1,key2) holding(a2,key1) holding(a2,key2)"
+    "      awake(a0) near(a1,a0) near(a2,a1))\n"
+    /* single-variable, one constant */
+    "rule opens(X: actor): holding(X, key1) => can_open(X)\n"
+    /* single-variable, the same predicate at a second pattern */
+    "rule keyring(X: actor): holding(X, key1) & holding(X, key2) => full_set(X)\n"
+    /* join, a constant in a body atom that mentions no variable at all */
+    "rule spots(X: actor, Y: actor): near(X, Y) & awake(a0) => threat(X, Y)\n";
+
+static int test_const_args(void)
+{
+    intern *sy = intern_new();
+    story_diag di[16];
+    story_diags dg = { di, 16, 0, 0 };
+    world *w = story_compile(CONST_ARGS, "constarg.story", sy, &dg);
+    CHECK(w);
+    /* the single-variable family over `actor`, plus the join rule's own */
+    CHECK(world_lane_family_count(w) == 2);
+
+    bool ok = false;
+    CHECK(world_lanes_check(w, &ok) > 0);
+    CHECK(ok);
+
+    CHECK(world_query(w, dl_pos(intern_id(sy, "can_open(a0)"))) == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "can_open(a1)"))) == DL_REFUTED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "can_open(a2)"))) == DL_PROVED);
+    /* only a2 holds both keys — a collapsed local would prove a0 and a1 too */
+    CHECK(world_query(w, dl_pos(intern_id(sy, "full_set(a0)"))) == DL_REFUTED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "full_set(a1)"))) == DL_REFUTED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "full_set(a2)"))) == DL_PROVED);
+    /* the join's constant body atom: awake(a0) holds, so `near` decides */
+    CHECK(world_query(w, dl_pos(intern_id(sy, "threat(a1,a0)"))) == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "threat(a0,a1)"))) == DL_REFUTED);
+
+    /* and the constant tracks the state it names, rather than being folded in */
+    world_set(w, intern_id(sy, "awake(a0)"), false);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "threat(a1,a0)"))) == DL_REFUTED);
+    world_set(w, intern_id(sy, "holding(a2,key2)"), false);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "full_set(a2)"))) == DL_REFUTED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "can_open(a2)"))) == DL_PROVED);
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
 /* ---- #235: one predicate at TWO argument patterns is two columns ----------
  *
  * A family-local is a predicate at an argument pattern, not a predicate.
@@ -768,6 +830,7 @@ int main(void)
     if (test_step_lanes()) return 1;
     if (test_step_lanes_global()) return 1;
     if (test_two_arg_patterns()) return 1;
+    if (test_const_args()) return 1;
     if (test_provider_lanes()) return 1;
     printf("test_lanes: all passed\n");
     return 0;

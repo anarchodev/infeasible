@@ -110,8 +110,8 @@ static const struct shape SHAPES[] = {
       "rule r(X: actor, Y: actor): near(X, Y) & alert(Y) => threat(X, Y)", 2,
       "a derived body imports from its own family" },
     { "a CONSTANT in an argument", NEAR_AWAKE,
-      "rule r(X: actor, Y: actor): near(X, Y) & awake(a0) => threat(X, Y)", 0,
-      "join_atom_ok: every arg must be a rule variable" },
+      "rule r(X: actor, Y: actor): near(X, Y) & awake(a0) => threat(X, Y)", 1,
+      "a constant is a fixed index into the ground map (#226)" },
     { "two rules conclude the head", "state ( near(actor, actor)  awake(actor)  angry(actor) )",
       "rule r(X: actor, Y: actor): near(X, Y) & awake(Y) => threat(X, Y)\n"
       "rule s(X: actor, Y: actor): near(X, Y) & angry(Y) => threat(X, Y)", 0,
@@ -208,11 +208,19 @@ static void fill(world *w, intern *sy, int n)
             }
 }
 
-/* One tick's shape: a base fact moves, then a conclusion is read. */
+/* One tick's shape: a base fact moves, then a conclusion is read.
+ *
+ * The untimed first tick is load-bearing: the first query of a world's life
+ * builds the N=1 judgment family, which is tens of milliseconds at these sizes
+ * and is not a cost any later tick pays. Smeared across the sample it lands
+ * almost entirely on the laned column, whose own ticks are microseconds — so
+ * leaving it in understates the very speedup this table exists to report. */
 static double solve_ms(world *w, intern *sy, int reps)
 {
     uint32_t q = intern_id(sy, "threat(a0,a1)");
     uint32_t toggle = intern_id(sy, "awake(a1)");
+    world_set(w, toggle, false);
+    (void)world_query(w, dl_pos(q));
     double t0 = now_ms();
     for (int k = 0; k < reps; k++) {
         world_set(w, toggle, k % 2 == 0);
@@ -252,13 +260,14 @@ int main(int argc, char **argv)
     cost(ns, (int)(sizeof ns / sizeof ns[0]));
 
     printf("\nReading: the nested loop already exists — lane the first variable,\n"
-           "iterate the cartesian product of the rest — and it is worth two orders\n"
-           "of magnitude against N=1, never under ~70x here (the spread above is\n"
-           "noise: the laned side is sub-microsecond at small N; read the floor).\n"
+           "iterate the cartesian product of the rest — and it is worth two to four\n"
+           "orders of magnitude against N=1, WIDENING with N: the laned side solves\n"
+           "one iteration's slice on demand while N=1 re-solves the whole ground\n"
+           "theory, so the gap grows with the theory rather than staying flat.\n"
            "The wall is not the solve, it is the\n"
            "BUILD: the ground map is npred x niter x nent uint32, so a binary rule\n"
            "is quadratic in N, in compile time AND resident memory, while the solve\n"
-           "stays two orders of magnitude ahead. That is what caps the mechanism\n"
+           "stays orders of magnitude ahead. That is what caps the mechanism\n"
            "today, and it is why the widening that matters is a SPARSE outer loop\n"
            "(iterate the tuples the fact index says exist, the way the #28 matcher\n"
            "already does for grounding) rather than anything about throughput.\n"
