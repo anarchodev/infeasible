@@ -139,6 +139,43 @@ bool world_provider_holds_at(const world *w, uint32_t pred,
 bool world_num_cmp_holds(const world *w, uint32_t num_atom,
                          world_cmp op, long threshold);
 
+/* Batched provider fill (#229). The per-atom callback above is one indirect call
+ * per ground atom returning one bit, sitting under a solver whose whole premise
+ * is 64 entities to a word. `near(X, Y)` over N actors is N^2 calls per solve,
+ * and every one of them re-enters the host's index from the top: the shape
+ * forbids the host from walking that index once even where it could.
+ *
+ * The batched form answers a RUN of ground atoms differing in exactly one
+ * argument. `args`/`nargs` is the ground template and `slot` names the argument
+ * the run varies, so bit i of `out` is the verdict of pred(args with
+ * args[slot] := ents[i]); `args[slot]` itself is ents[0] and carries no extra
+ * information. `out` is zeroed by the caller and holds ceil(nents/64) words.
+ *
+ * The engine cuts the runs out of its own registration order, so a run is a
+ * re-grouping of questions it would have asked anyway — never more of them, and
+ * never about an atom the family does not contain.
+ *
+ * Optional and additive: with no fill callback every atom goes through the
+ * per-atom form exactly as today, and a run of one always does. With both set
+ * the two MUST agree — batching changes when the host is asked, never what it
+ * answers (I4) — which is what world_providers_check pins, the discipline
+ * world_lanes_check applies to layouts. */
+typedef void (*world_provider_fill_fn)(void *ctx, uint32_t pred,
+                                       const uint32_t *args, int nargs, int slot,
+                                       const uint32_t *ents, int nents,
+                                       uint64_t *out);
+void world_set_provider_fill_fn(world *w, world_provider_fill_fn fn, void *ctx);
+
+/* Differential oracle for the batched form (the world_lanes_check of the
+ * provider boundary): every registered provider atom answered BOTH ways — once
+ * per-atom, once inside the run the loader would place it in — and compared.
+ * Returns the number of atoms checked; sets *ok false on any disagreement. With
+ * either callback unset there is nothing to compare and it checks nothing. */
+int world_providers_check(world *w, bool *ok);
+/* How many ground provider atoms are registered — the size of what a solve asks
+ * the host, and the denominator world_providers_check counts against. */
+int world_provider_atom_count(const world *w);
+
 /* Trace-time provider rendering (#178). A host-answered relation contributes
  * nothing to a why-trace but its own verdict: `los(a,b) [PROVED]` is the whole
  * story, while WHAT the ray hit — the crate at (3,7), the 3.2 metres — sits in

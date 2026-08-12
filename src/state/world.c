@@ -319,6 +319,12 @@ struct world {
              char *disp; } *provs;              /* #178 render scratch */
     int nprov, capprov;
     world_provider_fn provider_fn; void *provider_ctx;
+    /* #229: the batched half of the same boundary. The loader cuts `provs` into
+     * runs differing in one argument slot and asks for a run at a time; scratch
+     * is grown to nprov once and reused, so a solve allocates nothing. */
+    world_provider_fill_fn provider_fill_fn; void *provider_fill_ctx;
+    int *fill_idx; uint32_t *fill_locs, *fill_ents; uint64_t *fill_out;
+    int fill_cap;
     /* Trace-time only (#178): phrases one provider's answer for the why-trace.
      * Never consulted during a solve, so it sits outside I4. */
     world_provider_render_fn provider_render_fn; void *provider_render_ctx;
@@ -595,6 +601,7 @@ void world_free(world *w)
     for (int i = 0; i < w->nprov; i++)
         free(w->provs[i].disp);                    /* #178 render scratch */
     free(w->provs);
+    free(w->fill_idx); free(w->fill_locs); free(w->fill_ents); free(w->fill_out);
     free(w->rollsites);
     if (w->rcpt) {
         for (int i = 0; i < w->caprcpt; i++)
@@ -1000,18 +1007,149 @@ bool world_provider_holds_at(const world *w, uint32_t pred,
     return w->provider_fn(w->provider_ctx, pred, args, nargs);
 }
 
+void world_set_provider_fill_fn(world *w, world_provider_fill_fn fn, void *ctx)
+{
+    w->provider_fill_fn = fn;
+    w->provider_fill_ctx = ctx;
+}
+
+/* Does provider atom `i` extend the run started by atom `first`? Same predicate
+ * and arity, and the argument tuples differ in exactly ONE position — which
+ * becomes the run's slot if the run is still a singleton, and must match it
+ * otherwise. Registration order does the rest: the grounder emits a predicate's
+ * ground atoms from a nested loop, so a run is the inner loop, found rather than
+ * searched for. */
+static bool run_extends(const world *w, int first, int i, int *slot)
+{
+    if (w->provs[i].pred != w->provs[first].pred ||
+        w->provs[i].nargs != w->provs[first].nargs || w->provs[i].nargs < 1)
+        return false;
+    int d = -1;
+    for (int k = 0; k < w->provs[i].nargs; k++)
+        if (w->provs[i].args[k] != w->provs[first].args[k]) {
+            if (d >= 0) return false;              /* two slots differ: not a run */
+            d = k;
+        }
+    if (d < 0) return false;                       /* identical (dedup makes this
+                                                    * unreachable) — never batch */
+    if (*slot < 0) { *slot = d; return true; }
+    return d == *slot;
+}
+
+static void fill_reserve(world *w, int n)
+{
+    if (w->fill_cap >= n) return;
+    w->fill_cap = n;
+    w->fill_idx  = realloc(w->fill_idx,  (size_t)n * sizeof *w->fill_idx);
+    w->fill_locs = realloc(w->fill_locs, (size_t)n * sizeof *w->fill_locs);
+    w->fill_ents = realloc(w->fill_ents, (size_t)n * sizeof *w->fill_ents);
+    w->fill_out  = realloc(w->fill_out, (size_t)((n + 63) / 64) * sizeof *w->fill_out);
+}
+
+/* Answer one run into `w->fill_out` (bit k = the verdict for w->fill_idx[k]).
+ * A run of one goes per-atom: batching it would cost a bitset dance to ask a
+ * question the plain callback answers directly. */
+static void run_answers(world *w, int slot, int n)
+{
+    int words = (n + 63) / 64;
+    memset(w->fill_out, 0, (size_t)words * sizeof *w->fill_out);
+    if (n == 1 || !w->provider_fill_fn) {
+        for (int k = 0; k < n; k++)
+            if (provider_holds(w, w->fill_idx[k]))
+                w->fill_out[k / 64] |= 1ull << (k % 64);
+        return;
+    }
+    for (int k = 0; k < n; k++)
+        w->fill_ents[k] = w->provs[w->fill_idx[k]].args[slot];
+    const int first = w->fill_idx[0];
+    w->provider_fill_fn(w->provider_fill_ctx, w->provs[first].pred,
+                        w->provs[first].args, w->provs[first].nargs, slot,
+                        w->fill_ents, n, w->fill_out);
+}
+
+/* Walk the provider table in registration order, cutting it into runs and
+ * handing each to `sink` (which reads w->fill_idx[0..n) and w->fill_out). With
+ * `of` non-NULL only atoms the family locates are visited — a run is always a
+ * re-grouping of the questions the per-atom path would have asked, never more.
+ * Returns the number of atoms visited. */
+static int provider_runs(world *w, const uint32_t *of, uint32_t cap,
+                         void (*sink)(world *, void *, int, int), void *u)
+{
+    fill_reserve(w, w->nprov);
+    int n = 0, slot = -1, visited = 0;
+    for (int i = 0; i < w->nprov; i++) {
+        uint32_t pa = w->provs[i].atom;
+        if (of && (pa >= cap || of[pa] == LOC_NONE))
+            continue;
+        if (n > 0 && !run_extends(w, w->fill_idx[0], i, &slot)) {
+            run_answers(w, slot, n);
+            sink(w, u, slot, n);
+            n = 0; slot = -1;
+        }
+        w->fill_idx[n] = i;
+        w->fill_locs[n] = of ? of[pa] : 0;
+        n++;
+        visited++;
+    }
+    if (n > 0) {
+        run_answers(w, slot, n);
+        sink(w, u, slot, n);
+    }
+    return visited;
+}
+
+static void load_run(world *w, void *u, int slot, int n)
+{
+    dlcol *f = u;
+    (void)slot;
+    for (int k = 0; k < n; k++) {
+        bool holds = (w->fill_out[k / 64] >> (k % 64)) & 1;
+        dlcol_add_fact(f, (dl_lit){ w->fill_locs[k], !holds }, 0);
+    }
+}
+
 /* Load every ground provider atom as a closed-world fact from the callback —
  * mirrors the numeric-guard load; consulted fresh each solve (positions/state may
  * have changed), constant within the solve so the fixpoint's re-reads agree.
  * `of`/`cap` name the target family's location map (the shared dense map today;
- * the jfam-only sparse map once the judgment family stops sweeping fluents). */
+ * the jfam-only sparse map once the judgment family stops sweeping fluents).
+ * With a fill callback registered (#229) the atoms are asked a run at a time;
+ * without one this is the per-atom loop it has always been. */
 static void load_providers(world *w, dlcol *f, const uint32_t *of, uint32_t cap)
 {
-    for (int i = 0; i < w->nprov; i++) {
-        uint32_t pa = w->provs[i].atom;
-        if (pa < cap && of[pa] != LOC_NONE)
-            dlcol_add_fact(f, (dl_lit){ of[pa], !provider_holds(w, i) }, 0);
+    if (!w->provider_fill_fn || !w->provider_fn) {
+        for (int i = 0; i < w->nprov; i++) {
+            uint32_t pa = w->provs[i].atom;
+            if (pa < cap && of[pa] != LOC_NONE)
+                dlcol_add_fact(f, (dl_lit){ of[pa], !provider_holds(w, i) }, 0);
+        }
+        return;
     }
+    provider_runs(w, of, cap, load_run, f);
+}
+
+static void check_run(world *w, void *u, int slot, int n)
+{
+    bool *ok = u;
+    (void)slot;
+    for (int k = 0; k < n; k++) {
+        bool batched = (w->fill_out[k / 64] >> (k % 64)) & 1;
+        if (batched != provider_holds(w, w->fill_idx[k]))
+            *ok = false;
+    }
+}
+
+int world_provider_atom_count(const world *w) { return w->nprov; }
+
+int world_providers_check(world *w, bool *ok)
+{
+    if (ok) *ok = true;
+    if (!w->provider_fill_fn || !w->provider_fn)
+        return 0;
+    bool agreed = true;
+    int n = provider_runs(w, NULL, 0, check_run, &agreed);
+    if (ok) *ok = agreed;
+    return n;
 }
 
 void world_set_seed(world *w, uint64_t seed) { w->seed = seed; }
