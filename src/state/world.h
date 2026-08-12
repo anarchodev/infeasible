@@ -590,16 +590,25 @@ int  world_action_blockers(world *w, uint32_t action, dl_lit *out, int cap);
  * word instead of grounded per entity into distinct atoms. The grounder emits
  * them; world_query answers from the family when the queried atom is a lane
  * cell, with world_lanes_check the differential pin against the N=1 query
- * path. `ground` is a flat
- * natoms*nent array of the equivalent named ground atom for each
- * (predicate-local-id, lane); `is_fluent` flags which locals take base facts.
- * `is_import` (may be NULL = none) flags locals that are DERIVED elsewhere and
- * imported: their per-cell verdict is queried and injected each solve, rather
- * than concluded here — the join matcher's derived-body case (§5.5 import).
- * The world copies all and takes ownership of `fam`. */
+ * path. `ground` is a flat natoms*nent array of the equivalent named ground atom
+ * for each (predicate-local-id, lane), and `kind[a]` says where local `a`'s
+ * column comes from. The world copies all and takes ownership of `fam`. */
+enum {
+    WORLD_LANE_DERIVED = 0,   /* concluded in this family — no fact load */
+    WORLD_LANE_FLUENT,        /* base fact: closed-world from the store */
+    WORLD_LANE_IMPORT,        /* derived ELSEWHERE: the per-cell verdict is
+                               * queried and injected each solve rather than
+                               * concluded here (§5.5 import, the join matcher's
+                               * derived-body case) */
+    WORLD_LANE_PROVIDER       /* host-answered relation (#233): the column is a
+                               * bitset the provider fills — one call per
+                               * (predicate, iteration) where the host takes the
+                               * batched form, else one per cell. Constant within
+                               * a solve and re-read for every one, exactly as on
+                               * the N=1 path (§5.6). */
+};
 void world_add_lane_family(world *w, dlcol *fam, int natoms, int nent, int niter,
-                           const uint32_t *ground, const bool *is_fluent,
-                           const bool *is_import);
+                           const uint32_t *ground, const uint8_t *kind);
 int  world_lane_family_count(const world *w);
 
 /* Grounded-theory size introspection (bench/debug — §5.2 grounding cost). A

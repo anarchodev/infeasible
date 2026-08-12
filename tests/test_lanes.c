@@ -601,6 +601,118 @@ static int test_step_lanes_global(void)
     return 0;
 }
 
+/* ---- #233: a provider read is a lane COLUMN, not a bail -------------------
+ *
+ * A host-answered relation used to disqualify its rule from the lane path, on
+ * the stated grounds that it is host-answered. It is a column like any other:
+ * constant within a solve, re-read for every one, and a bitset on both sides of
+ * the boundary. The pin is the usual one — the laned verdicts must equal the
+ * N=1 path's — run twice, because there are two column loaders: one call per
+ * cell, and (with a batched host, #229) one call for the whole column. Both
+ * must produce the same column, which world_lanes_check is what proves. */
+
+static intern *PSY;                     /* the host's view of the vocabulary */
+static uint32_t P_NEAR, P_AWAKE_HOST;
+static long P_ATOM_CALLS, P_FILL_CALLS;
+
+static int p_actor(uint32_t ent)
+{
+    const char *s = intern_name(PSY, ent);
+    return s && s[0] == 'a' ? atoi(s + 1) : -1;
+}
+
+static bool p_holds(uint32_t pred, const uint32_t *args, int nargs)
+{
+    if (pred == P_NEAR && nargs == 2) {
+        int i = p_actor(args[0]), j = p_actor(args[1]);
+        return i >= 0 && j >= 0 && (i - j == 1 || j - i == 1);
+    }
+    if (pred == P_AWAKE_HOST && nargs == 1) {
+        int i = p_actor(args[0]);
+        return i >= 0 && i % 2 == 0;
+    }
+    return false;
+}
+
+static bool p_prov(void *ctx, uint32_t pred, const uint32_t *args, int nargs)
+{
+    (void)ctx;
+    P_ATOM_CALLS++;
+    return p_holds(pred, args, nargs);
+}
+
+static void p_fill(void *ctx, uint32_t pred, const uint32_t *args, int nargs,
+                   int slot, const uint32_t *ents, int nents, uint64_t *out)
+{
+    (void)ctx;
+    P_FILL_CALLS++;
+    uint32_t a[4];
+    for (int k = 0; k < nargs && k < 4; k++) a[k] = args[k];
+    for (int i = 0; i < nents; i++) {
+        a[slot] = ents[i];
+        if (p_holds(pred, a, nargs))
+            out[i / 64] |= 1ull << (i % 64);
+    }
+}
+
+static const char *PROV_LANES =
+    "sort actor\n"
+    "entity (a0, a1, a2, a3 : actor)\n"
+    "provider near(actor, actor)\n"          /* binary: the join family's column */
+    "provider awake_host(actor)\n"           /* unary: the single-var family's */
+    "state (hostile(actor))\n"
+    "init (hostile(a1) hostile(a3))\n"
+    "rule menaces(X: actor, Y: actor): near(X, Y) & hostile(Y) => menaced(X, Y)\n"
+    "rule wakes(X: actor): awake_host(X) => awake(X)\n";
+
+static int test_provider_lanes_one(bool batched)
+{
+    intern *sy = intern_new();
+    story_diag di[16];
+    story_diags dg = { di, 16, 0, 0 };
+    world *w = story_compile(PROV_LANES, "provlane.story", sy, &dg);
+    CHECK(w);
+    PSY = sy;
+    P_NEAR = intern_id(sy, "near");
+    P_AWAKE_HOST = intern_id(sy, "awake_host");
+    P_ATOM_CALLS = P_FILL_CALLS = 0;
+    world_set_provider_fn(w, p_prov, NULL);
+    if (batched)
+        world_set_provider_fill_fn(w, p_fill, NULL);
+
+    /* both families formed: the unary provider lanes as a single-var column,
+     * the binary one as the join family's */
+    CHECK(world_lane_family_count(w) == 2);
+
+    bool ok = false;
+    CHECK(world_lanes_check(w, &ok) > 0);
+    CHECK(ok);
+
+    /* and the verdicts are the host's own answers, read through the lanes */
+    CHECK(world_query(w, dl_pos(intern_id(sy, "menaced(a0,a1)"))) == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "menaced(a2,a3)"))) == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "menaced(a1,a2)"))) == DL_REFUTED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "menaced(a0,a3)"))) == DL_REFUTED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "awake(a0)"))) == DL_PROVED);
+    CHECK(world_query(w, dl_pos(intern_id(sy, "awake(a1)"))) == DL_REFUTED);
+
+    /* the column really came from the loader under test: without a fill
+     * callback every cell is a call, with one the runs go in bulk (and the N=1
+     * oracle the check compares against batches too, so per-atom calls can be
+     * zero — only a run of one still goes through the plain callback) */
+    CHECK(batched ? P_FILL_CALLS > 0 : (P_FILL_CALLS == 0 && P_ATOM_CALLS > 0));
+
+    world_free(w);
+    intern_free(sy);
+    return 0;
+}
+
+static int test_provider_lanes(void)
+{
+    if (test_provider_lanes_one(false)) return 1;
+    return test_provider_lanes_one(true);
+}
+
 int main(void)
 {
     if (test_homogeneous_agrees()) return 1;
@@ -613,6 +725,7 @@ int main(void)
     if (test_derived_body_join_neg()) return 1;
     if (test_step_lanes()) return 1;
     if (test_step_lanes_global()) return 1;
+    if (test_provider_lanes()) return 1;
     printf("test_lanes: all passed\n");
     return 0;
 }

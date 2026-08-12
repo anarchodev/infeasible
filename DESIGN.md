@@ -2645,17 +2645,23 @@ the layout they already have, it costs nothing semantically, and
 `world_providers_check` pins it against the per-atom form), but it is not the
 lever.
 
-The cost is one level up: **reading a provider disqualifies its rule from the
-lane path**, so `near(X, Y) & awake(Y) => threat(X, Y)` solves N² ground rules
-one at a time. The identical rule with `near` stored as a fluent lanes and runs
-an order of magnitude faster — and forced back onto N=1 by an unrelated
-disqualifier it costs exactly what the provider version costs, which is the
-measurement that locates the whole gap in the gate rather than the crossing. A
-provider column is a bitset the host already knows how to fill, which is exactly
-what the batched form hands it, so the first item of work this section implies
-is giving a provider read a lane column. The host phase in `bench_slice` is a
-third thing again: it writes fact columns directly and never crosses this
-interface at all.
+The cost was one level up, and it is the section's own thesis in miniature: what
+a relation IS decided how it was evaluated. **A provider is a lane column**
+(`WORLD_LANE_PROVIDER`) — the family's fact row is the bitset the host fills, so
+the answers land where the solve reads them, and a batched host fills a whole
+column in one crossing. It is constant within a solve and re-read for every one,
+exactly as on the N=1 path (§5.6), and `world_lanes_check` pins the column
+against that path cell by cell.
+
+What that retired was a gate, not an optimization: reading a provider used to
+disqualify its rule from the lane path outright, on the stated grounds that a
+provider is host-answered. So `near(X, Y) & awake(Y) => threat(X, Y)` solved N²
+ground rules one at a time, and measured exactly what the same rule with `near`
+stored as a fluent costs when it is forced off lanes by an unrelated
+disqualifier — which is what located the gap in the gate rather than in the
+crossing. As a column it costs what the stored-fluent version costs. The host
+phase in `bench_slice` is a third thing again: it writes fact columns directly
+and never crosses this interface at all.
 
 **Retractions** (each closes a plausible path):
 

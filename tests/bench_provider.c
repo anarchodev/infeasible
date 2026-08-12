@@ -25,10 +25,15 @@
  *          real `near`/`los` provider does (§5.6: the host owns the geometry).
  *          Per-atom this scans a neighbourhood per PAIR; batched, per SUBJECT.
  *
- * The third column of the story is the one neither host can fix: a rule reading
- * a provider is disqualified from the lane path (story.c's lane_atom_ok /
- * join_atom_ok), so all of this feeds an N=1 solve. Batching the boundary does
- * not change that, and the report says so.
+ * The two right-hand columns are the control that says where a provider's cost
+ * actually was: the SAME rule with `near` as a stored fluent — no host, no
+ * callback, no boundary — laned, and then forced onto N=1 by a never-firing
+ * second rule on the head. A provider read used to be disqualified from the lane
+ * path outright, which put the provider columns on `fluent N=1`; since #233 a
+ * provider is a lane COLUMN (the family's fact row is the bitset the host fills)
+ * and they sit with `fluent laned` instead. Every laned shape here is checked
+ * against N=1 with world_lanes_check before it is timed, because a family that
+ * forms and disagrees is worse than no family at all.
  *
  * Deterministic (I4): positions are assigned by index, never randomly. Built -O2
  * regardless of build type; build Release for meaningful numbers. Not a test. */
@@ -242,11 +247,19 @@ static void host_free(host *h)
 }
 
 /* One tick: a base fact moves, a conclusion is read — the whole provider table
- * is re-asked, because a provider is consulted fresh every solve (§5.6). */
+ * is re-asked, because a provider is consulted fresh every solve (§5.6).
+ *
+ * The untimed first tick is load-bearing: the first query of a world's life
+ * builds the N=1 judgment family, which at these sizes is tens of milliseconds
+ * and would otherwise be smeared across the sample — a world that had already
+ * been queried (by a differential check, say) would then look faster than one
+ * that had not, for no reason a tick pays. */
 static double tick_ms(world *w, intern *sy, int reps)
 {
     uint32_t q = intern_id(sy, "threat(a0,a1)");
     uint32_t toggle = intern_id(sy, "awake(a1)");
+    world_set(w, toggle, false);
+    (void)world_query(w, dl_pos(q));
     double t0 = now_ms();
     for (int k = 0; k < reps; k++) {
         world_set(w, toggle, k % 2 == 0);
@@ -325,6 +338,13 @@ static void sweep(const int *ns, int nn, bool use_index, const char *label)
                 fprintf(stderr, "bench_provider: batched != per-atom at N=%d\n", n);
                 exit(1);
             }
+            /* the laned provider column against the N=1 path, before timing it */
+            ok = true;
+            if (world_lanes_check(w, &ok) && !ok) {
+                fprintf(stderr, "bench_provider: lanes != N=1 at N=%d (%s)\n",
+                        n, mode ? "batched" : "per-atom");
+                exit(1);
+            }
             h.atom_calls = h.fill_calls = 0;
             double ms = tick_ms(w, sy, reps);
             if (mode == 0) {
@@ -367,26 +387,23 @@ int main(int argc, char **argv)
     sweep(ns, nn, false, "flat host: an O(1) distance test (pure call overhead)");
     sweep(ns, nn, true, "index host: a uniform-grid broadphase, re-entered per call");
 
-    printf("\nReading, and it is not the reading this file was written to get:\n\n"
-           "The BOUNDARY is not the cost. `host floor` is every one of those N^2\n"
-           "answers computed with no engine in the middle, and it is under 1%% of\n"
-           "the tick; batching collapses the call count by a factor of N and moves\n"
-           "the tick by nothing (the index host's better ratio is its own scan\n"
-           "work amortising, not the crossing). One indirect call per ground atom\n"
-           "is an ugly interface, but it is not where the time goes.\n\n"
-           "The last two columns say where. They are the SAME rule with `near` as\n"
-           "a stored fluent — no host, no callback, no boundary at all — first as\n"
-           "the compiler routes it, then forced onto N=1 by a never-firing second\n"
-           "rule on the head. `fluent N=1` lands on the provider columns, and\n"
-           "`fluent laned` is an order of magnitude under both. The whole cost of\n"
-           "a provider is that READING one takes its rule off the lane path\n"
-           "(story.c's lane_atom_ok / join_atom_ok reject a provider atom), so the\n"
-           "shape that would have solved 64 entities to a word solves N^2 ground\n"
-           "rules one at a time instead.\n\n"
-           "So the batched fill (#229) is the right interface and the wrong lever:\n"
-           "the lever is laning a provider read — a provider column is a bitset the\n"
-           "host already knows how to fill, which is exactly what the fill callback\n"
-           "hands it. That is the sequel, and bench_slice's 90%% is a third thing\n"
-           "again: a host phase that never crosses this interface at all.\n");
+    printf("\nReading:\n\n"
+           "The BOUNDARY is not the cost, and never was. `host floor` is every one\n"
+           "of those N^2 answers computed with no engine in the middle, and it is a\n"
+           "few percent of the tick. Batching (#229) collapses the call count by a\n"
+           "factor of N — a whole column in one call — which is the right interface\n"
+           "and, on a host whose answers are cheap, worth little on its own.\n\n"
+           "The cost was the GATE. A provider read used to disqualify its rule from\n"
+           "the lane path, which put these columns on `fluent N=1`: the shape that\n"
+           "can solve 64 entities to a word solving N^2 ground rules one at a time.\n"
+           "Since #233 a provider is a lane column — the family's fact row IS the\n"
+           "bitset the host fills, so the answers land where the solve reads them —\n"
+           "and the provider columns sit with `fluent laned` instead, which is the\n"
+           "cost of the shape rather than the cost of the host.\n\n"
+           "What to watch here: if a provider column ever drifts back toward\n"
+           "`fluent N=1`, a bail has re-formed (or a shape stopped laning) — the\n"
+           "world_lanes_check above will not catch that, because being slow is not\n"
+           "being wrong. bench_slice's 90%% is a third thing again: a host phase\n"
+           "that never crosses this interface at all.\n");
     return 0;
 }
