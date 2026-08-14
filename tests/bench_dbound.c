@@ -107,6 +107,45 @@ static long sweep(const pos *p, int n, int ndim, long *probes, uint8_t *hit)
     return res;
 }
 
+
+/* ---- indexing EVERY bound axis: bucket, then compare only neighbours -------
+ * The sweep above files entities by x alone, so it compares everything in the
+ * same column strip however far apart in y. Filing by every bound axis puts
+ * non-matching pairs in different buckets, so they are never formed. This is
+ * the same answer by the same predicate — only the search changes. */
+static long bucketed(const pos *p, int n, int ndim, long *probes)
+{
+    int side = 1;
+    while ((double)side * side < n / 1.2) side++;
+    int W = side + 2, H = ndim >= 2 ? side + 2 : 1, D = ndim >= 3 ? side + 2 : 1;
+    size_t nb = (size_t)W * H * D;
+    int *head = malloc(nb * sizeof *head), *next = malloc((size_t)n * sizeof *next);
+    for (size_t i = 0; i < nb; i++) head[i] = -1;
+    for (int i = 0; i < n; i++) {
+        size_t b = ((size_t)(p[i].x + 1) * H + (ndim >= 2 ? p[i].y + 1 : 0)) * D
+                 + (ndim >= 3 ? p[i].z + 1 : 0);
+        next[i] = head[b]; head[b] = i;
+    }
+    long res = 0, pr = 0;
+    for (int i = 0; i < n; i++) {
+        for (int dx = -RADIUS; dx <= RADIUS; dx++)
+        for (int dy = ndim >= 2 ? -RADIUS : 0; dy <= (ndim >= 2 ? RADIUS : 0); dy++)
+        for (int dz = ndim >= 3 ? -RADIUS : 0; dz <= (ndim >= 3 ? RADIUS : 0); dz++) {
+            size_t b = ((size_t)(p[i].x + 1 + dx) * H + (ndim >= 2 ? p[i].y + 1 + dy : 0)) * D
+                     + (ndim >= 3 ? p[i].z + 1 + dz : 0);
+            if (b >= nb) continue;
+            for (int j = head[b]; j >= 0; j = next[j]) {
+                if (j <= i) continue;                 /* each unordered pair once */
+                pr++;
+                if (within(&p[i], &p[j], ndim)) res += 2;
+            }
+        }
+    }
+    free(head); free(next);
+    *probes = pr;
+    return res;
+}
+
 /* ---- eager: what the engine grounds today ---------------------------------- */
 
 static void eager(int n, int ndim, const pos *p, int *rules, double *mb, double *comp)
@@ -210,6 +249,21 @@ int main(int argc, char **argv)
         long probes = 0;
         long res = sweep(p, n, ndim, &probes, NULL);
         printf("   %dD  | %9ld %9ld %10.1f\n", ndim, probes, res, (double)res/n);
+        free(p);
+    }
+
+    printf("\n== one indexed axis vs every bound axis (N=65536)\n");
+    printf("  dims |   1-axis probes   all-axis probes   results   ratio\n");
+    printf("-------+------------------------------------------------------\n");
+    for (int ndim = 1; ndim <= 3; ndim++) {
+        int n = 65536;
+        pos *p = malloc((size_t)n * sizeof *p);
+        place(p, n, ndim, false);
+        long p1 = 0, p2 = 0;
+        long r1 = sweep(p, n, ndim, &p1, NULL);
+        long r2 = bucketed(p, n, ndim, &p2);
+        printf("   %dD  | %14ld %17ld %9ld %6.0fx%s\n", ndim, p1, p2, r2,
+               (double)p1 / (double)(p2 ? p2 : 1), r1 == r2 ? "" : "  RESULTS DIFFER!");
         free(p);
     }
 
