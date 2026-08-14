@@ -9845,11 +9845,13 @@ static void emit_step_lanes(parser *p)
         ast_action *a = &p->actions[i];
         if (a->nbind > 0) {
             /* a `for each` binder cast (e.g. Fireball): the binder's target var is
-             * the lane axis and the cast is a broadcast trigger. First cut: one
-             * caster var, one binder over S, no caster-side requires/effects,
-             * boolean where/when guards over the target (arity-1 over S), and
-             * constant-RHS numeric effects on the target. */
-            if (a->neff != 0 || a->nreq != 0 || a->nvars != 1 || a->nbind != 1)
+             * the lane axis and the cast is a broadcast trigger. One binder over
+             * S, no caster-side requires/effects, boolean where/when guards over
+             * the target (arity-1 over S), and constant-RHS numeric effects on it.
+             * The cast is either per-caster (`fireball(C)`, one cast atom per
+             * caster) or CASTERLESS (`sweep:`, #240) — a setup/broadcast action
+             * whose single arity-0 atom drives the same bcast local. */
+            if (a->neff != 0 || a->nreq != 0 || a->nvars > 1 || a->nbind != 1)
                 return;
             ast_binder *bnd = &p->binders[a->bind_ix[0]];
             if (bnd->nvars != 1 || bnd->vars[0].sort != S) return;
@@ -10214,13 +10216,22 @@ static void emit_step_lanes(parser *p)
     if (nbcast > 0) {
         int total = 0;
         for (int i = 0; i < p->nactions; i++)
-            if (act_is_binder[i]) total += domain_size(p, p->actions[i].vars[0].sort);
+            if (act_is_binder[i])
+                total += p->actions[i].nvars == 1
+                       ? domain_size(p, p->actions[i].vars[0].sort)
+                       : 1;                        /* casterless: one arity-0 atom */
         uint32_t *catom = malloc((size_t)(total ? total : 1) * sizeof *catom);
         int *clocal = malloc((size_t)(total ? total : 1) * sizeof *clocal);
         int ncast = 0;
         for (int i = 0; i < p->nactions; i++) if (act_is_binder[i]) {
-            int Sc = p->actions[i].vars[0].sort, kc = domain_size(p, Sc);
             uint32_t nameatom = intern_id(p->syms, p->actions[i].name);
+            if (p->actions[i].nvars == 0) {   /* casterless cast: the bare atom */
+                catom[ncast] = nameatom;
+                clocal[ncast] = bcast_local[i];
+                ncast++;
+                continue;
+            }
+            int Sc = p->actions[i].vars[0].sort, kc = domain_size(p, Sc);
             for (int c = 0; c < kc; c++) {
                 uint32_t ent = domain_at(p, Sc, c);
                 catom[ncast] = ground_pred(p, nameatom, &ent, 1);
