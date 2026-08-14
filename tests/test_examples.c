@@ -47,6 +47,7 @@ static const char *EXAMPLES[] = {
     "spellbook5e.story",
     "srd_probe.story",
     "srd_probe2.story",
+    "tactics.story",
     "taxonomy5e.story",
 };
 enum { NEXAMPLES = (int)(sizeof EXAMPLES / sizeof EXAMPLES[0]) };
