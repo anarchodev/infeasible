@@ -96,6 +96,25 @@ static const variant VARIANTS[] = {
       "    { hp(X) -= 3 when resist_fire(X), hp(X) -= 9 when vuln_fire(X) }\n",
       true, "sweep" },
 
+    /* NUMERIC LANDMARK GUARDS (#242): `hp(X) >= n` in a body is one read-only
+     * bit per lane, filled from the value store at fact-load. The thresholds sit
+     * a few hits from the starting hp so the columns actually FLIP mid-trajectory
+     * — a guard that never changes value would pass the differential without
+     * having been tested. */
+    { "numeric guard in an action's requires",
+      "action hurt(T: unit): requires hp(T) >= 99990 causes hp(T) -= 7\n", true },
+
+    { "numeric guard in a ramification body",
+      "action hurt(T: unit): causes hp(T) -= 7\n"
+      "rule bloodied(X: unit): hp(X) <= 99990 causes on_fire(X)\n", true },
+
+    /* two thresholds on one fluent are two columns, not one (the #235 lesson
+     * about keying by predicate alone, on the guard side) */
+    { "two thresholds on one numeric fluent",
+      "action hurt(T: unit): requires hp(T) >= 99980 causes hp(T) -= 7\n"
+      "rule hurt1(X: unit): hp(X) <= 99993 causes on_fire(X)\n"
+      "rule hurt2(X: unit): hp(X) <= 99986 causes panicked(X)\n", true },
+
     /* #241: a boolean binder item still bails. When that retires, flip this to
      * true and the differential below starts covering it. */
     { "casterless binder, BOOLEAN item",

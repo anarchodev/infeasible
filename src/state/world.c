@@ -140,6 +140,20 @@ typedef struct {
     int     *bcast_of;
     uint32_t bcast_of_cap;
 
+    /* Numeric landmark guard columns (#242). `hp(X) >= 1` in a body is already a
+     * boolean atom on the N=1 path (world_add_guard) whose truth the engine
+     * computes from the value store — so per lane it is one bit, and the column
+     * is filled at fact-load exactly as a provider column is (#233), with the
+     * engine as the filler instead of the host. Read-only: a guard is derived,
+     * never committed, so it has no primed twin and no inertia (I1). */
+    int      nguard;
+    struct step_lane_guard {
+        uint32_t  loc;            /* the WORLD_STEP_GUARD family-local it fills */
+        int      *cell;           /* [nent]: lane -> w->nums index, -1 if absent */
+        world_cmp op;
+        long      thr;
+    } *guards;
+
     uint32_t *lane_ent;           /* [nent]: the entity each lane stands for —
                                    * a receipt's binding, and nothing else */
     int split_value;              /* #121 mixed routing: the split value index
@@ -543,6 +557,9 @@ void world_free(world *w)
             free(w->steplanes[i].numeff[k].table);   /* one 2^k fold per effect */
         free(w->steplanes[i].numeff);
         free(w->steplanes[i].bcast_of);
+        for (int k = 0; k < w->steplanes[i].nguard; k++)
+            free(w->steplanes[i].guards[k].cell);
+        free(w->steplanes[i].guards);
         free(w->steplanes[i].lane_ent);
     }
     free(w->steplanes);
@@ -2333,6 +2350,7 @@ void world_add_step_lane_family(world *w, dlcol *fam, int nloc, int nent,
     sf->nnumeff = 0; sf->numeff = NULL;            /* world_step_lane_set_numeric */
     sf->covers_numeric = false;
     sf->bcast_of = NULL; sf->bcast_of_cap = 0;     /* broadcast triggers: off unless set */
+    sf->nguard = 0; sf->guards = NULL;             /* guard columns (#242): likewise */
     sf->split_value = -1;                          /* whole-transition family (#121) */
     sf->lane_ent = NULL;                           /* receipt provenance (#88): off
                                                     * unless world_step_lane_set_prov */
@@ -2429,6 +2447,27 @@ void world_step_lane_set_numeric(world *w, int numsc, const uint32_t *num_atom_c
     sf->covers_numeric = true;
 }
 
+void world_step_lane_set_guards(world *w, int nguard, const uint32_t *loc,
+                                const uint32_t *num_atom_cell,
+                                const int *op, const long *thr)
+{
+    if (w->nsteplanes == 0 || nguard <= 0) return;
+    step_lane_family *sf = &w->steplanes[w->nsteplanes - 1];
+    sf->nguard = nguard;
+    sf->guards = malloc((size_t)nguard * sizeof *sf->guards);
+    for (int g = 0; g < nguard; g++) {
+        sf->guards[g].loc = loc[g];
+        sf->guards[g].op  = (world_cmp)op[g];
+        sf->guards[g].thr = thr[g];
+        sf->guards[g].cell = malloc((size_t)(sf->nent ? sf->nent : 1)
+                                    * sizeof *sf->guards[g].cell);
+        for (int e = 0; e < sf->nent; e++) {
+            uint32_t at = num_atom_cell[(size_t)g * sf->nent + e];
+            sf->guards[g].cell[e] = at ? num_index(w, at) : -1;
+        }
+    }
+}
+
 /* Register broadcast cast triggers on the last-added step lane family: each of the
  * `ncast` ground cast atoms drives the WORLD_STEP_BCAST local `cast_local[i]` — a
  * `for each` binder's cast fans out over every target lane of that local. */
@@ -2516,6 +2555,19 @@ static void solve_step_lane_family(world *w, step_lane_family *sf,
             uint64_t *neg = dlcol_fact_row(sf->fam, (dl_lit){ (uint32_t)a, true });
             memset(pos, 0x00, (size_t)W * sizeof *pos);
             memset(neg, 0xFF, (size_t)W * sizeof *neg);
+        }
+    }
+    /* numeric landmark guards (#242): one bit per lane, compared straight out of
+     * the value store — the same column a provider read fills (#233), with the
+     * engine as the filler. Closed-world: a lane with no numeric cell reads
+     * false, matching world_get_num's undeclared-reads-0 on the N=1 path. */
+    for (int g = 0; g < sf->nguard; g++) {
+        const struct step_lane_guard *gd = &sf->guards[g];
+        for (int e = 0; e < sf->nent; e++) {
+            int i = gd->cell[e];
+            bool holds = cmp_ok(i >= 0 ? w->nums[i].value : 0, gd->thr, gd->op);
+            dl_lit l = { gd->loc, !holds };
+            dlcol_add_fact(sf->fam, l, e);
         }
     }
     /* flip the occurring actions to true at their lanes (reverse map, O(k)) */
