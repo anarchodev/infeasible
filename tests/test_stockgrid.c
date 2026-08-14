@@ -1,0 +1,237 @@
+/* Golden test for the stock square-grid provider (§5.6, #255).
+ *
+ * The acceptance test is the last case: a `.story` with spatial rules and NO
+ * game code — the only C is `stock_grid_install`, which is the PLATFORM wiring
+ * a library shipped with the engine, not a game answering its own questions.
+ * Before #255 a hostless story could not express "next to" at all.
+ *
+ * The rest pins the two things a stock provider must not get wrong. It is
+ * derived from ordinary state, so it must FOLLOW that state — a cached index
+ * that misses a move answers yesterday's geometry and replay diverges. And it
+ * offers two forms of the same question (point and generator), so they must
+ * agree: enumerating changes when the host is asked, never what it answers. */
+
+#include "stock/grid.h"
+#include "state/world.h"
+#include "core/intern.h"
+#include "lang/story.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifndef STORY_DIR
+#define STORY_DIR "examples"
+#endif
+
+#define CHECK(c) \
+    do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); \
+                     return 1; } } while (0)
+
+/* ---- a hand-built world, so the geometry is checkable by inspection -------- */
+
+enum { N = 9 };
+static const int PX[N] = { 0, 1, 1, 2, 5, 5, 6, 20, 20 };
+static const int PY[N] = { 0, 0, 1, 2, 5, 6, 5,  0, 40 };
+
+static bool adj_truth(int i, int j)
+{
+    if (i == j) return false;
+    int dx = PX[i] - PX[j], dy = PY[i] - PY[j];
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    return dx <= 1 && dy <= 1;
+}
+
+int main(void)
+{
+    intern *sy = intern_new();
+    world *w = world_new(sy);
+    uint32_t ent[N];
+    for (int i = 0; i < N; i++) {
+        char b[48];
+        snprintf(b, sizeof b, "u%d", i);
+        ent[i] = intern_id(sy, b);
+        snprintf(b, sizeof b, "grid_x(u%d)", i);
+        uint32_t xa = intern_id(sy, b);
+        world_declare_num(w, xa, -1000, 1000, true);
+        world_set_num(w, xa, PX[i]);
+        snprintf(b, sizeof b, "grid_y(u%d)", i);
+        uint32_t ya = intern_id(sy, b);
+        world_declare_num(w, ya, -1000, 1000, true);
+        world_set_num(w, ya, PY[i]);
+        snprintf(b, sizeof b, "grid_blocks(u%d)", i);
+        world_declare_fluent(w, intern_id(sy, b));
+    }
+    stock_grid *g = stock_grid_install(w, sy, ent, N);
+    CHECK(g != NULL);
+    uint32_t P_ADJ = intern_id(sy, "grid_adjacent"), P_LOS = intern_id(sy, "grid_los");
+
+    /* measurements: a diagonal costs one on Chebyshev, two on Manhattan */
+    CHECK(stock_grid_chebyshev(g, ent[0], ent[2]) == 1);
+    CHECK(stock_grid_manhattan(g, ent[0], ent[2]) == 2);
+    CHECK(stock_grid_chebyshev(g, ent[0], ent[7]) == 20);
+    printf("  measurements: chebyshev 1 / manhattan 2 across a diagonal\n");
+
+    /* the point form against an exhaustive check of the whole population */
+    {
+        int pairs = 0;
+        for (int i = 0; i < N; i++)
+            for (int j = 0; j < N; j++) {
+                uint32_t args[2] = { ent[i], ent[j] };
+                bool got = world_provider_holds_at(w, P_ADJ, args, 2);
+                if (got != adj_truth(i, j)) {
+                    fprintf(stderr, "FAIL adjacency (%d,%d): got %d\n", i, j, got);
+                    return 1;
+                }
+                pairs += got;
+            }
+        printf("  point form: %d ordered adjacent pairs, all correct\n", pairs);
+    }
+
+    /* the generator against the point form — the #254 differential */
+    {
+        bool ok = false;
+        int checks = world_providers_gen_check(w, P_ADJ, ent, N, &ok);
+        CHECK(ok && checks == N * N);
+        printf("  generator: agrees with the point form over %d pairs\n", checks);
+    }
+
+    /* SEPARABILITY: the run must cost the answer, not the population. u8 sits
+     * alone 40 cells away, so asking about it walks its own nine buckets and
+     * whatever hash collisions land there — a constant, since the bucket count
+     * scales with the entity count and the load factor does not. Asserting
+     * zero would be asserting a perfect hash; asserting it does not grow with
+     * N is the property that matters. */
+    {
+        uint32_t out[N];
+        long before = stock_grid_probes(g);
+        int n = world_provider_gen(w, P_ADJ, ent[8], out, N);
+        long small = stock_grid_probes(g) - before;
+        CHECK(n == 0);
+
+        enum { CROWD = 600 };
+        world *wc = world_new(sy);
+        uint32_t ec[CROWD];
+        for (int i = 0; i < CROWD; i++) {
+            char b[48];
+            snprintf(b, sizeof b, "c%d", i);
+            ec[i] = intern_id(sy, b);
+            snprintf(b, sizeof b, "grid_x(c%d)", i);
+            uint32_t xa = intern_id(sy, b);
+            world_declare_num(wc, xa, -1000, 1000, true);
+            /* all but the last packed into a 4x4 block; the last alone, far off */
+            world_set_num(wc, xa, i == CROWD - 1 ? 500 : i % 4);
+            snprintf(b, sizeof b, "grid_y(c%d)", i);
+            uint32_t ya = intern_id(sy, b);
+            world_declare_num(wc, ya, -1000, 1000, true);
+            world_set_num(wc, ya, i == CROWD - 1 ? 500 : (i / 4) % 4);
+            snprintf(b, sizeof b, "grid_blocks(c%d)", i);
+            world_declare_fluent(wc, intern_id(sy, b));
+        }
+        stock_grid *gc = stock_grid_install(wc, sy, ec, CROWD);
+        uint32_t big_out[8];
+        long b0 = stock_grid_probes(gc);
+        int nc = world_provider_gen(wc, P_ADJ, ec[CROWD - 1], big_out, 8);
+        long big = stock_grid_probes(gc) - b0;
+        CHECK(nc == 0);
+        if (big > 4 * small + 16) {
+            fprintf(stderr, "FAIL separability: %ld cells at N=%d vs %ld at N=%d\n",
+                    big, CROWD, small, N);
+            return 1;
+        }
+        printf("  separability: isolated query walks %ld cells at N=%d, "
+               "%ld at N=%d (population 66x)\n", small, N, big, CROWD);
+        world_free(wc); stock_grid_free(gc);
+    }
+
+    /* line of sight: u4 and u6 are 1 apart on a row; drop a blocker between two
+     * further apart and the segment must be refused */
+    {
+        uint32_t a[2] = { ent[0], ent[3] };
+        CHECK(world_provider_holds_at(w, P_LOS, a, 2));      /* (0,0) -> (2,2) */
+        world_set(w, intern_id(sy, "grid_blocks(u2)"), true);
+        stock_grid_refresh(g);
+        /* u2 at (1,1) is on the diagonal between them */
+        CHECK(!world_provider_holds_at(w, P_LOS, a, 2));
+        world_set(w, intern_id(sy, "grid_blocks(u2)"), false);
+        stock_grid_refresh(g);
+        CHECK(world_provider_holds_at(w, P_LOS, a, 2));
+        printf("  line of sight: clear, blocked by an interposed entity, clear\n");
+    }
+
+    /* an entity the grid never heard of is not adjacent to anything, rather
+     * than colliding with lane 0 */
+    {
+        uint32_t ghost = intern_id(sy, "ghost");
+        uint32_t a[2] = { ent[0], ghost };
+        CHECK(!world_provider_holds_at(w, P_ADJ, a, 2));
+        CHECK(stock_grid_chebyshev(g, ent[0], ghost) < 0);
+        printf("  unknown entity: not adjacent, distance undefined\n");
+    }
+
+    world_free(w);
+    stock_grid_free(g);
+    intern_free(sy);
+
+    /* ---- THE ACCEPTANCE TEST: a spatial story with no game code ------------ */
+    {
+        char path[512];
+        snprintf(path, sizeof path, "%s/grid_pure.story", STORY_DIR);
+        FILE *f = fopen(path, "rb");
+        CHECK(f != NULL);
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        char *src = malloc((size_t)sz + 1);
+        size_t rd = fread(src, 1, (size_t)sz, f); src[rd] = 0; fclose(f);
+
+        intern *s2 = intern_new();
+        story_diag di[16]; story_diags dg = { di, 16, 0, 0 };
+        world *w2 = story_compile(src, "grid_pure.story", s2, &dg);
+        CHECK(w2 != NULL && dg.nerrors == 0);
+
+        /* the platform installs the library; the GAME contributes no code */
+        const char *names[] = { "scout", "sentry", "ally", "wall" };
+        uint32_t e2[4];
+        for (int i = 0; i < 4; i++) e2[i] = intern_id(s2, names[i]);
+        stock_grid *g2 = stock_grid_install(w2, s2, e2, 4);
+        CHECK(g2 != NULL);
+
+        /* scout at (1,1), sentry at (2,1): adjacent, and the sentry is hostile */
+        CHECK(world_query(w2, dl_pos(intern_id(s2, "adjacent_to(scout,sentry)")))
+              == DL_PROVED);
+        CHECK(world_query(w2, dl_pos(intern_id(s2, "in_melee(scout)"))) == DL_PROVED);
+        /* the wall at (5,1) stands between the sentry and the ally at (8,1) */
+        CHECK(world_query(w2, dl_pos(intern_id(s2, "can_see(sentry,ally)")))
+              == DL_REFUTED);
+        printf("  story: adjacency and blocked sight, with zero game code\n");
+
+        /* MOVEMENT: an ordinary numeric effect, and the geometry must follow.
+         * A cached index that misses this answers yesterday's world. */
+        char err[160];
+        uint32_t west = intern_id(s2, "west(scout)"), east = intern_id(s2, "east(scout)");
+        CHECK(world_step(w2, &west, 1, err, sizeof err) == 0);
+        CHECK(world_get_num(w2, intern_id(s2, "grid_x(scout)")) == 0);
+        /* two cells from the sentry now: the judgment must FOLLOW the move */
+        CHECK(world_query(w2, dl_pos(intern_id(s2, "adjacent_to(scout,sentry)")))
+              == DL_REFUTED);
+        CHECK(world_query(w2, dl_pos(intern_id(s2, "in_melee(scout)"))) == DL_REFUTED);
+        CHECK(world_step(w2, &east, 1, err, sizeof err) == 0);
+        CHECK(world_query(w2, dl_pos(intern_id(s2, "adjacent_to(scout,sentry)")))
+              == DL_PROVED);
+        printf("  movement: the geometry follows state across two steps\n");
+
+        /* the exception the library deliberately does not own: a blinded actor
+         * sees nothing, however clear the line. `blind > spots` decides it. */
+        CHECK(world_query(w2, dl_pos(intern_id(s2, "can_see(sentry,scout)")))
+              == DL_PROVED);
+        world_set(w2, intern_id(s2, "blinded(sentry)"), true);
+        CHECK(world_query(w2, dl_pos(intern_id(s2, "can_see(sentry,scout)")))
+              == DL_REFUTED);
+        printf("  the story's exception overrides the measured premise\n");
+
+        world_free(w2); stock_grid_free(g2); intern_free(s2); free(src);
+    }
+
+    printf("test_stockgrid: all passed\n");
+    return 0;
+}
