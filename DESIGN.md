@@ -2676,6 +2676,96 @@ and never crosses this interface at all.
   engine still cannot know the frame budget. The choice is made statically and
   stated; adaptivity, where wanted, is the existing pinned-vs-adaptive lever.
 
+### 8.3 Ordered axes: a difference bound is an access path
+
+`x(A) - x(B) <= r` is already legal surface — a §5.8 expression guard between
+two fluent reads on two variables. It is currently carried into the emitted
+rule as a FILTER the solver evaluates, so the rule grounds the sort cross
+product and the bound only prunes afterwards. At ~1.2 entities per cell and
+radius 1 that is 1,048,576 instances, 464 MB and a 4.1 s compile at N=1024 for
+one rule, and a hard error past 2^20 instances — whose diagnostic already names
+the missing thing: *"every variable must be bound by a positive base-fluent
+atom … add a sparser anchor"*. A difference bound is exactly the sparser anchor
+it cannot accept.
+
+**The interface property that makes this safe is conservatism, not exactness.**
+The bound stays an ordinary body conjunct, so the rule re-checks it: an index
+that yields a SUPERSET of the satisfying pairs is always correct and costs only
+probes. Only an index that drops a satisfying pair is wrong. So the index is a
+performance artifact with a differential pin against the exhaustive answer —
+the same posture as the lane path against N=1, and the same reason it is safe
+to change.
+
+**Two quantities, and they are not the same win** (`bench_dbound`, N=65536):
+
+| | 1D | 2D | 3D |
+| --- | --: | --: | --: |
+| matching pairs per entity | 837.5 | 10.7 | 0.1 |
+| probes, one indexed axis | 27.4M | 27.4M | 27.4M |
+| probes, every bound axis indexed | 27.4M | 349,940 | 4,466 |
+
+Exploiting **sparsity** recovers SPACE: each added dimension multiplies
+selectivity by roughly (2r+1)/spread, so the answer collapses. Exploiting
+**separability** recovers TIME: only the axes actually indexed keep
+non-matching pairs from being formed, which is why one indexed axis leaves the
+probe column flat however many dimensions the rule constrains. The two come
+apart, and a design that conflates them will report the wrong win.
+
+**Decision: index every axis a bound mentions.** With all of them bucketed,
+probes equal the matching-pair count exactly — every comparison succeeds, so
+search cost equals answer size. That is optimal rather than near-optimal; what
+remains against hand-written C is layout (a counting-sort CSR row, as the host
+grid in `bench_slice` already uses, instead of a per-bucket chase), which is
+§8.2's business and not a separate algorithm.
+
+It also inverts the naive reading: with one indexed axis, extra dimensions are
+free but useless; with all of them, they are actively good — the 3D query does
+4,466 comparisons where the 1D one does 27 million. High-dimensional state is
+what makes a query cheap, provided the index knows every dimension it
+constrains.
+
+**Why a planner rather than one blessed structure.** Unlike a spatial index,
+the axes here are heterogeneous — position, hp, initiative, cooldown, with
+different ranges and distributions — and different rules bound different
+SUBSETS of them. That is multi-attribute indexing, whose answer is a choice
+made from statistics. The statistics exist: ranges are declared and radii are
+in the source, so 2r/range is a compile-time selectivity estimate — the input
+§8.2 wants and a provider structurally cannot supply. Realised spread is
+dynamic, though (a flat axis inside a wide declared range), and the index build
+is a sort, so it yields measured spread for free; feeding that back is the
+§8.1 pinned-vs-adaptive lever, not a new mechanism.
+
+**What the constraints rule out.** Exactness forbids approximate schemes (LSH,
+projection): a dropped pair is a silently missing rule instance, and the trace
+would explain a world that is not there. I4 forbids hash-order enumeration
+without a canonical sort. And this workload is REBUILD-dominated rather than
+query-dominated — entities move every tick and each tick runs roughly one bulk
+enumeration — which is the axis on which games and databases genuinely differ:
+it favours counting sort, radix, and insertion sort over near-sorted data, and
+disfavours the query-optimal trees that rebalance badly under motion.
+
+**Retractions** (each closes a plausible path):
+
+- *Approximate or probabilistic indexes*: forbidden by exactness above, not
+  merely undesirable.
+- *High-dimensional exotica* (cover trees, pyramid, X-trees): a game rule
+  bounds two to four axes. Where k is large enough for the curse to bite, the
+  answer is so sparse that indexing the single most selective axis and
+  filtering wins anyway. The awkward case is the middle, and the middle is a
+  planner problem rather than a structure problem.
+- *One blessed structure*: refuted by heterogeneous axes — the subset a rule
+  bounds is what wants indexing, not the world.
+- *An author-declared index*: that is §8.1 operational policy, so it is an
+  override rather than the default; and a declared index is a claim the DATA
+  can violate (the flat-axis case), which an estimate fed by the build cannot.
+
+**Open**: a space-filling-curve key (Morton/Hilbert) collapsing k axes to one
+total order, so a single structure answers any subset as a set of intervals —
+attractive because rules share axes unpredictably, and because the key is its
+own canonical order. And incremental maintenance: temporal coherence is the
+largest unexploited factor here, since a rebuild-dominated workload pays for
+every index it does not patch.
+
 ## 9. Tooling (first-class, built early)
 
 - `why <literal>?` — proof/defeat trace: which rules supported, which
