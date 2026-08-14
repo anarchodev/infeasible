@@ -91,6 +91,30 @@ typedef enum {
 } world_cmp;
 
 void world_declare_num(world *w, uint32_t atom, long min, long max, bool has_range);
+
+/* Structured view of a numeric fluent (#250), the twin of
+ * world_set_fluent_struct: records the ground atom's (pred, arg-entity) shape
+ * so a predicate can be inverted back to its instances. The grounder attaches
+ * it beside world_declare_num.
+ *
+ * Unlike the boolean extension index, this one is BUILD-ONCE. The boolean index
+ * holds the currently-TRUE tuples and so refreshes on every state edit; a
+ * numeric fluent has no truth to change — its instances are fixed after
+ * grounding and only the VALUES move. world_set_num therefore does not
+ * invalidate it, and a reader (the ordered-axis index, §8.3) re-reads values
+ * through it rather than rebuilding. Invalidating per tick would cost exactly
+ * the work the index exists to save. */
+void world_set_num_struct(world *w, uint32_t atom, uint32_t pred,
+                          const uint32_t *args, int nargs);
+
+/* The declared instances of an ARITY-1 numeric predicate, in declaration order
+ * — the order grounding walks, so it feeds roll-site indices and lane
+ * assignment (I4). Returns the count and borrows two parallel arrays: the
+ * entity each instance is about, and its ground atom. Valid until the next
+ * numeric declaration. A predicate of another arity, or one with no structure
+ * registered, answers 0. */
+int world_num_ext1(world *w, uint32_t pred, const uint32_t **ents,
+                   const uint32_t **atoms);
 void world_set_num(world *w, uint32_t atom, long value);
 long world_get_num(const world *w, uint32_t atom);
 

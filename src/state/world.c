@@ -255,6 +255,16 @@ struct world {
              const expr_ins *hi_code; int n_hi;
              world_merge merge; } *nums;   /* ASSIGN-class algebra (#85) */
     int nnum, capnum;
+    /* #250: the (pred, entity) shape of each numeric instance, so a predicate
+     * can be inverted to its instances. Parallel to w->nums. pred == 0 means
+     * no structure was registered. */
+    struct { uint32_t pred, ent; int arity; } *numst;
+    /* the arity-1 extension, materialised on demand and reused: numeric
+     * instances are fixed after grounding, so only world_declare_num
+     * invalidates this — world_set_num deliberately does not. */
+    uint32_t *numext_pred; int *numext_lo, *numext_n; int numext_np;
+    uint32_t *numext_ent, *numext_atom;
+    bool      numext_built;
     struct { uint32_t guard, num; world_cmp op; long threshold; } *guards;
     int ng, capg;
     /* Primed guards (§5.8 #87): over the NEXT value, minted as strict facts by
@@ -503,6 +513,8 @@ static void invalidate_state_solved_of(world *w, uint32_t pred)
         w->lanes[i].solved = false;
 }
 
+static void numext_invalidate(world *w);
+
 void world_free(world *w)
 {
     if (w->reground_free && w->reground_ctx) {     /* #59: compiler-owned matcher */
@@ -546,6 +558,8 @@ void world_free(world *w)
         free(w->steplanes[i].lane_ent);
     }
     free(w->steplanes);
+    free(w->numst);
+    numext_invalidate(w);
     free(w->step_snap);
     free(w->last_actions);
     free(w->lane_map);
@@ -842,10 +856,89 @@ static int num_index(const world *w, uint32_t atom)
     return atom < w->num_of_cap ? w->num_of[atom] : -1;
 }
 
+/* Drop the cached arity-1 extension: a new instance changes what a predicate's
+ * instances ARE. world_set_num changes only their values and must not call it. */
+static void numext_invalidate(world *w)
+{
+    free(w->numext_pred); free(w->numext_lo); free(w->numext_n);
+    free(w->numext_ent);  free(w->numext_atom);
+    w->numext_pred = NULL; w->numext_lo = NULL; w->numext_n = NULL;
+    w->numext_ent = NULL;  w->numext_atom = NULL;
+    w->numext_np = 0; w->numext_built = false;
+}
+
+void world_set_num_struct(world *w, uint32_t atom, uint32_t pred,
+                          const uint32_t *args, int nargs)
+{
+    int i = num_index(w, atom);
+    if (i < 0) return;
+    w->numst[i].pred  = pred;
+    w->numst[i].arity = nargs;
+    w->numst[i].ent   = nargs >= 1 ? args[0] : 0;
+    numext_invalidate(w);
+}
+
+int world_num_ext1(world *w, uint32_t pred, const uint32_t **ents,
+                   const uint32_t **atoms)
+{
+    if (!w->numext_built) {
+        /* one pass to count instances per predicate, one to place them —
+         * declaration order preserved within each predicate (I4) */
+        w->numext_ent  = malloc((size_t)(w->nnum ? w->nnum : 1) * sizeof *w->numext_ent);
+        w->numext_atom = malloc((size_t)(w->nnum ? w->nnum : 1) * sizeof *w->numext_atom);
+        w->numext_pred = malloc((size_t)(w->nnum ? w->nnum : 1) * sizeof *w->numext_pred);
+        w->numext_lo   = malloc((size_t)(w->nnum ? w->nnum : 1) * sizeof *w->numext_lo);
+        w->numext_n    = malloc((size_t)(w->nnum ? w->nnum : 1) * sizeof *w->numext_n);
+        w->numext_np = 0;
+        for (int i = 0; i < w->nnum; i++) {
+            if (w->numst[i].arity != 1 || w->numst[i].pred == 0) continue;
+            int slot = -1;
+            for (int j = 0; j < w->numext_np; j++)
+                if (w->numext_pred[j] == w->numst[i].pred) { slot = j; break; }
+            if (slot < 0) {
+                slot = w->numext_np++;
+                w->numext_pred[slot] = w->numst[i].pred;
+                w->numext_n[slot] = 0;
+            }
+            w->numext_n[slot]++;
+        }
+        int at = 0;
+        for (int j = 0; j < w->numext_np; j++) { w->numext_lo[j] = at; at += w->numext_n[j]; w->numext_n[j] = 0; }
+        for (int i = 0; i < w->nnum; i++) {
+            if (w->numst[i].arity != 1 || w->numst[i].pred == 0) continue;
+            for (int j = 0; j < w->numext_np; j++)
+                if (w->numext_pred[j] == w->numst[i].pred) {
+                    int k = w->numext_lo[j] + w->numext_n[j]++;
+                    w->numext_ent[k]  = w->numst[i].ent;
+                    w->numext_atom[k] = w->nums[i].atom;
+                    break;
+                }
+        }
+        w->numext_built = true;
+    }
+    for (int j = 0; j < w->numext_np; j++)
+        if (w->numext_pred[j] == pred) {
+            if (ents)  *ents  = w->numext_ent  + w->numext_lo[j];
+            if (atoms) *atoms = w->numext_atom + w->numext_lo[j];
+            return w->numext_n[j];
+        }
+    if (ents) *ents = NULL;
+    if (atoms) *atoms = NULL;
+    return 0;
+}
+
 void world_declare_num(world *w, uint32_t atom, long min, long max, bool has_range)
 {
     if (num_index(w, atom) >= 0) return;
+    int prev = w->capnum;
     GROW(w->nums, w->nnum, w->capnum);
+    if (w->capnum != prev || !w->numst) {
+        w->numst = realloc(w->numst, (size_t)w->capnum * sizeof *w->numst);
+        for (int i = w->nnum; i < w->capnum; i++)
+            { w->numst[i].pred = 0; w->numst[i].ent = 0; w->numst[i].arity = -1; }
+    }
+    w->numst[w->nnum].pred = 0; w->numst[w->nnum].ent = 0; w->numst[w->nnum].arity = -1;
+    numext_invalidate(w);
     w->nums[w->nnum].atom = atom;
     w->nums[w->nnum].value = 0;
     w->nums[w->nnum].min = min;

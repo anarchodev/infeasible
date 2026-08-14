@@ -6965,6 +6965,10 @@ static void declare_ground_fluents(parser *p)
             if (f->is_num) {                       /* value-store slot, not an atom */
                 uint32_t atom = ground_pred(p, f->pred, binding, f->nargs);
                 world_declare_num(p->w, atom, f->rmin, f->rmax, f->has_range);
+                world_set_num_struct(p->w, atom, f->pred, binding, f->nargs);
+                                                   /* #250: the extension index,
+                                                    * the numeric twin of
+                                                    * world_set_fluent_struct */
                 if (f->merge_mode)                 /* `merge min|max` (#85) */
                     world_set_num_merge(p->w, atom, f->merge_mode == 1
                                         ? WORLD_MERGE_MIN : WORLD_MERGE_MAX);
