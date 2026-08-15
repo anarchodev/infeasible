@@ -115,6 +115,32 @@ check('focus exposes exactly the frozen ops',
         f.current() === 'c', f.current());
   check('every nav dir is one of the frozen four',
         NAV_DIRS.length === 4 && NAV_DIRS.every((d) => typeof d === 'string'));
+
+  // Navigation is RECT-to-rect, not centre-to-centre — Godot's rule, and the
+  // reason is this shape. `wide` spans the row, so its CENTRE is far to the
+  // right of `near` while its EDGE is touching. Centre distance picks `far`;
+  // the correct answer is `near`, which is adjacent.
+  const sized = [
+    { id: 'wide', x:  0, y: 0, w: 200, h: 10 },
+    { id: 'near', x: 210, y: 0, w:  10, h: 10 },
+    { id: 'far',  x: 260, y: 0, w:  10, h: 10 },
+  ];
+  backend.pad({});               platform.sampleInput(); f.targets(sized);
+  backend.pad({ nav: ['right'] }); platform.sampleInput(); f.targets(sized);
+  check('a wide target navigates to its NEIGHBOUR, not the nearest centre',
+        f.current() === 'near', f.current());
+
+  // an edge: focus back onto the leftmost, then press left. There is nothing
+  // that way, and the frozen behaviour is STAY rather than wrap — Unity offers
+  // wrapAround and Unreal a Wrap rule, both opt-in, and silently wrapping a
+  // grid is worse than not moving.
+  backend.pad({});               platform.sampleInput(); f.targets(sized);
+  backend.pad({ nav: ['left'] }); platform.sampleInput(); f.targets(sized);
+  check('left from `near` reaches the wide neighbour', f.current() === 'wide', f.current());
+  backend.pad({});               platform.sampleInput(); f.targets(sized);
+  backend.pad({ nav: ['left'] }); platform.sampleInput(); f.targets(sized);
+  check('and left again stays put rather than wrapping',
+        f.current() === 'wide', f.current());
 }
 check('persistence is one small blob and nothing else',
       same(Object.keys(platform.cart.data), DATA_OPS));

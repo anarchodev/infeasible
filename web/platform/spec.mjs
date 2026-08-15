@@ -94,7 +94,30 @@ export const INPUT_OPS = ['pointer', 'button', 'pressed', 'key', 'keyp'];
  *    focus.cancelled()    whether cancel was pressed this tick
  *
  *  A cart built on this runs on a d-pad, a touchscreen and a mouse without
- *  knowing which it has. */
+ *  knowing which it has.
+ *
+ *  PRIOR ART, because this problem is thirty years old and the convergence is
+ *  total. Godot: `ui_left/right/up/down` + `ui_accept` + `ui_cancel`, over
+ *  `Control.focus_neighbor_*`. Unity: Navigate/Submit/Cancel actions over
+ *  `Selectable`, with `Navigation.Mode` = Automatic | Explicit | Horizontal |
+ *  Vertical | None. Unreal: `EUINavigation` Left/Right/Up/Down/Next/Previous
+ *  with per-widget rules. Four directions, a confirm and a cancel, every time.
+ *  PICO-8 is the outlier that proves it from the other side — it has no focus
+ *  system because it never offered a pointer, and its opt-in "devkit mouse" is
+ *  documented as forfeiting portability, which is exactly what reading
+ *  INPUT_OPS above means here.
+ *
+ *  Deliberately NOT taken from them, each recoverable later:
+ *    - explicit per-target neighbour overrides (all three have them, for when
+ *      geometry guesses wrong). Adding one means a target grows optional
+ *      neighbour ids; nothing here forecloses it.
+ *    - Next/Previous as a separate tab order (Godot `focus_next`, Unreal
+ *      Next/Previous), which on a pad is the shoulder buttons.
+ *    - wrap at the edges (Unity `wrapAround`, Unreal's Wrap rule). Both make
+ *      it opt-in; the frozen behaviour here is STAY, because silently wrapping
+ *      a grid is worse than not moving.
+ *    - per-USER focus (Unreal), which is what local multiplayer needs and
+ *      what a single `current()` cannot express. */
 export const FOCUS_OPS = ['targets', 'current', 'confirmed', 'cancelled'];
 
 /** Directional navigation intent, edge-triggered like `keyp`. A backend maps

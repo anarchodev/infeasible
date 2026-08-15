@@ -163,37 +163,46 @@ function makeInput(be) {
   return { api, sample, state: () => ({ cur, prev, gen }) };
 }
 
-/** Centre of a target, the reference point for geometric navigation. */
-const mid = (t) => ({ x: t.x + t.w / 2, y: t.y + t.h / 2 });
-
 /**
- * Which target lies `dir` of `from`? Standard spatial navigation: keep only
- * the targets genuinely in that direction, then take the nearest by distance
- * along the axis of travel plus a penalty for drifting off it. The penalty is
- * what stops a d-pad press jumping diagonally across a screen to something
- * marginally closer in a straight line.
+ * Which target lies `dir` of `from`? The shortest RECT-TO-RECT distance, not
+ * centre-to-centre — which is Godot's approach (`Control::_window_find_focus_
+ * neighbor`) and matters whenever the targets are not all the same size: a
+ * wide button's centre can be far from a small neighbour whose edge is
+ * touching it, and centre distance picks the wrong one.
+ *
+ * Direction is filtered first, by whether any part of the candidate lies
+ * beyond the source along the axis of travel. Unity (`Selectable.
+ * FindSelectable`) instead scores `dot / |v|²` from a point on the source's
+ * edge — "blow up a balloon in the direction of travel and take the first
+ * centre it touches" — which is elegant but still measures to a centre, and
+ * so has the same size sensitivity.
  *
  * Ties break on DECLARATION ORDER, which is why spec.mjs calls target order
  * semantics: two equidistant targets must resolve the same way on every
- * machine and every replay (I4).
+ * machine and every replay (I4). Both engines above tie-break too, and both
+ * do it on scene order, which is the same choice.
  */
 function navigate(targets, fromId, dir) {
   const from = targets.find((t) => t.id === fromId);
   if (!from) return targets.length ? targets[0].id : null;
-  const a = mid(from);
-  let best = null, bestScore = Infinity;
+  const ax = dir === 'left' || dir === 'right';
+  const sign = (dir === 'right' || dir === 'down') ? 1 : -1;
+  /* how far along the axis of travel a rect's near and far edges sit */
+  const lo = (t) => sign * (ax ? t.x : t.y);
+  const hi = (t) => sign * ((ax ? t.x + t.w : t.y + t.h));
+  const beyond = Math.max(lo(from), hi(from));
+
+  let best = null, bestD = Infinity;
   for (const t of targets) {
     if (t.id === fromId) continue;
-    const b = mid(t);
-    const dx = b.x - a.x, dy = b.y - a.y;
-    let along, across;
-    if (dir === 'left')       { along = -dx; across = Math.abs(dy); }
-    else if (dir === 'right') { along =  dx; across = Math.abs(dy); }
-    else if (dir === 'up')    { along = -dy; across = Math.abs(dx); }
-    else                      { along =  dy; across = Math.abs(dx); }
-    if (along <= 0) continue;                 /* not in this direction at all */
-    const score = along + across * 2;
-    if (score < bestScore) { bestScore = score; best = t.id; }
+    /* MAX of the two edges, so an overlapping candidate that extends further
+     * in the direction of travel still counts as being that way */
+    if (Math.max(lo(t), hi(t)) <= beyond) continue;
+    /* gap between the rectangles on each axis; 0 when they overlap there */
+    const gx = Math.max(0, Math.max(from.x - (t.x + t.w), t.x - (from.x + from.w)));
+    const gy = Math.max(0, Math.max(from.y - (t.y + t.h), t.y - (from.y + from.h)));
+    const d = gx * gx + gy * gy;
+    if (d < bestD) { bestD = d; best = t.id; }
   }
   return best ?? fromId;                      /* nothing that way: stay put */
 }

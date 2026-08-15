@@ -3074,6 +3074,36 @@ sprites at RTS scale. Nothing in the surface may assume more.
     mouse forecloses both. It was settled while two carts existed, because a
     frozen interface is cheap to change before a cart population and
     impossible after.
+
+    **The convergence in the prior art is total**, which is the main reason to
+    trust the shape. Godot: `ui_left/right/up/down` + `ui_accept` +
+    `ui_cancel`, over `Control.focus_neighbor_*`. Unity: Navigate/Submit/Cancel
+    over `Selectable`, `Navigation.Mode` ∈ {Automatic, Explicit, Horizontal,
+    Vertical, None}. Unreal: `EUINavigation` Left/Right/Up/Down/Next/Previous
+    with per-widget rules. Four directions, one confirm, one cancel, every
+    time. PICO-8 proves it from the other side: it has no focus system because
+    it never offered a pointer, and its opt-in "devkit mouse" is documented as
+    forfeiting portability — which is precisely what reading the pointer ops
+    means here.
+
+    **Navigation is rect-to-rect, not centre-to-centre**, following Godot's
+    `_window_find_focus_neighbor`: the shortest distance between the two
+    rectangles, filtered by whether the candidate extends beyond the source
+    along the axis of travel. Centres mislead as soon as targets differ in
+    size — a wide button's centre sits far from a small neighbour whose edge is
+    touching it. Unity's `Selectable.FindSelectable` scores `dot / |v|²` from a
+    point on the source's edge, which is elegant ("blow a balloon along the
+    direction of travel and take the first centre it touches") but still
+    measures to a centre and keeps the same sensitivity.
+
+    Four things the prior art has that this deliberately does not, each
+    recoverable without breaking the freeze: explicit per-target neighbour
+    overrides for when geometry guesses wrong (all three engines have them);
+    Next/Previous as a tab order distinct from direction, which on a pad is the
+    shoulder buttons; wrap at the edges, which Unity and Unreal both make
+    opt-in and which is frozen here as STAY, since silently wrapping a grid is
+    worse than not moving; and per-USER focus, which is what local multiplayer
+    needs and what a single `current()` cannot express.
   - **Input is polled, never delivered as events.** `pointer()` in internal
     resolution coordinates, `button(i)`/`pressed(i)` over three pointer
     buttons, `key(k)`/`keyp(k)` over a frozen named key set — kept, because a
