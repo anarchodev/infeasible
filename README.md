@@ -32,3 +32,22 @@ src/state/  fact store, step function (inertia, ramifications, conflicts)
 tests/      golden semantic tests: Yale shooting, cellar, ramifications, conflicts
 examples/   surface-language sketches (.story)
 ```
+
+## Licence
+
+The engine is **Apache-2.0** (see [LICENSE](LICENSE) and [NOTICE](NOTICE)).
+Apache rather than MIT for two reasons that matter to a project taking outside
+contributions: an express patent grant with retaliation, and §5, under which a
+contribution is offered under the licence unless it says otherwise — a CLA for
+code, without the paperwork.
+
+**Content is licensed separately**, because Apache-2.0 is a software licence:
+
+- assets (graphics, audio) under **CC0 or CC BY 4.0** — never `BY-NC` (which
+  forbids selling the result) or `BY-ND` (which forbids the remixing that is
+  the point);
+- fonts under the **SIL Open Font License**, or supplied by the backend, since
+  §12 freezes text as metrics rather than glyphs.
+
+Each contributed asset carries a manifest entry — author, licence, source —
+which serves the CC BY attribution requirement and the credits from one record.
