@@ -1,0 +1,36 @@
+infeasible
+Copyright 2026 anarchodev and the infeasible contributors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This project was licensed MIT through 2026-08-15 and relicensed to Apache-2.0
+by its sole copyright holder. Every commit up to that point remains available
+under the MIT terms it was published under; the relicense binds this and later
+work.
+
+---- Content licensing ------------------------------------------------------
+
+The Apache-2.0 terms above cover the ENGINE — the C sources, the tooling, and
+the tests. Content shipped with or contributed to a game built on it is
+licensed separately, because Apache-2.0 is a software licence and Creative
+Commons themselves advise against applying CC licences to code:
+
+  - Assets (graphics, audio) must be contributed under CC0 or CC BY 4.0.
+    CC BY-NC and CC BY-ND are NOT acceptable: NonCommercial forbids sale on
+    Steam, the console stores and the App Store, and NoDerivatives forbids the
+    modification a remix community exists to do. One of either, accepted early
+    and forgotten, is removed rather than relicensed.
+  - Fonts: SIL Open Font License, or none. The §12 presentation interface
+    freezes text as METRICS rather than glyphs, so a backend may supply its own
+    rather than the project bundling one.
+
+Every contributed asset carries a manifest entry naming its author, licence
+and source. That entry is the record for both obligations at once: CC BY
+attribution, and the credits.
+
+---- Third-party ------------------------------------------------------------
+
+Content derived from the System Reference Document 5.1 ("SRD 5.1") by Wizards
+of the Coast LLC is licensed under the Creative Commons Attribution 4.0
+International License (CC BY 4.0). Games shipping such content must carry that
+attribution; the engine itself contains none.
