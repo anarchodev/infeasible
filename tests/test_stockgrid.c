@@ -247,6 +247,60 @@ int main(void)
         world_free(w2); stock_grid_free(g2); intern_free(s2); free(src);
     }
 
+    /* ---- the tactics slice's rule set on the same library ------------------
+     *
+     * grid_pure.story is a fixture; tactics.story is content — a squad rule set
+     * with a band ladder, a criss-cross and ramifications, authored without
+     * regard for what lanes. Running it here is what stops the stock grid from
+     * being pinned only by the example written to exercise it. */
+    {
+        char path[512];
+        snprintf(path, sizeof path, "%s/tactics.story", STORY_DIR);
+        FILE *f = fopen(path, "rb");
+        CHECK(f != NULL);
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        char *src = malloc((size_t)sz + 1);
+        size_t rd = fread(src, 1, (size_t)sz, f); src[rd] = 0; fclose(f);
+
+        intern *s3 = intern_new();
+        story_diag di[16]; story_diags dg = { di, 16, 0, 0 };
+        world *w3 = story_compile(src, "tactics.story", s3, &dg);
+        CHECK(w3 != NULL && dg.nerrors == 0);
+        static const char *NAMES[] = { "r1","r2","r3","r4","b1","b2","b3","b4" };
+        uint32_t e3[8];
+        for (int i = 0; i < 8; i++) e3[i] = intern_id(s3, NAMES[i]);
+        stock_grid *g3 = stock_grid_install(w3, s3, e3, 8);
+        CHECK(g3 != NULL);
+
+        /* r1 (1,1) and b1 (2,1) are adjacent; r2 (1,3) and b2 (8,3) are seven
+         * cells apart, past the `<= 6` the STORY chose */
+        CHECK(world_query(w3, dl_pos(intern_id(s3, "engaged(r1,b1)"))) == DL_PROVED);
+        CHECK(world_query(w3, dl_pos(intern_id(s3, "sighted(r1,b1)"))) == DL_PROVED);
+        CHECK(world_query(w3, dl_pos(intern_id(s3, "engaged(r2,b2)"))) == DL_REFUTED);
+        CHECK(world_query(w3, dl_pos(intern_id(s3, "sighted(r2,b2)"))) == DL_REFUTED);
+
+        /* the band ladder, over the same world: rooted stops a walker, and the
+         * champion's authored exception outranks the condition that stops it */
+        CHECK(world_query(w3, dl_pos(intern_id(s3, "advance(r2)"))) == DL_PROVED);
+        world_set(w3, intern_id(s3, "rooted(r2)"), true);
+        CHECK(world_query(w3, dl_pos(intern_id(s3, "advance(r2)"))) == DL_REFUTED);
+        world_set(w3, intern_id(s3, "rooted(r1)"), true);      /* r1 is champion */
+        CHECK(world_query(w3, dl_pos(intern_id(s3, "advance(r1)"))) == DL_PROVED);
+        /* and immunity still tops the ladder */
+        world_set(w3, intern_id(s3, "stunned(r1)"), true);
+        CHECK(world_query(w3, dl_pos(intern_id(s3, "advance(r1)"))) == DL_REFUTED);
+
+        /* movement is ordinary state, so the geometry follows it */
+        char err[160];
+        uint32_t west = intern_id(s3, "west(b1)");
+        CHECK(world_step(w3, &west, 1, err, sizeof err) == 0);
+        CHECK(world_get_num(w3, intern_id(s3, "grid_x(b1)")) == 1);
+        CHECK(world_query(w3, dl_pos(intern_id(s3, "engaged(r1,b1)"))) == DL_PROVED);
+        printf("  tactics.story: grid, band ladder and champion exception\n");
+
+        world_free(w3); stock_grid_free(g3); intern_free(s3); free(src);
+    }
+
     printf("test_stockgrid: all passed\n");
     return 0;
 }
