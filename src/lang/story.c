@@ -7497,6 +7497,14 @@ typedef struct {
     long      threshold;
     int       nargs;
     uint32_t  arg[MAX_ARGS];   /* a var NAME or a constant entity (disambiguated below) */
+    /* #257: a generator-capable provider can BIND its free argument instead of
+     * filtering a pair the join already formed. `gen_yield` is what it produced
+     * last reground and `gen_off` turns it back into a filter when it turned
+     * out to be denser than the fluent scan it displaced — §8.1's adaptive
+     * lever rather than a guess that is wrong invisibly. */
+    long      gen_yield;
+    long      gen_runs;
+    bool      gen_off;
 } m_atom;
 
 typedef struct {
@@ -7652,6 +7660,28 @@ static bool m_is_generator(const m_atom *a)   /* a positive fluent — scannable
     return !a->neg && !a->is_guard && !a->is_provider;
 }
 
+/* A provider that can ENUMERATE (#254) binds its free argument rather than
+ * testing a pair the join already built. Usable only in the connected position
+ * — exactly one argument bound, the other free — because the protocol asks
+ * `pred(a, ·)` for a known `a`. A var reachable ONLY through a provider still
+ * leaves the rule eager: enumerability is a runtime registration and the
+ * compile-time eligibility check cannot see it, so this is an optimisation
+ * inside an already-matchable rule, never a widening of what matches. */
+static bool m_provider_generator(const story_matcher *m, const m_rule *r,
+                                 const m_atom *a, const bool *vb, int *pbound,
+                                 int *pfree)
+{
+    if (a->neg || a->is_guard || !a->is_provider || a->gen_off) return false;
+    if (a->nargs != 2 || !world_provider_generates(m->w, a->pred)) return false;
+    int v0 = m_var_index((m_rule *)r, a->arg[0]);
+    int v1 = m_var_index((m_rule *)r, a->arg[1]);
+    if (v0 < 0 || v1 < 0 || v0 == v1) return false;   /* a constant arg: later */
+    if (vb[v0] == vb[v1]) return false;               /* both or neither bound */
+    *pbound = vb[v0] ? v0 : v1;
+    *pfree  = vb[v0] ? v1 : v0;
+    return true;
+}
+
 /* Selectivity-ordered join plan (#46): visit the generator atoms smallest live
  * extension first (factindex_count), each connected to an already-bound var so we
  * never form an accidental cartesian sub-join. The order is a deterministic
@@ -7660,7 +7690,9 @@ static bool m_is_generator(const m_atom *a)   /* a positive fluent — scannable
  * shrinks the intermediate bindings walked. `gorder` gets the body indices of the
  * generators in visitation order; filters (negation, guards, providers) are not
  * ordered here — they apply at the leaf / to the solver. */
-static void plan_generators(m_rule *r, const factindex *ix, int *gorder, int *pngen)
+static void plan_generators(const story_matcher *m, m_rule *r,
+                            const factindex *ix, int *gorder, uint8_t *gkind,
+                            int *pngen)
 {
     bool used[MAX_BODY] = { 0 };
     bool vb[MAX_ARGS]   = { 0 };            /* vars bound by already-ordered generators */
@@ -7685,11 +7717,25 @@ static void plan_generators(m_rule *r, const factindex *ix, int *gorder, int *pn
                           (conn != best_conn ? conn : cnt < bestcnt);
             if (better) { best = b; bestcnt = cnt; best_conn = conn; }
         }
-        gorder[ngen++] = best;
+        gorder[ngen] = best; gkind[ngen] = 0; ngen++;
         used[best] = true;
         for (int k = 0; k < r->body[best].nargs; k++) {
             int vi = m_var_index(r, r->body[best].arg[k]);
             if (vi >= 0) vb[vi] = true;
+        }
+        /* #257: a provider that can enumerate binds its free argument as soon
+         * as its other one is bound. Inserted rather than substituted — every
+         * fluent scan stays in the plan, so no constraint is lost and a scan
+         * whose var is now bound degenerates to a point probe. That is where
+         * the win is: |F| x run intermediates instead of |F|^2. */
+        for (int b = 0; b < r->nbody; b++) {
+            int bound, freev;
+            if (used[b]) continue;
+            if (!m_provider_generator(m, r, &r->body[b], vb, &bound, &freev))
+                continue;
+            gorder[ngen] = b; gkind[ngen] = 1; ngen++;
+            used[b] = true;
+            vb[freev] = true;
         }
     }
     *pngen = ngen;
@@ -7699,7 +7745,8 @@ static void plan_generators(m_rule *r, const factindex *ix, int *gorder, int *pn
  * visiting generators in the selectivity order `gorder` (see plan_generators).
  * At the leaf every var is bound; the negated fluent filters are applied, then
  * the instance is emitted with its full body. */
-static void m_match_rec(story_matcher *m, m_rule *r, const int *gorder, int ngen,
+static void m_match_rec(story_matcher *m, m_rule *r, const int *gorder,
+                        const uint8_t *gkind, int ngen,
                         int gi, uint32_t *bind, const factindex *ix)
 {
     if (gi == ngen) {
@@ -7711,6 +7758,24 @@ static void m_match_rec(story_matcher *m, m_rule *r, const int *gorder, int ngen
         return;
     }
     m_atom *at = &r->body[gorder[gi]];
+    if (gkind[gi]) {                        /* #257: enumerate from the provider */
+        int v0 = m_var_index(r, at->arg[0]), v1 = m_var_index(r, at->arg[1]);
+        int bv = bind[v0] != INTERN_NONE ? v0 : v1;
+        int fv = bv == v0 ? v1 : v0;
+        int cap = world_provider_gen(m->w, at->pred, bind[bv], NULL, 0);
+        uint32_t *run = malloc((size_t)(cap ? cap : 1) * sizeof *run);
+        int got = world_provider_gen(m->w, at->pred, bind[bv], run, cap);
+        at->gen_runs++;
+        at->gen_yield += got;
+        for (int k = 0; k < got; k++) {
+            m->probes++;
+            bind[fv] = run[k];
+            m_match_rec(m, r, gorder, gkind, ngen, gi + 1, bind, ix);
+        }
+        bind[fv] = INTERN_NONE;
+        free(run);
+        return;
+    }
     int n = at->nargs;
     bool     filt[FACTINDEX_MAXARGS];
     uint32_t want[FACTINDEX_MAXARGS];
@@ -7734,7 +7799,7 @@ static void m_match_rec(story_matcher *m, m_rule *r, const int *gorder, int ngen
             if (bind[vi] == INTERN_NONE) { bind[vi] = tup[k]; set[nset++] = vi; }
             else if (bind[vi] != tup[k]) { ok = false; break; }   /* repeated var agrees */
         }
-        if (ok) m_match_rec(m, r, gorder, ngen, gi + 1, bind, ix);
+        if (ok) m_match_rec(m, r, gorder, gkind, ngen, gi + 1, bind, ix);
         for (int s = 0; s < nset; s++) bind[set[s]] = INTERN_NONE; /* backtrack */
     }
 }
@@ -7750,6 +7815,7 @@ static void m_capture_atom(parser *p, m_atom *d, const ast_atom *s)
     d->threshold = s->threshold;
     d->nargs = s->nargs;
     for (int k = 0; k < s->nargs && k < MAX_ARGS; k++) d->arg[k] = s->args[k].name;
+    d->gen_yield = 0; d->gen_runs = 0; d->gen_off = false;   /* #257 */
 }
 
 /* Deep-copy one matchable rule into the retained plan (survives the parser). */
@@ -7896,8 +7962,9 @@ void story_matcher_reground(story_matcher *m)
         m_rule *r = &m->rules[i];
         for (int v = 0; v < r->nvars; v++) bind[v] = INTERN_NONE;
         int gorder[MAX_BODY], ngen = 0;
-        plan_generators(r, ix, gorder, &ngen);       /* selectivity order for THIS tick */
-        m_match_rec(m, r, gorder, ngen, 0, bind, ix);
+        uint8_t gkind[MAX_BODY];
+        plan_generators(m, r, ix, gorder, gkind, &ngen); /* order for THIS tick */
+        m_match_rec(m, r, gorder, gkind, ngen, 0, bind, ix);
     }
 }
 
