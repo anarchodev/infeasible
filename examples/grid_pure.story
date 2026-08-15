@@ -22,6 +22,13 @@ provider (
     grid_los(actor, actor)          // no blocker stands between them
 )
 
+// The MEASUREMENT form (§5.6): the library returns a distance and the STORY
+// picks the threshold, so "shouting range is three cells" is a line of content
+// a remixer can edit — not a number compiled into a C library behind an
+// `in_range` that answers yes or no and accounts for nothing.
+function grid_chebyshev(actor, actor) : int
+function grid_manhattan(actor, actor) : int
+
 entity ( scout, sentry, ally, wall : actor )
 
 state (
@@ -54,6 +61,9 @@ rule beside(A: actor, B: actor):
 
 rule spots(A: actor, B: actor):
     awake(A) & awake(B) & grid_los(A, B)        => can_see(A, B)
+
+rule shouting(A: actor, B: actor):
+    awake(A) & awake(B) & grid_chebyshev(A, B) <= 3  => in_shout(A, B)
 
 rule threatened(A: actor, B: actor):
     adjacent_to(A, B) & hostile(B)              => in_melee(A)

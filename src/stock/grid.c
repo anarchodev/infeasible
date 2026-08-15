@@ -25,7 +25,7 @@ struct stock_grid {
     uint32_t *xa, *ya, *ba;          /* [nent] the grid_x/grid_y/grid_blocks atoms */
     long     *x, *y;                 /* [nent] positions as of the last refresh */
     bool     *blocks;                /* [nent] is this entity a sight blocker */
-    uint32_t  p_adj, p_los;
+    uint32_t  p_adj, p_los, f_cheb, f_manh;
     /* bucket index: CSR over a power-of-two hash of (cell_x, cell_y) */
     int      *start, *item;          /* [nbucket+1], [nent] */
     int       nbucket;
@@ -175,6 +175,29 @@ static int grid_gen(void *ctx, uint32_t pred, uint32_t a, uint32_t *out, int cap
     return n;
 }
 
+/* The MEASUREMENT form (#258): a value provider called from a rule body, so
+ * the story writes the threshold — `grid_chebyshev(A, B) <= 3` — and the
+ * exceptions stay where `why?` can reach them. Entity arguments arrive as
+ * their interned atoms, the same identity the relation callbacks receive.
+ *
+ * An entity the grid has never heard of is INFINITELY far rather than -1: a
+ * guard reads `<= n`, so a negative "undefined" would make every unknown
+ * entity adjacent to everything. */
+enum { GRID_FAR = 1 << 24 };
+
+static long grid_fn(void *ctx, uint32_t pred, const long *args, int nargs)
+{
+    stock_grid *g = ctx;
+    if (nargs != 2) return GRID_FAR;
+    int d;
+    if (pred == g->f_cheb)
+        d = stock_grid_chebyshev(g, (uint32_t)args[0], (uint32_t)args[1]);
+    else if (pred == g->f_manh)
+        d = stock_grid_manhattan(g, (uint32_t)args[0], (uint32_t)args[1]);
+    else return GRID_FAR;
+    return d < 0 ? GRID_FAR : d;
+}
+
 long stock_grid_probes(const stock_grid *g) { return g ? g->probes : 0; }
 
 stock_grid *stock_grid_install(world *w, intern *syms,
@@ -210,7 +233,10 @@ stock_grid *stock_grid_install(world *w, intern *syms,
     g->item  = malloc((size_t)nent * sizeof *g->item);
     g->p_adj = intern_id(syms, "grid_adjacent");
     g->p_los = intern_id(syms, "grid_los");
+    g->f_cheb = intern_id(syms, "grid_chebyshev");
+    g->f_manh = intern_id(syms, "grid_manhattan");
     world_set_provider_fn(w, grid_point, g);
+    world_set_fn_provider_fn(w, grid_fn, g);
     world_set_provider_gen_fn(w, g->p_adj, grid_gen, g);
     stock_grid_refresh(g);
     return g;

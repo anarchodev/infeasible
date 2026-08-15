@@ -105,6 +105,14 @@ typedef enum {
     EX_MIN, EX_MAX,
     EX_TEST,  /* `test([~]p(args))` (#86): a literal's solved verdict as 0/1.
                * `pred`/`args` = the literal; `konst` = 1 for a `~` literal. */
+    EX_ENT,   /* an ENTITY term (#258): a rule variable or a named entity read in
+               * an expression, so a value provider can be called with one —
+               * `chebyshev(A, B)`. `pred` holds the variable name or entity
+               * atom, `konst` the sort index. Lowers to EXPR_CONST with the
+               * entity's interned atom, resolved through the binding: the
+               * grounder already substitutes an entity per role, so it is a
+               * compile-time constant, exactly as #226's constant argument is.
+               * An entity is a HANDLE — require_int keeps it out of arithmetic. */
     EX_PRIOR  /* `prior` (#82/#94): inside a layered definition's expression,
                * the value that would have held without this definition —
                * compiles to EXPR_P over the chain's running value. */
@@ -1134,6 +1142,11 @@ static bool parse_atom(parser *p, ast_atom *out)
     if (ident_is(p->cur, "roll") || ident_is(p->cur, "min") || ident_is(p->cur, "max") ||
         ident_is(p->cur, "divup") ||
         (p->cur.kind == TK_IDENT && find_value(p, intern_tok(p, p->cur)) >= 0) ||
+        (p->cur.kind == TK_IDENT && find_function(p, intern_tok(p, p->cur)) >= 0) ||
+                                    /* #258: a value provider is a MEASUREMENT, and
+                                     * `chebyshev(A,B) <= 3` is how a story rules on
+                                     * one — so a declared function leads a guard the
+                                     * way a declared value does */
         (p->cur.kind == TK_IDENT && is_declared_num(p, intern_tok(p, p->cur)) &&
          numread_starts_expr(p)) ||
         p->cur.kind == TK_INT || p->cur.kind == TK_LPAREN || p->cur.kind == TK_MINUS) {
@@ -3112,7 +3125,7 @@ static bool expr_has_test(parser *p, int e, int depth)
     ex_node *n = &p->exprs[e];
     switch (n->kind) {
     case EX_TEST: return true;
-    case EX_CONST: case EX_ROLL: return false;
+    case EX_CONST: case EX_ENT: case EX_ROLL: return false;
     case EX_LOAD: {
         int vi = find_value(p, n->pred);
         if (vi < 0) return false;
@@ -3136,6 +3149,29 @@ static bool expr_has_test(parser *p, int e, int depth)
 
 /* Validate an effect-RHS expression tree (§5.8): every fluent read resolves to
  * a declared numeric fluent of matching arity with in-scope args. */
+/* Arithmetic is INT-ONLY (#258). expr_value_sort already tracks a static
+ * `int | sort` per expression node, but until here nothing enforced it: both
+ * are a `long` in the VM, so `hp(X) := at(X) * 3 + 1` compiled and did
+ * arithmetic on an opaque cell handle — the very thing the fluent is tagged
+ * is_cell to forbid, enforced on the write side only. A sorted value is a
+ * handle: copy it, pass it, compare it to another of its own sort, but never
+ * compute with it. */
+static void require_int(parser *p, int e)
+{
+    if (e < 0) return;
+    int s = expr_value_sort(p, e);
+    if (s < 0) return;                              /* already an integer */
+    ex_node *n = &p->exprs[e];
+    const char *what = n->kind == EX_CALL ? "the result of '%s'" : "'%s'";
+    char sub[MAX_NAME + 32];
+    snprintf(sub, sizeof sub, what, intern_name(p->syms, n->pred));
+    serr(p, n->line, n->col,
+         "%s is a %s handle, not a number — arithmetic takes integers, and a "
+         "value of a declared domain is opaque (§5.6): copy it, pass it to a "
+         "function, or compare it to another %s, but never compute with it",
+         sub, value_sort_name(p, s), value_sort_name(p, s));
+}
+
 static void check_expr(parser *p, int e, var_bind *vars, int nvars)
 {
     if (e < 0) return;
@@ -3145,8 +3181,23 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
     case EX_ROLL:                    /* a seeded draw — nothing to resolve */
         return;
     case EX_LOAD: {
-        note_ref(p, n->pred, n->line, n->col);
         pred_info *pi = find_pred(p, n->pred);
+        if (!pi && n->nargs == 0) {
+            /* #258: a bare identifier naming a rule VARIABLE or a declared
+             * ENTITY is an entity term, not a fluent read — how a value
+             * provider gets its subject (`chebyshev(A, B)`). Reclassified here
+             * rather than at parse time because only the checker knows the
+             * rule's variables, and BEFORE note_ref: a variable is not a
+             * condition, so the orphan analysis must not see it as one. */
+            int vi = var_index(vars, nvars, n->pred);
+            int ei = find_entity(p, n->pred);
+            if (vi >= 0 || ei >= 0) {
+                n->kind  = EX_ENT;
+                n->konst = vi >= 0 ? vars[vi].sort : p->ents[ei].sort;
+                return;
+            }
+        }
+        note_ref(p, n->pred, n->line, n->col);
         if (n->nprimed) {                      /* primed numeric read (#84/#87) */
             if (!p->in_ramif_eff) {
                 serr(p, n->line, n->col,
@@ -3270,10 +3321,13 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
     }
     case EX_NEG:
         check_expr(p, n->lhs, vars, nvars);
+        require_int(p, n->lhs);
         return;
     default:
         check_expr(p, n->lhs, vars, nvars);
         check_expr(p, n->rhs, vars, nvars);
+        require_int(p, n->lhs);
+        require_int(p, n->rhs);
         return;
     }
 }
@@ -3343,6 +3397,7 @@ static int expr_value_sort(parser *p, int e)
         int fi = find_function(p, n->pred);
         return fi >= 0 ? find_sort(p, p->functions[fi].ret) : -1;
     }
+    if (n->kind == EX_ENT) return (int)n->konst;
     if (n->kind == EX_LOAD) {
         pred_info *pi = find_pred(p, n->pred);
         return (pi && pi->is_cell) ? pi->val_sort : -1;
@@ -3478,7 +3533,7 @@ static void check_guard_test_nodes(parser *p, int e, int depth)
     ex_node *n = &p->exprs[e];
     switch (n->kind) {
     case EX_TEST:  check_tested_cone_pred(p, n->pred, n->line, n->col); return;
-    case EX_CONST: case EX_ROLL: return;
+    case EX_CONST: case EX_ENT: case EX_ROLL: return;
     case EX_LOAD: {
         /* a LAYERED value read in a guard tests its markers (#82/#94): every
          * definition body must settle in pass A — its preds' cones test-free
@@ -3859,7 +3914,7 @@ static bool expr_reads_roll(parser *p, int e)
     if (e < 0) return false;
     ex_node *n = &p->exprs[e];
     switch (n->kind) {
-    case EX_CONST: case EX_LOAD: return false;
+    case EX_CONST: case EX_ENT: case EX_LOAD: return false;
     case EX_ROLL: return true;
     case EX_NEG:  return expr_reads_roll(p, n->lhs);
     case EX_CALL:
@@ -3876,7 +3931,7 @@ static bool expr_uses_var(parser *p, int e, uint32_t name)
     if (e < 0) return false;
     ex_node *n = &p->exprs[e];
     switch (n->kind) {
-    case EX_CONST: case EX_ROLL: return false;
+    case EX_CONST: case EX_ENT: case EX_ROLL: return false;
     case EX_LOAD:
         for (int k = 0; k < n->nargs; k++) if (n->args[k].name == name) return true;
         return false;
@@ -4215,7 +4270,7 @@ static bool expr_has_prior(parser *p, int e)
     ex_node *n = &p->exprs[e];
     switch (n->kind) {
     case EX_PRIOR: return true;
-    case EX_CONST: case EX_ROLL: case EX_LOAD: return false;
+    case EX_CONST: case EX_ENT: case EX_ROLL: case EX_LOAD: return false;
     case EX_CALL:
         for (int k = 0; k < n->nargs; k++)
             if (expr_has_prior(p, n->cargs[k])) return true;
@@ -4355,7 +4410,7 @@ static bool expr_value_cycle(parser *p, int e, bool *onstack, bool *done)
     if (e < 0) return false;
     ex_node *n = &p->exprs[e];
     switch (n->kind) {
-    case EX_CONST: case EX_ROLL: return false;
+    case EX_CONST: case EX_ENT: case EX_ROLL: return false;
     case EX_LOAD: {
         int vj = find_value(p, n->pred);
         return vj >= 0 && value_cycle_dfs(p, vj, onstack, done);
@@ -4582,7 +4637,7 @@ static bool expr_tree_reads_value(parser *p, int e, uint32_t pred,
                                       depth + 1))
                 return true;
         return false;
-    case EX_CONST: case EX_ROLL: case EX_TEST: case EX_PRIOR:
+    case EX_CONST: case EX_ENT: case EX_ROLL: case EX_TEST: case EX_PRIOR:
         return false;
     case EX_NEG:
         return expr_tree_reads_value(p, n->lhs, pred, args, nargs, depth + 1);
@@ -4651,7 +4706,7 @@ static void check_partial_expr(parser *p, int e, const psafe_ctx *cx, int depth)
         for (int k = 0; k < n->nargs; k++)
             check_partial_expr(p, n->cargs[k], cx, depth + 1);
         return;
-    case EX_CONST: case EX_ROLL: case EX_TEST: case EX_PRIOR:
+    case EX_CONST: case EX_ENT: case EX_ROLL: case EX_TEST: case EX_PRIOR:
         return;
     case EX_NEG: check_partial_expr(p, n->lhs, cx, depth + 1); return;
     default:
@@ -4888,7 +4943,7 @@ static void collect_primed_loads(parser *p, int e, uint32_t *pg, int *npgf)
         for (int k = 0; k < n->nargs; k++)
             collect_primed_loads(p, n->cargs[k], pg, npgf);
         return;
-    case EX_CONST: case EX_ROLL: case EX_TEST: case EX_PRIOR: return;
+    case EX_CONST: case EX_ENT: case EX_ROLL: case EX_TEST: case EX_PRIOR: return;
     case EX_NEG: collect_primed_loads(p, n->lhs, pg, npgf); return;
     default:
         collect_primed_loads(p, n->lhs, pg, npgf);
@@ -4919,7 +4974,7 @@ static int primed_read_floor(parser *p, int e)
             if (c > m) m = c;
         }
         return m;
-    case EX_CONST: case EX_ROLL: case EX_TEST: case EX_PRIOR: return 0;
+    case EX_CONST: case EX_ENT: case EX_ROLL: case EX_TEST: case EX_PRIOR: return 0;
     case EX_NEG: return primed_read_floor(p, n->lhs);
     default:
         m = primed_read_floor(p, n->lhs);
@@ -6355,6 +6410,7 @@ static bool expr_fold(parser *p, int e, long *out)
     case EX_LOAD:  return false;
     case EX_ROLL:  return false;              /* a fresh draw — never a constant */
     case EX_CALL:  return false;              /* a host call — never a constant */
+    case EX_ENT:   return false;              /* an entity handle, not an int (#258) */
     case EX_TEST:  return false;              /* a solved verdict — never a constant */
     case EX_PRIOR: return false;              /* the chain's running value */
     case EX_NEG:
@@ -6413,6 +6469,15 @@ static void render_expr(parser *p, int e, var_bind *vars, int nvars,
     case EX_PRIOR:
         *off += append_term(buf, cap, *off, "prior");
         return;
+    case EX_ENT: {                     /* #258: the entity BOUND here, by name —
+                                        * `chebyshev(scout, sentry) <= 3` is what
+                                        * makes a measurement explicable, where
+                                        * the variable would say nothing */
+        ast_arg ea = { 0 }; ea.name = n->pred;
+        uint32_t ent = resolve_arg(vars, nvars, binding, ea);
+        *off += append_term(buf, cap, *off, intern_name(p->syms, ent));
+        return;
+    }
     case EX_ROLL:
         snprintf(tmp, sizeof tmp, "roll(%ld)", n->konst);
         *off += append_term(buf, cap, *off, tmp);
@@ -6507,6 +6572,15 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
         if (*pos < MAX_CODE) {
             code[*pos].op = n->nprimed ? EXPR_LOADN : EXPR_LOAD;   /* #84 */
             code[(*pos)++].arg = (long)g;
+        } else p->code_of = true;
+        return;
+    }
+    if (n->kind == EX_ENT) {                   /* #258: the entity, as its atom */
+        ast_arg ea = { 0 }; ea.name = n->pred;
+        uint32_t ent = resolve_arg(vars, nvars, binding, ea);
+        if (*pos < MAX_CODE) {
+            code[*pos].op = EXPR_CONST;
+            code[(*pos)++].arg = (long)ent;
         } else p->code_of = true;
         return;
     }
@@ -8630,7 +8704,7 @@ static bool cp_expr_varies(parser *p, int e, var_bind *vars, int nvars,
     if (e < 0 || depth > 2 * MAX_ARGS) return false;
     ex_node *n = &p->exprs[e];
     switch (n->kind) {
-    case EX_CONST: return false;
+    case EX_CONST: case EX_ENT: return false;
     case EX_ROLL:  return true;
     case EX_LOAD: case EX_TEST: {
         for (int k = 0; k < n->nargs; k++) {
@@ -9687,7 +9761,7 @@ static bool collect_lane_tests(parser *p, int e, int S, uint32_t var,
 {
     ex_node *n = &p->exprs[e];
     switch (n->kind) {
-    case EX_CONST: return true;
+    case EX_CONST: case EX_ENT: return true;
     case EX_LOAD: case EX_ROLL: case EX_CALL: case EX_PRIOR:
         return false;
     case EX_TEST: {

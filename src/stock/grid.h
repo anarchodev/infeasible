@@ -38,15 +38,20 @@
  * it, which is why the `neighbor(cell, dir)` shape of `patrol.story`'s opaque
  * cell domain has no counterpart here.
  *
- * MEASUREMENTS ARE NOT YET REACHABLE. §5.6's rule is that a stock provider
- * returns the smallest measurement that still admits a ruling — `chebyshev`,
- * not `in_range` — so the exceptions stay in the story where `why?` can reach
- * them. That form does not compile: `chebyshev(A, B) <= 3` in a rule body is
- * rejected ("'chebyshev' is compared numerically but is not a declared numeric
- * fluent"), because a value-returning provider is reachable only from the
- * effect VM and an entity variable cannot be an expression operand at all. So
- * this slice ships the two RELATIONS from §5.6's blessed list — `adjacent` and
- * `los_clear` — and the measurements wait on that gap. */
+ * MEASUREMENTS (#258). §5.6's rule is that a stock provider returns the
+ * smallest measurement that still admits a ruling — `chebyshev`, not
+ * `in_range` — so the thresholds and their exceptions stay in the story where
+ * `why?` can reach them. A story writes:
+ *
+ *     function ( grid_chebyshev(actor, actor) : int
+ *                grid_manhattan(actor, actor) : int )
+ *
+ *     rule near(A: actor, B: actor):
+ *         grid_chebyshev(A, B) <= 3  => in_shout(A, B)
+ *
+ * and owns the number. An entity the grid has never heard of measures as
+ * INFINITELY far rather than -1: a guard reads `<= n`, so a negative
+ * "undefined" would make an unknown entity close to everything. */
 
 typedef struct stock_grid stock_grid;
 

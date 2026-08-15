@@ -229,6 +229,21 @@ int main(void)
               == DL_REFUTED);
         printf("  the story's exception overrides the measured premise\n");
 
+        /* THE MEASUREMENT FORM (#258): the library returns a distance and the
+         * STORY picks the threshold. sentry is at (2,1); after the two moves
+         * above the scout is back at (1,1), and ally sits at (8,1). */
+        CHECK(world_query(w2, dl_pos(intern_id(s2, "in_shout(scout,sentry)")))
+              == DL_PROVED);                       /* chebyshev 1 <= 3 */
+        CHECK(world_query(w2, dl_pos(intern_id(s2, "in_shout(scout,ally)")))
+              == DL_REFUTED);                      /* chebyshev 7 > 3 */
+        /* and it FOLLOWS state, like the relations do */
+        for (int k = 0; k < 4; k++)
+            CHECK(world_step(w2, &east, 1, err, sizeof err) == 0);
+        CHECK(world_get_num(w2, intern_id(s2, "grid_x(scout)")) == 5);
+        CHECK(world_query(w2, dl_pos(intern_id(s2, "in_shout(scout,ally)")))
+              == DL_PROVED);                       /* chebyshev 3 <= 3 */
+        printf("  measurement: the story owns the threshold, and it tracks state\n");
+
         world_free(w2); stock_grid_free(g2); intern_free(s2); free(src);
     }
 

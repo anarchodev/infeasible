@@ -121,6 +121,24 @@ static int test_errors(void)
             "action go(C: actor): causes for each c: point where in_r(c): hp(C) -= 1\n",
             "range a variable over the opaque domain"))
         return 1;
+    /* ARITHMETIC on a handle (#258). A cell is stored in the value store and is
+     * a `long` in the VM exactly as an int is, so `hp(X) := at(X) * 3 + 1`
+     * compiled and computed with an opaque handle — the write side enforced
+     * is_cell, the operand side did not. */
+    if (expect_error_msg(
+            "domain cell\nsort actor\nentity ( a : actor )\n"
+            "state ( at(actor) : cell  hp(actor) : int in 0..100 )\n"
+            "action bad(X: actor): causes hp(X) := at(X) * 3 + 1\n",
+            "is a cell handle, not a number"))
+        return 1;
+    /* the same handle NEGATED, since unary and binary arithmetic are separate
+     * paths through the checker */
+    if (expect_error_msg(
+            "domain cell\nsort actor\nentity ( a : actor )\n"
+            "state ( at(actor) : cell  hp(actor) : int in 0..100 )\n"
+            "action bad(X: actor): causes hp(X) := 0 - at(X)\n",
+            "is a cell handle, not a number"))
+        return 1;
     return 0;
 }
 
