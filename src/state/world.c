@@ -1070,8 +1070,10 @@ int world_provider_gen(world *w, uint32_t pred, uint32_t a,
             continue;
         }
         /* canonicalise: the host's order is its index's, not the story's (I4),
-         * and a host may legitimately report the same pair twice */
-        qsort(w->genbuf, (size_t)n, sizeof *w->genbuf, u32_asc);
+         * and a host may legitimately report the same pair twice. Guarded
+         * because an empty run leaves genbuf NULL, and qsort's first argument
+         * is declared non-null — UB even for a count of zero. */
+        if (n > 0) qsort(w->genbuf, (size_t)n, sizeof *w->genbuf, u32_asc);
         int m = 0;
         for (int k = 0; k < n; k++)
             if (m == 0 || w->genbuf[k] != w->genbuf[m - 1]) w->genbuf[m++] = w->genbuf[k];

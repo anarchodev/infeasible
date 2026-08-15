@@ -23,6 +23,16 @@ ctest --test-dir build -R test_dl --output-on-failure
 ./build/test_dl          # or run the binary directly; it prints "test_dl: all passed"
 ```
 
+A sanitizer build is one flag, and it FAILS on a finding rather than printing one:
+
+```sh
+cmake -B build-asan -DINF_SANITIZE=ON
+cmake --build build-asan
+ctest --test-dir build-asan --output-on-failure
+```
+
+`-fno-sanitize-recover=undefined` is why that is worth having. UBSan's default is to print a diagnostic and continue, so a test that reads an uninitialised `bool` — a planner decision silently depending on heap contents (#257) — prints one line and still exits 0, and ctest shows output only for failing tests. Run it whenever you add a code path the existing tests do not reach; ASan finds the bounds errors, UBSan finds the uninitialised `bool`/`enum` loads and the null passed where a callee declares non-null.
+
 Default build type is `Debug`; core compiles with `-Wall -Wextra` under **C17**. There is **no native renderer**. The WASM/JS boundary is a separate build, not part of the CMake project:
 
 ```sh

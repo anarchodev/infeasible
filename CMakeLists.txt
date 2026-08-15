@@ -13,6 +13,25 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Debug)
 endif()
 
+# Sanitizer build (not the default):
+#
+#   cmake -B build-asan -DINF_SANITIZE=ON && cmake --build build-asan
+#   ctest --test-dir build-asan --output-on-failure
+#
+# `-fno-sanitize-recover=undefined` is the load-bearing part. UBSan's default is
+# to print a diagnostic and CONTINUE, so a test that reads an uninitialised
+# `bool` — the #257 bug, where a planner decision silently depended on heap
+# contents — prints one line and still exits 0. ctest shows output only for
+# FAILING tests, so that line reaches nobody. ASan already aborts by default;
+# this makes UBSan behave the same way, which is the only way a sanitizer
+# finding becomes a red test rather than scrollback.
+option(INF_SANITIZE "Build with ASan + UBSan, failing the run on any diagnostic" OFF)
+if(INF_SANITIZE)
+  add_compile_options(-fsanitize=address,undefined -fno-sanitize-recover=undefined
+                      -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=address,undefined)
+endif()
+
 add_library(infeasible_core STATIC
   src/core/arena.c
   src/core/intern.c
