@@ -117,6 +117,12 @@ add_executable(bench_matcher tests/bench_matcher.c)
 target_link_libraries(bench_matcher PRIVATE infeasible_core)
 target_compile_options(bench_matcher PRIVATE -O2)
 
+# Difference bounds as a generator (§5.2): does a band join over an ordered
+# numeric axis make the pair space sparse? Build Release; not a ctest target.
+add_executable(bench_dbound tests/bench_dbound.c)
+target_link_libraries(bench_dbound PRIVATE infeasible_core)
+target_compile_options(bench_dbound PRIVATE -O2)
+
 # #84 adoption gate (DESIGN §5.8): configured per-type stage vs the modeled
 # .story pipeline. Build Release for meaningful numbers; not a ctest target.
 add_executable(bench_dtype tests/bench_dtype.c)

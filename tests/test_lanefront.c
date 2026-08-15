@@ -41,6 +41,9 @@ typedef struct {
     const char *name;
     const char *tail;
     bool        expect_lanes;
+    const char *also;      /* an extra ground action cast every step, or NULL —
+                            * for shapes whose action takes no unit argument and
+                            * so cannot ride TRAJ's `hurt(u%d)` (#240) */
 } variant;
 
 /* Same shapes and the same order as bench_lanes' table. Every one defines
@@ -78,6 +81,46 @@ static const variant VARIANTS[] = {
     { "boolean effect + ramification",
       "action hurt(T: unit): causes on_fire(T)\n"
       "rule spread(X: unit): on_fire(X)' causes panicked(X)\n", true },
+
+    /* CASTERLESS binder casts (#240): a `for each` whose action takes no caster
+     * — the setup/broadcast shape. One arity-0 cast atom drives the bcast local
+     * that a per-caster cast drives once per caster. */
+    { "casterless binder, const RHS",
+      "action hurt(T: unit): causes hp(T) -= 7\n"
+      "action sweep: causes for each X: unit where ~immune_fire(X) : hp(X) -= 3\n",
+      true, "sweep" },
+
+    { "casterless binder, per-item when",
+      "action hurt(T: unit): causes hp(T) -= 7\n"
+      "action sweep: causes for each X: unit where ~immune_fire(X) :\n"
+      "    { hp(X) -= 3 when resist_fire(X), hp(X) -= 9 when vuln_fire(X) }\n",
+      true, "sweep" },
+
+    /* NUMERIC LANDMARK GUARDS (#242): `hp(X) >= n` in a body is one read-only
+     * bit per lane, filled from the value store at fact-load. The thresholds sit
+     * a few hits from the starting hp so the columns actually FLIP mid-trajectory
+     * — a guard that never changes value would pass the differential without
+     * having been tested. */
+    { "numeric guard in an action's requires",
+      "action hurt(T: unit): requires hp(T) >= 99990 causes hp(T) -= 7\n", true },
+
+    { "numeric guard in a ramification body",
+      "action hurt(T: unit): causes hp(T) -= 7\n"
+      "rule bloodied(X: unit): hp(X) <= 99990 causes on_fire(X)\n", true },
+
+    /* two thresholds on one fluent are two columns, not one (the #235 lesson
+     * about keying by predicate alone, on the guard side) */
+    { "two thresholds on one numeric fluent",
+      "action hurt(T: unit): requires hp(T) >= 99980 causes hp(T) -= 7\n"
+      "rule hurt1(X: unit): hp(X) <= 99993 causes on_fire(X)\n"
+      "rule hurt2(X: unit): hp(X) <= 99986 causes panicked(X)\n", true },
+
+    /* #241: a boolean binder item still bails. When that retires, flip this to
+     * true and the differential below starts covering it. */
+    { "casterless binder, BOOLEAN item",
+      "action hurt(T: unit): causes hp(T) -= 7\n"
+      "action sweep: causes for each X: unit where ~immune_fire(X) : on_fire(X)\n",
+      false, "sweep" },
 };
 enum { NVARIANTS = (int)(sizeof VARIANTS / sizeof VARIANTS[0]) };
 
@@ -204,7 +247,7 @@ static int run_variant(const variant *v)
 
     int rc = 0;
     for (int t = 0; t < NTRAJ && rc == 0; t++) {
-        uint32_t aL[3], aN[3];
+        uint32_t aL[4], aN[4];
         int na = 0;
         for (int j = 0; j < 3; j++) {
             if (TRAJ[t][j] < 0) continue;
@@ -212,6 +255,11 @@ static int run_variant(const variant *v)
             snprintf(b, sizeof b, "hurt(u%d)", TRAJ[t][j]);
             aL[na] = intern_id(sy, b);
             aN[na] = intern_id(sn, b);
+            na++;
+        }
+        if (v->also) {                 /* an argument-less cast (#240) */
+            aL[na] = intern_id(sy, v->also);
+            aN[na] = intern_id(sn, v->also);
             na++;
         }
         /* pin 1 — per-lane next-state verdicts against the N=1 step family,
