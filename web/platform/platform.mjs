@@ -16,6 +16,7 @@
 // slightly differently.
 
 import { DRAW_OPS, AUDIO_OPS, KEYS, BUTTONS, PALETTE, CARTDATA_CELLS,
+         NAV_DIRS,
          GLYPH_W, GLYPH_H, BIG_GLYPH_W, BIG_GLYPH_H, textWidth } from './spec.mjs';
 
 const KEYSET = new Set(KEYS);
@@ -132,8 +133,10 @@ function makeData(be) {
  * what it was told.
  */
 function makeInput(be) {
-  const empty = { x: 0, y: 0, buttons: new Array(BUTTONS).fill(false), keys: new Set() };
-  let cur = empty, prev = empty;
+  const empty = { x: 0, y: 0, buttons: new Array(BUTTONS).fill(false),
+                  keys: new Set(), nav: new Set(), confirm: false, cancel: false,
+                  moved: false };
+  let cur = empty, prev = empty, gen = 0;
   const api = {
     pointer: () => ({ x: cur.x, y: cur.y }),
     button:  (i = 0) => !!cur.buttons[i],
@@ -150,9 +153,106 @@ function makeInput(be) {
     prev = cur;
     cur = { x: raw.x | 0, y: raw.y | 0,
             buttons: Array.from({ length: BUTTONS }, (_, i) => !!raw.buttons?.[i]),
-            keys: new Set(raw.keys ?? []) };
+            keys: new Set(raw.keys ?? []),
+            nav: new Set(raw.nav ?? []),
+            confirm: !!raw.confirm, cancel: !!raw.cancel,
+            moved: false };
+    cur.moved = cur.x !== prev.x || cur.y !== prev.y;
+    gen++;
   };
-  return { api, sample };
+  return { api, sample, state: () => ({ cur, prev, gen }) };
+}
+
+/** Centre of a target, the reference point for geometric navigation. */
+const mid = (t) => ({ x: t.x + t.w / 2, y: t.y + t.h / 2 });
+
+/**
+ * Which target lies `dir` of `from`? Standard spatial navigation: keep only
+ * the targets genuinely in that direction, then take the nearest by distance
+ * along the axis of travel plus a penalty for drifting off it. The penalty is
+ * what stops a d-pad press jumping diagonally across a screen to something
+ * marginally closer in a straight line.
+ *
+ * Ties break on DECLARATION ORDER, which is why spec.mjs calls target order
+ * semantics: two equidistant targets must resolve the same way on every
+ * machine and every replay (I4).
+ */
+function navigate(targets, fromId, dir) {
+  const from = targets.find((t) => t.id === fromId);
+  if (!from) return targets.length ? targets[0].id : null;
+  const a = mid(from);
+  let best = null, bestScore = Infinity;
+  for (const t of targets) {
+    if (t.id === fromId) continue;
+    const b = mid(t);
+    const dx = b.x - a.x, dy = b.y - a.y;
+    let along, across;
+    if (dir === 'left')       { along = -dx; across = Math.abs(dy); }
+    else if (dir === 'right') { along =  dx; across = Math.abs(dy); }
+    else if (dir === 'up')    { along = -dy; across = Math.abs(dx); }
+    else                      { along =  dy; across = Math.abs(dx); }
+    if (along <= 0) continue;                 /* not in this direction at all */
+    const score = along + across * 2;
+    if (score < bestScore) { bestScore = score; best = t.id; }
+  }
+  return best ?? fromId;                      /* nothing that way: stay put */
+}
+
+/**
+ * The focus surface — the portable input model (§12, spec.FOCUS_OPS).
+ *
+ * The cart declares its focusable regions each tick and asks what was
+ * confirmed. Everything device-specific resolves here: a d-pad walks the
+ * regions geometrically, a mouse hit-tests them, a tap does both at once.
+ *
+ * Focus SURVIVES across ticks and is platform state, not cart state — which
+ * costs replay nothing, because what a save records is the action a cart
+ * submitted, never the focus that led to it.
+ */
+function makeFocus(inp) {
+  let targets = [], id = null, confirmedId = null, cancelled = false, done = -1;
+  const api = {
+    targets(list) {
+      targets = (list ?? []).map((t) => ({
+        id: t.id, x: t.x | 0, y: t.y | 0, w: t.w | 0, h: t.h | 0,
+      }));
+      /* a focused thing that stopped existing hands focus to the first
+       * remaining target rather than to nothing: a d-pad user with no focus
+       * has no way back in */
+      if (!targets.some((t) => t.id === id)) id = targets.length ? targets[0].id : null;
+      resolve();
+      return api;
+    },
+    current: () => id,
+    confirmed: () => confirmedId,
+    cancelled: () => cancelled,
+  };
+
+  /* Resolution happens on DECLARATION, because the platform cannot navigate a
+   * list it has not been given and the cart declares and reads inside one
+   * tick(). Guarded by the input generation so a cart that declares twice does
+   * not get two d-pad steps out of one press. */
+  const resolve = () => {
+    const { cur, prev, gen } = inp.state();
+    if (gen === done) return;
+    done = gen;
+    confirmedId = null;
+    cancelled = cur.cancel && !prev.cancel;
+
+    for (const d of NAV_DIRS)                 /* edge-triggered, like keyp */
+      if (cur.nav.has(d) && !prev.nav.has(d)) id = navigate(targets, id, d);
+
+    /* A pointer sets focus only when it MOVES. Otherwise a stale cursor
+     * resting on a button would fight the d-pad for focus every tick. */
+    const over = targets.find((t) => cur.x >= t.x && cur.x < t.x + t.w &&
+                                     cur.y >= t.y && cur.y < t.y + t.h);
+    if (cur.moved && over) id = over.id;
+
+    const clicked = cur.buttons[0] && !prev.buttons[0];
+    if (clicked) { if (over) { id = over.id; confirmedId = over.id; } }
+    else if (cur.confirm && !prev.confirm) confirmedId = id;
+  };
+  return { api };
 }
 
 /**
@@ -168,16 +268,18 @@ export function createPlatform(backend) {
     if (typeof backend[op] !== 'function')
       throw new Error(`backend is missing the frozen audio op '${op}'`);
 
-  const { api: input, sample } = makeInput(backend);
+  const inp = makeInput(backend);
+  const foc = makeFocus(inp);
   return {
     /** exactly what a cart sees, and nothing more */
     cart: {
       draw:  makeDraw(backend),
-      input,
+      input: inp.api,
+      focus: foc.api,
       audio: makeAudio(backend),
       data:  makeData(backend),
     },
     /** runtime-only: the once-per-tick input snapshot */
-    sampleInput: sample,
+    sampleInput: inp.sample,
   };
 }

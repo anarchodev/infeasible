@@ -244,9 +244,19 @@ export function createCanvasBackend(canvas, { resolution = DEFAULT_RESOLUTION } 
     latchB: [false, false, false],
     latchK: new Set(),
     readInput() {
+      const keys = new Set([...be.raw.keys, ...be.latchK]);
+      /* The portable model (spec.FOCUS_OPS) on the inputs this backend has:
+       * arrows navigate, enter/space confirm, escape cancels. A gamepad
+       * backend fills the same three fields from a d-pad and two face buttons
+       * and the cart cannot tell the difference — which is the point. */
+      const nav = new Set();
+      for (const d of ['left', 'right', 'up', 'down']) if (keys.has(d)) nav.add(d);
       const out = { x: be.raw.x, y: be.raw.y,
                     buttons: be.raw.buttons.map((b, i) => b || be.latchB[i]),
-                    keys: new Set([...be.raw.keys, ...be.latchK]) };
+                    keys,
+                    nav,
+                    confirm: keys.has('enter') || keys.has('space'),
+                    cancel:  keys.has('escape') };
       be.latchB = [false, false, false];
       be.latchK.clear();
       return out;

@@ -342,6 +342,34 @@ export function createScene(w, iface, doms) {
     rebuild,
     draw,
     /** What the pointer is over: a menu row, or an occupant of a region. */
+    /** The scene's clickable regions as FOCUS TARGETS (§12), in a stable
+     *  order: menu commands first, then entities. `hit` answers the same
+     *  regions positionally; this answers them navigably, which is the only
+     *  form a d-pad can use. Order is the geometric-navigation tiebreak, so
+     *  it is semantics rather than presentation (I4). */
+    targets() {
+      const m = model;
+      if (!m) return [];
+      const out = [];
+      for (const b of m.menu)
+        out.push({ id: `cmd:${b.term}`, x: b.x, y: b.y, w: b.w, h: b.h });
+      for (const list of Object.values(m.slots))
+        for (const o of list)
+          if (o.at) out.push({ id: `ent:${o.e}`, x: o.at.x - 3, y: o.at.y - 3, w: 22, h: 22 });
+      return out;
+    },
+    /** What a focus id stands for — the navigable twin of `hit`. */
+    target(id) {
+      const m = model;
+      if (!m || !id) return null;
+      if (id.startsWith('cmd:')) {
+        const term = id.slice(4);
+        const b = m.menu.find((x) => x.term === term);
+        return b ? { kind: 'cmd', term: b.term, ok: b.ok, blockers: b.blockers } : null;
+      }
+      const e = id.slice(4);
+      return { kind: 'entity', entity: e };
+    },
     hit(p) {
       const m = model;
       if (!m) return null;

@@ -38,9 +38,14 @@ export function pureCart({ world, iface, doms, sheets, resolution = [640, 360] }
     },
 
     tick(ctx) {
-      const { input } = ctx;
-      if (!input.pressed(0)) return null;
-      const target = scene.hit(input.pointer());
+      /* The PORTABLE input model (§12, spec.FOCUS_OPS): declare what is
+       * focusable, ask what was confirmed. This driver never reads a pointer
+       * or a key, so it plays identically on a mouse, a touchscreen and a
+       * d-pad — and a cart that reached for `input.pointer()` here would have
+       * been a desktop-only cart without anything saying so. */
+      const id = ctx.focus.targets(scene.targets()).confirmed();
+      if (!id) return null;
+      const target = scene.target(id);
       if (!target) { this.why = ctx.why = ''; return null; }
 
       if (target.kind === 'entity') {

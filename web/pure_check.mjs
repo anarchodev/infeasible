@@ -148,6 +148,35 @@ const sceneSrc = readFileSync(new URL('./platform/scene.mjs', import.meta.url), 
 const cartSrc = readFileSync(new URL('./platform/purecart.mjs', import.meta.url), 'utf8');
 const handSrc = readFileSync(new URL('./carts/cellar.mjs', import.meta.url), 'utf8');
 
+// ---- the PORTABLE path: the same cart, played with NO POINTER -------------
+//
+// §12's input model is focus + confirm precisely so a cart runs on a d-pad,
+// and the only way to know a cart does is to play it that way. `backend.pad()`
+// drives nav/confirm directly — no pointer, no keyboard, the way a console
+// backend would. Run last, because it moves the world.
+const padStep = (o) => { backend.pad(o); rt.advance(1); backend.pad({}); rt.advance(1); };
+const padTo = (want) => {
+  for (let i = 0; i < 40; i++) {
+    if (rt.ctx.focus.current() === want) { padStep({ confirm: true }); return true; }
+    padStep({ nav: ['down'] });
+  }
+  return false;
+};
+{
+  const offered = scene.model().menu.find((b) => b.ok);
+  const before = rt.ctx.log.length;
+  const reached = padTo(`cmd:${offered.term}`);
+  check('a d-pad reaches a command with no pointer at all', reached, offered?.label);
+  check('...and confirming it submits the action a click would',
+        rt.ctx.log.length === before + 1, `log ${before} -> ${rt.ctx.log.length}`);
+  // focus is geometric, so it must also come BACK
+  const first = rt.ctx.focus.current();
+  padStep({ nav: ['up'] });
+  check('...and navigation is reversible', rt.ctx.focus.current() !== first ||
+        scene.model().menu.length === 1, rt.ctx.focus.current());
+}
+
+
 console.log('\nthe price');
 console.log(`  presentation rules in .story        ${rules(presentation, /^rule /gm)}`);
 console.log(`  menu rules                          0  (the engine answers it)`);

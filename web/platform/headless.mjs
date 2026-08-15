@@ -59,12 +59,25 @@ export function createHeadlessBackend({ resolution = DEFAULT_RESOLUTION } = {}) 
     // The test driver sets this; the platform samples it at tick boundaries
     // exactly as it samples a browser's.
     raw: { x: 0, y: 0, buttons: [false, false, false], keys: new Set() },
-    readInput() { return be.raw; },
+    readInput() {
+      const keys = be.raw.keys ?? new Set();
+      const nav = new Set(be.raw.nav ?? []);
+      for (const d of ['left', 'right', 'up', 'down']) if (keys.has(d)) nav.add(d);
+      return { ...be.raw, keys, nav,
+               confirm: !!be.raw.confirm || keys.has('enter') || keys.has('space'),
+               cancel:  !!be.raw.cancel  || keys.has('escape') };
+    },
     point(x, y, buttons = []) {
-      be.raw = { x, y, buttons: [!!buttons[0], !!buttons[1], !!buttons[2]],
-                 keys: be.raw.keys };
+      be.raw = { ...be.raw, x, y,
+                 buttons: [!!buttons[0], !!buttons[1], !!buttons[2]] };
     },
     press(...keys) { be.raw = { ...be.raw, keys: new Set(keys) }; },
+    /** Drive the PORTABLE path directly — no pointer, no keyboard, the way a
+     *  gamepad backend would. This is what lets a check play a cart the way a
+     *  console would and prove it is reachable without a mouse. */
+    pad({ nav = [], confirm = false, cancel = false } = {}) {
+      be.raw = { ...be.raw, nav: new Set(nav), confirm, cancel };
+    },
 
     loadCartdata() { return cartdata; },
     saveCartdata(blob) { cartdata = Int32Array.from(blob); },

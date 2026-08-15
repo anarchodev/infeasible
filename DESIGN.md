@@ -3051,9 +3051,35 @@ sprites at RTS scale. Nothing in the surface may assume more.
   and the weekend-sized claim above is gone. All three sit *inside* the
   presentation interface, below the durability line, and nothing outside it is
   reachable from a cart.
+  - **The portable input model is focus + confirm** (decided). Pointer and
+    keys are not universal: a gamepad has neither a position nor a keyboard,
+    and a touchscreen has a position only while a finger is down, so it has
+    taps but no hover. Adding a gamepad op beside the others does not fix it —
+    a cart written against three input styles is a cart written three times.
+    The asymmetry that decides the design is that **focus can be driven by any
+    of them, and pointer can be derived from none**: given a set of focusable
+    regions, a d-pad walks them geometrically, a tap hit-tests them, an arrow
+    key does what the d-pad does; given only a pointer, nothing can synthesise
+    navigation, because nothing knows what is navigable. So the cart declares
+    its focusable regions each tick and asks what was confirmed
+    (`focus.targets`/`current`/`confirmed`/`cancelled`), and the platform owns
+    movement, hit-testing and edge detection. Target ORDER is the tiebreak for
+    geometric navigation, so it is semantics rather than presentation (I4);
+    resolution happens on declaration, because a cart declares and reads
+    within one `tick()` and the platform cannot navigate a list it has not
+    been given. A vanished target re-homes focus to a reachable one rather
+    than dropping it, since a d-pad user with no focus has no way back in.
+    The decision is dated by the platform list — phones and consoles are
+    consumer targets for exported games, and a frozen interface that assumes a
+    mouse forecloses both. It was settled while two carts existed, because a
+    frozen interface is cheap to change before a cart population and
+    impossible after.
   - **Input is polled, never delivered as events.** `pointer()` in internal
     resolution coordinates, `button(i)`/`pressed(i)` over three pointer
-    buttons, `key(k)`/`keyp(k)` over a frozen named key set. The polling shape
+    buttons, `key(k)`/`keyp(k)` over a frozen named key set — kept, because a
+    desktop-only cart is a legitimate thing to be and should be able to say so
+    by reading them; what is *not* legitimate is a cart that reads them
+    without noticing it has chosen. The polling shape
     is PICO-8's, adopted for I4 and not for nostalgia: the save is an action
     log, so a callback firing between ticks lets a cart branch on input the
     replay never observes. Input is sampled once per tick at the tick
@@ -3081,7 +3107,7 @@ sprites at RTS scale. Nothing in the surface may assume more.
     readable by rules. A fluent may never be initialised from it, or a
     world's history stops being a function of its log.
 
-  Twenty-odd ops across all four surfaces — still an afternoon to learn, still
+  Twenty-odd ops across all five surfaces — still an afternoon to learn, still
   a weekend to port, and now the whole cart-facing platform rather than only
   its drawing half.
 

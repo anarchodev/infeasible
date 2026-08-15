@@ -22,7 +22,7 @@
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 
-import { DRAW_OPS, AUDIO_OPS, INPUT_OPS, DATA_OPS, RESOLUTIONS, PALETTE,
+import { DRAW_OPS, AUDIO_OPS, INPUT_OPS, FOCUS_OPS, NAV_DIRS, DATA_OPS, RESOLUTIONS, PALETTE,
          letterbox, toInternal } from './platform/spec.mjs';
 import { createPlatform } from './platform/platform.mjs';
 import { createHeadlessBackend } from './platform/headless.mjs';
@@ -84,6 +84,38 @@ check('audio exposes exactly the frozen ops',
       same(Object.keys(platform.cart.audio), AUDIO_OPS));
 check('input exposes exactly the frozen ops',
       same(Object.keys(platform.cart.input), INPUT_OPS));
+check('focus exposes exactly the frozen ops',
+      same(Object.keys(platform.cart.focus), FOCUS_OPS));
+
+// The portable model is only worth freezing if it works without the inputs it
+// exists to replace. Declare two targets, navigate with nav alone, confirm
+// with confirm alone — no pointer, no key, the way a gamepad backend drives.
+{
+  const f = platform.cart.focus;
+  const two = [{ id: 'a', x: 0, y: 0, w: 10, h: 10 },
+               { id: 'b', x: 0, y: 40, w: 10, h: 10 }];
+  backend.pad({});               platform.sampleInput(); f.targets(two);
+  check('focus defaults to the first declared target', f.current() === 'a', f.current());
+  backend.pad({ nav: ['down'] }); platform.sampleInput(); f.targets(two);
+  check('nav moves it geometrically, with no pointer',  f.current() === 'b', f.current());
+  backend.pad({});               platform.sampleInput(); f.targets(two);
+  backend.pad({ nav: ['up'] });   platform.sampleInput(); f.targets(two);
+  check('and back',                                     f.current() === 'a', f.current());
+  backend.pad({ confirm: true }); platform.sampleInput();
+  check('confirm reports the focused id',
+        f.targets(two).confirmed() === 'a', f.targets(two).confirmed());
+  backend.pad({});               platform.sampleInput();
+  check('confirm is edge-triggered, not held',
+        f.targets(two).confirmed() === null, f.targets(two).confirmed());
+  // a target that vanishes must hand focus somewhere reachable, or a d-pad
+  // user is stranded with nothing selected and no way to select anything
+  backend.pad({});               platform.sampleInput();
+  f.targets([{ id: 'c', x: 0, y: 0, w: 10, h: 10 }]);
+  check('a vanished target re-homes focus rather than dropping it',
+        f.current() === 'c', f.current());
+  check('every nav dir is one of the frozen four',
+        NAV_DIRS.length === 4 && NAV_DIRS.every((d) => typeof d === 'string'));
+}
 check('persistence is one small blob and nothing else',
       same(Object.keys(platform.cart.data), DATA_OPS));
 check('a cart cannot resample input mid-tick',

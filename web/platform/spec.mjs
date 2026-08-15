@@ -62,8 +62,45 @@ export const AUDIO_OPS = ['sound', 'stop', 'music', 'music_stop'];
 
 /** Input is POLLED, never delivered as events (§12) — the save is an action
  *  log, so a callback firing between ticks would let a cart branch on input
- *  the replay never observes. Sampled once per tick, at the tick boundary. */
+ *  the replay never observes. Sampled once per tick, at the tick boundary.
+ *
+ *  POINTER AND KEYS ARE NOT UNIVERSAL. A gamepad has neither: no position, no
+ *  keyboard. A touchscreen has a position only while a finger is down, so it
+ *  has taps but no hover. Only the FOCUS surface below is answerable on every
+ *  device, so a cart that reads these directly is a desktop cart — which is a
+ *  legitimate thing to be, and is why they are still here. */
 export const INPUT_OPS = ['pointer', 'button', 'pressed', 'key', 'keyp'];
+
+/** The portable input model (§12).
+ *
+ *  Pointer-and-keyboard is not portable, and the fix is not to add a gamepad
+ *  op beside it: a cart written against three input styles is a cart written
+ *  three times. The asymmetry that decides the design is that FOCUS CAN BE
+ *  DRIVEN BY ANY OF THEM, and pointer cannot be derived from the others —
+ *  given a set of focusable regions, a d-pad walks it geometrically, a tap
+ *  hit-tests it, and an arrow key does what the d-pad does. Given only a
+ *  pointer, nothing can synthesise navigation, because nothing knows what is
+ *  navigable.
+ *
+ *  So the cart declares its focusable regions each tick and asks what was
+ *  confirmed. The platform owns focus movement, hit-testing and the edge
+ *  detection; the backend supplies whichever raw inputs it has.
+ *
+ *    focus.targets(list)  declare this tick's focusables, in order:
+ *                         [{ id, x, y, w, h }, ...]. Order is the tiebreak for
+ *                         geometric navigation, so it is semantics (I4).
+ *    focus.current()      the focused id, or null
+ *    focus.confirmed()    the id confirmed THIS tick, or null
+ *    focus.cancelled()    whether cancel was pressed this tick
+ *
+ *  A cart built on this runs on a d-pad, a touchscreen and a mouse without
+ *  knowing which it has. */
+export const FOCUS_OPS = ['targets', 'current', 'confirmed', 'cancelled'];
+
+/** Directional navigation intent, edge-triggered like `keyp`. A backend maps
+ *  its own d-pad, stick or arrow keys onto these; it is never raw axes, for
+ *  the same reason KEYS is never raw codes. */
+export const NAV_DIRS = ['left', 'right', 'up', 'down'];
 
 /** Persistence is not storage (§12): one small fixed-size numeric blob for
  *  cross-run NON-game state (settings, cosmetic unlocks), explicitly outside
