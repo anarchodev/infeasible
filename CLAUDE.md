@@ -33,6 +33,14 @@ ctest --test-dir build-asan --output-on-failure
 
 `-fno-sanitize-recover=undefined` is why that is worth having. UBSan's default is to print a diagnostic and continue, so a test that reads an uninitialised `bool` — a planner decision silently depending on heap contents (#257) — prints one line and still exits 0, and ctest shows output only for failing tests. Run it whenever you add a code path the existing tests do not reach; ASan finds the bounds errors, UBSan finds the uninitialised `bool`/`enum` loads and the null passed where a callee declares non-null.
 
+Valgrind finds what neither sanitizer can, and is worth a pass over any new code path:
+
+```sh
+valgrind -q --track-origins=yes --error-exitcode=99 ./build/test_foo
+```
+
+UBSan's `bool`/`enum` checks catch an uninitialised load only when the garbage byte is out of range — a byte that lands on 0 or 1 is a valid `bool` and passes while the program still depends on it. Memcheck catches it every time, and `--track-origins` names the ALLOCATION site rather than the read, which is where the fix goes. It found the #94 row-cap bug in both pure carts on its first run.
+
 Default build type is `Debug`; core compiles with `-Wall -Wextra` under **C17**. There is **no native renderer**. The WASM/JS boundary is a separate build, not part of the CMake project:
 
 ```sh

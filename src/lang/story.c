@@ -4496,7 +4496,21 @@ static void order_value_layers(parser *p)
                  * still collides is two definitions that both apply to the
                  * same instance — a catch-all beside a row, or two catch-alls
                  * (#94's rule, restated per instance). */
-                if (vdef_is_row(r)) { rows[nrows++ < MAX_LAYERS ? nrows - 1 : 0] = ri; continue; }
+                if (vdef_is_row(r)) {
+                    /* Rows are not LAYERS: `rows` is MAX_VDEFS wide, and
+                     * bounding it by MAX_LAYERS clamped every write past the
+                     * eighth to index 0 while `nrows` kept counting — so the
+                     * copy below read uninitialised slots and stored them as
+                     * RULE INDICES. Loud, not capped (#94). */
+                    if (nrows >= MAX_VDEFS) {
+                        serr(p, r->line, r->col,
+                             "'%s' has more than %d lookup-table rows — split "
+                             "the value across two (#94)", vn, MAX_VDEFS);
+                        return;
+                    }
+                    rows[nrows++] = ri;
+                    continue;
+                }
                 if (base >= 0) {
                     serr(p, r->line, r->col,
                          "'%s' has two unconditional definitions ('%s' and "
