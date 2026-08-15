@@ -9833,6 +9833,26 @@ static bool step_guard_ok(parser *p, const ast_atom *a, int S, uint32_t var)
     return a->nargs == 1 && a->args[0].name == var;
 }
 
+/* A derived JUDGMENT read by the transition (#261) — arity-1 over the lane
+ * sort, concluded by rules rather than stored. The judgment layer settles
+ * before a step solves, so the verdict is queried per lane and injected
+ * (WORLD_STEP_IMPORT), the step side's twin of the §5.5 judgment import.
+ *
+ * Condition position only: a judgment is derived, so writing one would be the
+ * write-back I1 forbids — and the effect side already refuses it elsewhere.
+ * A PRIMED read is the #87 stratification case and must keep bailing. */
+static bool step_import_ok(parser *p, const ast_atom *a, int S, uint32_t var)
+{
+    if (a->is_guard || a->is_expr_guard || a->primed || a->is_member) return false;
+    if (a->value != INTERN_NONE || a->is_defined) return false;
+    pred_info *pi = find_pred(p, a->pred);
+    if (!pi || !pi->is_head) return false;             /* not concluded anywhere */
+    if (pi->is_fluent || pi->is_provider || pi->is_num ||
+        pi->is_mv || pi->is_cell || pi->is_value || pi->is_kindpred) return false;
+    if (pi->arity != 1 || pred_arg_sort(pi, 0) != S) return false;
+    return a->nargs == 1 && a->args[0].name == var;
+}
+
 static bool step_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var,
                          bool is_effect)
 {
@@ -10011,6 +10031,10 @@ static void emit_step_lanes(parser *p)
      * columns, the same way two arguments are two columns (#235). */
     struct { uint32_t pred; world_cmp cmp; long thr; } gd[MAX_PREDS];
     int ngd = 0;
+    /* distinct derived judgments the transition reads (#261): one read-only
+     * column each, filled from the settled judgment layer at fact-load */
+    uint32_t imp[MAX_PREDS];
+    int nimp = 0;
     bool act_has_num[MAX_ACTIONS], act_is_binder[MAX_ACTIONS];
     for (int i = 0; i < p->nactions; i++) { act_has_num[i] = false; act_is_binder[i] = false; }
     int neff_act[MAX_LANE_NUMEFF], neff_schema[MAX_LANE_NUMEFF], neff_op[MAX_LANE_NUMEFF];
@@ -10078,6 +10102,13 @@ static void emit_step_lanes(parser *p)
             return;
         uint32_t var = a->vars[0].name;
         for (int b = 0; b < a->nreq; b++) {
+            if (step_import_ok(p, &a->requires[b], S, var)) {      /* #261 column */
+                uint32_t ip = a->requires[b].pred;
+                int found = -1;
+                for (int j = 0; j < nimp; j++) if (imp[j] == ip) { found = j; break; }
+                if (found < 0) { if (nimp >= MAX_PREDS) return; imp[nimp++] = ip; }
+                continue;
+            }
             if (step_guard_ok(p, &a->requires[b], S, var)) {       /* #242 column */
                 const ast_atom *g = &a->requires[b];
                 int found = -1;
@@ -10143,10 +10174,10 @@ static void emit_step_lanes(parser *p)
         if (act_has_num[i]) nmark++;
         if (act_is_binder[i]) nbcast++;
     }
-    int nloc = 2 * nf + ng + na + nmark + nbcast + nbitem + ngd;
+    int nloc = 2 * nf + ng + na + nmark + nbcast + nbitem + ngd + nimp;
     dlcol *f = dlcol_new(nloc, nent);
     int cur_local[MAX_PREDS], pri_local[MAX_PREDS], glob_local[MAX_PREDS];
-    int gd_local[MAX_PREDS];
+    int gd_local[MAX_PREDS], imp_local[MAX_PREDS];
     int inertia_pos[MAX_PREDS], inertia_neg[MAX_PREDS], act_local[MAX_ACTIONS];
     int marker_local[MAX_ACTIONS], bcast_local[MAX_ACTIONS], bmarker[MAX_LANE_NUMEFF];
     for (int i = 0; i < p->nactions; i++) { marker_local[i] = -1; bcast_local[i] = -1; }
@@ -10166,6 +10197,13 @@ static void emit_step_lanes(parser *p)
     for (int j = 0; j < ng; j++) {
         glob_local[j] = n; kind[n] = WORLD_STEP_CUR;   /* broadcast read-only input */
         dlcol_set_atom_name(f, (uint32_t)n, intern_name(p->syms, glob[j]));
+        n++;
+    }
+    /* imported judgments (#261): read-only per-lane columns whose bits come
+     * from the settled judgment layer, not from any rule in this family. */
+    for (int j = 0; j < nimp; j++) {
+        imp_local[j] = n; kind[n] = WORLD_STEP_IMPORT;
+        dlcol_set_atom_name(f, (uint32_t)n, intern_name(p->syms, imp[j]));
         n++;
     }
     /* numeric landmark guards (#242): read-only per-lane columns filled from the
@@ -10230,6 +10268,12 @@ static void emit_step_lanes(parser *p)
         for (int b = 0; b < a->nreq; b++) {
             uint32_t rp = a->requires[b].pred;
             int loc;
+            if (step_import_ok(p, &a->requires[b], S, a->vars[0].name)) {
+                int ij = -1;                           /* #261: an import column */
+                for (int j = 0; j < nimp; j++) if (imp[j] == rp) { ij = j; break; }
+                body[bi++] = (dl_lit){ (uint32_t)imp_local[ij], a->requires[b].neg };
+                continue;
+            }
             if (a->requires[b].is_guard) {             /* #242: a guard column */
                 int gj = -1;
                 for (int j = 0; j < ngd; j++)
@@ -10325,6 +10369,11 @@ static void emit_step_lanes(parser *p)
     for (int j = 0; j < ng; j++)
         for (int e = 0; e < nent; e++)
             ground[(size_t)glob_local[j] * nent + e] = glob[j];  /* broadcast (arity 0) */
+    for (int j = 0; j < nimp; j++)
+        for (int e = 0; e < nent; e++) {
+            uint32_t ent = domain_at(p, S, e);
+            ground[(size_t)imp_local[j] * nent + e] = ground_pred(p, imp[j], &ent, 1);
+        }
     /* a guard column's ground atom is the N=1 path's guard literal, so a trace
      * naming it reads identically whichever path produced it (#242) */
     for (int j = 0; j < ngd; j++)

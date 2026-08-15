@@ -697,9 +697,22 @@ int  world_lanes_check(world *w, bool *ok);
 /* WORLD_STEP_GUARD: a numeric landmark guard (`hp(X) >= 1`, #242) — a read-only
  * per-lane bit the engine computes from the value store at fact-load, the same
  * column shape as a provider read (#233) with the engine as the filler. Derived,
- * so it has no primed twin, no inertia, and is never a write target (I1). */
+ * so it has no primed twin, no inertia, and is never a write target (I1).
+ *
+ * WORLD_STEP_IMPORT: a derived JUDGMENT read by the transition (#261) —
+ * `rule bleeds(X): engaged_by(X) causes hp(X) -= 4`. The step side's twin of
+ * WORLD_LANE_IMPORT: the per-lane verdict is QUERIED and injected at fact-load
+ * rather than concluded here, because the judgment layer settles before the
+ * transition and the step family holds no judgment rules. Read-only and
+ * derived, so like a guard column it has no primed twin, no inertia, and is
+ * never a write target (I1).
+ *
+ * It matters because the crowd-scale shape needs it: a pairwise interaction
+ * that grounds N^2 as a 2-var action (#243) is affordable as a JUDGMENT plus a
+ * per-unit effect — which is what bench_slice's hand-written reference does —
+ * and expressing that in .story reads a judgment from a step rule. */
 enum { WORLD_STEP_CUR, WORLD_STEP_PRIMED, WORLD_STEP_ACTION, WORLD_STEP_BCAST,
-       WORLD_STEP_GUARD };
+       WORLD_STEP_GUARD, WORLD_STEP_IMPORT };
 void world_add_step_lane_family(world *w, dlcol *fam, int nloc, int nent,
                                 const uint32_t *ground, const uint8_t *kind);
 /* Attach the numeric lane extension (§5.8) to the last-added step lane family:

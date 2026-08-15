@@ -2655,6 +2655,23 @@ static void solve_step_lane_family(world *w, step_lane_family *sf,
             memset(neg, 0xFF, (size_t)W * sizeof *neg);
         }
     }
+    /* imported judgments (#261): the verdict is QUERIED per lane and injected,
+     * not concluded here — the judgment layer has settled by the time a step
+     * solves, and this family holds no judgment rules. Both polarities, and
+     * silence for UNDECIDED: injecting ~a for an unproved `a` would force the
+     * wrong verdict on the complement, exactly as the judgment-side import
+     * (WORLD_LANE_IMPORT) is careful not to. */
+    for (int a = 0; a < sf->nloc; a++) {
+        if (sf->kind[a] != WORLD_STEP_IMPORT) continue;
+        for (int e = 0; e < sf->nent; e++) {
+            uint32_t g = sf->ground[(size_t)a * sf->nent + e];
+            if (!g) continue;
+            if (world_query(w, (dl_lit){ g, false }) == DL_PROVED)
+                dlcol_add_fact(sf->fam, (dl_lit){ (uint32_t)a, false }, e);
+            else if (world_query(w, (dl_lit){ g, true }) == DL_PROVED)
+                dlcol_add_fact(sf->fam, (dl_lit){ (uint32_t)a, true }, e);
+        }
+    }
     /* numeric landmark guards (#242): one bit per lane, compared straight out of
      * the value store — the same column a provider read fills (#233), with the
      * engine as the filler. Closed-world: a lane with no numeric cell reads
