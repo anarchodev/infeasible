@@ -694,7 +694,12 @@ int  world_lanes_check(world *w, bool *ok);
 /* WORLD_STEP_BCAST: a broadcast cast trigger (a `for each` binder's action) —
  * one signal ANDed into every target-lane, true when any of the action's ground
  * cast atoms occurred this step (see world_step_lane_set_bcast). */
-enum { WORLD_STEP_CUR, WORLD_STEP_PRIMED, WORLD_STEP_ACTION, WORLD_STEP_BCAST };
+/* WORLD_STEP_GUARD: a numeric landmark guard (`hp(X) >= 1`, #242) — a read-only
+ * per-lane bit the engine computes from the value store at fact-load, the same
+ * column shape as a provider read (#233) with the engine as the filler. Derived,
+ * so it has no primed twin, no inertia, and is never a write target (I1). */
+enum { WORLD_STEP_CUR, WORLD_STEP_PRIMED, WORLD_STEP_ACTION, WORLD_STEP_BCAST,
+       WORLD_STEP_GUARD };
 void world_add_step_lane_family(world *w, dlcol *fam, int nloc, int nent,
                                 const uint32_t *ground, const uint8_t *kind);
 /* Attach the numeric lane extension (§5.8) to the last-added step lane family:
@@ -733,6 +738,14 @@ void world_step_lane_set_prov(world *w, const uint32_t *lane_ents, int nent,
  * when it occurs — the discrete cast fans out over the target lanes. */
 void world_step_lane_set_bcast(world *w, int ncast, const uint32_t *cast_atom,
                                const int *cast_local);
+/* Register numeric landmark guard columns (#242) on the last-added step lane
+ * family. Guard g fills family-local `loc[g]`; `num_atom_cell[g*nent + e]` is
+ * the ground numeric atom lane e compares (0 = this lane has none, reading
+ * false), against `op[g] thr[g]`. Resolved to value-store indices here, so the
+ * per-step fill is an array read and a compare — no atom lookup per lane. */
+void world_step_lane_set_guards(world *w, int nguard, const uint32_t *loc,
+                                const uint32_t *num_atom_cell,
+                                const int *op, const long *thr);
 /* #121 mixed routing: bind the last-added step lane family to one split value
  * (the grounder emits one family per value, its split guards erased), and mark
  * a step rule as covered by those families under the given value bitmask (bit

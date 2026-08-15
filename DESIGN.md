@@ -2676,6 +2676,82 @@ and never crosses this interface at all.
   engine still cannot know the frame budget. The choice is made statically and
   stated; adaptivity, where wanted, is the existing pinned-vs-adaptive lever.
 
+### 8.3 Ordered axes: what a difference bound measures, and who owns it
+
+`x(A) - x(B) <= r` is legal surface — a §5.8 expression guard between two
+fluent reads on two variables — and it grounds the sort cross product, because
+the bound is carried into the emitted rule as a FILTER the solver applies after
+every pair has been formed. At ~1.2 entities per cell and radius 1 that is
+1,048,576 instances, 464 MB and a 4.1 s compile at N=1024 for one rule, and a
+hard error past 2^20 whose diagnostic already names what is missing: *"every
+variable must be bound by a positive base-fluent atom … add a sparser anchor"*.
+
+**The anchor is a provider, not a grounder index.** A difference bound reduces
+to `f(A) - f(B) ⋈ k` over ONE numeric fluent read at arity 1, so the shapes it
+can serve are exactly the same-fluent pairs: x/x, y/y, hp/hp, init/init,
+level/level. Of those only a spatial coordinate ever has large N — initiative
+is 8-20 entities, level 4-6, hp bands the same, and a few hundred instances is
+nothing to solve. Under §5.6 and the stock-provider decision, space is answered
+by a shipped grid library that knows its own geometry, so the one case with a
+scale problem has an owner outside the grounder and the engine learns no
+geometry. What the compiler owes an author is therefore a DIAGNOSTIC, not an
+index: recognising the conjunct and naming the provider that serves it.
+
+**Two quantities, measured, and they are not the same win** (`bench_dbound`,
+N=65536, varying only how many dimensions the rule bounds):
+
+| | 1D | 2D | 3D |
+| --- | --: | --: | --: |
+| matching pairs per entity | 837.5 | 10.7 | 0.1 |
+| probes, one indexed axis | 27.4M | 27.4M | 27.4M |
+| probes, every bound axis indexed | 27.4M | 349,940 | 4,466 |
+
+Exploiting **sparsity** recovers SPACE: each added dimension multiplies
+selectivity by roughly (2r+1)/spread, so the answer collapses — and it costs
+nothing, because the extra conjuncts were being checked anyway. Exploiting
+**separability** recovers TIME: only the axes actually indexed keep
+non-matching pairs from being formed, which is why one indexed axis leaves the
+probe column flat however many dimensions the rule constrains. The two come
+apart, and a design that conflates them will claim the wrong win.
+
+With every bound axis indexed, probes equal the matching-pair count exactly —
+every comparison succeeds, so search cost is answer size. That is optimal
+rather than near-optimal, and it is the property any spatial index has to hit,
+whoever owns it. Its counter-case is equally sharp: give every entity the same
+coordinate on the indexed axis and probes become exactly N²/2 while the answer
+stays at 2.5% of N². **Separability is a property of the data, not of the
+query** — an index cannot recover time an axis with no spread never had.
+
+**Retractions** (each closes a plausible path):
+
+- *A general ordered-axis index in the grounder*: it would serve one shape
+  class whose only large-N member is space, and space has a better owner. Both
+  structures were built and compared: a grid provider KNOWS its geometry — two
+  integer axes, a radius in whole cells — so it hashes both coordinates into
+  one bucket and scans nine, where a general index buckets each axis separately
+  and intersects, and needs apparatus for radius-0 axes, offset bands and
+  arbitrary axis counts that a grid has none of. Measured on an isolated query:
+  2 cells walked at N=9, 0 at N=600. The specialisation wins and the general
+  index was deleted.
+- *Approximate or probabilistic indexes* (LSH, projection): a dropped pair is
+  a silently missing rule instance, and the trace would explain a world that is
+  not there. An index may over-approximate freely — the conjuncts stay in the
+  body and are re-checked — but never under-approximate.
+- *High-dimensional structures* (cover trees, pyramid, X-trees): a game rule
+  bounds two to four axes. Where k is large enough for the curse to bite, the
+  answer is so sparse that indexing the single most selective axis and
+  filtering wins anyway.
+- *Profile-guided or author-declared index selection*: §8.1 already refuses
+  the first and makes the second an override rather than a default. A declared
+  index is additionally a claim the DATA can violate, which the flat-axis case
+  above is exactly.
+
+**Open**: the half-space join, which this section does not cover and neither
+does a grid. `price(I) <= budget(P)` and `hp(E) <= threat(P)` are difference
+bounds across TWO predicates with only one side, so there is no finite radius
+and nothing to bucket; they want a sorted axis with a seek, `O(log N + |out|)`.
+Whether that class occurs at scale in authored content is unmeasured.
+
 ## 9. Tooling (first-class, built early)
 
 - `why <literal>?` — proof/defeat trace: which rules supported, which

@@ -9805,6 +9805,34 @@ static int step_fidx(parser *p, const int *fpred, int nf, uint32_t pred)
 /* A boolean fluent read/write for a step rule: the action's own variable over S
  * (any polarity), or — for a READ (is_effect=false) — an arity-0 global, which
  * broadcasts to every lane. Globals as effects are deferred (return false). */
+static const char *lane_cmp_spelling(world_cmp op)
+{
+    switch (op) {
+    case WORLD_CMP_LE: return "<=";
+    case WORLD_CMP_LT: return "<";
+    case WORLD_CMP_GE: return ">=";
+    case WORLD_CMP_GT: return ">";
+    case WORLD_CMP_EQ: return "=";
+    }
+    return "?";
+}
+
+/* A numeric LANDMARK guard on the lane var (#242) — `hp(X) >= 1`. Already an
+ * ordinary boolean atom on the N=1 path (world_add_guard computes it from the
+ * value store), so per lane it is one bit and the family can carry it as a
+ * read-only column. Condition position only: a guard is derived, never written.
+ * An expression guard (#130) is not this — its operands are not a single stored
+ * number — and a primed guard is the #87 stratified case, which bails earlier. */
+static bool step_guard_ok(parser *p, const ast_atom *a, int S, uint32_t var)
+{
+    if (!a->is_guard || a->is_expr_guard || a->primed || a->neg) return false;
+    pred_info *pi = find_pred(p, a->pred);
+    if (!pi || !pi->is_fluent || !pi->is_num || pi->is_mv || pi->is_cell)
+        return false;
+    if (pi->arity != 1 || pred_arg_sort(pi, 0) != S) return false;
+    return a->nargs == 1 && a->args[0].name == var;
+}
+
 static bool step_atom_ok(parser *p, const ast_atom *a, int S, uint32_t var,
                          bool is_effect)
 {
@@ -9977,6 +10005,12 @@ static void emit_step_lanes(parser *p)
     int na = 0;
     uint32_t glob[MAX_PREDS];
     int ng = 0;
+    /* distinct numeric landmark guards read anywhere (#242): `hp(X) >= 1` is one
+     * read-only bit per lane, computed from the value store at fact-load. Keyed
+     * by (pred, cmp, threshold) — the same fluent at two thresholds is two
+     * columns, the same way two arguments are two columns (#235). */
+    struct { uint32_t pred; world_cmp cmp; long thr; } gd[MAX_PREDS];
+    int ngd = 0;
     bool act_has_num[MAX_ACTIONS], act_is_binder[MAX_ACTIONS];
     for (int i = 0; i < p->nactions; i++) { act_has_num[i] = false; act_is_binder[i] = false; }
     int neff_act[MAX_LANE_NUMEFF], neff_schema[MAX_LANE_NUMEFF], neff_op[MAX_LANE_NUMEFF];
@@ -10000,11 +10034,13 @@ static void emit_step_lanes(parser *p)
         ast_action *a = &p->actions[i];
         if (a->nbind > 0) {
             /* a `for each` binder cast (e.g. Fireball): the binder's target var is
-             * the lane axis and the cast is a broadcast trigger. First cut: one
-             * caster var, one binder over S, no caster-side requires/effects,
-             * boolean where/when guards over the target (arity-1 over S), and
-             * constant-RHS numeric effects on the target. */
-            if (a->neff != 0 || a->nreq != 0 || a->nvars != 1 || a->nbind != 1)
+             * the lane axis and the cast is a broadcast trigger. One binder over
+             * S, no caster-side requires/effects, boolean where/when guards over
+             * the target (arity-1 over S), and constant-RHS numeric effects on it.
+             * The cast is either per-caster (`fireball(C)`, one cast atom per
+             * caster) or CASTERLESS (`sweep:`, #240) — a setup/broadcast action
+             * whose single arity-0 atom drives the same bcast local. */
+            if (a->neff != 0 || a->nreq != 0 || a->nvars > 1 || a->nbind != 1)
                 return;
             ast_binder *bnd = &p->binders[a->bind_ix[0]];
             if (bnd->nvars != 1 || bnd->vars[0].sort != S) return;
@@ -10042,6 +10078,19 @@ static void emit_step_lanes(parser *p)
             return;
         uint32_t var = a->vars[0].name;
         for (int b = 0; b < a->nreq; b++) {
+            if (step_guard_ok(p, &a->requires[b], S, var)) {       /* #242 column */
+                const ast_atom *g = &a->requires[b];
+                int found = -1;
+                for (int j = 0; j < ngd; j++)
+                    if (gd[j].pred == g->pred && gd[j].cmp == g->cmp &&
+                        gd[j].thr == g->threshold) { found = j; break; }
+                if (found < 0) {
+                    if (ngd >= MAX_PREDS) return;
+                    gd[ngd].pred = g->pred; gd[ngd].cmp = g->cmp;
+                    gd[ngd].thr = g->threshold; ngd++;
+                }
+                continue;
+            }
             if (!step_atom_ok(p, &a->requires[b], S, var, false)) return;
             if (find_pred(p, a->requires[b].pred)->arity == 0) {   /* a global read */
                 uint32_t g = a->requires[b].pred;
@@ -10094,9 +10143,10 @@ static void emit_step_lanes(parser *p)
         if (act_has_num[i]) nmark++;
         if (act_is_binder[i]) nbcast++;
     }
-    int nloc = 2 * nf + ng + na + nmark + nbcast + nbitem;
+    int nloc = 2 * nf + ng + na + nmark + nbcast + nbitem + ngd;
     dlcol *f = dlcol_new(nloc, nent);
     int cur_local[MAX_PREDS], pri_local[MAX_PREDS], glob_local[MAX_PREDS];
+    int gd_local[MAX_PREDS];
     int inertia_pos[MAX_PREDS], inertia_neg[MAX_PREDS], act_local[MAX_ACTIONS];
     int marker_local[MAX_ACTIONS], bcast_local[MAX_ACTIONS], bmarker[MAX_LANE_NUMEFF];
     for (int i = 0; i < p->nactions; i++) { marker_local[i] = -1; bcast_local[i] = -1; }
@@ -10116,6 +10166,16 @@ static void emit_step_lanes(parser *p)
     for (int j = 0; j < ng; j++) {
         glob_local[j] = n; kind[n] = WORLD_STEP_CUR;   /* broadcast read-only input */
         dlcol_set_atom_name(f, (uint32_t)n, intern_name(p->syms, glob[j]));
+        n++;
+    }
+    /* numeric landmark guards (#242): read-only per-lane columns filled from the
+     * value store. Named as the author wrote them, so the trace reads the same
+     * on both paths. */
+    for (int j = 0; j < ngd; j++) {
+        gd_local[j] = n; kind[n] = WORLD_STEP_GUARD;
+        snprintf(nbuf, sizeof nbuf, "%s %s %ld", intern_name(p->syms, gd[j].pred),
+                 lane_cmp_spelling(gd[j].cmp), gd[j].thr);
+        dlcol_set_atom_name(f, (uint32_t)n, nbuf);
         n++;
     }
     for (int j = 0; j < na; j++) {
@@ -10170,6 +10230,14 @@ static void emit_step_lanes(parser *p)
         for (int b = 0; b < a->nreq; b++) {
             uint32_t rp = a->requires[b].pred;
             int loc;
+            if (a->requires[b].is_guard) {             /* #242: a guard column */
+                int gj = -1;
+                for (int j = 0; j < ngd; j++)
+                    if (gd[j].pred == rp && gd[j].cmp == a->requires[b].cmp &&
+                        gd[j].thr == a->requires[b].threshold) { gj = j; break; }
+                body[bi++] = (dl_lit){ (uint32_t)gd_local[gj], false };
+                continue;
+            }
             if (find_pred(p, rp)->arity == 0) {        /* a global: broadcast read */
                 int gj = -1;
                 for (int j = 0; j < ng; j++) if (glob[j] == rp) { gj = j; break; }
@@ -10257,6 +10325,16 @@ static void emit_step_lanes(parser *p)
     for (int j = 0; j < ng; j++)
         for (int e = 0; e < nent; e++)
             ground[(size_t)glob_local[j] * nent + e] = glob[j];  /* broadcast (arity 0) */
+    /* a guard column's ground atom is the N=1 path's guard literal, so a trace
+     * naming it reads identically whichever path produced it (#242) */
+    for (int j = 0; j < ngd; j++)
+        for (int e = 0; e < nent; e++) {
+            uint32_t ent = domain_at(p, S, e);
+            uint32_t num = ground_pred(p, gd[j].pred, &ent, 1);
+            snprintf(nbuf, sizeof nbuf, "%s %s %ld", intern_name(p->syms, num),
+                     lane_cmp_spelling(gd[j].cmp), gd[j].thr);
+            ground[(size_t)gd_local[j] * nent + e] = intern_id(p->syms, nbuf);
+        }
     for (int j = 0; j < na; j++)
         for (int e = 0; e < nent; e++) {
             uint32_t ent = domain_at(p, S, e);
@@ -10369,13 +10447,22 @@ static void emit_step_lanes(parser *p)
     if (nbcast > 0) {
         int total = 0;
         for (int i = 0; i < p->nactions; i++)
-            if (act_is_binder[i]) total += domain_size(p, p->actions[i].vars[0].sort);
+            if (act_is_binder[i])
+                total += p->actions[i].nvars == 1
+                       ? domain_size(p, p->actions[i].vars[0].sort)
+                       : 1;                        /* casterless: one arity-0 atom */
         uint32_t *catom = malloc((size_t)(total ? total : 1) * sizeof *catom);
         int *clocal = malloc((size_t)(total ? total : 1) * sizeof *clocal);
         int ncast = 0;
         for (int i = 0; i < p->nactions; i++) if (act_is_binder[i]) {
-            int Sc = p->actions[i].vars[0].sort, kc = domain_size(p, Sc);
             uint32_t nameatom = intern_id(p->syms, p->actions[i].name);
+            if (p->actions[i].nvars == 0) {   /* casterless cast: the bare atom */
+                catom[ncast] = nameatom;
+                clocal[ncast] = bcast_local[i];
+                ncast++;
+                continue;
+            }
+            int Sc = p->actions[i].vars[0].sort, kc = domain_size(p, Sc);
             for (int c = 0; c < kc; c++) {
                 uint32_t ent = domain_at(p, Sc, c);
                 catom[ncast] = ground_pred(p, nameatom, &ent, 1);
@@ -10385,6 +10472,27 @@ static void emit_step_lanes(parser *p)
         }
         world_step_lane_set_bcast(p->w, ncast, catom, clocal);
         free(catom); free(clocal);
+    }
+
+    /* register the numeric guard columns: per (guard, lane) the ground numeric
+     * atom that lane compares, resolved to a value-store index once (#242). */
+    if (ngd > 0) {
+        size_t nc = (size_t)ngd * (size_t)(nent ? nent : 1);
+        uint32_t *gloc = malloc((size_t)ngd * sizeof *gloc);
+        uint32_t *gcell = malloc(nc * sizeof *gcell);
+        int *gop = malloc((size_t)ngd * sizeof *gop);
+        long *gthr = malloc((size_t)ngd * sizeof *gthr);
+        for (int j = 0; j < ngd; j++) {
+            gloc[j] = (uint32_t)gd_local[j];
+            gop[j]  = (int)gd[j].cmp;
+            gthr[j] = gd[j].thr;
+            for (int e = 0; e < nent; e++) {
+                uint32_t ent = domain_at(p, S, e);
+                gcell[(size_t)j * nent + e] = ground_pred(p, gd[j].pred, &ent, 1);
+            }
+        }
+        world_step_lane_set_guards(p->w, ngd, gloc, gcell, gop, gthr);
+        free(gloc); free(gcell); free(gop); free(gthr);
     }
     free(ground);
     free(kind);
