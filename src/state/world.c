@@ -342,6 +342,13 @@ struct world {
      * runs differing in one argument slot and asks for a run at a time; scratch
      * is grown to nprov once and reused, so a solve allocates nothing. */
     world_provider_fill_fn provider_fill_fn; void *provider_fill_ctx;
+    /* #254: per-PREDICATE generator callbacks. Enumerability belongs to one
+     * relation's index, not to the host — adjacency may enumerate where line of
+     * sight can only answer a point query. Plus a scratch run, grown to the
+     * largest answer seen, so enumerating costs no allocation per call. */
+    struct { uint32_t pred; world_provider_gen_fn fn; void *ctx; } *pgen;
+    int       npgen, cappgen;
+    uint32_t *genbuf; int genbufcap;
     int *fill_idx; uint32_t *fill_locs, *fill_ents; uint64_t *fill_out;
     int fill_cap;
     /* Trace-time only (#178): phrases one provider's answer for the why-trace.
@@ -563,6 +570,8 @@ void world_free(world *w)
         free(w->steplanes[i].lane_ent);
     }
     free(w->steplanes);
+    free(w->pgen);
+    free(w->genbuf);
     free(w->step_snap);
     free(w->last_actions);
     free(w->lane_map);
@@ -1027,6 +1036,95 @@ bool world_provider_holds_at(const world *w, uint32_t pred,
 {
     if (!w->provider_fn) return false;
     return w->provider_fn(w->provider_ctx, pred, args, nargs);
+}
+
+static int pgen_index(const world *w, uint32_t pred)
+{
+    for (int i = 0; i < w->npgen; i++) if (w->pgen[i].pred == pred) return i;
+    return -1;
+}
+
+void world_set_provider_gen_fn(world *w, uint32_t pred,
+                               world_provider_gen_fn fn, void *ctx)
+{
+    int i = pgen_index(w, pred);
+    if (i < 0) {
+        if (w->npgen == w->cappgen) {
+            w->cappgen = w->cappgen ? w->cappgen * 2 : 8;
+            w->pgen = realloc(w->pgen, (size_t)w->cappgen * sizeof *w->pgen);
+        }
+        i = w->npgen++;
+        w->pgen[i].pred = pred;
+    }
+    w->pgen[i].fn = fn;
+    w->pgen[i].ctx = ctx;
+}
+
+bool world_provider_generates(const world *w, uint32_t pred)
+{
+    int i = pgen_index(w, pred);
+    return i >= 0 && w->pgen[i].fn != NULL;
+}
+
+static int u32_asc(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : (x > y);
+}
+
+int world_provider_gen(world *w, uint32_t pred, uint32_t a,
+                       uint32_t *out, int cap)
+{
+    int i = pgen_index(w, pred);
+    if (i < 0 || !w->pgen[i].fn) return 0;
+    /* ask once; if the host had more than the scratch held, grow and re-ask —
+     * the run is the host's to size, and it says so by returning the total */
+    for (;;) {
+        int n = w->pgen[i].fn(w->pgen[i].ctx, pred, a, w->genbuf, w->genbufcap);
+        if (n > w->genbufcap) {
+            w->genbufcap = n;
+            w->genbuf = realloc(w->genbuf, (size_t)n * sizeof *w->genbuf);
+            continue;
+        }
+        /* canonicalise: the host's order is its index's, not the story's (I4),
+         * and a host may legitimately report the same pair twice. Guarded
+         * because an empty run leaves genbuf NULL, and qsort's first argument
+         * is declared non-null — UB even for a count of zero. */
+        if (n > 0) qsort(w->genbuf, (size_t)n, sizeof *w->genbuf, u32_asc);
+        int m = 0;
+        for (int k = 0; k < n; k++)
+            if (m == 0 || w->genbuf[k] != w->genbuf[m - 1]) w->genbuf[m++] = w->genbuf[k];
+        for (int k = 0; k < m && k < cap; k++) out[k] = w->genbuf[k];
+        return m;
+    }
+}
+
+int world_providers_gen_check(world *w, uint32_t pred, const uint32_t *ents,
+                              int nent, bool *ok)
+{
+    if (ok) *ok = true;
+    if (!world_provider_generates(w, pred) || !w->provider_fn) return 0;
+    size_t sz = (size_t)(nent ? nent : 1) * sizeof(uint32_t);
+    uint32_t *got = malloc(sz), *want = malloc(sz);
+    int checks = 0;
+    for (int i = 0; i < nent; i++) {
+        int n = world_provider_gen(w, pred, ents[i], got, nent);
+        int m = 0;
+        for (int j = 0; j < nent; j++) {
+            uint32_t args[2] = { ents[i], ents[j] };
+            checks++;
+            if (w->provider_fn(w->provider_ctx, pred, args, 2)) want[m++] = ents[j];
+        }
+        /* the oracle is canonicalised the same way, so the caller's enumeration
+         * order of `ents` cannot make a correct generator look wrong */
+        qsort(want, (size_t)m, sizeof *want, u32_asc);
+        if (n != m || memcmp(got, want, (size_t)m * sizeof *want) != 0) {
+            if (ok) *ok = false;
+            break;
+        }
+    }
+    free(got); free(want);
+    return checks;
 }
 
 void world_set_provider_fill_fn(world *w, world_provider_fill_fn fn, void *ctx)

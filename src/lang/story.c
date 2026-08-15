@@ -105,6 +105,14 @@ typedef enum {
     EX_MIN, EX_MAX,
     EX_TEST,  /* `test([~]p(args))` (#86): a literal's solved verdict as 0/1.
                * `pred`/`args` = the literal; `konst` = 1 for a `~` literal. */
+    EX_ENT,   /* an ENTITY term (#258): a rule variable or a named entity read in
+               * an expression, so a value provider can be called with one —
+               * `chebyshev(A, B)`. `pred` holds the variable name or entity
+               * atom, `konst` the sort index. Lowers to EXPR_CONST with the
+               * entity's interned atom, resolved through the binding: the
+               * grounder already substitutes an entity per role, so it is a
+               * compile-time constant, exactly as #226's constant argument is.
+               * An entity is a HANDLE — require_int keeps it out of arithmetic. */
     EX_PRIOR  /* `prior` (#82/#94): inside a layered definition's expression,
                * the value that would have held without this definition —
                * compiles to EXPR_P over the chain's running value. */
@@ -1134,6 +1142,11 @@ static bool parse_atom(parser *p, ast_atom *out)
     if (ident_is(p->cur, "roll") || ident_is(p->cur, "min") || ident_is(p->cur, "max") ||
         ident_is(p->cur, "divup") ||
         (p->cur.kind == TK_IDENT && find_value(p, intern_tok(p, p->cur)) >= 0) ||
+        (p->cur.kind == TK_IDENT && find_function(p, intern_tok(p, p->cur)) >= 0) ||
+                                    /* #258: a value provider is a MEASUREMENT, and
+                                     * `chebyshev(A,B) <= 3` is how a story rules on
+                                     * one — so a declared function leads a guard the
+                                     * way a declared value does */
         (p->cur.kind == TK_IDENT && is_declared_num(p, intern_tok(p, p->cur)) &&
          numread_starts_expr(p)) ||
         p->cur.kind == TK_INT || p->cur.kind == TK_LPAREN || p->cur.kind == TK_MINUS) {
@@ -3112,7 +3125,7 @@ static bool expr_has_test(parser *p, int e, int depth)
     ex_node *n = &p->exprs[e];
     switch (n->kind) {
     case EX_TEST: return true;
-    case EX_CONST: case EX_ROLL: return false;
+    case EX_CONST: case EX_ENT: case EX_ROLL: return false;
     case EX_LOAD: {
         int vi = find_value(p, n->pred);
         if (vi < 0) return false;
@@ -3136,6 +3149,29 @@ static bool expr_has_test(parser *p, int e, int depth)
 
 /* Validate an effect-RHS expression tree (§5.8): every fluent read resolves to
  * a declared numeric fluent of matching arity with in-scope args. */
+/* Arithmetic is INT-ONLY (#258). expr_value_sort already tracks a static
+ * `int | sort` per expression node, but until here nothing enforced it: both
+ * are a `long` in the VM, so `hp(X) := at(X) * 3 + 1` compiled and did
+ * arithmetic on an opaque cell handle — the very thing the fluent is tagged
+ * is_cell to forbid, enforced on the write side only. A sorted value is a
+ * handle: copy it, pass it, compare it to another of its own sort, but never
+ * compute with it. */
+static void require_int(parser *p, int e)
+{
+    if (e < 0) return;
+    int s = expr_value_sort(p, e);
+    if (s < 0) return;                              /* already an integer */
+    ex_node *n = &p->exprs[e];
+    const char *what = n->kind == EX_CALL ? "the result of '%s'" : "'%s'";
+    char sub[MAX_NAME + 32];
+    snprintf(sub, sizeof sub, what, intern_name(p->syms, n->pred));
+    serr(p, n->line, n->col,
+         "%s is a %s handle, not a number — arithmetic takes integers, and a "
+         "value of a declared domain is opaque (§5.6): copy it, pass it to a "
+         "function, or compare it to another %s, but never compute with it",
+         sub, value_sort_name(p, s), value_sort_name(p, s));
+}
+
 static void check_expr(parser *p, int e, var_bind *vars, int nvars)
 {
     if (e < 0) return;
@@ -3145,8 +3181,23 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
     case EX_ROLL:                    /* a seeded draw — nothing to resolve */
         return;
     case EX_LOAD: {
-        note_ref(p, n->pred, n->line, n->col);
         pred_info *pi = find_pred(p, n->pred);
+        if (!pi && n->nargs == 0) {
+            /* #258: a bare identifier naming a rule VARIABLE or a declared
+             * ENTITY is an entity term, not a fluent read — how a value
+             * provider gets its subject (`chebyshev(A, B)`). Reclassified here
+             * rather than at parse time because only the checker knows the
+             * rule's variables, and BEFORE note_ref: a variable is not a
+             * condition, so the orphan analysis must not see it as one. */
+            int vi = var_index(vars, nvars, n->pred);
+            int ei = find_entity(p, n->pred);
+            if (vi >= 0 || ei >= 0) {
+                n->kind  = EX_ENT;
+                n->konst = vi >= 0 ? vars[vi].sort : p->ents[ei].sort;
+                return;
+            }
+        }
+        note_ref(p, n->pred, n->line, n->col);
         if (n->nprimed) {                      /* primed numeric read (#84/#87) */
             if (!p->in_ramif_eff) {
                 serr(p, n->line, n->col,
@@ -3270,10 +3321,13 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
     }
     case EX_NEG:
         check_expr(p, n->lhs, vars, nvars);
+        require_int(p, n->lhs);
         return;
     default:
         check_expr(p, n->lhs, vars, nvars);
         check_expr(p, n->rhs, vars, nvars);
+        require_int(p, n->lhs);
+        require_int(p, n->rhs);
         return;
     }
 }
@@ -3343,6 +3397,7 @@ static int expr_value_sort(parser *p, int e)
         int fi = find_function(p, n->pred);
         return fi >= 0 ? find_sort(p, p->functions[fi].ret) : -1;
     }
+    if (n->kind == EX_ENT) return (int)n->konst;
     if (n->kind == EX_LOAD) {
         pred_info *pi = find_pred(p, n->pred);
         return (pi && pi->is_cell) ? pi->val_sort : -1;
@@ -3478,7 +3533,7 @@ static void check_guard_test_nodes(parser *p, int e, int depth)
     ex_node *n = &p->exprs[e];
     switch (n->kind) {
     case EX_TEST:  check_tested_cone_pred(p, n->pred, n->line, n->col); return;
-    case EX_CONST: case EX_ROLL: return;
+    case EX_CONST: case EX_ENT: case EX_ROLL: return;
     case EX_LOAD: {
         /* a LAYERED value read in a guard tests its markers (#82/#94): every
          * definition body must settle in pass A — its preds' cones test-free
@@ -3859,7 +3914,7 @@ static bool expr_reads_roll(parser *p, int e)
     if (e < 0) return false;
     ex_node *n = &p->exprs[e];
     switch (n->kind) {
-    case EX_CONST: case EX_LOAD: return false;
+    case EX_CONST: case EX_ENT: case EX_LOAD: return false;
     case EX_ROLL: return true;
     case EX_NEG:  return expr_reads_roll(p, n->lhs);
     case EX_CALL:
@@ -3876,7 +3931,7 @@ static bool expr_uses_var(parser *p, int e, uint32_t name)
     if (e < 0) return false;
     ex_node *n = &p->exprs[e];
     switch (n->kind) {
-    case EX_CONST: case EX_ROLL: return false;
+    case EX_CONST: case EX_ENT: case EX_ROLL: return false;
     case EX_LOAD:
         for (int k = 0; k < n->nargs; k++) if (n->args[k].name == name) return true;
         return false;
@@ -4215,7 +4270,7 @@ static bool expr_has_prior(parser *p, int e)
     ex_node *n = &p->exprs[e];
     switch (n->kind) {
     case EX_PRIOR: return true;
-    case EX_CONST: case EX_ROLL: case EX_LOAD: return false;
+    case EX_CONST: case EX_ENT: case EX_ROLL: case EX_LOAD: return false;
     case EX_CALL:
         for (int k = 0; k < n->nargs; k++)
             if (expr_has_prior(p, n->cargs[k])) return true;
@@ -4355,7 +4410,7 @@ static bool expr_value_cycle(parser *p, int e, bool *onstack, bool *done)
     if (e < 0) return false;
     ex_node *n = &p->exprs[e];
     switch (n->kind) {
-    case EX_CONST: case EX_ROLL: return false;
+    case EX_CONST: case EX_ENT: case EX_ROLL: return false;
     case EX_LOAD: {
         int vj = find_value(p, n->pred);
         return vj >= 0 && value_cycle_dfs(p, vj, onstack, done);
@@ -4441,7 +4496,21 @@ static void order_value_layers(parser *p)
                  * still collides is two definitions that both apply to the
                  * same instance — a catch-all beside a row, or two catch-alls
                  * (#94's rule, restated per instance). */
-                if (vdef_is_row(r)) { rows[nrows++ < MAX_LAYERS ? nrows - 1 : 0] = ri; continue; }
+                if (vdef_is_row(r)) {
+                    /* Rows are not LAYERS: `rows` is MAX_VDEFS wide, and
+                     * bounding it by MAX_LAYERS clamped every write past the
+                     * eighth to index 0 while `nrows` kept counting — so the
+                     * copy below read uninitialised slots and stored them as
+                     * RULE INDICES. Loud, not capped (#94). */
+                    if (nrows >= MAX_VDEFS) {
+                        serr(p, r->line, r->col,
+                             "'%s' has more than %d lookup-table rows — split "
+                             "the value across two (#94)", vn, MAX_VDEFS);
+                        return;
+                    }
+                    rows[nrows++] = ri;
+                    continue;
+                }
                 if (base >= 0) {
                     serr(p, r->line, r->col,
                          "'%s' has two unconditional definitions ('%s' and "
@@ -4582,7 +4651,7 @@ static bool expr_tree_reads_value(parser *p, int e, uint32_t pred,
                                       depth + 1))
                 return true;
         return false;
-    case EX_CONST: case EX_ROLL: case EX_TEST: case EX_PRIOR:
+    case EX_CONST: case EX_ENT: case EX_ROLL: case EX_TEST: case EX_PRIOR:
         return false;
     case EX_NEG:
         return expr_tree_reads_value(p, n->lhs, pred, args, nargs, depth + 1);
@@ -4651,7 +4720,7 @@ static void check_partial_expr(parser *p, int e, const psafe_ctx *cx, int depth)
         for (int k = 0; k < n->nargs; k++)
             check_partial_expr(p, n->cargs[k], cx, depth + 1);
         return;
-    case EX_CONST: case EX_ROLL: case EX_TEST: case EX_PRIOR:
+    case EX_CONST: case EX_ENT: case EX_ROLL: case EX_TEST: case EX_PRIOR:
         return;
     case EX_NEG: check_partial_expr(p, n->lhs, cx, depth + 1); return;
     default:
@@ -4888,7 +4957,7 @@ static void collect_primed_loads(parser *p, int e, uint32_t *pg, int *npgf)
         for (int k = 0; k < n->nargs; k++)
             collect_primed_loads(p, n->cargs[k], pg, npgf);
         return;
-    case EX_CONST: case EX_ROLL: case EX_TEST: case EX_PRIOR: return;
+    case EX_CONST: case EX_ENT: case EX_ROLL: case EX_TEST: case EX_PRIOR: return;
     case EX_NEG: collect_primed_loads(p, n->lhs, pg, npgf); return;
     default:
         collect_primed_loads(p, n->lhs, pg, npgf);
@@ -4919,7 +4988,7 @@ static int primed_read_floor(parser *p, int e)
             if (c > m) m = c;
         }
         return m;
-    case EX_CONST: case EX_ROLL: case EX_TEST: case EX_PRIOR: return 0;
+    case EX_CONST: case EX_ENT: case EX_ROLL: case EX_TEST: case EX_PRIOR: return 0;
     case EX_NEG: return primed_read_floor(p, n->lhs);
     default:
         m = primed_read_floor(p, n->lhs);
@@ -6355,6 +6424,7 @@ static bool expr_fold(parser *p, int e, long *out)
     case EX_LOAD:  return false;
     case EX_ROLL:  return false;              /* a fresh draw — never a constant */
     case EX_CALL:  return false;              /* a host call — never a constant */
+    case EX_ENT:   return false;              /* an entity handle, not an int (#258) */
     case EX_TEST:  return false;              /* a solved verdict — never a constant */
     case EX_PRIOR: return false;              /* the chain's running value */
     case EX_NEG:
@@ -6413,6 +6483,15 @@ static void render_expr(parser *p, int e, var_bind *vars, int nvars,
     case EX_PRIOR:
         *off += append_term(buf, cap, *off, "prior");
         return;
+    case EX_ENT: {                     /* #258: the entity BOUND here, by name —
+                                        * `chebyshev(scout, sentry) <= 3` is what
+                                        * makes a measurement explicable, where
+                                        * the variable would say nothing */
+        ast_arg ea = { 0 }; ea.name = n->pred;
+        uint32_t ent = resolve_arg(vars, nvars, binding, ea);
+        *off += append_term(buf, cap, *off, intern_name(p->syms, ent));
+        return;
+    }
     case EX_ROLL:
         snprintf(tmp, sizeof tmp, "roll(%ld)", n->konst);
         *off += append_term(buf, cap, *off, tmp);
@@ -6507,6 +6586,15 @@ static void emit_expr(parser *p, int e, var_bind *vars, int nvars,
         if (*pos < MAX_CODE) {
             code[*pos].op = n->nprimed ? EXPR_LOADN : EXPR_LOAD;   /* #84 */
             code[(*pos)++].arg = (long)g;
+        } else p->code_of = true;
+        return;
+    }
+    if (n->kind == EX_ENT) {                   /* #258: the entity, as its atom */
+        ast_arg ea = { 0 }; ea.name = n->pred;
+        uint32_t ent = resolve_arg(vars, nvars, binding, ea);
+        if (*pos < MAX_CODE) {
+            code[*pos].op = EXPR_CONST;
+            code[(*pos)++].arg = (long)ent;
         } else p->code_of = true;
         return;
     }
@@ -7423,6 +7511,14 @@ typedef struct {
     long      threshold;
     int       nargs;
     uint32_t  arg[MAX_ARGS];   /* a var NAME or a constant entity (disambiguated below) */
+    /* #257: a generator-capable provider can BIND its free argument instead of
+     * filtering a pair the join already formed. `gen_yield` is what it produced
+     * last reground and `gen_off` turns it back into a filter when it turned
+     * out to be denser than the fluent scan it displaced — §8.1's adaptive
+     * lever rather than a guess that is wrong invisibly. */
+    long      gen_yield;
+    long      gen_runs;
+    bool      gen_off;
 } m_atom;
 
 typedef struct {
@@ -7578,6 +7674,28 @@ static bool m_is_generator(const m_atom *a)   /* a positive fluent — scannable
     return !a->neg && !a->is_guard && !a->is_provider;
 }
 
+/* A provider that can ENUMERATE (#254) binds its free argument rather than
+ * testing a pair the join already built. Usable only in the connected position
+ * — exactly one argument bound, the other free — because the protocol asks
+ * `pred(a, ·)` for a known `a`. A var reachable ONLY through a provider still
+ * leaves the rule eager: enumerability is a runtime registration and the
+ * compile-time eligibility check cannot see it, so this is an optimisation
+ * inside an already-matchable rule, never a widening of what matches. */
+static bool m_provider_generator(const story_matcher *m, const m_rule *r,
+                                 const m_atom *a, const bool *vb, int *pbound,
+                                 int *pfree)
+{
+    if (a->neg || a->is_guard || !a->is_provider || a->gen_off) return false;
+    if (a->nargs != 2 || !world_provider_generates(m->w, a->pred)) return false;
+    int v0 = m_var_index((m_rule *)r, a->arg[0]);
+    int v1 = m_var_index((m_rule *)r, a->arg[1]);
+    if (v0 < 0 || v1 < 0 || v0 == v1) return false;   /* a constant arg: later */
+    if (vb[v0] == vb[v1]) return false;               /* both or neither bound */
+    *pbound = vb[v0] ? v0 : v1;
+    *pfree  = vb[v0] ? v1 : v0;
+    return true;
+}
+
 /* Selectivity-ordered join plan (#46): visit the generator atoms smallest live
  * extension first (factindex_count), each connected to an already-bound var so we
  * never form an accidental cartesian sub-join. The order is a deterministic
@@ -7586,7 +7704,9 @@ static bool m_is_generator(const m_atom *a)   /* a positive fluent — scannable
  * shrinks the intermediate bindings walked. `gorder` gets the body indices of the
  * generators in visitation order; filters (negation, guards, providers) are not
  * ordered here — they apply at the leaf / to the solver. */
-static void plan_generators(m_rule *r, const factindex *ix, int *gorder, int *pngen)
+static void plan_generators(const story_matcher *m, m_rule *r,
+                            const factindex *ix, int *gorder, uint8_t *gkind,
+                            int *pngen)
 {
     bool used[MAX_BODY] = { 0 };
     bool vb[MAX_ARGS]   = { 0 };            /* vars bound by already-ordered generators */
@@ -7611,11 +7731,25 @@ static void plan_generators(m_rule *r, const factindex *ix, int *gorder, int *pn
                           (conn != best_conn ? conn : cnt < bestcnt);
             if (better) { best = b; bestcnt = cnt; best_conn = conn; }
         }
-        gorder[ngen++] = best;
+        gorder[ngen] = best; gkind[ngen] = 0; ngen++;
         used[best] = true;
         for (int k = 0; k < r->body[best].nargs; k++) {
             int vi = m_var_index(r, r->body[best].arg[k]);
             if (vi >= 0) vb[vi] = true;
+        }
+        /* #257: a provider that can enumerate binds its free argument as soon
+         * as its other one is bound. Inserted rather than substituted — every
+         * fluent scan stays in the plan, so no constraint is lost and a scan
+         * whose var is now bound degenerates to a point probe. That is where
+         * the win is: |F| x run intermediates instead of |F|^2. */
+        for (int b = 0; b < r->nbody; b++) {
+            int bound, freev;
+            if (used[b]) continue;
+            if (!m_provider_generator(m, r, &r->body[b], vb, &bound, &freev))
+                continue;
+            gorder[ngen] = b; gkind[ngen] = 1; ngen++;
+            used[b] = true;
+            vb[freev] = true;
         }
     }
     *pngen = ngen;
@@ -7625,7 +7759,8 @@ static void plan_generators(m_rule *r, const factindex *ix, int *gorder, int *pn
  * visiting generators in the selectivity order `gorder` (see plan_generators).
  * At the leaf every var is bound; the negated fluent filters are applied, then
  * the instance is emitted with its full body. */
-static void m_match_rec(story_matcher *m, m_rule *r, const int *gorder, int ngen,
+static void m_match_rec(story_matcher *m, m_rule *r, const int *gorder,
+                        const uint8_t *gkind, int ngen,
                         int gi, uint32_t *bind, const factindex *ix)
 {
     if (gi == ngen) {
@@ -7637,6 +7772,24 @@ static void m_match_rec(story_matcher *m, m_rule *r, const int *gorder, int ngen
         return;
     }
     m_atom *at = &r->body[gorder[gi]];
+    if (gkind[gi]) {                        /* #257: enumerate from the provider */
+        int v0 = m_var_index(r, at->arg[0]), v1 = m_var_index(r, at->arg[1]);
+        int bv = bind[v0] != INTERN_NONE ? v0 : v1;
+        int fv = bv == v0 ? v1 : v0;
+        int cap = world_provider_gen(m->w, at->pred, bind[bv], NULL, 0);
+        uint32_t *run = malloc((size_t)(cap ? cap : 1) * sizeof *run);
+        int got = world_provider_gen(m->w, at->pred, bind[bv], run, cap);
+        at->gen_runs++;
+        at->gen_yield += got;
+        for (int k = 0; k < got; k++) {
+            m->probes++;
+            bind[fv] = run[k];
+            m_match_rec(m, r, gorder, gkind, ngen, gi + 1, bind, ix);
+        }
+        bind[fv] = INTERN_NONE;
+        free(run);
+        return;
+    }
     int n = at->nargs;
     bool     filt[FACTINDEX_MAXARGS];
     uint32_t want[FACTINDEX_MAXARGS];
@@ -7660,7 +7813,7 @@ static void m_match_rec(story_matcher *m, m_rule *r, const int *gorder, int ngen
             if (bind[vi] == INTERN_NONE) { bind[vi] = tup[k]; set[nset++] = vi; }
             else if (bind[vi] != tup[k]) { ok = false; break; }   /* repeated var agrees */
         }
-        if (ok) m_match_rec(m, r, gorder, ngen, gi + 1, bind, ix);
+        if (ok) m_match_rec(m, r, gorder, gkind, ngen, gi + 1, bind, ix);
         for (int s = 0; s < nset; s++) bind[set[s]] = INTERN_NONE; /* backtrack */
     }
 }
@@ -7676,6 +7829,7 @@ static void m_capture_atom(parser *p, m_atom *d, const ast_atom *s)
     d->threshold = s->threshold;
     d->nargs = s->nargs;
     for (int k = 0; k < s->nargs && k < MAX_ARGS; k++) d->arg[k] = s->args[k].name;
+    d->gen_yield = 0; d->gen_runs = 0; d->gen_off = false;   /* #257 */
 }
 
 /* Deep-copy one matchable rule into the retained plan (survives the parser). */
@@ -7822,8 +7976,9 @@ void story_matcher_reground(story_matcher *m)
         m_rule *r = &m->rules[i];
         for (int v = 0; v < r->nvars; v++) bind[v] = INTERN_NONE;
         int gorder[MAX_BODY], ngen = 0;
-        plan_generators(r, ix, gorder, &ngen);       /* selectivity order for THIS tick */
-        m_match_rec(m, r, gorder, ngen, 0, bind, ix);
+        uint8_t gkind[MAX_BODY];
+        plan_generators(m, r, ix, gorder, gkind, &ngen); /* order for THIS tick */
+        m_match_rec(m, r, gorder, gkind, ngen, 0, bind, ix);
     }
 }
 
@@ -8630,7 +8785,7 @@ static bool cp_expr_varies(parser *p, int e, var_bind *vars, int nvars,
     if (e < 0 || depth > 2 * MAX_ARGS) return false;
     ex_node *n = &p->exprs[e];
     switch (n->kind) {
-    case EX_CONST: return false;
+    case EX_CONST: case EX_ENT: return false;
     case EX_ROLL:  return true;
     case EX_LOAD: case EX_TEST: {
         for (int k = 0; k < n->nargs; k++) {
@@ -9715,7 +9870,7 @@ static bool collect_lane_tests(parser *p, int e, int S, uint32_t var,
 {
     ex_node *n = &p->exprs[e];
     switch (n->kind) {
-    case EX_CONST: return true;
+    case EX_CONST: case EX_ENT: return true;
     case EX_LOAD: case EX_ROLL: case EX_CALL: case EX_PRIOR:
         return false;
     case EX_TEST: {

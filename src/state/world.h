@@ -166,6 +166,55 @@ typedef void (*world_provider_fill_fn)(void *ctx, uint32_t pred,
                                        uint64_t *out);
 void world_set_provider_fill_fn(world *w, world_provider_fill_fn fn, void *ctx);
 
+/* Generator-capable providers (#254). The two forms above both TEST a tuple the
+ * engine already formed: `near(a,b)?` for a pair it chose to ask about. So a
+ * variable can never be bound by a provider — the compiler and the tick-time
+ * matcher agree that "every variable must be bound by a positive base-fluent
+ * atom", and a var reachable only through `near(X,Y)` leaves the rule grounding
+ * the sort cross product with the provider pruning afterwards.
+ *
+ * The generator form inverts the question: not "does near(a,b) hold" but "give
+ * me the b for which near(a,·) holds". The host walks its own index once and
+ * hands back a run; the engine binds the variable from it. This is the batched
+ * fill taken one step further — from runs the ENGINE chose to runs the HOST
+ * chose — and the structure a host needs is the one it already keeps (a
+ * counting-sorted cell bucket, as tests/bench_slice.c's reference does).
+ *
+ * `out` takes up to `cap` entities; the return is the TOTAL, which may exceed
+ * `cap`, so a caller can size a buffer by asking with cap 0 first.
+ *
+ * Registered PER PREDICATE, unlike the point and fill callbacks: enumerability
+ * is a property of one relation's index, not of the host, and a host that can
+ * enumerate adjacency may have only a point query for line of sight. A
+ * predicate with no generator keeps today's behaviour exactly — the capability
+ * is declared by registration and asked about with world_provider_generates,
+ * never guessed at.
+ *
+ * I4: the run's order is the HOST's, so the engine canonicalises it — ascending
+ * by entity atom, duplicates dropped — before anyone sees it. Grounding order
+ * sets roll-site indices and lane assignment, so a host that enumerates its
+ * buckets in a different order after a rebuild must not move a die roll. */
+typedef int (*world_provider_gen_fn)(void *ctx, uint32_t pred, uint32_t a,
+                                     uint32_t *out, int cap);
+void world_set_provider_gen_fn(world *w, uint32_t pred,
+                               world_provider_gen_fn fn, void *ctx);
+bool world_provider_generates(const world *w, uint32_t pred);
+/* The canonicalised run for `pred(a, ·)`: ascending, deduplicated. Writes up to
+ * `cap` and returns the full count (which may exceed `cap`). 0 with no
+ * generator registered — a caller must check world_provider_generates rather
+ * than read an empty run as "nothing holds". */
+int  world_provider_gen(world *w, uint32_t pred, uint32_t a,
+                        uint32_t *out, int cap);
+
+/* Differential oracle for the generator form, the world_providers_check of this
+ * boundary: for each entity in `ents`, what the generator yields must equal the
+ * subset of `ents` the per-atom callback says holds — same members, same order.
+ * Enumerating changes when the host is asked, never what it answers. Returns
+ * the number of (a, b) comparisons made; sets *ok false on any disagreement.
+ * Checks nothing when either callback is missing. */
+int world_providers_gen_check(world *w, uint32_t pred, const uint32_t *ents,
+                              int nent, bool *ok);
+
 /* Differential oracle for the batched form (the world_lanes_check of the
  * provider boundary): every registered provider atom answered BOTH ways — once
  * per-atom, once inside the run the loader would place it in — and compared.

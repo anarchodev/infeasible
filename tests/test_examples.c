@@ -38,6 +38,7 @@ static const char *EXAMPLES[] = {
     "duel_pure.story",
     "encounter5e.story",
     "fireball5e.story",
+    "grid_pure.story",
     "mv_door.story",
     "numeric_combat.story",
     "numeric_hp.story",
