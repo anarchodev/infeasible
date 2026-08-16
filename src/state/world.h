@@ -94,6 +94,13 @@ void world_declare_num(world *w, uint32_t atom, long min, long max, bool has_ran
 void world_set_num(world *w, uint32_t atom, long value);
 long world_get_num(const world *w, uint32_t atom);
 
+/* Was this numeric fluent ever declared? `world_get_num` answers 0 for one
+ * that was not, which is a legitimate value — so a host that DERIVES from a
+ * fluent it does not own (the stock grid reading `grid_x`, §5.6) cannot tell
+ * "at the origin" from "not on the map" without asking. Reading state stays
+ * unconditional; this is about the vocabulary, not the values. */
+bool world_has_num(const world *w, uint32_t atom);
+
 /* Register a guard atom: `guard` is proved exactly when the numeric fluent
  * `num` satisfies `<op> threshold` for its current value. */
 void world_add_guard(world *w, uint32_t guard, uint32_t num,

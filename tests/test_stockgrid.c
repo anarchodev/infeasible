@@ -160,6 +160,30 @@ int main(void)
         printf("  line of sight: clear, blocked by an interposed entity, clear\n");
     }
 
+    /* OCCLUSION: how much of the target a blocker hides, which is a different
+     * question from whether the centre line is clear — and the pair (u0, u8)
+     * is the proof that it is different, not a slower way to ask the same one.
+     * A ruling like `has_cover` would have had to answer one of them. */
+    {
+        world_set(w, intern_id(sy, "grid_blocks(u2)"), true);
+        stock_grid_refresh(g);
+        /* u2 at (1,1) sits between u0 (0,0) and u3 (2,2): every corner hidden */
+        CHECK(stock_grid_occlusion(g, ent[0], ent[3]) == 100);
+        /* u1 is beside u0 with nothing between them */
+        CHECK(stock_grid_occlusion(g, ent[0], ent[1]) == 0);
+        /* u7 is twenty cells down an empty row */
+        CHECK(stock_grid_occlusion(g, ent[0], ent[7]) == 0);
+        /* u8 far up the steep diagonal: the centre line grazes past the
+         * blocker and all four corner rays cross it */
+        CHECK(stock_grid_los(g, ent[0], ent[8]));
+        CHECK(stock_grid_occlusion(g, ent[0], ent[8]) == 100);
+        world_set(w, intern_id(sy, "grid_blocks(u2)"), false);
+        stock_grid_refresh(g);
+        CHECK(stock_grid_occlusion(g, ent[0], ent[3]) == 0);
+        printf("  occlusion: 100%% behind a blocker, 0%% with none — and it "
+               "disagrees with line of sight, which is why both exist\n");
+    }
+
     /* an entity the grid never heard of is not adjacent to anything, rather
      * than colliding with lane 0 */
     {
@@ -204,6 +228,31 @@ int main(void)
         CHECK(world_query(w2, dl_pos(intern_id(s2, "can_see(sentry,ally)")))
               == DL_REFUTED);
         printf("  story: adjacency and blocked sight, with zero game code\n");
+
+        /* THE PROVIDER ACCOUNTS FOR ITSELF (§5.6). A relation that answers yes
+         * or no and explains nothing leaves a hole in the trace exactly where
+         * the reader is looking, and the reader's next move is to go read C.
+         * The library phrases its own answer instead: the distance it compared,
+         * and — the part a boolean could never have carried — WHICH entity is
+         * standing in the way. Trace-time only, so a solve pays nothing. */
+        {
+            char *buf = NULL; size_t n = 0;
+            FILE *m = open_memstream(&buf, &n);
+            world_why(w2, dl_pos(intern_id(s2, "adjacent_to(scout,sentry)")), m);
+            fclose(m);
+            CHECK(strstr(buf, "chebyshev 1 <= 1") != NULL);
+            free(buf);
+
+            buf = NULL; n = 0;
+            m = open_memstream(&buf, &n);
+            world_why(w2, dl_pos(intern_id(s2, "can_see(sentry,ally)")), m);
+            fclose(m);
+            CHECK(strstr(buf, "wall blocks it at (5,1)") != NULL);
+            free(buf);
+            printf("  the trace carries the library's own account: the distance "
+                   "it measured, and the wall that blocked the line\n");
+        }
+
 
         /* MOVEMENT: an ordinary numeric effect, and the geometry must follow.
          * A cached index that misses this answers yesterday's world. */
@@ -361,6 +410,102 @@ int main(void)
         printf("  ...and the story drew its own conclusion from the hit\n");
 
         world_free(w4); stock_grid_free(g4); intern_free(s4); free(src);
+    }
+
+    /* ---- THE COVER RULING IS CONTENT, NOT A LIBRARY CALL -------------------
+     *
+     * The library could have shipped `has_cover`. cover.story is what shipping
+     * the measurement instead buys: 50 and 75 are the story's numbers, the
+     * bands defeat each other in the story's ordering, and Sharpshooter — an
+     * exception no geometry could express — is four lines of content. Every
+     * one of those would have been unreachable behind a boolean provider. */
+    {
+        char path[512];
+        snprintf(path, sizeof path, "%s/cover.story", STORY_DIR);
+        FILE *f = fopen(path, "rb");
+        CHECK(f != NULL);
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        char *src = malloc((size_t)sz + 1);
+        size_t rd = fread(src, 1, (size_t)sz, f); src[rd] = 0; fclose(f);
+
+        intern *s5 = intern_new();
+        story_diag di[16]; story_diags dg = { di, 16, 0, 0 };
+        world *w5 = story_compile(src, "cover.story", s5, &dg);
+        CHECK(w5 != NULL && dg.nerrors == 0);
+        static const char *C[] = { "archer", "grunt", "flanker", "sniper",
+                                   "pinned", "crate", "barrel" };
+        uint32_t e5[7];
+        for (int i = 0; i < 7; i++) e5[i] = intern_id(s5, C[i]);
+        stock_grid *g5 = stock_grid_install(w5, s5, e5, 7);
+        CHECK(g5 != NULL);
+
+        /* the four bands, one per target: 0%, 50%, 75%, 100% */
+        CHECK(world_query(w5, dl_pos(intern_id(s5, "half_cover(archer,grunt)")))
+              == DL_REFUTED);
+        CHECK(world_query(w5, dl_pos(intern_id(s5, "half_cover(archer,flanker)")))
+              == DL_PROVED);
+        CHECK(world_query(w5, dl_pos(intern_id(s5,
+              "three_quarters_cover(archer,sniper)"))) == DL_PROVED);
+        CHECK(world_query(w5, dl_pos(intern_id(s5, "total_cover(archer,pinned)")))
+              == DL_PROVED);
+        /* a better band DEFEATS the lesser one — that is what `outbid >` says */
+        CHECK(world_query(w5, dl_pos(intern_id(s5, "half_cover(archer,sniper)")))
+              == DL_REFUTED);
+        CHECK(world_query(w5, dl_pos(intern_id(s5,
+              "three_quarters_cover(archer,pinned)"))) == DL_REFUTED);
+        printf("  cover.story: four bands over one measurement, defeat between them\n");
+
+        /* THE ARGUMENT, in one pair of queries: the sniper is three-quarters
+         * hidden AND in plain sight down the centre line. `has_cover` could
+         * not have said both, and `can_see` could not have said either. */
+        CHECK(world_query(w5, dl_pos(intern_id(s5, "can_see(archer,sniper)")))
+              == DL_PROVED);
+        CHECK(world_query(w5, dl_pos(intern_id(s5, "targetable(archer,pinned)")))
+              == DL_REFUTED);
+        CHECK(world_query(w5, dl_pos(intern_id(s5, "targetable(archer,sniper)")))
+              == DL_PROVED);
+        printf("  ...three-quarters hidden and in plain sight are both true\n");
+
+        /* the exception the library must not own */
+        CHECK(world_query(w5, dl_pos(intern_id(s5, "harder_shot(archer,flanker)")))
+              == DL_PROVED);
+        world_set(w5, intern_id(s5, "sharpshooter(archer)"), true);
+        CHECK(world_query(w5, dl_pos(intern_id(s5, "harder_shot(archer,flanker)")))
+              == DL_REFUTED);
+        /* and the feat reaches half and three-quarters cover only: total cover
+         * is not something a feat sees through, and no rule says it is */
+        CHECK(world_query(w5, dl_pos(intern_id(s5, "targetable(archer,pinned)")))
+              == DL_REFUTED);
+        world_set(w5, intern_id(s5, "sharpshooter(archer)"), false);
+        printf("  ...and Sharpshooter beats the band without touching total cover\n");
+
+        /* the ruling reaches the transition: a covered target takes the
+         * careful shot, an open one the snap shot, and the pinned one neither */
+        char err[200];
+        uint32_t careful = intern_id(s5, "careful_shot(archer,flanker)");
+        CHECK(world_step(w5, &careful, 1, err, sizeof err) == 0);
+        CHECK(world_get_num(w5, intern_id(s5, "hp(flanker)")) == 9);
+        uint32_t snap = intern_id(s5, "snap_shot(archer,grunt)");
+        CHECK(world_step(w5, &snap, 1, err, sizeof err) == 0);
+        CHECK(world_get_num(w5, intern_id(s5, "hp(grunt)")) == 6);
+        uint32_t blocked = intern_id(s5, "snap_shot(archer,pinned)");
+        CHECK(world_step(w5, &blocked, 1, err, sizeof err) == 0);
+        CHECK(world_get_num(w5, intern_id(s5, "hp(pinned)")) == 12);
+        printf("  ...and the guard on each action reads the ruling, not the grid\n");
+
+        /* MOVEMENT re-decides it with nothing recomputing anything: the
+         * flanker steps out of the crate's shadow, 50%% drops to 25%%, and the
+         * band goes with it */
+        uint32_t step = intern_id(s5, "sidestep(flanker)");
+        CHECK(world_step(w5, &step, 1, err, sizeof err) == 0);
+        CHECK(world_get_num(w5, intern_id(s5, "grid_y(flanker)")) == 2);
+        CHECK(world_query(w5, dl_pos(intern_id(s5, "half_cover(archer,flanker)")))
+              == DL_REFUTED);
+        CHECK(world_query(w5, dl_pos(intern_id(s5, "harder_shot(archer,flanker)")))
+              == DL_REFUTED);
+        printf("  ...a sidestep out of the shadow drops the band\n");
+
+        world_free(w5); stock_grid_free(g5); intern_free(s5); free(src);
     }
 
     printf("test_stockgrid: all passed\n");

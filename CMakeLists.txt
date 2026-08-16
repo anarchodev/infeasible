@@ -54,14 +54,14 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 enable_testing()
-foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse test_scene test_bands test_clamp test_setparam test_domain test_sortunion test_intargs test_functional test_store test_fnprovider test_ground test_mv test_numeric test_numpipe test_numeff test_ramif test_prov test_lanes test_binder test_numlane test_binderlane test_judgstep test_provider test_roster test_provgen test_provjoin test_stockgrid test_safety test_cardinality test_spatial test_factindex test_dbound test_matcher test_ticktime test_selectivity test_dlcol_incr test_locstable test_matchview test_sparsejfam test_sparseuniverse test_lazyq test_inits test_model test_lsp test_div test_value test_enumarg test_merge test_exprtest test_strata test_layers test_modeled test_kinds test_reaction test_split test_taxonomy test_taxprobe test_partial test_conflict test_cycle test_excl test_matchwatch test_probe5e test_testlane test_lanefront test_emit test_steplog test_guards test_provtrace test_provfill test_iface test_subscribe test_secondclient test_actions test_examples)
+foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse test_scene test_bands test_clamp test_setparam test_domain test_sortunion test_intargs test_functional test_store test_fnprovider test_ground test_mv test_numeric test_numpipe test_numeff test_ramif test_prov test_lanes test_binder test_numlane test_binderlane test_judgstep test_provider test_roster test_provgen test_provjoin test_stockgrid test_hexgrid test_safety test_cardinality test_spatial test_factindex test_dbound test_matcher test_ticktime test_selectivity test_dlcol_incr test_locstable test_matchview test_sparsejfam test_sparseuniverse test_lazyq test_inits test_model test_lsp test_div test_value test_enumarg test_merge test_exprtest test_strata test_layers test_modeled test_kinds test_reaction test_split test_taxonomy test_taxprobe test_partial test_conflict test_cycle test_excl test_matchwatch test_probe5e test_testlane test_lanefront test_emit test_steplog test_guards test_provtrace test_provfill test_iface test_subscribe test_secondclient test_actions test_examples)
   add_executable(${t} tests/${t}.c)
   target_link_libraries(${t} PRIVATE infeasible_core)
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
 
 # These compile real .story files from the source tree; hand them the path.
-foreach(t IN ITEMS test_parse test_ground test_mv test_numeric test_numeff test_ramif test_binder test_provider test_spatial test_stockgrid test_reaction test_taxprobe test_probe5e test_emit test_secondclient test_actions test_examples)
+foreach(t IN ITEMS test_parse test_ground test_mv test_numeric test_numeff test_ramif test_binder test_provider test_spatial test_stockgrid test_hexgrid test_reaction test_taxprobe test_probe5e test_emit test_secondclient test_actions test_examples)
   target_compile_definitions(${t} PRIVATE
     STORY_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples")
 endforeach()

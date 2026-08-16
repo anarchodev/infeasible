@@ -4391,6 +4391,63 @@ static const stock_decl *stock_find(parser *p, uint32_t name, int arity, bool wa
     return NULL;
 }
 
+/* The roster, spelled for a diagnostic — built from the table rather than
+ * written out beside it, because a library that grows is exactly the thing a
+ * hand-maintained list falls behind. */
+static const char *roster_list(bool want_fn, char *buf, size_t cap)
+{
+    size_t at = 0;
+    int n = 0, total = 0;
+    for (int i = 0; i < STOCK_NPROVIDERS; i++)
+        if ((STOCK_PROVIDERS[i].ret != NULL) == want_fn) total++;
+    for (int i = 0; i < STOCK_NPROVIDERS && at + 1 < cap; i++) {
+        const stock_decl *d = &STOCK_PROVIDERS[i];
+        if ((d->ret != NULL) != want_fn) continue;
+        const char *sep = n == 0 ? "" : (n == total - 1 ? " and " : ", ");
+        int wrote = snprintf(buf + at, cap - at, "%s%s/%d", sep, d->name, d->arity);
+        if (wrote < 0) break;
+        at += (size_t)wrote > cap - at ? cap - at : (size_t)wrote;
+        n++;
+    }
+    return buf;
+}
+
+/* A stock provider reads ordinary state to answer — the square grid reads
+ * `grid_x`/`grid_y`, the hex `hex_q`/`hex_r` — and an undeclared numeric
+ * fluent reads 0 (`world_get_num`). So a story that declares `hex_adjacent`
+ * over square positions stands its whole cast on the origin, where everyone is
+ * adjacent to everyone and every line of sight is clear: #263's silent wrong
+ * answer with the sign flipped, and reachable only because there are now two
+ * topologies to mix up. The vocabulary is checkable, so check it. */
+static void check_stock_state(parser *p, const stock_decl *d, const char *who,
+                              const int *argsort, int nargs, int line, int col)
+{
+    for (int r = 0; r < (int)(sizeof d->reads / sizeof d->reads[0]); r++) {
+        if (!d->reads[r]) break;
+        pred_info *pi = find_pred(p, intern_id(p->syms, d->reads[r]));
+        if (!pi || !pi->is_fluent || !pi->is_num || pi->arity != 1) {
+            serr(p, line, col,
+                 "'%s' is answered from the positions the library reads, and "
+                 "nothing here declares `%s(…) : int` — an undeclared position "
+                 "reads 0, so every entity would stand on one cell and the "
+                 "answer would be wrong rather than missing (§5.6)",
+                 who, d->reads[r]);
+            continue;
+        }
+        for (int k = 0; k < nargs; k++) {
+            if (argsort[k] < 0 || argsort[k] >= p->nsorts) continue;  /* `int` */
+            if (p->sorts[argsort[k]].is_domain) continue;   /* an opaque handle */
+            if (sort_admits(p, pi->argsort[0], argsort[k])) continue;
+            serr(p, line, col,
+                 "'%s' measures a '%s', but '%s' is declared over '%s' — a "
+                 "'%s' has no position stored anywhere, so the measurement "
+                 "would read 0 for every one of them",
+                 who, arg_sort_name(p, argsort[k]), d->reads[r],
+                 arg_sort_name(p, pi->argsort[0]), arg_sort_name(p, argsort[k]));
+        }
+    }
+}
+
 /* A provider nobody answers reads closed-world FALSE, forever and silently
  * (#263): the rule never fires, and the failure is indistinguishable from a
  * world where the relation happens not to hold. That was tolerable while a
@@ -4399,11 +4456,18 @@ static const stock_decl *stock_find(parser *p, uint32_t name, int arity, bool wa
  * writes `host provider`, which is the same claim made out loud. */
 static void check_provider_roster(parser *p)
 {
+    char list[256];
     for (int i = 0; i < p->nproviders; i++) {
         if (p->prov_host[i]) continue;
         ast_fluent *pr = &p->providers[i];
-        if (stock_find(p, pr->pred, pr->nargs, false)) continue;
         const char *n = intern_name(p->syms, pr->pred);
+        const stock_decl *d = stock_find(p, pr->pred, pr->nargs, false);
+        if (d) {
+            pred_info *pi = find_pred(p, pr->pred);
+            if (pi && pi->is_provider)
+                check_stock_state(p, d, n, pi->argsort, pi->arity, pr->line, pr->col);
+            continue;
+        }
         if (stock_find(p, pr->pred, pr->nargs, true))
             serr(p, pr->line, pr->col,
                  "'%s' is a stock MEASUREMENT, not a relation — declare it "
@@ -4417,20 +4481,28 @@ static void check_provider_roster(parser *p)
                  "(#263). The platform supplies %s. If an EMBEDDER answers "
                  "this one, say so: `host provider %s(…)`",
                  n, pr->nargs, pr->nargs == 1 ? "" : "s",
-                 "grid_adjacent/2, grid_los/2, grid_chebyshev/2 and "
-                 "grid_manhattan/2", n);
+                 roster_list(false, list, sizeof list), n);
     }
     for (int i = 0; i < p->nfunctions; i++) {
         if (p->fn_host[i]) continue;
         ast_function *fn = &p->functions[i];
-        if (stock_find(p, fn->name, fn->nargs, true)) continue;
         const char *n = intern_name(p->syms, fn->name);
+        const stock_decl *d = stock_find(p, fn->name, fn->nargs, true);
+        if (d) {
+            int argsort[MAX_ARGS];
+            for (int k = 0; k < fn->nargs; k++)
+                argsort[k] = fn->argsort[k] == INTERN_NONE
+                                 ? INT_SORT : find_sort(p, fn->argsort[k]);
+            check_stock_state(p, d, n, argsort, fn->nargs, fn->line, fn->col);
+            continue;
+        }
         serr(p, fn->line, fn->col,
              "no stock function '%s' takes %d argument%s — an unanswered one "
              "returns 0 at every call, which is a distance of zero (#263). "
-             "The platform supplies grid_chebyshev/2 and grid_manhattan/2. If "
-             "an EMBEDDER answers this one, say so: `host provider %s(…) : …`",
-             n, fn->nargs, fn->nargs == 1 ? "" : "s", n);
+             "The platform supplies %s. If an EMBEDDER answers this one, say "
+             "so: `host provider %s(…) : …`",
+             n, fn->nargs, fn->nargs == 1 ? "" : "s",
+             roster_list(true, list, sizeof list), n);
     }
 }
 

@@ -927,6 +927,11 @@ long world_get_num(const world *w, uint32_t atom)
     return i >= 0 ? w->nums[i].value : 0;
 }
 
+bool world_has_num(const world *w, uint32_t atom)
+{
+    return num_index(w, atom) >= 0;
+}
+
 static int guard_index(const world *w, uint32_t atom)
 {
     return atom < w->guard_of_cap ? w->guard_of[atom] : -1;
