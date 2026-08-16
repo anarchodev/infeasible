@@ -44,6 +44,10 @@ add_library(infeasible_core STATIC
   src/lang/lexer.c
   src/lang/story.c
   src/stock/grid.c
+  src/platform/spec.c
+  src/platform/platform.c
+  src/platform/headless.c
+  src/runtime/runtime.c
   src/lang/dbound.c
   src/lsp/json.c
   src/lsp/lsp.c
@@ -54,17 +58,23 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 enable_testing()
-foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse test_scene test_bands test_clamp test_setparam test_domain test_sortunion test_intargs test_functional test_store test_fnprovider test_ground test_mv test_numeric test_numpipe test_numeff test_ramif test_prov test_lanes test_binder test_numlane test_binderlane test_judgstep test_provider test_roster test_provgen test_provjoin test_stockgrid test_hexgrid test_safety test_cardinality test_spatial test_factindex test_dbound test_matcher test_ticktime test_selectivity test_dlcol_incr test_locstable test_matchview test_sparsejfam test_sparseuniverse test_lazyq test_inits test_model test_lsp test_div test_value test_enumarg test_merge test_exprtest test_strata test_layers test_modeled test_kinds test_reaction test_split test_taxonomy test_taxprobe test_partial test_conflict test_cycle test_excl test_matchwatch test_probe5e test_testlane test_lanefront test_emit test_steplog test_guards test_provtrace test_provfill test_iface test_subscribe test_secondclient test_actions test_examples)
+foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse test_scene test_bands test_clamp test_setparam test_domain test_sortunion test_intargs test_functional test_store test_fnprovider test_ground test_mv test_numeric test_numpipe test_numeff test_ramif test_prov test_lanes test_binder test_numlane test_binderlane test_judgstep test_provider test_roster test_provgen test_provjoin test_stockgrid test_hexgrid test_safety test_cardinality test_spatial test_factindex test_dbound test_matcher test_ticktime test_selectivity test_dlcol_incr test_locstable test_matchview test_sparsejfam test_sparseuniverse test_lazyq test_inits test_model test_lsp test_div test_value test_enumarg test_merge test_exprtest test_strata test_layers test_modeled test_kinds test_reaction test_split test_taxonomy test_taxprobe test_partial test_conflict test_cycle test_excl test_matchwatch test_probe5e test_testlane test_lanefront test_emit test_steplog test_guards test_provtrace test_provfill test_iface test_subscribe test_secondclient test_actions test_platform test_examples)
   add_executable(${t} tests/${t}.c)
   target_link_libraries(${t} PRIVATE infeasible_core)
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
 
 # These compile real .story files from the source tree; hand them the path.
-foreach(t IN ITEMS test_parse test_ground test_mv test_numeric test_numeff test_ramif test_binder test_provider test_spatial test_stockgrid test_hexgrid test_reaction test_taxprobe test_probe5e test_emit test_secondclient test_actions test_examples)
+foreach(t IN ITEMS test_parse test_ground test_mv test_numeric test_numeff test_ramif test_binder test_provider test_spatial test_stockgrid test_hexgrid test_reaction test_taxprobe test_probe5e test_emit test_secondclient test_actions test_platform test_examples)
   target_compile_definitions(${t} PRIVATE
     STORY_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples")
 endforeach()
+
+# test_platform reads web/platform/spec.mjs — the OTHER spelling of the §12
+# freeze — and compares it name by name against src/platform/spec.c. A freeze
+# copied into two files is a freeze that drifts; this is what stops it.
+target_compile_definitions(test_platform PRIVATE
+  WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")
 
 # The native .story language server (DESIGN.md §6.1 item 7): JSON-RPC over
 # stdio, pushing compiler diagnostics to an editor. Not a test — a shipped
