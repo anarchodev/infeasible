@@ -16,7 +16,7 @@
 //     ax/ay/aw/ah(anchor)     geometry, as a numeric state table
 //     panel(anchor, style)    a box is drawn there
 //     caption(anchor, word)   text — the ATOM IS THE LABEL (`w_the_cellar`)
-//     shows/prop_shows(E, sprite)   that thing draws as that sprite
+//     shows(E, sprite)              that thing draws as that sprite
 //     in_anchor/prop_in(E, anchor)  ...packed into that region, declaration order
 //     here(actor, room)       where an actor is — also fills a room-sorted
 //                             action parameter when a command is submitted
@@ -34,6 +34,10 @@
 //   clients cannot disagree about what is on top.
 
 sort actor, item
+// Anything that can appear on the map (#231). A cover, not inheritance: it
+// admits its members and adds nothing, which is what lets ONE `shows`
+// predicate carry every drawable instead of one per sort.
+sort drawable union actor, item
 enum room   { cellar, hall, vault }
 
 // ---- the presentation vocabulary -------------------------------------------
@@ -261,9 +265,9 @@ rule carried(X: actor, T: item): holding(X, T) => held(T, X)
 // what each thing looks like
 rule spr_hero: showing => shows(hero, s_hero)
 rule spr_guard: showing => shows(guard, s_guard)
-rule spr_key: showing => prop_shows(rusty_key, s_key)
-rule spr_torch: showing => prop_shows(torch, s_torch)
-rule spr_flask: showing => prop_shows(antidote, s_flask)
+rule spr_key: showing => shows(rusty_key, s_key)
+rule spr_torch: showing => shows(torch, s_torch)
+rule spr_flask: showing => shows(antidote, s_flask)
 
 // the dark, as a region rather than a person: the renderer shades an anchor
 rule fog_c(X: actor): at(X) = cellar & in_dark(X) => shaded(a_cellar)

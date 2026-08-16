@@ -8,6 +8,7 @@
 
 /** @typedef {"hero" | "guard"} T_actor */
 /** @typedef {"rusty_key" | "torch" | "antidote"} T_item */
+/** @typedef {string} T_drawable */   // opaque domain: host-minted handles
 /** @typedef {"cellar" | "hall" | "vault"} T_room */
 /** @typedef {"s_hero" | "s_guard" | "s_key" | "s_torch" | "s_flask"} T_sprite */
 /** @typedef {"st_room" | "st_bar" | "st_title" | "st_button" | "st_button_off"} T_style */
@@ -17,11 +18,12 @@
 /** @typedef {"snd_step" | "snd_chime" | "snd_lock" | "snd_thud" | "snd_gulp"} T_sound */
 
 export const STORY = "examples/cellar_pure.story";
-export const SOURCE_HASH = "a610f7ea";
-export const SORTS = {"actor":["hero","guard"],"item":["rusty_key","torch","antidote"]};
+export const SOURCE_HASH = "746883e7";
+export const SORTS = {"actor":["hero","guard"],"item":["rusty_key","torch","antidote"],"drawable":["hero","guard","rusty_key","torch","antidote"]};
+export const UNIONS = {"drawable":["actor","item"]};
 export const ENUMS = {"room":["cellar","hall","vault"],"sprite":["s_hero","s_guard","s_key","s_torch","s_flask"],"style":["st_room","st_bar","st_title","st_button","st_button_off"],"anchor":["a_title","a_cellar","a_hall","a_vault","a_door","a_bar","a_who","a_note","a_menu","a_status"],"word":["w_the_cellar","w_cellar","w_hall","w_vault","w_hero","w_guard","w_locked","w_jammed","w_open","w_weakened","w_oof","w_aah","w_got_it","w_tab_switches"],"cue":["q_footstep","q_pickup","q_clunk","q_heave","q_sip"],"sound":["snd_step","snd_chime","snd_lock","snd_thud","snd_gulp"]};
 
-export const IFACE = {"judgments":[{"name":"weakened","args":["actor"]},{"name":"here","args":["actor","room"]},{"name":"torch_in","args":["room"]},{"name":"in_dark","args":["actor"]},{"name":"can_enter_vault","args":["actor"]},{"name":"can_unlock_door","args":["actor"]},{"name":"can_force_door","args":["actor"]},{"name":"down","args":["actor"]},{"name":"panel","args":["anchor","style"]},{"name":"caption","args":["anchor","word"]},{"name":"in_anchor","args":["actor","anchor"]},{"name":"prop_in","args":["item","anchor"]},{"name":"held","args":["item","actor"]},{"name":"shows","args":["actor","sprite"]},{"name":"prop_shows","args":["item","sprite"]},{"name":"shaded","args":["anchor"]},{"name":"gauge","args":["anchor","actor"]},{"name":"picked","args":["actor"]},{"name":"cue_sound","args":["cue","sound"]},{"name":"cue_word","args":["cue","word"]}],"state":[{"name":"at","args":["actor"],"type":"enum","values":["cellar","hall","vault"]},{"name":"on_floor","args":["item","room"],"type":"bool"},{"name":"holding","args":["actor","item"],"type":"bool"},{"name":"door","args":[],"type":"enum","values":["locked","jammed","open"]},{"name":"poisoned","args":["actor"],"type":"bool"},{"name":"hp","args":["actor"],"type":"int"},{"name":"hp_max","args":["actor"],"type":"int"},{"name":"selected","args":["actor"],"type":"bool"},{"name":"showing","args":[],"type":"bool"}],"actions":[{"name":"go_hall","params":["actor"]},{"name":"go_cellar","params":["actor"]},{"name":"enter_vault","params":["actor"]},{"name":"leave_vault","params":["actor"]},{"name":"take_torch","params":["actor","room"]},{"name":"take_key","params":["actor","room"]},{"name":"take_antidote","params":["actor","room"]},{"name":"drop_torch","params":["actor","room"]},{"name":"drop_key","params":["actor","room"]},{"name":"drop_antidote","params":["actor","room"]},{"name":"unlock","params":["actor"]},{"name":"force_door","params":["actor"]},{"name":"drink","params":["actor"]},{"name":"pick_hero","params":[]},{"name":"pick_guard","params":[]}],"values":[{"name":"ax","args":["anchor"]},{"name":"ay","args":["anchor"]},{"name":"aw","args":["anchor"]},{"name":"ah","args":["anchor"]},{"name":"gauge_value","args":["actor"]},{"name":"gauge_max","args":["actor"]}]};
+export const IFACE = {"unions":{"drawable":["actor","item"]},"judgments":[{"name":"weakened","args":["actor"]},{"name":"here","args":["actor","room"]},{"name":"torch_in","args":["room"]},{"name":"in_dark","args":["actor"]},{"name":"can_enter_vault","args":["actor"]},{"name":"can_unlock_door","args":["actor"]},{"name":"can_force_door","args":["actor"]},{"name":"down","args":["actor"]},{"name":"panel","args":["anchor","style"]},{"name":"caption","args":["anchor","word"]},{"name":"in_anchor","args":["actor","anchor"]},{"name":"prop_in","args":["item","anchor"]},{"name":"held","args":["item","actor"]},{"name":"shows","args":["drawable","sprite"]},{"name":"shaded","args":["anchor"]},{"name":"gauge","args":["anchor","actor"]},{"name":"picked","args":["actor"]},{"name":"cue_sound","args":["cue","sound"]},{"name":"cue_word","args":["cue","word"]}],"state":[{"name":"at","args":["actor"],"type":"enum","values":["cellar","hall","vault"]},{"name":"on_floor","args":["item","room"],"type":"bool"},{"name":"holding","args":["actor","item"],"type":"bool"},{"name":"door","args":[],"type":"enum","values":["locked","jammed","open"]},{"name":"poisoned","args":["actor"],"type":"bool"},{"name":"hp","args":["actor"],"type":"int"},{"name":"hp_max","args":["actor"],"type":"int"},{"name":"selected","args":["actor"],"type":"bool"},{"name":"showing","args":[],"type":"bool"}],"actions":[{"name":"go_hall","params":["actor"]},{"name":"go_cellar","params":["actor"]},{"name":"enter_vault","params":["actor"]},{"name":"leave_vault","params":["actor"]},{"name":"take_torch","params":["actor","room"]},{"name":"take_key","params":["actor","room"]},{"name":"take_antidote","params":["actor","room"]},{"name":"drop_torch","params":["actor","room"]},{"name":"drop_key","params":["actor","room"]},{"name":"drop_antidote","params":["actor","room"]},{"name":"unlock","params":["actor"]},{"name":"force_door","params":["actor"]},{"name":"drink","params":["actor"]},{"name":"pick_hero","params":[]},{"name":"pick_guard","params":[]}],"values":[{"name":"ax","args":["anchor"]},{"name":"ay","args":["anchor"]},{"name":"aw","args":["anchor"]},{"name":"ah","args":["anchor"]},{"name":"gauge_value","args":["actor"]},{"name":"gauge_max","args":["actor"]}]};
 
 // #159 exclusive groups, exactly as world_step checks them: a step admits at
 // most one member per (group, key). The builder below refuses the second at
@@ -197,21 +199,13 @@ export function open(M, src) {
     held: (a0, a1) => { chk("item", a0); chk("actor", a1);
       return VERDICT[api.query(s, id(`held(${a0},${a1})`), 0)]; },
     /**
-     * @param {T_actor} a0
+     * @param {string} a0
      * @param {T_sprite} a1
      * @returns {'undecided'|'proved'|'refuted'}
      */
 
-    shows: (a0, a1) => { chk("actor", a0); chk("sprite", a1);
+    shows: (a0, a1) => { chk("drawable", a0); chk("sprite", a1);
       return VERDICT[api.query(s, id(`shows(${a0},${a1})`), 0)]; },
-    /**
-     * @param {T_item} a0
-     * @param {T_sprite} a1
-     * @returns {'undecided'|'proved'|'refuted'}
-     */
-
-    prop_shows: (a0, a1) => { chk("item", a0); chk("sprite", a1);
-      return VERDICT[api.query(s, id(`prop_shows(${a0},${a1})`), 0)]; },
     /**
      * @param {T_anchor} a0
      * @returns {'undecided'|'proved'|'refuted'}
@@ -443,21 +437,13 @@ export function open(M, src) {
     held: (a0, a1) => { chk("item", a0); chk("actor", a1);
       return `held(${a0},${a1})`; },
     /**
-     * @param {T_actor} a0
+     * @param {string} a0
      * @param {T_sprite} a1
      * @returns {string}
      */
 
-    shows: (a0, a1) => { chk("actor", a0); chk("sprite", a1);
+    shows: (a0, a1) => { chk("drawable", a0); chk("sprite", a1);
       return `shows(${a0},${a1})`; },
-    /**
-     * @param {T_item} a0
-     * @param {T_sprite} a1
-     * @returns {string}
-     */
-
-    prop_shows: (a0, a1) => { chk("item", a0); chk("sprite", a1);
-      return `prop_shows(${a0},${a1})`; },
     /**
      * @param {T_anchor} a0
      * @returns {string}

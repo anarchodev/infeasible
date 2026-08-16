@@ -12,9 +12,10 @@
 export const STORY = "examples/cellar_ground.story";
 export const SOURCE_HASH = "c8c5d5a2";
 export const SORTS = {"actor":["hero","guard"],"item":["antidote"]};
+export const UNIONS = {};
 export const ENUMS = {};
 
-export const IFACE = {"judgments":[{"name":"weakened","args":["actor"]},{"name":"can_force_door","args":["actor"]}],"state":[{"name":"poisoned","args":["actor"],"type":"bool"},{"name":"holding","args":["actor","item"],"type":"bool"},{"name":"strong","args":["actor"],"type":"bool"},{"name":"door_closed","args":[],"type":"bool"}],"actions":[{"name":"force_door","params":["actor"]}],"values":[]};
+export const IFACE = {"unions":{},"judgments":[{"name":"weakened","args":["actor"]},{"name":"can_force_door","args":["actor"]}],"state":[{"name":"poisoned","args":["actor"],"type":"bool"},{"name":"holding","args":["actor","item"],"type":"bool"},{"name":"strong","args":["actor"],"type":"bool"},{"name":"door_closed","args":[],"type":"bool"}],"actions":[{"name":"force_door","params":["actor"]}],"values":[]};
 
 // #159 exclusive groups, exactly as world_step checks them: a step admits at
 // most one member per (group, key). The builder below refuses the second at

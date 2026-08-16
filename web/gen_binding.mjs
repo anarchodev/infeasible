@@ -117,9 +117,17 @@ for (const e of iface.enums) w(`/** @typedef {${union(e.values)}} T_${e.name} */
 w();
 w(`export const STORY = ${JSON.stringify(iface.story)};`);
 w(`export const SOURCE_HASH = ${JSON.stringify(SOURCE_HASH)};`);
+// A declared COVER (#231) is an argument domain like any other — a predicate
+// over `drawable` is crossed by drawable's entities — so it belongs here. What
+// it is NOT is an entity's sort: every covered entity appears under its base
+// sort too, so a client inverting this into "entity -> its sort" must skip the
+// covers, and UNIONS below is how it tells.
 w(`export const SORTS = ${JSON.stringify(
-  Object.fromEntries(iface.sorts.filter((s) => s.kind === 'sort')
+  Object.fromEntries(iface.sorts.filter((s) => s.kind !== 'domain')
                                 .map((s) => [s.name, s.entities])))};`);
+w(`export const UNIONS = ${JSON.stringify(
+  Object.fromEntries(iface.sorts.filter((s) => s.kind === 'union')
+                                .map((s) => [s.name, s.members])))};`);
 // Enum domains are argument vocabularies too (#96: a value grounds like an
 // entity), so the runtime check below covers them — otherwise a `room`
 // argument is the one position where a typo still interns a fresh atom.
@@ -132,6 +140,10 @@ w();
 // crossing its argument domains, which needs the arity and the sorts, not a
 // function per name.
 w(`export const IFACE = ${JSON.stringify({
+  // covers, so a consumer can tell an argument domain that merely ADMITS an
+  // entity from the sort the entity was declared of (#231)
+  unions: Object.fromEntries(iface.sorts.filter((s) => s.kind === 'union')
+                                        .map((s) => [s.name, s.members])),
   judgments: iface.judgments.map((j) => ({ name: j.name, args: j.args })),
   state: iface.state.map((f) => ({ name: f.name, args: f.args, type: f.type,
                                    values: f.values })),

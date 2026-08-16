@@ -8,6 +8,7 @@
 
 /** @typedef {"you" | "gnoll" | "imp"} T_fighter */
 /** @typedef {"edge_a" | "edge_b" | "spark" | "salve"} T_card */
+/** @typedef {string} T_drawable */   // opaque domain: host-minted handles
 /** @typedef {"z_hand" | "z_spent"} T_zone */
 /** @typedef {"s_you" | "s_gnoll" | "s_imp" | "s_strike" | "s_bolt" | "s_mend"} T_sprite */
 /** @typedef {"st_room" | "st_bar" | "st_title" | "st_button" | "st_button_off"} T_style */
@@ -17,11 +18,12 @@
 /** @typedef {"snd_thud" | "snd_ring" | "snd_chime"} T_sound */
 
 export const STORY = "examples/duel_pure.story";
-export const SOURCE_HASH = "81236a04";
-export const SORTS = {"fighter":["you","gnoll","imp"],"card":["edge_a","edge_b","spark","salve"]};
+export const SOURCE_HASH = "0a81c2a8";
+export const SORTS = {"fighter":["you","gnoll","imp"],"card":["edge_a","edge_b","spark","salve"],"drawable":["you","gnoll","imp","edge_a","edge_b","spark","salve"]};
+export const UNIONS = {"drawable":["fighter","card"]};
 export const ENUMS = {"zone":["z_hand","z_spent"],"sprite":["s_you","s_gnoll","s_imp","s_strike","s_bolt","s_mend"],"style":["st_room","st_bar","st_title","st_button","st_button_off"],"anchor":["a_title","a_foes","a_self","a_hand","a_bar","a_who","a_note","a_menu","a_status"],"word":["w_the_duel","w_foes","w_you","w_hand","w_energy","w_downed","w_aimed","w_end_turn"],"cue":["q_hit","q_ward","q_heal"],"sound":["snd_thud","snd_ring","snd_chime"]};
 
-export const IFACE = {"judgments":[{"name":"down","args":["fighter"]},{"name":"in_hand","args":["card"]},{"name":"enemy","args":["fighter"]},{"name":"ally","args":["fighter"]},{"name":"target","args":["fighter"]},{"name":"picked","args":["fighter"]},{"name":"aimed","args":["fighter"]},{"name":"panel","args":["anchor","style"]},{"name":"caption","args":["anchor","word"]},{"name":"shows","args":["fighter","sprite"]},{"name":"prop_shows","args":["card","sprite"]},{"name":"in_anchor","args":["fighter","anchor"]},{"name":"prop_in","args":["card","anchor"]},{"name":"gauge","args":["anchor","fighter"]},{"name":"gauge_low","args":["fighter"]},{"name":"cue_sound","args":["cue","sound"]}],"state":[{"name":"in_zone","args":["card"],"type":"enum","values":["z_hand","z_spent"]},{"name":"is_strike","args":["card"],"type":"bool"},{"name":"is_bolt","args":["card"],"type":"bool"},{"name":"is_mend","args":["card"],"type":"bool"},{"name":"hostile","args":["fighter"],"type":"bool"},{"name":"alive","args":["fighter"],"type":"bool"},{"name":"hp","args":["fighter"],"type":"int"},{"name":"hp_max","args":["fighter"],"type":"int"},{"name":"energy","args":[],"type":"int"},{"name":"selected","args":["fighter"],"type":"bool"},{"name":"aiming","args":["fighter"],"type":"bool"},{"name":"showing","args":[],"type":"bool"}],"actions":[{"name":"strike","params":["card","fighter"]},{"name":"bolt","params":["card","fighter"]},{"name":"mend","params":["card","fighter"]},{"name":"end_turn","params":[]},{"name":"aim_gnoll","params":[]},{"name":"aim_imp","params":[]},{"name":"aim_you","params":[]}],"values":[{"name":"ax","args":["anchor"]},{"name":"ay","args":["anchor"]},{"name":"aw","args":["anchor"]},{"name":"ah","args":["anchor"]},{"name":"gauge_value","args":["fighter"]},{"name":"gauge_max","args":["fighter"]}]};
+export const IFACE = {"unions":{"drawable":["fighter","card"]},"judgments":[{"name":"down","args":["fighter"]},{"name":"in_hand","args":["card"]},{"name":"enemy","args":["fighter"]},{"name":"ally","args":["fighter"]},{"name":"target","args":["fighter"]},{"name":"picked","args":["fighter"]},{"name":"aimed","args":["fighter"]},{"name":"panel","args":["anchor","style"]},{"name":"caption","args":["anchor","word"]},{"name":"shows","args":["drawable","sprite"]},{"name":"in_anchor","args":["fighter","anchor"]},{"name":"prop_in","args":["card","anchor"]},{"name":"gauge","args":["anchor","fighter"]},{"name":"gauge_low","args":["fighter"]},{"name":"cue_sound","args":["cue","sound"]}],"state":[{"name":"in_zone","args":["card"],"type":"enum","values":["z_hand","z_spent"]},{"name":"is_strike","args":["card"],"type":"bool"},{"name":"is_bolt","args":["card"],"type":"bool"},{"name":"is_mend","args":["card"],"type":"bool"},{"name":"hostile","args":["fighter"],"type":"bool"},{"name":"alive","args":["fighter"],"type":"bool"},{"name":"hp","args":["fighter"],"type":"int"},{"name":"hp_max","args":["fighter"],"type":"int"},{"name":"energy","args":[],"type":"int"},{"name":"selected","args":["fighter"],"type":"bool"},{"name":"aiming","args":["fighter"],"type":"bool"},{"name":"showing","args":[],"type":"bool"}],"actions":[{"name":"strike","params":["card","fighter"]},{"name":"bolt","params":["card","fighter"]},{"name":"mend","params":["card","fighter"]},{"name":"end_turn","params":[]},{"name":"aim_gnoll","params":[]},{"name":"aim_imp","params":[]},{"name":"aim_you","params":[]}],"values":[{"name":"ax","args":["anchor"]},{"name":"ay","args":["anchor"]},{"name":"aw","args":["anchor"]},{"name":"ah","args":["anchor"]},{"name":"gauge_value","args":["fighter"]},{"name":"gauge_max","args":["fighter"]}]};
 
 // #159 exclusive groups, exactly as world_step checks them: a step admits at
 // most one member per (group, key). The builder below refuses the second at
@@ -165,21 +167,13 @@ export function open(M, src) {
     caption: (a0, a1) => { chk("anchor", a0); chk("word", a1);
       return VERDICT[api.query(s, id(`caption(${a0},${a1})`), 0)]; },
     /**
-     * @param {T_fighter} a0
+     * @param {string} a0
      * @param {T_sprite} a1
      * @returns {'undecided'|'proved'|'refuted'}
      */
 
-    shows: (a0, a1) => { chk("fighter", a0); chk("sprite", a1);
+    shows: (a0, a1) => { chk("drawable", a0); chk("sprite", a1);
       return VERDICT[api.query(s, id(`shows(${a0},${a1})`), 0)]; },
-    /**
-     * @param {T_card} a0
-     * @param {T_sprite} a1
-     * @returns {'undecided'|'proved'|'refuted'}
-     */
-
-    prop_shows: (a0, a1) => { chk("card", a0); chk("sprite", a1);
-      return VERDICT[api.query(s, id(`prop_shows(${a0},${a1})`), 0)]; },
     /**
      * @param {T_fighter} a0
      * @param {T_anchor} a1
@@ -405,21 +399,13 @@ export function open(M, src) {
     caption: (a0, a1) => { chk("anchor", a0); chk("word", a1);
       return `caption(${a0},${a1})`; },
     /**
-     * @param {T_fighter} a0
+     * @param {string} a0
      * @param {T_sprite} a1
      * @returns {string}
      */
 
-    shows: (a0, a1) => { chk("fighter", a0); chk("sprite", a1);
+    shows: (a0, a1) => { chk("drawable", a0); chk("sprite", a1);
       return `shows(${a0},${a1})`; },
-    /**
-     * @param {T_card} a0
-     * @param {T_sprite} a1
-     * @returns {string}
-     */
-
-    prop_shows: (a0, a1) => { chk("card", a0); chk("sprite", a1);
-      return `prop_shows(${a0},${a1})`; },
     /**
      * @param {T_fighter} a0
      * @param {T_anchor} a1
