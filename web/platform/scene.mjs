@@ -9,8 +9,10 @@
 //   ax/ay/aw/ah(anchor)      geometry, as derived VALUES (not stored facts)
 //   panel(anchor, style)     a box
 //   caption(anchor, word)    text; the ATOM IS THE LABEL (`w_the_cellar`)
-//   shows(actor, sprite)     an actor's sprite
-//   prop_shows(item, sprite) a prop's sprite
+//   shows(drawable, sprite)  anything's sprite — ONE predicate over a declared
+//                            cover (`sort drawable union actor, item`, #231),
+//                            not one per sort with the renderer taking the
+//                            union at read time
 //   in_anchor(actor, anchor) actors packed into a region
 //   prop_in(item, anchor)    props packed into a region
 //   held(item, actor)        ...or carried beside a holder
@@ -77,7 +79,16 @@ export function createScene(w, iface, doms) {
   /** Which declared domain a ground argument belongs to. Sorts hold entities;
    *  enums hold values. Telling them apart is what lets a menu reason about
    *  "something of the subject's own kind" without knowing any kind's name. */
-  const sortMap = new Map(Object.entries(doms).flatMap(([k, v]) => v.map((e) => [e, k])));
+  /* entity -> its BASE sort. A declared cover (#231) is an argument domain and
+   * so appears in `doms`, listing its members' entities again under its own
+   * name; a flat inversion would answer "drawable" for a fighter and the kin
+   * test below would stop telling a card from a person. The artifact marks a
+   * cover so this can skip it — the sort of a thing is where it was declared,
+   * never a set that merely admits it. */
+  const covers = new Set(Object.keys(iface.unions ?? {}));
+  const sortMap = new Map(Object.entries(doms)
+    .filter(([k]) => !covers.has(k))
+    .flatMap(([k, v]) => v.map((e) => [e, k])));
   const sortOf = (e) => sortMap.get(e) ?? null;
   const isEntity = (a) => sortMap.has(a);
 
@@ -216,15 +227,15 @@ export function createScene(w, iface, doms) {
       shaded: proved('shaded').map((t) => t[0]),
       gauges: proved('gauge'),
       slots, held, picked, aimed, menu,
-      sprite: (e) => {
-        const a = proved('shows').find((t) => t[0] === e);
-        const p = proved('prop_shows').find((t) => t[0] === e);
-        return spriteIndex((a ?? p ?? [])[1]);
-      },
+      sprite: (e) => spriteIndex((proved('shows').find((t) => t[0] === e) ?? [])[1]),
     };
-    // sprite lookup is per-entity and would re-enumerate; flatten it once
-    const spr = new Map([...proved('shows'), ...proved('prop_shows')]
-                        .map(([e, s]) => [e, spriteIndex(s)]));
+    // sprite lookup is per-entity and would re-enumerate; flatten it once.
+    // ONE read: a story declares `sort drawable union actor, item` and every
+    // drawable is one predicate (#231). This used to spread `shows` and
+    // `prop_shows` together, which was a game's ONTOLOGY SHAPE leaking into
+    // the renderer — worse than the game word §12 forbids, and it grew a term
+    // per drawable sort.
+    const spr = new Map([...proved('shows')].map(([e, s]) => [e, spriteIndex(s)]));
     model.sprite = (e) => (spr.has(e) ? spr.get(e) : -1);
     return model;
   }

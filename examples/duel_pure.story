@@ -21,6 +21,9 @@
 // primitive, and the rest was one game's furniture.
 
 sort fighter, card
+// Anything that appears on the table (#231) — a cover, so ONE `shows`
+// predicate carries every drawable rather than one per sort.
+sort drawable union fighter, card
 enum zone   { z_hand, z_spent }
 
 // ---- presentation vocabulary, kept deliberately identical where it fits ----
@@ -191,9 +194,9 @@ rule cap_hand:  showing => caption(a_hand, w_hand)
 rule spr_you:   showing => shows(you, s_you)
 rule spr_gnoll: showing => shows(gnoll, s_gnoll)
 rule spr_imp:   showing => shows(imp, s_imp)
-rule spr_str(C: card): is_strike(C) => prop_shows(C, s_strike)
-rule spr_blt(C: card): is_bolt(C)   => prop_shows(C, s_bolt)
-rule spr_mnd(C: card): is_mend(C)   => prop_shows(C, s_mend)
+rule spr_str(C: card): is_strike(C) => shows(C, s_strike)
+rule spr_blt(C: card): is_bolt(C)   => shows(C, s_bolt)
+rule spr_mnd(C: card): is_mend(C)   => shows(C, s_mend)
 
 // no containment: a fighter's place is a fact about which side it is on
 rule pin_foe(F: fighter):  hostile(F) & alive(F)  => in_anchor(F, a_foes)

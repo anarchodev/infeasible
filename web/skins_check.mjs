@@ -106,7 +106,7 @@ check('...and every standing foe hit back', world.state.hp('you') === 14,
 
 // ---- the measurement -------------------------------------------------------
 
-const BLESSED = ['panel', 'caption', 'shows', 'prop_shows', 'in_anchor', 'prop_in',
+const BLESSED = ['panel', 'caption', 'shows', 'in_anchor', 'prop_in',
                  'held', 'shaded', 'gauge', 'picked', 'aimed', 'here',
                  'cue_sound', 'cue_word'];
 const has = (iface, n) => iface.judgments.some((j) => j.name === n);

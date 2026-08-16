@@ -396,7 +396,17 @@ typedef struct {
      * ground domain whose "entities" are the enum's values, so enum-typed
      * arguments, rule variables, and membership ride the existing odometer.
      * Values are not entities: `entity x : <enum>` is rejected. */
-    struct { char name[MAX_NAME]; int line, col; bool is_domain; bool is_enum; } sorts[MAX_SORTS];
+    /* `is_union` (#231): a declared COVER over other sorts — `sort thing union
+     * actor, item`. Not `<:` inheritance: a cover admits its members' entities
+     * and adds none of its own, so "everything placed on the map" is one
+     * predicate instead of one per sort. Sealed at world-build, and members are
+     * base sorts, so an entity is in exactly one member and a cover's entities
+     * are the disjoint concatenation of theirs — which is what lets a cover
+     * position be `off[m] + ent_pos`, leaving `ent_pos` a single int per
+     * entity rather than one per (entity, sort). */
+    struct { char name[MAX_NAME]; int line, col; bool is_domain; bool is_enum;
+             bool is_union; int nmem; int mem[MAX_SORTS]; int off[MAX_SORTS]; }
+        sorts[MAX_SORTS];
     int nsorts;
     struct ent_rec { uint32_t atom; int sort; int line, col; } *ents;  /* heap, grown */
     int nents, capents;
@@ -695,9 +705,37 @@ static void parse_sort(parser *p)
         copy_ident(p->sorts[p->nsorts].name, MAX_NAME, p->cur);
         p->sorts[p->nsorts].line = p->cur.line;
         p->sorts[p->nsorts].col = p->cur.col;
+        p->sorts[p->nsorts].is_union = false;
+        p->sorts[p->nsorts].nmem = 0;
+        int self = p->nsorts;
         ln = p->cur.line;
         p->nsorts++;
         advance(p);
+        /* `sort thing union actor, item` (#231) — a declared COVER. Contextual,
+         * like `fact` and `exclusive`, so `union` stays a usable identifier.
+         * Members may be declared later in the file, so the names are stashed
+         * encoded and resolved once every sort is known. */
+        if (p->cur.kind == TK_IDENT && ident_is(p->cur, "union")) {
+            advance(p);
+            do {
+                if (p->cur.kind != TK_IDENT) {
+                    char d[64]; tok_desc(p->cur, d, sizeof d);
+                    fail(p, p->cur.line, p->cur.col,
+                         "expected a member sort name after `union`, found %s", d);
+                    return;
+                }
+                if (p->sorts[self].nmem >= MAX_SORTS) {
+                    fail(p, p->cur.line, p->cur.col, "too many union members");
+                    return;
+                }
+                p->sorts[self].mem[p->sorts[self].nmem++] =
+                    -(int)intern_tok(p, p->cur) - 2;
+                advance(p);
+            } while (p->cur.kind == TK_COMMA && (advance(p), true));
+            p->sorts[self].is_union = true;
+            ln = p->cur.line;
+            continue;                               /* a cover ends its clause */
+        }
         if (p->cur.kind == TK_COMMA) advance(p);    /* optional separator */
         /* The ungrouped form is ONE line: a name on the next line is the next
          * declaration, not another sort. Without this, `sort actor` followed by
@@ -2664,7 +2702,14 @@ static uint32_t domain_at(parser *p, int sort, int k)
 static int entity_pos(parser *p, int sort, uint32_t atom)
 {
     int i = find_entity(p, atom);
-    return (i >= 0 && p->ents[i].sort == sort) ? p->ent_pos[i] : -1;
+    if (i < 0) return -1;
+    if (p->ents[i].sort == sort) return p->ent_pos[i];
+    /* a cover position is the member's offset plus its position there (#231) */
+    if (sort >= 0 && sort < p->nsorts && p->sorts[sort].is_union)
+        for (int m = 0; m < p->sorts[sort].nmem; m++)
+            if (p->sorts[sort].mem[m] == p->ents[i].sort)
+                return p->sorts[sort].off[m] + p->ent_pos[i];
+    return -1;
 }
 
 static pred_info *find_pred(parser *p, uint32_t pred)
@@ -2808,6 +2853,66 @@ static void resolve_entities(parser *p)
             atom_map_set(&p->ent_of, &p->ent_of_cap, at, i);
     }
 
+    /* Resolve union members (#231), now that every sort is known. Members are
+     * BASE sorts: a cover of covers would make membership a graph walk and an
+     * entity's position ambiguous, and nothing needs it. */
+    for (int u = 0; u < p->nsorts; u++) {
+        if (!p->sorts[u].is_union) continue;
+        int keep = 0;
+        for (int i = 0; i < p->sorts[u].nmem; i++) {
+            uint32_t nm = (uint32_t)(-p->sorts[u].mem[i] - 2);
+            int m = find_sort(p, nm);
+            if (m < 0) {
+                serr(p, p->sorts[u].line, p->sorts[u].col,
+                     "sort '%s' unions the undeclared sort '%s'",
+                     p->sorts[u].name, intern_name(p->syms, nm));
+                continue;
+            }
+            if (m == u) {
+                serr(p, p->sorts[u].line, p->sorts[u].col,
+                     "sort '%s' cannot union itself", p->sorts[u].name);
+                continue;
+            }
+            if (p->sorts[m].is_union) {
+                serr(p, p->sorts[u].line, p->sorts[u].col,
+                     "sort '%s' unions '%s', which is itself a union — a cover "
+                     "covers base sorts, so that an entity has one member sort "
+                     "and one position in each cover (#231)",
+                     p->sorts[u].name, p->sorts[m].name);
+                continue;
+            }
+            if (p->sorts[m].is_domain || p->sorts[m].is_enum) {
+                serr(p, p->sorts[u].line, p->sorts[u].col,
+                     "sort '%s' unions '%s', which is %s — a cover is over "
+                     "entity sorts", p->sorts[u].name, p->sorts[m].name,
+                     p->sorts[m].is_domain ? "an opaque domain" : "an enum");
+                continue;
+            }
+            bool dup = false;
+            for (int j = 0; j < keep; j++) if (p->sorts[u].mem[j] == m) dup = true;
+            if (dup) {
+                serr(p, p->sorts[u].line, p->sorts[u].col,
+                     "sort '%s' names '%s' twice", p->sorts[u].name, p->sorts[m].name);
+                continue;
+            }
+            p->sorts[u].mem[keep++] = m;
+        }
+        p->sorts[u].nmem = keep;
+        if (keep == 0)
+            serr(p, p->sorts[u].line, p->sorts[u].col,
+                 "sort '%s' is a union with no members", p->sorts[u].name);
+    }
+    /* an entity may not be declared OF a cover: it belongs to a member, and the
+     * cover admits it — declaring one directly would give it no member sort */
+    for (int i = 0; i < p->nents; i++) {
+        int es = p->ents[i].sort;
+        if (es >= 0 && es < p->nsorts && p->sorts[es].is_union)
+            serr(p, p->ents[i].line, p->ents[i].col,
+                 "'%s' is declared of the union '%s' — declare it of a member "
+                 "sort; the cover admits it automatically (#231)",
+                 intern_name(p->syms, p->ents[i].atom), p->sorts[es].name);
+    }
+
     /* per-sort entity lists + each entity's position within its sort */
     for (int s = 0; s < p->nsorts; s++) p->domain_n[s] = 0;
     for (int i = 0; i < p->nents; i++)
@@ -2824,7 +2929,32 @@ static void resolve_entities(parser *p)
         p->ent_pos[i] = fill[s];
         p->domain_ents[s][fill[s]++] = p->ents[i].atom;
     }
+
+    /* A cover's entities are its members' concatenated, in member-declaration
+     * order — so a cover position is `off[m] + ent_pos`, and `ent_pos` stays
+     * one int per entity rather than one per (entity, sort). Members are base
+     * sorts and an entity has one, so the concatenation is disjoint and needs
+     * no dedup. */
+    for (int u = 0; u < p->nsorts; u++) {
+        if (!p->sorts[u].is_union) continue;
+        int total = 0;
+        for (int i = 0; i < p->sorts[u].nmem; i++) {
+            p->sorts[u].off[i] = total;
+            total += p->domain_n[p->sorts[u].mem[i]];
+        }
+        p->domain_n[u] = total;
+        free(p->domain_ents[u]);
+        p->domain_ents[u] = malloc((size_t)(total ? total : 1)
+                                   * sizeof *p->domain_ents[u]);
+        for (int i = 0; i < p->sorts[u].nmem; i++) {
+            int m = p->sorts[u].mem[i];
+            for (int k = 0; k < p->domain_n[m]; k++)
+                p->domain_ents[u][p->sorts[u].off[i] + k] = p->domain_ents[m][k];
+        }
+    }
 }
+
+static bool sort_admits(parser *p, int want, int got);
 
 /* Build the predicate registry: fluents (with arg sorts) plus rule heads. */
 static void build_pred_registry(parser *p)
@@ -3059,6 +3189,8 @@ static void defer_head_read(parser *p, const pred_info *pi, int k, int got,
  * inside effect expressions. `is_read` distinguishes a position that CONSULTS
  * the predicate from one that concludes or writes it — only a read defers a
  * judgment's sort check (#217); a conclusion IS the signature (#205). */
+static bool sort_admits(parser *p, int want, int got);
+
 static void check_pred_args(parser *p, uint32_t pred, pred_info *pi,
                             const ast_arg *args, int nargs,
                             var_bind *vars, int nvars, bool is_read,
@@ -3096,7 +3228,7 @@ static void check_pred_args(parser *p, uint32_t pred, pred_info *pi,
                 serr(p, arg->line, arg->col,
                      "argument %d of '%s' expects an integer but got '%s'",
                      k + 1, intern_name(p->syms, pred), intern_name(p->syms, arg->name));
-            else if (want >= 0 && got >= 0 && want != got)
+            else if (want >= 0 && got >= 0 && !sort_admits(p, want, got))
                 serr(p, arg->line, arg->col,
                      "argument %d of '%s' expects sort '%s' but got '%s'",
                      k + 1, intern_name(p->syms, pred),
@@ -6023,27 +6155,60 @@ static void infer_head_sorts(parser *p)
                 pi->headsort[k] = s;
                 pi->headrule[k] = i;
             } else if (pi->headsort[k] != s) {
+                /* #231: two rules concluding at different sorts pin the COVER
+                 * when one is declared over both — the join in the cover
+                 * lattice. `shows(hero, …)` and `shows(key, …)` under a
+                 * `drawable union actor, item` are one predicate, which is the
+                 * whole point of a cover. Ambiguity is refused rather than
+                 * guessed: two covers admitting both leaves no least answer. */
+                int join = -1, njoin = 0;
+                for (int u = 0; u < p->nsorts; u++)
+                    if (p->sorts[u].is_union &&
+                        sort_admits(p, u, s) && sort_admits(p, u, pi->headsort[k]))
+                        { join = u; njoin++; }
+                if (njoin == 1) { pi->headsort[k] = join; continue; }
                 ast_rule *first = &p->rules[pi->headrule[k]];
-                serr(p, r->head.args[k].line, r->head.args[k].col,
-                     "argument %d of '%s' is '%s' here but '%s' at line %d — a "
-                     "predicate has one signature; conclude the other sort "
-                     "under its own predicate",
-                     k + 1, intern_name(p->syms, r->head.pred),
-                     arg_sort_name(p, s), arg_sort_name(p, pi->headsort[k]),
-                     first->head.args[k].line);
+                if (njoin > 1)
+                    serr(p, r->head.args[k].line, r->head.args[k].col,
+                         "argument %d of '%s' is '%s' here and '%s' at line %d, "
+                         "and more than one union covers both — say which by "
+                         "declaring the signature",
+                         k + 1, intern_name(p->syms, r->head.pred),
+                         arg_sort_name(p, s), arg_sort_name(p, pi->headsort[k]),
+                         first->head.args[k].line);
+                else
+                    serr(p, r->head.args[k].line, r->head.args[k].col,
+                         "argument %d of '%s' is '%s' here but '%s' at line %d — a "
+                         "predicate has one signature; conclude the other sort "
+                         "under its own predicate, or declare a union covering "
+                         "both (`sort <name> union %s, %s`)",
+                         k + 1, intern_name(p->syms, r->head.pred),
+                         arg_sort_name(p, s), arg_sort_name(p, pi->headsort[k]),
+                         first->head.args[k].line,
+                         arg_sort_name(p, pi->headsort[k]), arg_sort_name(p, s));
             }
         }
     }
 }
 
 /* Does an argument of sort `got` satisfy a signature position of sort `want`?
- * One predicate rather than an `==` at each site, because sort union (a cover:
- * `union drawable = actor | item`) makes admission a question with a real
- * answer — "is `got` covered by `want`" — and this is the place it grows. */
+ * One predicate rather than an `==` at each site, because sort union (#231) —
+ * a declared COVER, `sort thing union actor, item` — makes admission a
+ * question with a real answer: is `got` one of `want`'s members?
+ *
+ * A cover is not `<:` inheritance. It admits its members' entities and adds
+ * none of its own, so it is exactly the "everything placed on the map" case
+ * that otherwise needs one predicate per sort. Members are base sorts, so an
+ * entity belongs to exactly one, and admission is a flat membership test
+ * rather than a lattice walk. */
 static bool sort_admits(parser *p, int want, int got)
 {
-    (void)p;
-    return want == got;
+    if (want == got) return true;
+    if (want < 0 || want >= p->nsorts || got < 0) return false;
+    if (!p->sorts[want].is_union) return false;
+    for (int i = 0; i < p->sorts[want].nmem; i++)
+        if (p->sorts[want].mem[i] == got) return true;
+    return false;
 }
 
 /* #217: settle the judgment reads parked by `check_pred_args`, now that every
@@ -11146,7 +11311,22 @@ static char *harvest_iface(parser *p)
         sb_raw(&s, "{ ");
         sb_kv(&s, "name", p->sorts[i].name);
         sb_raw(&s, ", ");
-        sb_kv(&s, "kind", p->sorts[i].is_domain ? "domain" : "sort");
+        /* A COVER is published as its own kind, with its members (#231). It
+         * must not read as a plain sort: a client that builds "entity -> its
+         * sort" from these lists would find every covered entity under two
+         * names and answer whichever it saw last. Members are named so a
+         * client can still resolve the cover, and the entity list is emitted
+         * as usual so `w.lit.*` can spell atoms over cover-typed predicates. */
+        sb_kv(&s, "kind", p->sorts[i].is_domain ? "domain"
+                          : p->sorts[i].is_union ? "union" : "sort");
+        if (p->sorts[i].is_union) {
+            sb_raw(&s, ", \"members\": [");
+            for (int m = 0; m < p->sorts[i].nmem; m++) {
+                if (m) sb_raw(&s, ", ");
+                sb_str(&s, p->sorts[p->sorts[i].mem[m]].name);
+            }
+            sb_raw(&s, "]");
+        }
         if (!p->sorts[i].is_domain) {
             sb_raw(&s, ", \"entities\": [");
             for (int e = 0; e < p->domain_n[i]; e++) {
