@@ -14,8 +14,9 @@
 //   P3 Faerie Fire   ✓ mechanism CLOSED — relational base fluents + primed
 //                       retract ramification, live below. #76 remains open
 //                       for the sugared set-retract-with-provenance form.
-//   P4 duration      ✓ DECIDED (#7) — no time primitive; host turn-counters,
-//                       or an engine-side countdown (reaction5e's cleanup).
+//   P4 duration      ✓ DECIDED (#7) — no time primitive, and no host counter
+//                       either (#253): the countdown is a fluent and TIME
+//                       ADVANCES BY AN ACTION, so it is in the log.
 //   P5 the save roll  ✓ RESOLVED — but the original verdict was REVERSED:
 //                       randomness lives INSIDE the engine as a seeded
 //                       keyed lookup (§5.10), not above it. The host supplies
@@ -212,11 +213,37 @@ rule end_ff(C: actor, T: actor):
 // P4 — DURATION.  Shield lasts "until your next turn"; Faerie Fire "1 minute."
 // ===========================================================================
 //
-// ✓ DECIDED (#7): no time primitive, by design (I4). "Time" is turns, and
-// turns are host-driven — a host-tracked counter plus an ordinary retract
-// ramification. reaction5e.story shows the fully engine-side variant: a
-// countdown fluent decremented by a cleanup-phase ramification
-// (`bless_left -= 1`, expiry clears the mark), no host bookkeeping at all.
+// ✓ DECIDED (#7): no time primitive, by design (I4). This verdict used to
+// offer two routes — "a host-tracked counter, or the fully engine-side
+// countdown reaction5e shows". The first is gone with the per-game host
+// (#253), and it was the weaker one anyway: a counter outside the world is
+// state replay cannot reproduce, exactly like the wall of fire P7 had to
+// stop keeping in the host.
+//
+// So: a duration is a COUNTDOWN FLUENT, and time advances by an ACTION —
+// which puts it in the log and makes I2 do the work. The unit is the round,
+// because 5e's is: six seconds. A book duration converts once, in the story,
+// where a remixer can see the arithmetic:
+//
+//     enum span { round, minute, hour }
+//     value ticks(span) : int
+//     rule t_r: => ticks(round) = 1        // 6s
+//     rule t_m: => ticks(minute) = 10      // 60s / 6s
+//     rule t_h: => ticks(hour) = 600
+//
+//     action pass(D: span):
+//         causes for each X: actor where blessed(X) : bless_left(X) -= ticks(D)
+//
+// One action moves every clock in the world together, and the span is an
+// argument — so "rest an hour" is one step rather than six hundred, which is
+// what walking around a dungeon needs. An action argument cannot carry a
+// NUMBER, so the span is an enum and the amount is a lookup row (#94); that
+// is also better content, since "an hour is 600 rounds" is then a line rather
+// than a magic number at a call site.
+//
+// Expiry uses the PRIMED read (#87): `bless_left(X)' <= 0` clears the mark in
+// the same tick the clock runs out, where the unprimed guard would leave the
+// spell up for one more step.
 
 // ===========================================================================
 // P5 — THE SAVE ROLL.  Where does randomness enter without breaking I4?
