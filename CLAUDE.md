@@ -4,16 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`infeasible` is a narrative game engine in C where **the world is a logic database**. One non-monotonic logic (propositional *defeasible logic*) serves as the single semantics for both *what is true* (stats, judgments) and *what happens next* (state transitions via defeasible inertia). Worlds are authored in a `.story` surface language that grounds to a vocabulary-checked C world; a Canvas2D web client (WASM engine + JS host) handles presentation.
+`infeasible` is a narrative game engine in C where **the world is a logic database**. One non-monotonic logic (propositional *defeasible logic*) serves as the single semantics for both *what is true* (stats, judgments) and *what happens next* (state transitions via defeasible inertia). Worlds are authored in a `.story` surface language that grounds to a vocabulary-checked C world; presentation is a **native runtime** over the §12 frozen op set (`src/platform/`, `src/runtime/`), with the Canvas2D web client in `web/` as a second backend under the same interface.
 
 **A narrative/dialogue layer is out of scope** (DESIGN.md §2). Games are built as host code against the `world_*` surface (the typed JS/C binding of §6.3). Do not add narrative concepts — knots, choices, diverts, a dialogue VM — to the design or code; a narrative front end, if ever built, is a client above the `world_*` surface, not part of the engine.
 
-**Read `DESIGN.md` before non-trivial work** — it is the source of truth for semantics, invariants, and the milestone plan (§11). Current state: the logic engine, step function, and golden tests are in place; the **M1 `.story` compiler** (`src/lang/`: lexer → recursive-descent parse → build-time grounder) is live and growing slice by slice (typed vars over declared sorts, multi-valued and numeric fluents, providers, ramifications, set-quantified effect binders, burst cues). Every file in `examples/` compiles zero-diagnostic, pinned by `test_examples`; ten of them additionally have their *semantics* pinned (`test_prov`, `test_spatial`, `test_reaction`, `test_binder`, `test_taxprobe`, `test_probe5e`, `test_emit`, `test_secondclient`). Add a new example to `test_examples`' list — the list is explicit so that a file outside the net is a deliberate omission rather than an oversight. Presentation is **M2** and lives entirely in `web/`: a WASM build of the core driven from JS, the §12 **frozen presentation interface** (`web/platform/`), and the playable cellar cart (`web/carts/cellar.mjs` over `examples/cellar_play.story`). The §6.3 **interface artifact** is live: `story_compile_iface` emits the declared vocabulary (and the ground-atom spelling) as JSON, `web/gen_binding.mjs` turns it into a typed ES-module host binding with JSDoc types and a source hash, and `web/host.mjs` drives the cellar through it. `test_iface` pins the artifact — above all the ROUND TRIP: spell every ground atom the way the artifact says and the engine must have it, since a drift there is exactly the silent always-false bug the artifact exists to end.
+**Read `DESIGN.md` before non-trivial work** — it is the source of truth for semantics, invariants, and the milestone plan (§11). Current state: the logic engine, step function, and golden tests are in place; the **M1 `.story` compiler** (`src/lang/`: lexer → recursive-descent parse → build-time grounder) is live and growing slice by slice (typed vars over declared sorts, multi-valued and numeric fluents, providers, ramifications, set-quantified effect binders, burst cues). Every file in `examples/` compiles zero-diagnostic, pinned by `test_examples`; ten of them additionally have their *semantics* pinned (`test_prov`, `test_spatial`, `test_reaction`, `test_binder`, `test_taxprobe`, `test_probe5e`, `test_emit`, `test_secondclient`). Add a new example to `test_examples`' list — the list is explicit so that a file outside the net is a deliberate omission rather than an oversight. Presentation is **M2**. The §12 **frozen presentation interface** now has two implementations: `src/platform/` (native, with the `headless` backend and the `src/runtime/` loop) and `web/` (a WASM build of the core driven from JS, plus the playable cellar cart `web/carts/cellar.mjs` over `examples/cellar_play.story`). `test_platform` compares the two spellings of the freeze name by name. The §6.3 **interface artifact** is live: `story_compile_iface` emits the declared vocabulary (and the ground-atom spelling) as JSON, `web/gen_binding.mjs` turns it into a typed ES-module host binding with JSDoc types and a source hash, and `web/host.mjs` drives the cellar through it. `test_iface` pins the artifact — above all the ROUND TRIP: spell every ground atom the way the artifact says and the engine must have it, since a drift there is exactly the silent always-false bug the artifact exists to end.
 
 ## Build & test
 
 ```sh
-# Core + tests — no display needed. This is the whole native build (no renderer).
+# Core + tests — no display needed. This is the whole native build.
 cmake -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
@@ -41,7 +41,7 @@ valgrind -q --track-origins=yes --error-exitcode=99 ./build/test_foo
 
 UBSan's `bool`/`enum` checks catch an uninitialised load only when the garbage byte is out of range — a byte that lands on 0 or 1 is a valid `bool` and passes while the program still depends on it. Memcheck catches it every time, and `--track-origins` names the ALLOCATION site rather than the read, which is where the fix goes. It found the #94 row-cap bug in both pure carts on its first run.
 
-Default build type is `Debug`; core compiles with `-Wall -Wextra` under **C17**. There is **no native renderer**. The WASM/JS boundary is a separate build, not part of the CMake project:
+Default build type is `Debug`; core compiles with `-Wall -Wextra` under **C17**. The native build carries the platform tier but **no display backend yet** — `headless` implements every frozen op and draws nothing, so nothing in CMake needs a window. The WASM/JS boundary is a separate build, not part of the CMake project:
 
 ```sh
 scripts/build_wasm.sh   # bootstraps a repo-local pinned emsdk, emits build-wasm/ (git-ignored)
@@ -64,12 +64,15 @@ src/logic/   defeasible engine: theory, solve, why      (deps: core)
 src/state/   fact store, step function, inertia gen      (deps: core, logic)
 src/lang/    .story compiler: lexer → parse → grounder    (deps: core, state)
 src/lsp/     native .story language server (JSON-RPC/stdio)  (deps: core, lang)
+src/stock/   the platform's provider library: the grid, two topologies (deps: core, state)
+src/platform/ the §12 frozen presentation interface + headless backend (deps: core)
+src/runtime/ the loop: cart + platform + world, save = action log (deps: core, state, platform)
 src/wasm/    emcc-only JS↔C shim over world_* (not in CMake)
 tests/       golden semantic tests + benchmarks (ctest)
-web/         the client: WASM build, typed binding, §12 platform, carts (no CMake)
+web/         the browser client: WASM build, typed binding, §12 platform, carts (no CMake)
 ```
 
-`core`, `logic`, `state`, `lang`, and `lsp` link into one static lib `infeasible_core`; tests link against it. The `story-lsp` binary (`src/lsp/main.c`) links that lib — a shipped executable, not a test. `src/wasm/bindings.c` compiles **only** under `emcc` (see `scripts/build_wasm.sh`) — it is not part of the CMake library. There is no native renderer tier — the shipped presentation is a web client over a WASM build.
+Every `src/` tier above links into one static lib `infeasible_core`; tests link against it. The `story-lsp` binary (`src/lsp/main.c`) links that lib — a shipped executable, not a test. `src/wasm/bindings.c` compiles **only** under `emcc` (see `scripts/build_wasm.sh`) — it is not part of the CMake library. **The shipped product is a native runtime** (§12): `src/platform/` + `src/runtime/` are that runtime's presentation tier, and the browser client in `web/` is a backend under the same frozen interface. No DISPLAY backend exists natively yet — `headless` implements every frozen op and draws nothing — so `web/` is still the only thing that puts pixels on a screen.
 
 ### The logic engine (`src/logic/dl.h`)
 
@@ -107,7 +110,15 @@ A native LSP for `.story` (DESIGN.md §6.1 item 7), JSON-RPC 2.0 over stdio. It 
 
 A thin **VS Code client** lives in `editors/vscode/` (buildless CommonJS, matching the repo's no-build-step JS ethos — not in CMake): it only spawns `story-lsp` over stdio via `vscode-languageclient` and contributes the `.story` file association, comment/bracket config, and a TextMate grammar. Any language logic belongs in the server, so every editor benefits — the shim stays dumb. `npm install` + F5 to run (see its README). Positions are UTF-16 code units (the LSP default): the model/compiler produce byte columns, converted at the protocol boundary against the document text (`write_range` outgoing, `nav_target` incoming) — a no-op for ASCII, which the whole `.story` identifier grammar is. The span model is **cached per document**: one compile per edit in `refresh` (which produces both the published diagnostics and the cached model), reused by every navigation request until a didChange invalidates it — not a recompile per request. **Next:** effect-expr-tree traversal in the harvest (roll/fn-call guard reads), incremental document sync.
 
-### The client (`web/`)
+### The native runtime (`src/platform/`, `src/runtime/`)
+
+The §12 presentation interface, in C, and the loop over it. `spec.c` is the freeze as data — the op names (each carrying the OFFSET of its `plat_backend` slot, so the presence check walks a list rather than a hand-written sequence of NULL tests), the palette, the blessed resolutions, the two text cells, the key set as an index space (a tick's keyboard is one `uint64`, and edge detection is an AND-NOT), and the letterbox arithmetic **with its inverse**. `platform.c` assembles the cart-facing surfaces over a backend: draw validates and forwards, while input sampling, edge detection and focus navigation live below the line because they are what every cart would otherwise reimplement slightly differently. `headless.c` is a backend that records ops as text instead of drawing them — the honest second implementation, since a backend that implements every op with no drawing at all cannot accidentally depend on a display. There is no display backend yet.
+
+`runtime.c` is the two clocks: a TICK is one `world_step` with input sampled once at its boundary (I4), a FRAME is a repaint that can never change a fact, and the runtime never reads a clock — a driver decides when to step, which is the seat a network schedule takes for lockstep. The cart PROPOSES and the source DISPOSES: live, the proposal is what happens; replaying, the log decides and the proposal is discarded, which is what makes `rt_save` a save rather than a recording. The written form is the one `examples/cellar_play.log` uses, so a save this runtime writes is a save the other clients read — and `test_platform` closes that loop by replaying the log the browser cart produced by clicking and landing in the world `test_secondclient` asserts.
+
+**The freeze now has two spellings, so `test_platform` compares them.** `web/platform/spec.mjs` and `src/platform/spec.c` are different languages in different builds and neither is generated from the other, so the test reads the `.mjs` and checks it name by name — ops, keys, nav dirs, palette bytes, glyph metrics, cartdata size. Add an op on one side only and it fails there. That mechanical check is what keeps "frozen" a property of the code.
+
+### The browser client (`web/`)
 
 Not in CMake, no build step to run or remix. `exports.c` (under `emcc`) is the flat `inf_*` boundary; `gen_binding.mjs` reads the §6.3 interface artifact and emits the typed `*.binding.mjs` — including `w.lit.*`, the artifact's own ground-atom spelling, so `subscribe`/`why`/`receipt` never take a hand-typed atom. Generated bindings are **committed**: they are source-shaped, not build output, and a stale one refuses to open its story (source hash).
 
