@@ -25,6 +25,11 @@ bands stat_stack: base < condition < feat < immunity
 // ---- state ----
 
 state (
+    // positions the stock grid reads (#255): ordinary numeric fluents, so
+    // moving is an ordinary effect and the library needs no host beside it
+    grid_x(actor) : int in 0 .. 64
+    grid_y(actor) : int in 0 .. 64
+    grid_blocks(actor)                  // read by the library's LoS walk
     hp(actor)     : int in 0 .. hp_max(actor)
         // declared range = the outermost clamp stage (§5.8): "any leftover
         // damage is lost" (PHB) is schema, not a rule anyone can forget.
@@ -44,6 +49,8 @@ state (
 )
 
 init (
+    grid_x(aria)=1  grid_y(aria)=1      // adjacent to grunk, and in line of sight
+    grid_x(grunk)=2 grid_y(grunk)=1
     elf(aria)              monster(grunk)
     hp_max(aria) = 20      hp(aria) = 20
     hp_max(grunk) = 7      hp(grunk) = 7
@@ -51,10 +58,12 @@ init (
     holding(grunk, shortbow)
 )
 
-// spatial guards are provider-answered, never enumerated (§5.6)
+// Spatial guards come from the STOCK GRID (§5.6, #255) — the square-grid
+// library shipped with the engine, so this file needs no host code of its own.
+// Positions are ordinary numeric fluents the library reads by entity.
 provider (
-    adjacent(actor, actor)
-    los(actor, actor)
+    grid_adjacent(actor, actor)
+    grid_los(actor, actor)
 )
 
 // ---- speed: a DERIVED value (#82) ----
@@ -115,24 +124,24 @@ rule goblin_flees(X: actor): monster(X) & bloodied(X) => wants_flee(X)
 // ---- actions: the only mutation (I2); effects ride the pipeline (§5.8) ----
 
 action sword_strike(X: actor, Y: actor):
-    requires holding(X, longsword) & adjacent(X, Y)
+    requires holding(X, longsword) & grid_adjacent(X, Y)
     causes   hp(Y) -= 6
 
 action arrow_shot(X: actor, Y: actor):
-    requires holding(X, shortbow) & los(X, Y)
+    requires holding(X, shortbow) & grid_los(X, Y)
     causes   hp(Y) -= 4
     // both land on one tick? deltas SUM, order-free, and the trace is a
     // receipt: hp'(grunk) = 7 - 6 - 4 -> clamped to 0 by the declared range
 
 action power_word_heal(X: actor, Y: actor):
-    requires adjacent(X, Y)
+    requires grid_adjacent(X, Y)
     causes   hp(Y) := hp_max(Y)
     // `:=` is the pipeline's base stage; undefeated deltas still apply:
     // full heal while something deals 4 that tick -> hp_max - 4. Pipeline:
     // base (:=) -> Σ deltas -> clamp. Never an order among rules.
 
 action cast_sleep(X: actor, Y: actor):
-    requires los(X, Y)
+    requires grid_los(X, Y)
     causes   slept(Y)
 
 // ---- ramifications: the dying trigger, stratified (§5.8 / #87) ----
@@ -153,7 +162,7 @@ rule death_drop(X: actor, T: item):
 // No narrative layer (DESIGN.md §2). The combat loop is ordinary host code
 // against the world_* surface (§6.3): each turn it reads judgments and
 // offers the legal actions, e.g.
-//   adjacent(aria, grunk) -> offer sword_strike(aria, grunk)
+//   grid_adjacent(aria, grunk) -> offer sword_strike(aria, grunk)
 //   wants_flee(grunk)     -> the goblin's own intent judgment; the driver
 //                            may act on it without player input
 //   dead(grunk)           -> end the encounter

@@ -14,8 +14,9 @@
 //   P3 Faerie Fire   ✓ mechanism CLOSED — relational base fluents + primed
 //                       retract ramification, live below. #76 remains open
 //                       for the sugared set-retract-with-provenance form.
-//   P4 duration      ✓ DECIDED (#7) — no time primitive; host turn-counters,
-//                       or an engine-side countdown (reaction5e's cleanup).
+//   P4 duration      ✓ DECIDED (#7) — no time primitive, and no host counter
+//                       either (#253): the countdown is a fluent and TIME
+//                       ADVANCES BY AN ACTION, so it is in the log.
 //   P5 the save roll  ✓ RESOLVED — but the original verdict was REVERSED:
 //                       randomness lives INSIDE the engine as a seeded
 //                       keyed lookup (§5.10), not above it. The host supplies
@@ -27,6 +28,8 @@
 scene arena
 
 sort actor, item
+sort cell                                // a place a spell can be aimed at
+sort placed union actor, cell            // anything with a position (#231)
 
 enum spell { faerie_fire, fireball }    // was ⟂ GAP(minor): closed by `enum`
                                         // as a first-class value domain (#95/#96)
@@ -36,10 +39,16 @@ entity (
     grik, gnok, gob : actor         // three goblins, clustered — the AoE fodder
     thorn           : actor         // an ally fighter, also in blast range
 )
+entity ( c_pack, c_far : cell )     // the places the spells below are aimed at
 
 // ---- state -----------------------------------------------------------------
 
 state (
+    // positions the stock grid reads (#255); movement would be an ordinary
+    // effect on these, and the library needs no host beside them
+    grid_x(placed) : int in 0 .. 64
+    grid_y(placed) : int in 0 .. 64
+    grid_blocks(actor)
     hp(actor)     : int in 0 .. hp_max(actor)
     hp_max(actor) : int
     acb(actor)    : int             // armor class, base (the `ac` value layers on it)
@@ -62,16 +71,23 @@ state (
                                     // form the original probe asked for
 )
 
-provider (
-    in_blast(actor)                 // host-answered from at(·) geometry (§5.6).
-        // The original probe wanted `in_radius(actor, point, int)` and flagged
-        // `point` as a missing value type. RESOLVED BY DESIGN, not by a type:
-        // space is providers (§5.6) — the point and radius are the HOST's
-        // geometry, behind the provider seam; the logic only asks membership.
-    adjacent(actor, actor)
-)
+// The stock square grid (#255) answers both. The original probe asked for
+// `in_radius(actor, point, int)` and flagged `point` as a missing value type;
+// the answer recorded here used to be "resolved by design, not by a type — the
+// point and radius are the HOST's geometry behind a provider". That is no
+// longer the answer, and the probe's original ask is now GRANTED: the point is
+// a cell entity, and the radius is a threshold the story writes on a
+// measurement the library returns.
+provider grid_adjacent(actor, actor)
+function grid_chebyshev(placed, placed) : int
 
 init (
+    // the goblins clustered around c_pack, thorn caught with them, vera clear
+    grid_x(vera)=0  grid_y(vera)=0
+    grid_x(grik)=10 grid_y(grik)=10   grid_x(gnok)=11 grid_y(gnok)=10
+    grid_x(gob)=10  grid_y(gob)=11    grid_x(thorn)=12 grid_y(thorn)=10
+    grid_x(c_pack)=10 grid_y(c_pack)=10
+    grid_x(c_far)=40  grid_y(c_far)=40
     hp_max(vera) = 22   hp(vera) = 22   acb(vera) = 12   slots3(vera) = 2
     hp_max(thorn) = 30  hp(thorn) = 30  acb(thorn) = 18
     hp_max(grik) = 7    hp(grik) = 7    acb(grik) = 15   monster(grik)
@@ -110,15 +126,18 @@ rule saved(T: actor):       save_d20(T) + 2 >= 15  => saved(T)
 rule save_failed(T: actor): save_d20(T) + 2 < 15   => save_failed(T)
     // flat +2 DEX vs DC 15 for brevity; per-actor mods are one more fluent
 
-action fireball(C: actor):
+// A 20-foot radius is 4 squares on a 5-foot grid. That number lives HERE,
+// where a remixer can change it, rather than inside a provider that would
+// have answered yes or no and accounted for nothing.
+action fireball(C: actor, P: cell):
     requires slots3(C) >= 1
     causes   slots3(C) -= 1
-           & for each T: actor where in_blast(T): {
+           & for each T: actor where grid_chebyshev(T, P) <= 4: {
                  hp(T) -= fire_dmg(T)      when save_failed(T) ,  // full
                  hp(T) -= fire_dmg(T) / 2  when saved(T)          // half
              }
 
-// friendly-fire falls out for free: thorn is in `in_blast` too, so the same
+// friendly-fire falls out for free: thorn is inside the radius too, so the same
 // binder hits an ally. No special case — desirable, and a point in favor of
 // the binder over any "target the enemies" sugar.
 
@@ -152,10 +171,10 @@ rule ac_shielded(X: actor): shielded(X) => ac(X) = prior + 5
 // fine, the binder marks (caster, target) pairs at cast, and a primed
 // ramification retracts exactly this caster's set when concentration ends.
 
-action cast_faerie_fire(C: actor):
+action cast_faerie_fire(C: actor, P: cell):
     requires slots3(C) >= 1 & ~concentrating(C)
     causes   slots3(C) -= 1 & concentrating(C) & conc_spell(C) = faerie_fire
-           & for each T: actor where in_blast(T) & monster(T):
+           & for each T: actor where grid_chebyshev(T, P) <= 4 & monster(T):
                  faerie_fire_by(C, T)
 
 // the mark is a PROJECTION of the relation (I1) — never stored, so two
@@ -194,11 +213,37 @@ rule end_ff(C: actor, T: actor):
 // P4 — DURATION.  Shield lasts "until your next turn"; Faerie Fire "1 minute."
 // ===========================================================================
 //
-// ✓ DECIDED (#7): no time primitive, by design (I4). "Time" is turns, and
-// turns are host-driven — a host-tracked counter plus an ordinary retract
-// ramification. reaction5e.story shows the fully engine-side variant: a
-// countdown fluent decremented by a cleanup-phase ramification
-// (`bless_left -= 1`, expiry clears the mark), no host bookkeeping at all.
+// ✓ DECIDED (#7): no time primitive, by design (I4). This verdict used to
+// offer two routes — "a host-tracked counter, or the fully engine-side
+// countdown reaction5e shows". The first is gone with the per-game host
+// (#253), and it was the weaker one anyway: a counter outside the world is
+// state replay cannot reproduce, exactly like the wall of fire P7 had to
+// stop keeping in the host.
+//
+// So: a duration is a COUNTDOWN FLUENT, and time advances by an ACTION —
+// which puts it in the log and makes I2 do the work. The unit is the round,
+// because 5e's is: six seconds. A book duration converts once, in the story,
+// where a remixer can see the arithmetic:
+//
+//     enum span { round, minute, hour }
+//     value ticks(span) : int
+//     rule t_r: => ticks(round) = 1        // 6s
+//     rule t_m: => ticks(minute) = 10      // 60s / 6s
+//     rule t_h: => ticks(hour) = 600
+//
+//     action pass(D: span):
+//         causes for each X: actor where blessed(X) : bless_left(X) -= ticks(D)
+//
+// One action moves every clock in the world together, and the span is an
+// argument — so "rest an hour" is one step rather than six hundred, which is
+// what walking around a dungeon needs. An action argument cannot carry a
+// NUMBER, so the span is an enum and the amount is a lookup row (#94); that
+// is also better content, since "an hour is 600 rounds" is then a line rather
+// than a magic number at a call site.
+//
+// Expiry uses the PRIMED read (#87): `bless_left(X)' <= 0` clears the mark in
+// the same tick the clock runs out, where the unprimed guard would leave the
+// spell up for one more step.
 
 // ===========================================================================
 // P5 — THE SAVE ROLL.  Where does randomness enter without breaking I4?

@@ -7,11 +7,16 @@
 
 sort actor
 
-provider adjacent(actor, actor)          // answered host-side from positions
+// The stock grid answers adjacency (§5.6, #255): no host code here either.
+provider grid_adjacent(actor, actor)          // answered host-side from positions
 
 entity ( aria, grunk, snik : actor )
 
 state (
+    // positions the stock grid reads (#255) — no host code in this file
+    grid_x(actor) : int in 0 .. 64
+    grid_y(actor) : int in 0 .. 64
+    grid_blocks(actor)
     hp(actor)  : int in 0 .. 40
     ac(actor)  : int
     atk(actor) : int                     // attack bonus (to-hit)
@@ -20,6 +25,9 @@ state (
 )
 
 init (
+    grid_x(aria)=1  grid_y(aria)=1      // aria and grunk toe to toe;
+    grid_x(grunk)=2 grid_y(grunk)=1     // snik hangs back out of reach
+    grid_x(snik)=6  grid_y(snik)=1
     hp(aria)=24  ac(aria)=16  atk(aria)=5  dmg(aria)=3     // elf fighter
     hp(grunk)=7  ac(grunk)=15 atk(grunk)=4 dmg(grunk)=2     // goblin
     hp(snik)=7   ac(snik)=15  atk(snik)=4  dmg(snik)=2      // goblin
@@ -29,7 +37,7 @@ init (
 rule down(X: actor): hp(X) <= 0 -> down(X)
 
 // 5e: a melee attack against a prone creature has advantage
-rule advantage(A: actor, T: actor): adjacent(A, T) & prone(T) => advantage(A, T)
+rule advantage(A: actor, T: actor): grid_adjacent(A, T) & prone(T) => advantage(A, T)
 
 // to-hit — the d20 rolled INSIDE the guard. Advantage is modelled the clean
 // defeasible way: a SECOND independent d20 that also concludes `hit`, gated by
@@ -47,10 +55,10 @@ rule hit_adv(A: actor, T: actor):
 // rolled engine-side. A miss = the requires fails = no damage (the step still
 // commits — the turn is spent).
 action strike(A: actor, T: actor):
-    requires adjacent(A, T) & hit(A, T)
+    requires grid_adjacent(A, T) & hit(A, T)
     causes   hp(T) -= roll(6) + dmg(A)
 
 // knock a target prone — sets up advantage for the next attacker
 action shove(A: actor, T: actor):
-    requires adjacent(A, T)
+    requires grid_adjacent(A, T)
     causes   prone(T)
