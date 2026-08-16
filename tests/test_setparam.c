@@ -48,7 +48,7 @@ static int test_save(void)
 {
     const char *src =
         "sort actor\n"
-        "provider in_blast(actor)\n"
+        "host provider in_blast(actor)\n"
         "entity ( vera, grik, gnok, thorn : actor )\n"
         "state ( hp(actor) : int in 0 .. 60 )\n"
         "init ( hp(grik)=14 hp(gnok)=14 hp(thorn)=30 )\n"

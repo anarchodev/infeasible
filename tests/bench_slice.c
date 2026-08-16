@@ -427,7 +427,7 @@ int main(int argc, char **argv)
     grid_w = 128 * sc;
     grid_h = 64 * sc;
     printf("bench_slice: %d units, %d ticks, %dx%d-cell map — "
-           "provider + columnar judge + columnar step\n",
+           "host provider + columnar judge + columnar step\n",
            n, nticks, grid_w, grid_h);
 
     tick_ms *times = malloc((size_t)nticks * sizeof *times);

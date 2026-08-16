@@ -58,7 +58,7 @@ static int test_directional_move(void)
     const char *src =
         "domain cell\n"
         "sort actor\n"
-        "function neighbor(cell, int) : cell\n"
+        "host function neighbor(cell, int) : cell\n"
         "entity ( hero : actor )\n"
         "state ( at(actor) : cell )\n"
         "action go_east(X: actor): causes at(X) := neighbor(at(X), 1)\n"
@@ -107,7 +107,7 @@ static int test_no_callback(void)
     const char *src =
         "domain cell\n"
         "sort actor\n"
-        "function neighbor(cell, int) : cell\n"
+        "host function neighbor(cell, int) : cell\n"
         "entity ( hero : actor )\n"
         "state ( at(actor) : cell )\n"
         "action go(X: actor): causes at(X) := neighbor(at(X), 1)\n";
@@ -152,47 +152,47 @@ static int test_errors(void)
 {
     /* a function returning a non-cell type can't be a cell `:=` RHS */
     if (expect_error_msg(
-            "domain cell\nsort actor\nfunction dist(cell) : int\n"
+            "domain cell\nsort actor\nhost function dist(cell) : int\n"
             "state ( at(actor):cell )\n"
             "action m(X:actor): causes at(X) := dist(at(X))\n",
             "returning that cell type"))
         return 1;
     /* arity mismatch at the call site */
     if (expect_error_msg(
-            "domain cell\nsort actor\nfunction neighbor(cell, int) : cell\n"
+            "domain cell\nsort actor\nhost function neighbor(cell, int) : cell\n"
             "state ( at(actor):cell )\n"
             "action m(X:actor): causes at(X) := neighbor(at(X))\n",
             "takes 2 arguments but 1 given"))
         return 1;
     /* arithmetic on a call result is still forbidden on an opaque cell handle */
     if (expect_error_msg(
-            "domain cell\nsort actor\nfunction neighbor(cell, int) : cell\n"
+            "domain cell\nsort actor\nhost function neighbor(cell, int) : cell\n"
             "state ( at(actor):cell )\n"
             "action m(X:actor): causes at(X) := neighbor(at(X), 1) + 1\n",
             "must copy another cell fluent"))
         return 1;
     /* an unknown return type in the declaration is a located error */
     if (expect_error_msg(
-            "domain cell\nsort actor\nfunction f(cell) : nonsense\n"
+            "domain cell\nsort actor\nhost function f(cell) : nonsense\n"
             "state ( at(actor):cell )\n",
             "unknown return type"))
         return 1;
     /* a function name that clashes with a fluent */
     if (expect_error_msg(
             "domain cell\nsort actor\nstate ( at(actor):cell )\n"
-            "function at(cell) : cell\n",
+            "host function at(cell) : cell\n",
             "clashes with a fluent"))
         return 1;
     /* an int passed where a cell parameter is expected */
     if (expect_error_msg(
-            "domain cell\nsort actor\nfunction neighbor(cell, int) : cell\n"
+            "domain cell\nsort actor\nhost function neighbor(cell, int) : cell\n"
             "state ( at(actor):cell )\n"
             "action m(X:actor): causes at(X) := neighbor(5, 1)\n",
             "argument 1 expects cell but got int"))
         return 1;
     /* a cell passed where an int parameter is expected */
     if (expect_error_msg(
-            "domain cell\nsort actor\nfunction neighbor(cell, int) : cell\n"
+            "domain cell\nsort actor\nhost function neighbor(cell, int) : cell\n"
             "state ( at(actor):cell )\n"
             "action m(X:actor): causes at(X) := neighbor(at(X), at(X))\n",
             "argument 2 expects int but got cell"))
@@ -208,7 +208,7 @@ static int test_unified_provider_spelling(void)
     const char *src =
         "domain cell\n"
         "sort actor\n"
-        "provider (\n"
+        "host provider (\n"
         "    neighbor(cell, int) : cell\n"       /* typed: a value function */
         "    watched(actor)\n"                   /* untyped: a relation */
         ")\n"
@@ -239,9 +239,9 @@ static int test_unified_provider_spelling(void)
 
     /* misuse: an inline MV domain or a clamp range on a provider */
     static const struct { const char *src, *msg; } BAD[] = {
-        { "provider mood(actor) : { happy, sad }\nsort actor\n",
+        { "host provider mood(actor) : { happy, sad }\nsort actor\n",
           "doesn't name a callable type" },
-        { "sort actor\nprovider strength(actor) : int in 0 .. 5\n",
+        { "sort actor\nhost provider strength(actor) : int in 0 .. 5\n",
           "no clamp range" },
     };
     for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {

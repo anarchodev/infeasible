@@ -762,8 +762,8 @@ static void p_fill(void *ctx, uint32_t pred, const uint32_t *args, int nargs,
 static const char *PROV_LANES =
     "sort actor\n"
     "entity (a0, a1, a2, a3 : actor)\n"
-    "provider near(actor, actor)\n"          /* binary: the join family's column */
-    "provider awake_host(actor)\n"           /* unary: the single-var family's */
+    "host provider near(actor, actor)\n"          /* binary: the join family's column */
+    "host provider awake_host(actor)\n"           /* unary: the single-var family's */
     "state (hostile(actor))\n"
     "init (hostile(a1) hostile(a3))\n"
     "rule menaces(X: actor, Y: actor): near(X, Y) & hostile(Y) => menaced(X, Y)\n"

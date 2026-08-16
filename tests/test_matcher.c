@@ -41,7 +41,7 @@ static const char *STORY =
     "scene bench\n"
     "sort actor\n"
     "entity ( a, b, c : actor )\n"
-    "provider sees(actor, actor)\n"
+    "host provider sees(actor, actor)\n"
     "state (\n"
     "  adj(actor, actor)\n"
     "  awake(actor)\n"

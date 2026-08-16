@@ -39,7 +39,7 @@ static char *source(void)
 {
     size_t cap = 1u << 18; char *s = malloc(cap); int o = 0;
     o += snprintf(s + o, cap - o,
-        "sort actor\nprovider grid_adjacent(actor, actor)\nentity (");
+        "sort actor\nhost provider grid_adjacent(actor, actor)\nentity (");
     for (int i = 0; i < N; i++) o += snprintf(s + o, cap - o, "%su%d", i ? ", " : "", i);
     o += snprintf(s + o, cap - o, " : actor)\n"
         "state ( grid_x(actor) : int in 0..99  grid_y(actor) : int in 0..99\n"

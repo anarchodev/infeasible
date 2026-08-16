@@ -6,6 +6,7 @@
  * express Fireball with the host supplying only geometry + a seed. */
 
 #include "lang/story.h"
+#include "stock/grid.h"
 #include "state/world.h"
 #include "core/intern.h"
 #include "logic/dl.h"
@@ -58,7 +59,7 @@ static int test_provider(void)
     static const char *src =
         "sort actor\n"
         "entity ( wiz, g0, g1, g2 : actor )\n"
-        "provider in_range(actor, actor)\n"
+        "host provider in_range(actor, actor)\n"
         "state ( hp(actor) : int in 0 .. 40 )\n"
         "init ( hp(wiz)=40 hp(g0)=20 hp(g1)=20 hp(g2)=20 )\n"
         "action fireball(C: actor): causes for each T: actor where in_range(C, T): hp(T) -= 8\n"
@@ -142,7 +143,7 @@ static int test_faithful(void)
     static const char *src =
         "sort actor\n"
         "entity ( wiz, g0, g1, g2 : actor )\n"
-        "provider in_blast(actor)\n"
+        "host provider in_blast(actor)\n"
         "state ( hp(actor) : int in 0 .. 40 )\n"
         "init ( hp(g0)=40 hp(g1)=40 hp(g2)=40 )\n"
         "action fireball(C: actor): causes for each T: actor where in_blast(T): hp(T) -= roll(6)\n";
@@ -171,11 +172,17 @@ static int test_example(void)
     CHECK(src != NULL);
     intern *sy = intern_new();
     world *w = compile(src, sy); CHECK(w);
-    blastset set = { { intern_id(sy, "grik"), intern_id(sy, "gnok"), intern_id(sy, "gob") }, 3 };
-    world_set_provider_fn(w, geom, &set);
+    /* The STOCK grid, not a mock. The previous version handed the story a
+     * hand-written `in_blast` listing three goblins — so the test asserted
+     * against geometry it had supplied itself, and the story's spatial
+     * reasoning was only ever checked against something that agreed with it. */
+    static const char *G[] = { "vera", "grik", "gnok", "gob", "thorn", "c_pack" };
+    uint32_t ge[6];
+    for (int i = 0; i < 6; i++) ge[i] = intern_id(sy, G[i]);
+    stock_grid *grid = stock_grid_install(w, sy, ge, 6);
     world_set_seed(w, 0x5EED);
     char err[128];
-    uint32_t cast = intern_id(sy, "fireball(vera)");
+    uint32_t cast = intern_id(sy, "fireball(vera,c_pack)");
     CHECK(world_step(w, &cast, 1, err, sizeof err) == 0);
     /* 3d6 => 3..18 to the in-blast goblins; vera/thorn untouched (not in blast) */
     for (int i = 0; i < 3; i++) {
@@ -184,8 +191,15 @@ static int test_example(void)
         long dmg = 14 - world_get_num(w, intern_id(sy, b));
         CHECK(dmg >= 3 && dmg <= 18);
     }
-    CHECK(world_get_num(w, intern_id(sy, "hp(vera)"))  == 22);
-    CHECK(world_get_num(w, intern_id(sy, "hp(thorn)")) == 30);
+    CHECK(world_get_num(w, intern_id(sy, "hp(vera)"))  == 22);   /* far off */
+    /* FRIENDLY FIRE, which the story says falls out for free — and now does,
+     * because the radius decides it rather than a list the test wrote. Thorn
+     * stands two cells from the centre, inside the four the story allows. */
+    {
+        long dmg = 30 - world_get_num(w, intern_id(sy, "hp(thorn)"));
+        CHECK(dmg >= 3 && dmg <= 18);
+    }
+    stock_grid_free(grid);
     world_free(w); intern_free(sy); free(src);
     return 0;
 }

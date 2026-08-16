@@ -59,11 +59,11 @@ int main(void)
                "rule down(X: actor): hp(X) <= 0 => down(X)\n", 0, NULL)) return 1;
 
     /* a provider ANCHORED by a constant generates its free arg (who is near wiz) */
-    if (expect("sort actor\nentity ( wiz, g0 : actor )\nprovider near(actor, actor)\n"
+    if (expect("sort actor\nentity ( wiz, g0 : actor )\nhost provider near(actor, actor)\n"
                "rule flagged(X: actor): near(wiz, X) => flagged(X)\n", 0, NULL)) return 1;
 
     /* a provider anchored by ANOTHER generator: X by the fluent, Y by X via near */
-    if (expect("sort actor\nentity ( a0 : actor )\nprovider near(actor, actor)\n"
+    if (expect("sort actor\nentity ( a0 : actor )\nhost provider near(actor, actor)\n"
                "state ( awake(actor) )\n"
                "rule linked(X: actor, Y: actor): awake(X) & near(X, Y) => linked(X, Y)\n",
                0, NULL)) return 1;
@@ -76,7 +76,7 @@ int main(void)
                1, "no positive generator")) return 1;
 
     /* an UNANCHORED provider (both args free) binds neither — two warnings */
-    if (expect("sort actor\nentity ( a0, a1 : actor )\nprovider near(actor, actor)\n"
+    if (expect("sort actor\nentity ( a0, a1 : actor )\nhost provider near(actor, actor)\n"
                "rule linked(X: actor, Y: actor): near(X, Y) => linked(X, Y)\n",
                2, "no positive generator")) return 1;
 

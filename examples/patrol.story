@@ -12,9 +12,17 @@
 domain cell
 sort actor
 
-function step(cell, int) : cell     // host grid geometry: a cell one step in a
+// `host` (#263) is the claim made out loud: an EMBEDDER answers these, not the
+// platform. This file is §5.6's worked example of a host with its own topology
+// — opaque cell handles it mints and a geometry only it understands — which is
+// the case the stock grid deliberately does not cover. Without the marker the
+// compiler would refuse them, because an unanswered provider reads false
+// forever and silently; with it, the §6.3 artifact records that this story
+// needs a host, so a runtime that has none can refuse it rather than run every
+// spatial rule dead.
+host function step(cell, int) : cell // host grid geometry: a cell one step in a
                                     // direction. Deterministic and seedless (I4).
-provider near(actor, actor)         // host: the two actors are within alert range,
+host provider near(actor, actor)    // host: the two actors are within alert range,
                                     // computed from their at(·) positions.
 
 entity ( guard1, intruder1 : actor )

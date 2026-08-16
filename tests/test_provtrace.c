@@ -109,8 +109,8 @@ static const char *SRC =
     "domain cell\n"
     "entity ( guard1, intruder1 : actor )\n"
     "state ( at(actor) : cell   guard(actor)   intruder(actor) )\n"
-    "provider near(actor, actor)\n"
-    "function step(cell, int) : cell\n"
+    "host provider near(actor, actor)\n"
+    "host function step(cell, int) : cell\n"
     /* the state atoms anchor both variables — a bare provider generates
      * nothing (§5.2 range restriction), which the safety check enforces */
     "rule spot(G: actor, I: actor):\n"
