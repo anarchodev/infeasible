@@ -556,7 +556,7 @@ static int test_errors(void)
         /* the meta-sort never keys a runtime object */
         { "state marked(value)\n",
           "belong to kind predicates" },
-        { "provider near(value)\n",
+        { "host provider near(value)\n",
           "belong to kind predicates" },
         { "sort actor\nentity a : actor\nvalue s(value, actor) : int\n",
           "drop the `: int`" },

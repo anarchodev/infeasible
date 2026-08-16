@@ -179,7 +179,7 @@ static char *world_src(int n, bool as_provider, bool disqualify)
     size_t o = 0;
     o += (size_t)snprintf(s + o, cap - o, "sort actor\n%s\n"
                           "state ( awake(actor)  impossible(actor)%s )\nentity (",
-                          as_provider ? "provider near(actor, actor)" : "",
+                          as_provider ? "host provider near(actor, actor)" : "",
                           as_provider ? "" : "  near(actor, actor)");
     for (int i = 0; i < n; i++)
         o += (size_t)snprintf(s + o, cap - o, "%sa%d", i ? ", " : " ", i);

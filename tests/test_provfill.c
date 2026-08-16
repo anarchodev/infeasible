@@ -98,8 +98,8 @@ static void fill(void *ctx, uint32_t pred, const uint32_t *args, int nargs,
 
 static const char *SRC =
     "sort actor\n"
-    "provider near(actor, actor)\n"
-    "provider hostile(actor)\n"
+    "host provider near(actor, actor)\n"
+    "host provider hostile(actor)\n"
     "state ( guard(actor)  alarmed(actor) )\n"
     "entity ( a0, a1, a2, a3, a4, a5 : actor )\n"
     "init ( guard(a0) guard(a3) )\n"

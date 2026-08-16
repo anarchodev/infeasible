@@ -102,7 +102,7 @@ static const struct shape SHAPES[] = {
     { "one pred, TWO arg patterns", "state ( near(actor, actor) )",
       "rule r(X: actor, Y: actor): near(X, Y) & near(Y, X) => pair(X, Y)", 1,
       "a local is a pred AT A PATTERN — two columns of one relation (#235)" },
-    { "PROVIDER body atom", "state ( awake(actor) )\nprovider near(actor, actor)",
+    { "PROVIDER body atom", "state ( awake(actor) )\nhost provider near(actor, actor)",
       "rule r(X: actor, Y: actor): near(X, Y) & awake(Y) => threat(X, Y)", 1,
       "a host-answered relation is a column the provider fills (#233)" },
     { "derived body atom", NEAR_AWAKE,

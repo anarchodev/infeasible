@@ -57,7 +57,7 @@ static int test_copy_move(void)
     const char *src =
         "domain cell\n"
         "sort actor\n"
-        "provider same_cell(actor, actor)\n"
+        "host provider same_cell(actor, actor)\n"
         "entity ( aria, ally : actor )\n"
         "state ( at(actor) : cell )\n"
         "action follow(X: actor, Y: actor): causes at(X) := at(Y)\n"

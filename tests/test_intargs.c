@@ -49,7 +49,7 @@ static int test_radius(void)
 {
     const char *src =
         "sort actor\n"
-        "provider near(actor, actor, int)\n"
+        "host provider near(actor, actor, int)\n"
         "entity ( a, b, c : actor )\n"
         "state ( hp(actor) : int in 0 .. 60 )\n"
         "init ( hp(a)=20 hp(b)=20 hp(c)=20 )\n"
@@ -101,13 +101,13 @@ static int test_errors(void)
 {
     /* an int literal in a non-int (entity) position */
     if (expect_error_msg(
-            "sort actor\nprovider p(actor, int)\nentity ( x : actor )\n"
+            "sort actor\nhost provider p(actor, int)\nentity ( x : actor )\n"
             "state ( q(actor) )\nrule r(Y: actor): p(5, 3) => q(Y)\n",
             "not declared `int`"))
         return 1;
     /* an entity where an int is expected */
     if (expect_error_msg(
-            "sort actor\nprovider p(actor, int)\nentity ( x : actor )\n"
+            "sort actor\nhost provider p(actor, int)\nentity ( x : actor )\n"
             "state ( q(actor) )\nrule r(Y: actor): p(Y, x) => q(Y)\n",
             "expects an integer"))
         return 1;

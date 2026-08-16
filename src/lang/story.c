@@ -1,4 +1,5 @@
 #include "lang/story.h"
+#include "stock/stock.h"
 #include "lang/lexer.h"
 #include "state/factindex.h"
 
@@ -420,7 +421,13 @@ typedef struct {
     uint32_t *domain_ents[MAX_SORTS]; int domain_n[MAX_SORTS];
     ast_fluent  fluents[MAX_FLUENTS];
     int nfluents;
-    ast_fluent  providers[MAX_FLUENTS];   /* computed relations (§5.6), host-answered */
+    ast_fluent  providers[MAX_FLUENTS];   /* computed relations (§5.6) */
+    bool        prov_host[MAX_FLUENTS];   /* #263: answered by an EMBEDDER, not
+                                           * by the stock roster — declared
+                                           * `host provider`, republished in the
+                                           * artifact so a hostless runtime can
+                                           * refuse the story */
+    bool        fn_host[MAX_FLUENTS];
     int nproviders;
     ast_fluent  emits[MAX_FLUENTS];       /* burst cues (#11, §12): one-shot events
                                            * a step fires at the presentation
@@ -1777,7 +1784,15 @@ static void parse_emit(parser *p)
  *
  * The statable rule the split keywords obscured: HAS A RETURN TYPE ⇒ CALLED,
  * NOT GROUNDED. `function` remains a spelling alias for the typed form. */
-static void parse_provider(parser *p)
+/* `host provider near(actor, actor)` (#263) — this relation is answered by an
+ * EMBEDDER, not by the platform. An ordinary `provider` must name something
+ * the stock roster supplies, because a provider nobody answers reads false
+ * forever and silently; `host` is how a story says it knows that and means it,
+ * and the §6.3 artifact republishes the fact so a runtime with no host can
+ * refuse the story rather than run every rule of it dead.
+ *
+ * Contextual, like `fact` and `union`. */
+static void parse_provider(parser *p, bool is_host)
 {
     advance(p);                                    /* 'provider' */
     bool grouped = false;
@@ -1823,6 +1838,7 @@ static void parse_provider(parser *p)
             fn->ret = (tmp.is_num && !tmp.is_cell) ? INTERN_NONE : tmp.val_sort;
             fn->line = tmp.line;
             fn->col = tmp.col;
+            p->fn_host[p->nfunctions] = is_host;
             p->nfunctions++;
         } else {
             if (p->nproviders >= MAX_FLUENTS) {
@@ -1830,6 +1846,7 @@ static void parse_provider(parser *p)
                      MAX_FLUENTS);
                 return;
             }
+            p->prov_host[p->nproviders] = is_host;
             p->providers[p->nproviders++] = tmp;
         }
     } while (grouped && p->cur.kind == TK_IDENT);
@@ -1989,7 +2006,7 @@ static uint32_t parse_type_token(parser *p, bool *ok)
  * A value-returning host function (§5.6): args/return are declared sorts/domains
  * (or `int`). Registered so a call `f(…)` in an effect expression grounds to an
  * EX_CALL; the returned value is opaque to the engine (host-computed, I4). */
-static void parse_function(parser *p)
+static void parse_function(parser *p, bool is_host)
 {
     advance(p);                                    /* 'function' */
     if (p->cur.kind != TK_IDENT) {
@@ -2025,6 +2042,7 @@ static void parse_function(parser *p)
     bool ok;
     fn->ret = parse_type_token(p, &ok);
     if (!ok) return;
+    p->fn_host[p->nfunctions] = is_host;
     p->nfunctions++;
 }
 
@@ -4306,6 +4324,11 @@ static void register_set_providers(parser *p)
                      "too many providers (max %d)", MAX_FLUENTS);
                 return;
             }
+            /* Host-answered BY CONSTRUCTION (#263): a `set of` parameter is a
+             * transient membership relation the host supplies per cast, so the
+             * roster check must not ask whether the platform stocks it — the
+             * compiler synthesised it, the author never named it. */
+            p->prov_host[p->nproviders] = true;
             ast_fluent *pr = &p->providers[p->nproviders++];
             memset(pr, 0, sizeof *pr);
             pr->pred = name;
@@ -4352,6 +4375,65 @@ static void populate_sort_valued_fluents(parser *p)
 /* Validate value-returning function declarations (§5.6): every arg/return type is
  * a declared sort/domain (or `int`); the name doesn't clash with a fluent,
  * provider, or another function. Types are checked once here, not per call. */
+/* Is `name` on the stock roster, and does it match at this arity/shape? (#263)
+ * `want_fn` distinguishes a value FUNCTION (a measurement) from a boolean
+ * relation, because the two are different declarations of the same name. */
+static const stock_decl *stock_find(parser *p, uint32_t name, int arity, bool want_fn)
+{
+    const char *n = intern_name(p->syms, name);
+    for (int i = 0; i < STOCK_NPROVIDERS; i++) {
+        const stock_decl *d = &STOCK_PROVIDERS[i];
+        if (strcmp(d->name, n) != 0) continue;
+        if (d->arity != arity) continue;
+        if ((d->ret != NULL) != want_fn) continue;
+        return d;
+    }
+    return NULL;
+}
+
+/* A provider nobody answers reads closed-world FALSE, forever and silently
+ * (#263): the rule never fires, and the failure is indistinguishable from a
+ * world where the relation happens not to hold. That was tolerable while a
+ * game could ship a host to answer it; it cannot (#253), so an unrecognised
+ * name is an authoring error and says so. An embedder with its own topology
+ * writes `host provider`, which is the same claim made out loud. */
+static void check_provider_roster(parser *p)
+{
+    for (int i = 0; i < p->nproviders; i++) {
+        if (p->prov_host[i]) continue;
+        ast_fluent *pr = &p->providers[i];
+        if (stock_find(p, pr->pred, pr->nargs, false)) continue;
+        const char *n = intern_name(p->syms, pr->pred);
+        if (stock_find(p, pr->pred, pr->nargs, true))
+            serr(p, pr->line, pr->col,
+                 "'%s' is a stock MEASUREMENT, not a relation — declare it "
+                 "`function %s(…) : int` and write the threshold yourself "
+                 "(§5.6); a provider that answers yes or no accounts for "
+                 "nothing", n, n);
+        else
+            serr(p, pr->line, pr->col,
+                 "no stock provider '%s' takes %d argument%s, so nothing would "
+                 "answer it and every rule reading it would be silently false "
+                 "(#263). The platform supplies %s. If an EMBEDDER answers "
+                 "this one, say so: `host provider %s(…)`",
+                 n, pr->nargs, pr->nargs == 1 ? "" : "s",
+                 "grid_adjacent/2, grid_los/2, grid_chebyshev/2 and "
+                 "grid_manhattan/2", n);
+    }
+    for (int i = 0; i < p->nfunctions; i++) {
+        if (p->fn_host[i]) continue;
+        ast_function *fn = &p->functions[i];
+        if (stock_find(p, fn->name, fn->nargs, true)) continue;
+        const char *n = intern_name(p->syms, fn->name);
+        serr(p, fn->line, fn->col,
+             "no stock function '%s' takes %d argument%s — an unanswered one "
+             "returns 0 at every call, which is a distance of zero (#263). "
+             "The platform supplies grid_chebyshev/2 and grid_manhattan/2. If "
+             "an EMBEDDER answers this one, say so: `host provider %s(…) : …`",
+             n, fn->nargs, fn->nargs == 1 ? "" : "s", n);
+    }
+}
+
 static void check_functions(parser *p)
 {
     for (int i = 0; i < p->nfunctions; i++) {
@@ -6249,6 +6331,7 @@ static void semantic_pass(parser *p)
     build_pred_registry(p);
     check_fluent_bounds(p);
     check_functions(p);
+    check_provider_roster(p);   /* #263 */
 
     check_kfacts(p);                   /* #124: membership vocabulary first */
     solve_kind_stratum(p);             /* #125: the taxonomy solves at build */
@@ -11378,6 +11461,15 @@ static char *harvest_iface(parser *p)
             if (sec == 4) sb_head_argsorts(&s, p, pi);
             else          sb_argsorts(&s, p, pi);
             if (sec == 2) { sb_raw(&s, ", "); sb_kv(&s, "type", "int"); }
+            if (sec == 1) {
+                /* #263: an EMBEDDER answers this one, not the platform. Published
+                 * so a runtime with no host refuses the story rather than running
+                 * every rule that reads it silently false. */
+                bool hosted = false;
+                for (int j = 0; j < p->nproviders; j++)
+                    if (p->providers[j].pred == pi->pred && p->prov_host[j]) hosted = true;
+                if (hosted) sb_raw(&s, ", \"host\": true");
+            }
             sb_raw(&s, " }");
         }
         sb_raw(&s, first ? "]" : "\n  ]");
@@ -11394,7 +11486,9 @@ static char *harvest_iface(parser *p)
             if (k) sb_raw(&s, ", ");
             sb_str(&s, fn->argsort[k] ? intern_name(p->syms, fn->argsort[k]) : "int");
         }
-        sb_raw(&s, "], ");
+        sb_raw(&s, "]");
+        if (p->fn_host[i]) sb_raw(&s, ", \"host\": true");   /* #263 */
+        sb_raw(&s, ", ");
         sb_kv(&s, "returns", fn->ret ? intern_name(p->syms, fn->ret) : "int");
         sb_raw(&s, " }");
     }
@@ -11670,15 +11764,27 @@ static world *compile_impl(const char *src, const char *srcname, intern *syms,
         case TK_ENUM:   parse_enum(p);   break;
         case TK_ENTITY: parse_entity(p); break;
         case TK_STATE:  parse_state(p);  break;
-        case TK_PROVIDER: parse_provider(p); break;
-        case TK_FUNCTION: parse_function(p); break;
+        case TK_PROVIDER: parse_provider(p, false); break;
+        case TK_FUNCTION: parse_function(p, false); break;
         case TK_VALUE:  parse_value(p);  break;
         case TK_INIT:   parse_init(p);   break;
         case TK_RULE:   parse_rule(p);   break;
         case TK_ACTION: parse_action(p); break;
         case TK_BANDS:  parse_bands(p);  break;
         case TK_IDENT:
-            if (ident_is(p->cur, "fact"))           parse_fact(p);  /* #124 */
+            if (ident_is(p->cur, "host")) {         /* #263: embedder-answered */
+                advance(p);
+                if (p->cur.kind == TK_FUNCTION) { parse_function(p, true); break; }
+                if (p->cur.kind != TK_PROVIDER) {
+                    char d[64]; tok_desc(p->cur, d, sizeof d);
+                    fail(p, p->cur.line, p->cur.col,
+                         "`host` marks a provider or function as "
+                         "embedder-answered — expected one of those, found %s", d);
+                    break;
+                }
+                parse_provider(p, true);
+            }
+            else if (ident_is(p->cur, "fact"))      parse_fact(p);  /* #124 */
             else if (ident_is(p->cur, "emit"))      parse_emit(p);  /* #11 */
             else if (ident_is(p->cur, "exclusive")) parse_exclusive(p); /* #159 */
             else                                    parse_sup(p);

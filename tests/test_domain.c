@@ -52,7 +52,7 @@ static int test_point_targeting(void)
     const char *src =
         "domain point\n"
         "sort actor\n"
-        "provider in_radius(actor, point)\n"
+        "host provider in_radius(actor, point)\n"
         "entity ( vera, grik, gnok, thorn : actor )\n"
         "state ( hp(actor) : int in 0 .. 60 )\n"
         "init ( hp(grik)=14 hp(gnok)=14 hp(thorn)=30 )\n"
@@ -116,7 +116,7 @@ static int test_errors(void)
         return 1;
     /* a variable cannot range over an opaque domain */
     if (expect_error_msg(
-            "domain point\nsort actor\nprovider in_r(point)\n"
+            "domain point\nsort actor\nhost provider in_r(point)\n"
             "entity ( a : actor )\nstate ( hp(actor):int )\n"
             "action go(C: actor): causes for each c: point where in_r(c): hp(C) -= 1\n",
             "range a variable over the opaque domain"))

@@ -260,7 +260,7 @@ static const char *GRD_STORY =
     "scene grd\n"
     "sort actor\n"
     "entity ( a, b : actor )\n"
-    "provider sees(actor, actor)\n"
+    "host provider sees(actor, actor)\n"
     "state (\n"
     "  awake(actor)\n"
     "  hp(actor) : int in 0 .. 10\n"
