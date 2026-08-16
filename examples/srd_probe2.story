@@ -9,16 +9,24 @@
 //                          placement, §5.6); the count-CHOSEN-AT-CAST form
 //                          still waits on two marked gaps: §5.9 pool sugar
 //                          (`wolf[8]`) and the binder's `limit n` rider.
-//   P7 Wall of Fire     ✓ CLOSED — but by §5.6's decision, not by the
-//                          construct the original asked for: the ZONE is the
-//                          host's geometry behind a provider, not a fluent
-//                          over cells. The hazard tick and the grease trip
-//                          are ordinary rules, live below.
+//   P7 Wall of Fire     ✓ CLOSED, and BY THE CONSTRUCT THE ORIGINAL ASKED
+//                          FOR. The verdict here used to read "the zone is
+//                          the host's geometry behind a provider, not a
+//                          fluent over cells" — that was true while a game
+//                          could ship its own provider. It cannot (#253), and
+//                          the zone turns out to be exactly the fluent over
+//                          cells the original wanted: `on_fire(cell)` is
+//                          ordinary state, so the wall is IN THE SAVE and
+//                          replay re-derives nothing. Occupancy is a
+//                          measurement, not a host memory.
 
 scene wilds
 
-domain cell                           // §5.6 store-backed positions (landed —
-                                      // was "⟂ cell value domain" in the sketch)
+sort cell                             // a PLACE, and now an entity: a zone is
+                                      // state over cells and a spell is aimed
+                                      // at one, so cells must be nameable in
+                                      // an action (and therefore in the log)
+sort placed union actor, cell         // anything with a position (#231)
 sort actor
 enum school { conjuration, evocation }   // landed (#95/#96) — was the P1 gap
 
@@ -29,10 +37,16 @@ entity (
     wolf1, wolf2 : actor            // (two slots suffice for this slice)
     ogre  : actor
 )
+// The places a spell is aimed at. A cell is an entity because an action
+// argument is one — `cast_wall_of_fire(dara, c_gap)` is in the log, so the
+// wall replays exactly without anyone remembering where it went.
+entity ( c_gap, c_ford : cell )
 
-function summon_spot(cell, int) : cell   // host geometry: the i-th free cell
-                                         // adjacent to the caster (§5.6 — the
-                                         // grid lives behind the seam)
+// Placement needs no geometry function at all. A summoned creature is put at
+// coordinates ARITHMETIC on the caster's — ordinary numeric effects on
+// ordinary state — which is cheaper than the `summon_spot(cell, int)` host
+// call this file used to declare, and it is in the save.
+function grid_chebyshev(placed, placed) : int
 
 state (
     active(actor)                   // §5.9 pool membership — doubling as "present
@@ -41,7 +55,11 @@ state (
                                     // cardinality: a provider never anchors)
     hp(actor)     : int in 0 .. hp_max(actor)
     hp_max(actor) : int
-    at(actor)     : cell            // store-backed position (§5.6, landed)
+    grid_x(placed) : int in 0 .. 64 // positions the stock grid reads (#255)
+    grid_y(placed) : int in 0 .. 64
+    grid_blocks(actor)
+    on_fire(cell)                   // the wall's extent — STATE, so it saves
+    greased(cell)                   // likewise the grease
     monster(actor)
 
     // persistent zones: the zone's EXISTENCE is engine state; its EXTENT is
@@ -50,12 +68,15 @@ state (
     grease_down
 )
 
-provider (
-    in_fire_zone(actor)             // host: at(X) intersects the wall's line
-    in_grease(actor)                // host: at(X) is on the greased square
-)
+// No provider answers occupancy. A ZONE IS STATE OVER CELLS — see P7 — and
+// "X is standing in it" is a measurement of distance zero, which the stock
+// grid returns and the story thresholds.
 
 init (
+    grid_x(dara)=2  grid_y(dara)=2    // the ogre wades the ford; dara holds
+    grid_x(ogre)=6  grid_y(ogre)=2    // the gap the wall will close
+    grid_x(c_gap)=4 grid_y(c_gap)=2
+    grid_x(c_ford)=6 grid_y(c_ford)=2
     active(dara)        hp_max(dara) = 24   hp(dara) = 24
     hp_max(wolf1) = 11  hp_max(wolf2) = 11
     active(ogre)        hp_max(ogre) = 59   hp(ogre) = 59   monster(ogre)
@@ -72,8 +93,10 @@ init (
 
 action summon_two_wolves(C: actor):
     requires ~active(wolf1) & ~active(wolf2)
-    causes   active(wolf1) & at(wolf1) := summon_spot(at(C), 1) & hp(wolf1) := 11
-           & active(wolf2) & at(wolf2) := summon_spot(at(C), 2) & hp(wolf2) := 11
+    causes   active(wolf1) & hp(wolf1) := 11
+           & grid_x(wolf1) := grid_x(C) + 1 & grid_y(wolf1) := grid_y(C)
+           & active(wolf2) & hp(wolf2) := 11
+           & grid_x(wolf2) := grid_x(C) - 1 & grid_y(wolf2) := grid_y(C)
 
 // Two casters summoning in one step would contest the same slots; the
 // exclusivity protocol (#159) makes one-summon-per-step CHECKED, not hoped:
@@ -111,26 +134,32 @@ exclusive summon_two_wolves(_)
 // drop it), its EXTENT is host geometry answered through a provider, and
 // the hazard is an ordinary ramification gated on both:
 
-action cast_wall_of_fire(C: actor):
+// The wall is PAINTED ONTO CELLS. Its extent is state, so it is in the save
+// and replay re-derives nothing — where the host-authority version needed the
+// host to watch the action commit and remember where the line went.
+action cast_wall_of_fire(C: actor, P: cell):
     causes wall_of_fire_up
-    // the host records the line's geometry when it sees this action commit
-    // (it is the geometry authority, §5.6); replay re-derives it from the
-    // action log the same way (I4)
+         & for each K: cell where grid_chebyshev(K, P) <= 1 : on_fire(K)
 
-rule fire_tick(X: actor):
-    wall_of_fire_up & active(X) & in_fire_zone(X)  causes  hp(X) -= 5
-    // "in the wall at the start of its turn" — a per-tick ramification over
-    // provider-answered occupancy; structurally combat5e's torch-drop,
-    // just spatial
+rule fire_tick(X: actor, K: cell):
+    wall_of_fire_up & active(X) & on_fire(K) & grid_chebyshev(X, K) <= 0
+        causes  hp(X) -= 5
+    // "in the wall at the start of its turn". Distance ZERO is "standing on
+    // that cell" — occupancy as a measurement rather than a host memory, and
+    // still structurally combat5e's torch-drop.
 
-action cast_grease(C: actor):    requires ~grease_down  causes grease_down
+action cast_grease(C: actor, P: cell):
+    requires ~grease_down  causes grease_down & greased(P)
 action grease_dries(C: actor):   requires grease_down   causes ~grease_down
     // complementary `requires` = the #160 exclusion, same move as srd_probe's
     // concentration pair: a compile proves no step contests `grease_down`
 
-rule grease_fall(X: actor):
-    grease_down & active(X) & in_grease(X)  =>  prone(X)
-    // a judgment — recomputes on movement, never stored (I1)
+rule grease_fall(X: actor, K: cell):
+    grease_down & active(X) & greased(K) & grid_chebyshev(X, K) <= 0
+        =>  prone(X)
+    // still a judgment — recomputes on movement, never stored (I1). What
+    // changed is only where the occupancy comes from: a cell the story
+    // greased, not a square the host remembered.
 
 // The wall "lasts 1 minute" -> the P4 duration decomposition (#7, decided):
 // a host turn-counter, or reaction5e's engine-side cleanup countdown.

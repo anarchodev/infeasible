@@ -19,6 +19,7 @@
  *    gated wall-of-fire tick. */
 
 #include "lang/story.h"
+#include "stock/grid.h"
 #include "state/world.h"
 #include "core/intern.h"
 
@@ -140,26 +141,20 @@ static int test_combat5e(void)
 
 /* ---- srd_probe ----------------------------------------------------------- */
 
-static intern *P_SY;
-static uint32_t P_INBLAST;
-
-static bool blast_fn(void *ctx, uint32_t pred, const uint32_t *args, int nargs)
-{
-    (void)ctx;
-    if (pred != P_INBLAST || nargs != 1) return false;
-    const char *n = intern_name(P_SY, args[0]);
-    return strcmp(n, "vera") != 0;      /* everyone but the caster is in blast */
-}
-
 static long run_fireball(uint64_t seed, long hp_out[4], int saved_out[4])
 {
     static const char *T[4] = { "grik", "gnok", "gob", "thorn" };
     intern *sy = intern_new();
     world *w = compile_story("srd_probe.story", sy);
     if (!w) return -1;
-    P_SY = sy;
-    P_INBLAST = intern_id(sy, "in_blast");
-    world_set_provider_fn(w, blast_fn, NULL);
+    /* the STOCK grid, over actors and the aim cells together — the story's
+     * own `grid_chebyshev(T, c_pack) <= 4` decides the blast, so this test no
+     * longer supplies a hand-written `in_blast` the story had to trust (#253) */
+    static const char *G[] = { "vera", "grik", "gnok", "gob", "thorn",
+                               "c_pack", "c_far" };
+    uint32_t ge[7];
+    for (int i = 0; i < 7; i++) ge[i] = intern_id(sy, G[i]);
+    stock_grid *grid = stock_grid_install(w, sy, ge, 7);
     world_set_seed(w, seed);
 
     /* the save judgment, read PRE-step: §5.10 keys rolls per tick, so this
@@ -169,7 +164,8 @@ static long run_fireball(uint64_t seed, long hp_out[4], int saved_out[4])
         snprintf(b, sizeof b, "saved(%s)", T[i]);
         saved_out[i] = q(w, sy, b) == DL_PROVED;
     }
-    if (step1(w, sy, "fireball(vera)") != 0) { world_free(w); intern_free(sy); return -1; }
+    if (step1(w, sy, "fireball(vera,c_pack)") != 0)
+        { stock_grid_free(grid); world_free(w); intern_free(sy); return -1; }
     for (int i = 0; i < 4; i++) {
         char b[32];
         snprintf(b, sizeof b, "hp(%s)", T[i]);
@@ -178,6 +174,7 @@ static long run_fireball(uint64_t seed, long hp_out[4], int saved_out[4])
     long slots = world_get_num(w, intern_id(sy, "slots3(vera)"));
     world_free(w);
     intern_free(sy);
+    stock_grid_free(grid);
     return slots;
 }
 
@@ -205,17 +202,20 @@ static int test_srd_probe(void)
     intern *sy = intern_new();
     world *w = compile_story("srd_probe.story", sy);
     CHECK(w != NULL);
-    P_SY = sy;
-    P_INBLAST = intern_id(sy, "in_blast");
-    world_set_provider_fn(w, blast_fn, NULL);
+    static const char *G2[] = { "vera", "grik", "gnok", "gob", "thorn",
+                                "c_pack", "c_far" };
+    uint32_t ge2[7];
+    for (int i = 0; i < 7; i++) ge2[i] = intern_id(sy, G2[i]);
+    stock_grid *grid2 = stock_grid_install(w, sy, ge2, 7);
     world_set_seed(w, 7);
-    CHECK(step1(w, sy, "cast_faerie_fire(vera)") == 0);
+    CHECK(step1(w, sy, "cast_faerie_fire(vera,c_pack)") == 0);
     CHECK(q(w, sy, "faerie_fired(grik)") == DL_PROVED);   /* derived projection */
     CHECK(q(w, sy, "faerie_fired(thorn)") == DL_REFUTED); /* not a monster */
     CHECK(q(w, sy, "hidden(grik)") == DL_REFUTED);        /* outlined */
     CHECK(step1(w, sy, "break_concentration(vera)") == 0);
     CHECK(q(w, sy, "concentrating(vera)") == DL_REFUTED);
     CHECK(q(w, sy, "faerie_fired(grik)") == DL_REFUTED);  /* retracted with it */
+    stock_grid_free(grid2);
     world_free(w);
     intern_free(sy);
     return 0;
@@ -223,38 +223,19 @@ static int test_srd_probe(void)
 
 /* ---- srd_probe2 ---------------------------------------------------------- */
 
-static intern *Z_SY;
-static uint32_t Z_FIRE, Z_GREASE, Z_SPOT;
-static bool Z_WALL_ON;
-
-static bool zone_fn(void *ctx, uint32_t pred, const uint32_t *args, int nargs)
-{
-    (void)ctx;
-    if (pred == Z_FIRE && nargs == 1 && Z_WALL_ON)
-        return strcmp(intern_name(Z_SY, args[0]), "ogre") == 0;
-    (void)Z_GREASE;
-    return false;
-}
-
-static long spot_fn(void *ctx, uint32_t pred, const long *a, int n)
-{
-    (void)ctx;
-    if (pred == Z_SPOT && n == 2) return 1000 + a[1];   /* i-th free cell */
-    return 0;
-}
-
 static int test_srd_probe2(void)
 {
     intern *sy = intern_new();
     world *w = compile_story("srd_probe2.story", sy);
     CHECK(w != NULL);
-    Z_SY = sy;
-    Z_FIRE = intern_id(sy, "in_fire_zone");
-    Z_GREASE = intern_id(sy, "in_grease");
-    Z_SPOT = intern_id(sy, "summon_spot");
-    Z_WALL_ON = false;
-    world_set_provider_fn(w, zone_fn, NULL);
-    world_set_fn_provider_fn(w, spot_fn, NULL);
+    /* the STOCK grid, over actors and the aim cells. Nothing here answers
+     * occupancy any more: the wall's extent is state the story writes, and
+     * "standing in it" is a distance the library measures (#253). */
+    static const char *G3[] = { "dara", "wolf1", "wolf2", "ogre",
+                                "c_gap", "c_ford" };
+    uint32_t ge3[6];
+    for (int i = 0; i < 6; i++) ge3[i] = intern_id(sy, G3[i]);
+    stock_grid *grid3 = stock_grid_install(w, sy, ge3, 6);
 
     /* summon: pool slots come up placed and provisioned */
     CHECK(q(w, sy, "active(wolf1)") == DL_REFUTED);
@@ -262,16 +243,22 @@ static int test_srd_probe2(void)
     CHECK(q(w, sy, "active(wolf1)") == DL_PROVED);
     CHECK(q(w, sy, "active(wolf2)") == DL_PROVED);
     CHECK(world_get_num(w, intern_id(sy, "hp(wolf1)")) == 11);
+    /* placement is arithmetic on the caster's coordinates, not a host call */
+    CHECK(world_get_num(w, intern_id(sy, "grid_x(wolf1)")) == 3);
+    CHECK(world_get_num(w, intern_id(sy, "grid_x(wolf2)")) == 1);
+    stock_grid_refresh(grid3);
 
-    /* the wall: existence is a fluent, extent is the provider; the hazard
-     * ticks whoever the host says is in the zone */
-    CHECK(step1(w, sy, "cast_wall_of_fire(dara)") == 0);
-    Z_WALL_ON = true;                     /* host geometry now answers */
+    /* THE WALL. Extent is state the cast writes, so nothing outside the world
+     * has to remember where the line went — which is what makes it replay. */
+    CHECK(step1(w, sy, "cast_wall_of_fire(dara,c_ford)") == 0);
+    CHECK(q(w, sy, "on_fire(c_ford)") == DL_PROVED);
     char err[128];
     CHECK(world_step(w, NULL, 0, err, sizeof err) == 0);   /* an empty step */
+    /* the ogre is standing on the forded cell; dara is four squares back */
     CHECK(world_get_num(w, intern_id(sy, "hp(ogre)")) == 54);   /* 59 - 5 */
-    CHECK(world_get_num(w, intern_id(sy, "hp(dara)")) == 24);   /* not in zone */
+    CHECK(world_get_num(w, intern_id(sy, "hp(dara)")) == 24);   /* not in it */
 
+    stock_grid_free(grid3);
     world_free(w);
     intern_free(sy);
     return 0;
