@@ -27,6 +27,7 @@
 #endif
 
 static const char *EXAMPLES[] = {
+    "blast.story",
     "cellar.story",
     "cellar_ground.story",
     "cellar_play.story",

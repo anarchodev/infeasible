@@ -301,6 +301,68 @@ int main(void)
         world_free(w3); stock_grid_free(g3); intern_free(s3); free(src);
     }
 
+    /* ---- AREA OF EFFECT: the blast, over a real `cell` sort ----------------
+     *
+     * Three separately-landed pieces meet here for the first time: a cell
+     * ENTITY as the target (an action argument cannot carry a value, and a
+     * `domain point` reaches a provider as a placeholder the host resolves out
+     * of band, which is no use with no host), `sort placed union actor, cell`
+     * so one `grid_x` carries both (#231), and a MEASUREMENT the story
+     * thresholds rather than an `in_blast` ruling compiled into C. */
+    {
+        char path[512];
+        snprintf(path, sizeof path, "%s/blast.story", STORY_DIR);
+        FILE *f = fopen(path, "rb");
+        CHECK(f != NULL);
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        char *src = malloc((size_t)sz + 1);
+        size_t rd = fread(src, 1, (size_t)sz, f); src[rd] = 0; fclose(f);
+
+        intern *s4 = intern_new();
+        story_diag di[16]; story_diags dg = { di, 16, 0, 0 };
+        world *w4 = story_compile(src, "blast.story", s4, &dg);
+        CHECK(w4 != NULL && dg.nerrors == 0);
+        /* actors and cells install together — the grid reads coordinates by
+         * entity and has no opinion about which member sort one belongs to */
+        static const char *B[] = { "mage", "grik", "gnok", "thorn", "c22", "c55" };
+        uint32_t e4[6];
+        for (int i = 0; i < 6; i++) e4[i] = intern_id(s4, B[i]);
+        stock_grid *g4 = stock_grid_install(w4, s4, e4, 6);
+        CHECK(g4 != NULL);
+
+        char err[200];
+        uint32_t cast = intern_id(s4, "fireball(mage,c22)");
+        CHECK(world_step(w4, &cast, 1, err, sizeof err) == 0);
+
+        /* grik is ON the centre, gnok one cell out: both caught */
+        CHECK(world_get_num(w4, intern_id(s4, "hp(grik)")) == 22);
+        CHECK(world_get_num(w4, intern_id(s4, "hp(gnok)")) == 22);
+        /* the mage at (0,0) is two cells away, thorn is nine: both spared */
+        CHECK(world_get_num(w4, intern_id(s4, "hp(mage)"))  == 30);
+        CHECK(world_get_num(w4, intern_id(s4, "hp(thorn)")) == 30);
+        printf("  blast: the affected set is the measurement, resolved at tick time\n");
+
+        /* the exception the LIBRARY does not own: warded thorn is spared by a
+         * story condition, and would have been spared by distance anyway — so
+         * move the blast onto him and check the ward is what does it */
+        uint32_t cast2 = intern_id(s4, "fireball(mage,c55)");
+        world_set_num(w4, intern_id(s4, "grid_x(thorn)"), 5);
+        world_set_num(w4, intern_id(s4, "grid_y(thorn)"), 5);
+        stock_grid_refresh(g4);
+        CHECK(world_step(w4, &cast2, 1, err, sizeof err) == 0);
+        CHECK(world_get_num(w4, intern_id(s4, "hp(thorn)")) == 30);
+        CHECK(world_query(w4, dl_pos(intern_id(s4, "burning(thorn)"))) == DL_REFUTED);
+        printf("  ...and a warded target inside it is spared by the STORY\n");
+
+        /* burning is a conclusion with a rule behind it, which is what shipping
+         * the distance rather than the ruling buys: `why?` has something to say */
+        CHECK(world_query(w4, dl_pos(intern_id(s4, "burning(grik)"))) == DL_PROVED);
+        CHECK(world_query(w4, dl_pos(intern_id(s4, "singed(grik)"))) == DL_PROVED);
+        printf("  ...and the story drew its own conclusion from the hit\n");
+
+        world_free(w4); stock_grid_free(g4); intern_free(s4); free(src);
+    }
+
     printf("test_stockgrid: all passed\n");
     return 0;
 }

@@ -3410,7 +3410,10 @@ static void check_expr(parser *p, int e, var_bind *vars, int nvars)
                 if (want < 0) continue;
             }
             int got = expr_value_sort(p, n->cargs[k]);
-            if (got != want)
+            /* a cover admits its members here too (#231): a `placed`-typed
+             * parameter takes an actor or a cell, which is what lets one
+             * measurement serve every placed sort */
+            if (!(want < 0 ? got == want : sort_admits(p, want, got)))
                 serr(p, n->line, n->col,
                      "function '%s' argument %d expects %s but got %s",
                      intern_name(p->syms, n->pred), k + 1,
