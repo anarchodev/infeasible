@@ -746,6 +746,25 @@ The integration splits along the EDB / provider line:
   as defeasible action theory is the GOAP research hole §2 rules out. The index
   and any pathing must be seeded and float-free to preserve I4.
 
+**The platform ships the geometry, and it ships the measurement rather than
+the ruling.** Space being a provider does not mean every game writes one:
+`src/stock/` is the platform's own library, so a story with no host code
+declares `grid_adjacent` (square, over `grid_x`/`grid_y`) or `hex_adjacent`
+(hex, over axial `hex_q`/`hex_r`) and uses it — one index and one ray walk
+underneath, with the topology living in a distance function and a corner set,
+which is what "hex vs. square is just the neighbour function" means in code.
+What such a library may contain is bounded by a single rule: **a stock
+provider returns the smallest MEASUREMENT that still admits a ruling.**
+`grid_chebyshev`, `hex_distance`, `grid_occlusion` (what percent of a target's
+outline a blocker hides) — yes. `has_cover` — no: half at 50% and
+three-quarters at 75% are one game's numbers, and "unless Sharpshooter" is an
+exception that has to live where defeat can reach it. The measurements are
+also not interchangeable with each other, which is the argument for shipping
+several small ones: a target can be three-quarters hidden with its centre line
+perfectly clear, and a single boolean would have had to answer that question on
+the story's behalf. Get this line wrong and the product is 5e-in-C with a logic
+engine bolted on.
+
 **Functional fluents are the one new primitive this forces**, and they are
 now pinned: `at(X) : cell` is a multi-valued fluent (§5.7) over an entity
 domain, store-backed per §5.8's implementation shape — one `uint32` per

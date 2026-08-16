@@ -305,7 +305,10 @@ typedef enum { STORY_ERROR, STORY_WARNING } story_severity;
 typedef struct {
     story_severity sev;
     int            line, col;
-    char           msg[192];
+    /* Long enough for a diagnostic that ENUMERATES something — the stock
+     * provider roster (#263) is the case, and a message truncated mid-list
+     * offers the author a fix they cannot read. */
+    char           msg[288];
 } story_diag;
 
 typedef struct {
