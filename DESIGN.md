@@ -252,7 +252,7 @@ it is a kernel with clients:
   golden tests pin semantics (§11).
 
   A second client is evidence only if it is genuinely a second one, so it
-  is built to be unlike the browser cart in every dimension that could
+  is built to be unlike the reference cart in every dimension that could
   hide a private dependency: a different language (C against `world_*`,
   not JS against the §6.3 binding), a different presentation (a text
   frame), and — the load-bearing one — a different *architecture*. The
@@ -2844,8 +2844,8 @@ recovery at declaration boundaries so one error doesn't cascade.
    commit receipt as structured data — each changed value's undefeated
    contributions with ground-rule provenance — so attributed combat text is
    a projection of the delta, never a parsed `why?` string. Playable cellar in the
-   browser (WASM core + Canvas2D) driven entirely by host code (JS) against the
-   generated bindings. A trivial
+   reference web client (WASM core + Canvas2D) driven entirely by host code (JS)
+   against the generated bindings. A trivial
    second client in tests pins the no-private-APIs claim (§4.2) the way
    golden tests pin semantics — with no reference client, this test is the
    *only* thing keeping the client boundary honest, so it is a hard
@@ -2897,8 +2897,8 @@ same conditional-step semantics the 5e customer does (§12's update → resolve
 → draw) rather than the canary's real-time perf regime, and its complexity
 lives in **rules the engine generates and explains, not authored prose** — so
 one person can finish it without the writing-team cost a CRPG showcase would
-carry. It ships on the frozen web stack (Canvas2D renderer + WASM engine
-coprocessor + JS host loop, all decided 2026-07-21, §12); the 5e *remix
+carry. It ships as an ordinary cart on the frozen presentation interface (§12) —
+the same runtime, renderer and loop every other cart gets; the 5e *remix
 platform* remains the product vision and runs alongside it.
 
 **Peer-engine context.** `infeasible` is one of three peers (see
@@ -2909,28 +2909,49 @@ both. Each game introduces exactly one engine, so a regression localizes to the
 engine just added. This is the first link in that chain and therefore the one
 with no cross-engine concerns at all: **build no cross-engine glue here.**
 
-## 12. Distribution: web target and content artifacts
+## 12. Distribution: the runtime, carts, and content artifacts
 
-The shipped product is a browser platform for a remix community: many authors
+The shipped product is a **native runtime** for a remix community: many authors
 making scenarios, subclasses, spells, items, and total conversions on a shared
-5e chassis, with nothing to install. This is a distribution and packaging
-concern layered on the kernel (§4.2); it adds no engine semantics.
+5e chassis, played through one small player installed once. This is a
+distribution and packaging concern layered on the kernel (§4.2); it adds no
+engine semantics.
 
-**The web target.** The logic core compiles to WASM as a library. Presentation
-is a swappable client (§4.2): a single **hand-written Canvas2D renderer** for
-both development and the shipped product, behind the frozen PICO-8-sized
-presentation interface (below). No native (raylib) backend and no WebGL (Pixi)
-backend — Canvas2D alone, which the arithmetic below shows is ample at the
-StarCraft-1 ceiling (decided 2026-07-21). The core re-solves per
-action, not per frame, so the JS↔WASM boundary is crossed rarely and carries a
-subscription delta (§11 M2), not per-frame traffic — the inspector's reactive
-channel and the WASM marshalling seam are the same `world_subscribe` payload.
+**A cart is data, and everything executable is per-PLATFORM** (decided
+2026-08-16). Space is answered by platform providers (§5.6), presentation is a
+projection of the world (the infeasible cart, below), and the engine is C. What
+is left of a game is a `.story` file plus assets — so the install-once,
+run-anything console shape is not a packaging preference but the shape the
+kernel already has. Three deliverables follow:
+
+- the **runtime** — one player, installed once, running any cart; the creator
+  and remixer artifact;
+- a **per-cart export** — the same engine statically linked around one cart,
+  no loader and nothing fetched, for players and for stores;
+- a **browser backend**, if it ever earns its way back *as a backend* under the
+  frozen presentation interface (below) rather than as a parallel codebase.
+
+Two properties follow that bound the design elsewhere: a 64-bit address space,
+which matters when identity is already the majority of a laned world's footprint
+(§8.1), and an authoring story that is the author's own editor plus `story-lsp`
+(§9) rather than an in-application one.
+
+**The runtime target.** The logic core is a C library linked into the runtime
+directly — no marshalling layer between the world and the client that draws it.
+Presentation is a swappable client (§4.2): one **hand-written 2D renderer** per
+platform behind the frozen PICO-8-sized presentation interface (below), with no
+scene graph, shader stack or UI toolkit above it — the arithmetic below shows a
+plain 2D blitter is ample at the StarCraft-1 ceiling (decided 2026-07-21). The
+core re-solves per action, not per frame, so a client reads a **subscription
+delta** (§11 M2) rather than polling — the inspector's reactive channel and any
+out-of-process client's payload are the same `world_subscribe` data.
 
 **Compiler as a library over an IR.** Parsing and semantic analysis are
 separate stages: the parser emits a declaration IR; the analysis and grounding
 passes (§5.2, §5.8) consume that IR and never depend on the tokenizer. The
-analyzer therefore runs at native build time *or* in-browser at load — the
-property that keeps in-browser authoring (no build step) possible.
+analyzer therefore runs at build time *or* at load inside the runtime — the
+property that keeps content buildless, with no compile step between editing a
+`.story` and playing it.
 **Compilation is deterministic** — I4 extends to the compile step — so two
 peers grounding the same source obtain the identical theory. That is a
 lockstep-multiplayer correctness requirement, not merely cache hygiene.
@@ -2945,7 +2966,10 @@ construction. Compiled-only artifacts are never distributed.
 **Artifacts: reference the shared substrate, embed only at a self-sufficient
 leaf.** Three layers:
 
-- **Engine** (WASM): shared, hash-identified, optionally signed for provenance.
+- **Engine**: the runtime binary and the C source it is built from — shared,
+  hash-identified, optionally signed for provenance. A per-cart export inlines
+  this layer and the next into one file; it is the same two artifacts with the
+  reference resolved at build time rather than at load.
 - **Game / content pack**: `.story` source + assets + a manifest (id, author,
   version, `requires`), shipped as one container and referencing the engine by
   hash. Mods and total conversions are one artifact at different sizes (§6.4):
@@ -2961,6 +2985,19 @@ leaf.** Three layers:
   (never judgments — I1) is an optional load-time cache:
   nearest-checkpoint-plus-replay-the-tail.
 
+**How a cart reaches a player.** Two paths, and they are the first two
+deliverables above. A creator or remixer installs the runtime once and opens carts in it, so
+the association that matters is the **file extension**, not a URL scheme — an
+install-and-update client of the kind the indie storefronts already ship is
+exactly this flow, and it comes with scripted publishing and an audience that
+overlaps the customer (§11). A player who just wants the game gets a **per-cart
+export**: engine and cart statically linked, nothing fetched, nothing to
+install beside it. That export is also what makes closed platforms tractable —
+the store rules that constrain user-generated content attach to code *arriving
+after review*, and an export ships its `.story` inside the bundle, so nothing
+does. Source ships in both paths (above): a packaged build sells convenience,
+never exclusivity of the content.
+
 **The durability line.** The target artifact property is the 90s one: a
 shipped game that still runs and is still remixable in ten years. What
 actually survived that era — Doom WADs, Z-machine story files, the SCUMM
@@ -2970,22 +3007,23 @@ against the data format (source ports, Frotz, ScummVM). The kernel already
 has this shape: content is declarative data through a vetted interpreter
 (above), the save is `(engine-hash, game-hash, action-log)`, and I4 replay
 is the Doom-demo property — a playthrough reproduces exactly on any
-conforming engine. What rots on the web, ranked worst-first:
+conforming engine. What rots, ranked worst-first:
 
 1. **Anything fetched at runtime** — CDNs, servers, load-time packages —
    dies in years. The one-container artifact already forbids it: vendor
    everything, no exceptions.
 2. **Build toolchains** — the remixability killer; a ten-year-old
    dependency tree does not install. Discipline: **nothing in the artifact
-   requires a build step**. Content is already buildless (in-browser
-   analysis, above); host code's shipped, authoritative form is plain ES
-   modules that run as-is. Typed generated bindings (§6.3) and any
-   transpiled authoring layer are dev-time *views*, never required to run
-   or remix — the source-authoritative rule applied to the host layer.
-3. **Browser API deprecation** — low; the web's compat promise is the
-   strongest in computing. Canvas2D is effectively frozen; WebGL is
-   low-but-nonzero (the WebGPU transition); WASM is a small spec'd ISA
-   with multiple independent implementations, and the engine's C source
+   requires a build step**. Content is already buildless (load-time
+   analysis, above), and where a cart carries glue at all its shipped,
+   authoritative form is source that runs as-is. Typed generated bindings
+   (§6.3) and any transpiled authoring layer are dev-time *views*, never
+   required to run or remix — the source-authoritative rule applied to
+   whatever sits above `world_*`.
+3. **Platform API drift** — the OS windowing, input and audio surfaces a
+   backend sits on (and the browser's, for a browser backend). Bounded by
+   construction: a backend is one thin implementation of a frozen op set,
+   so drift prices a port and never reaches content. The engine's C source
    ships regardless, so the interpreter is rebuildable — the ScummVM
    escape hatch, held open on purpose.
 4. **Library abandonment** — smallest, and commonly misranked first. A
@@ -2995,15 +3033,15 @@ conforming engine. What rots on the web, ranked worst-first:
    the in-genre exhibit: a backend is the upstream's to remove, and what
    you vendored is what you keep.)
 
-The line itself: **below** it, durable by construction — the WASM engine
-(plus its C source), `.story` source and the interface artifact with their
-versioned serializations, the save format, buildless host JS against
-`world_*`, and the presentation interface (next). **Above** it,
-acknowledged mortal and cheaply replaceable — renderer implementations,
-DOM chrome, the platform site. The rule: the mortal layer reaches the
-durable one only through spec'd surfaces, so a platform break is a port of
-one thin implementation, never per-game surgery. Both disciplines are
-cheap now and unretrofittable in year eight.
+The line itself: **below** it, durable by construction — the engine's C source
+and the runtime built from it, `.story` source and the interface artifact with
+their versioned serializations, the save format, and the presentation interface
+(next). **Above** it, acknowledged mortal and cheaply replaceable — backend
+implementations, the window and OS chrome around them, the installer and the
+store pages. The rule: the mortal layer reaches the durable one only through
+spec'd surfaces, so a platform break is a port of one thin implementation, never
+per-game surgery. Both disciplines are cheap now and unretrofittable in year
+eight.
 
 **The presentation interface: PICO-8-sized, and frozen.** §4.2 makes
 presentation a swappable client; this fixes the *size* of the swap
@@ -3028,35 +3066,37 @@ splits into game pixels and suspiciously sharp text. The
 graphics ceiling is **StarCraft 1** (decided): 640×480-class palettized
 sprites at RTS scale. Nothing in the surface may assume more.
 
-- **The reference renderer is hand-written Canvas2D** — a few hundred
-  dependency-free lines, below the line. The arithmetic is ample even at
-  the ceiling: SC1 is a tile layer plus a few hundred animated sprites per
-  frame, software-rendered on 1998 CPUs; GPU-backed Canvas2D has orders of
-  magnitude more headroom. The sprite layer repaints per frame (movement
-  interpolation is presentation state); the tile layer pre-renders to an
-  offscreen canvas and repaints only when a subscription delta touches it
+- **The renderer is a hand-written 2D blitter** — a few hundred
+  dependency-free lines per backend, below the line. The arithmetic is ample
+  even at the ceiling: SC1 is a tile layer plus a few hundred animated sprites
+  per frame, software-rendered on 1998 CPUs; any GPU-backed 2D path today has
+  orders of magnitude more headroom. The sprite layer repaints per frame
+  (movement interpolation is presentation state); the tile layer pre-renders to
+  an offscreen surface and repaints only when a subscription delta touches it
   — for the static world, the delta stream is the repaint schedule. SC1's
   signature effects need no shaders: player colors are pre-baked recolored
   atlas variants (an asset-pipeline product, not a renderer op — the op
   set stays small), cloaking is the alpha op, fog of war is the composite
-  op over dithered overlay tiles. What Canvas2D cannot do (per-pixel
+  op over dithered overlay tiles. What a 2D blitter cannot do (per-pixel
   lighting, shaders, thousands of blended particles) is above the ceiling
   by decision: the constraint and the art direction agree.
-- **Canvas2D is the only renderer** (decided 2026-07-21) — no WebGL/Pixi
-  backend and no native raylib backend. Pixi would be a *vendored dependency
-  above* the durability line bought to gain performance the arithmetic here
-  says we do not need at the SC1 ceiling; a native renderer would be a second
-  platform to keep alive. One dependency-free renderer below the line is both
-  the more durable choice and the smaller surface to freeze.
-- **What keeps the interface honest without a second renderer.** The old
-  argument was that two live renderers prove the interface is small (the role
-  M2's trivial second client plays for `world_*`, §4.2). With one renderer that
-  proof falls to two other things: the op-set is frozen small *by construction*
-  (a dozen ops), and the eventual optional **native player** (§13) — a
-  preservation/offline runtime implementing those same ops over the same cart —
-  is the second backend that demonstrates portability if and when it is built.
-  Day-one honesty is the discipline of the frozen op-set, and the
-  weekend-rewritability of the Canvas2D renderer is still the evidence that the
+- **One renderer per platform, and no toolkit under it** (decided 2026-07-21) —
+  no scene graph, no shader stack, no retained-mode UI library. Such a
+  dependency would sit *above* the durability line and be bought to gain
+  performance the arithmetic here says we do not need at the SC1 ceiling. One
+  dependency-free 2D renderer below the line is both the more durable choice
+  and the smaller surface to freeze; the platform layer beneath it (window,
+  input, audio) is the only thing a port replaces.
+- **What keeps the interface honest.** Two live *display* backends would prove
+  the interface is small (the role M2's trivial second client plays for
+  `world_*`, §4.2), and the shipped runtime has one. The proof therefore falls
+  to two other things: the op-set is frozen small *by construction* (a couple
+  of dozen ops, listed below), and the **headless backend** implements exactly
+  that list with no drawing in it at all, which is what makes the freeze
+  mechanically checkable rather than aspirational (`platform_check`'s
+  correspondence check, below). A browser backend, if it is ever built, is the
+  second display implementation and demonstrates portability then; the
+  weekend-rewritability of any one backend is the standing evidence that the
   op-set is small enough to port.
 - **Learnability is the same property.** A PICO-8-sized draw model is
   learnable in an afternoon, which is what the remix community needs from
@@ -3064,12 +3104,12 @@ sprites at RTS scale. Nothing in the surface may assume more.
   decision.
 - **Input, audio and persistence are frozen here too, and each is frozen
   for a determinism reason rather than an aesthetic one.** Freezing the draw
-  ops alone does not make a cart portable: the moment content reaches for
-  `addEventListener`, Web Audio or `localStorage`, the optional native player
-  (§13) stops implementing a dozen ops and starts reimplementing a browser,
-  and the weekend-sized claim above is gone. All three sit *inside* the
-  presentation interface, below the durability line, and nothing outside it is
-  reachable from a cart.
+  ops alone does not make a cart portable: the moment content reaches for a
+  raw event API, a platform audio stack or a host storage API, a second backend
+  stops implementing a dozen ops and starts reimplementing whichever platform
+  the first one happened to sit on, and the weekend-sized claim above is gone.
+  All three sit *inside* the presentation interface, below the durability line,
+  and nothing outside it is reachable from a cart.
   - **The portable input model is focus + confirm** (decided). Pointer and
     keys are not universal: a gamepad has neither a position nor a keyboard,
     and a touchscreen has a position only while a finger is down, so it has
@@ -3225,8 +3265,9 @@ ever a fact. The consequences are the whole contract:
   declaration order, so a replay reproduces it exactly — a requirement for
   lockstep, rollback and the replay debugger, not a nicety.
 - *Flat, one crossing.* `world_emits` is a per-tick buffer of ground atom ids
-  the client reads through a typed-array view over WASM memory, exactly like
-  the delta — per step, never per atom.
+  the client reads in one go, exactly like the delta — per step, never per
+  atom. In-process that is a pointer; across any boundary a client is put
+  behind, it is one buffer rather than a call per cue.
 
 A cue is momentary, so its *condition* must be too: a ramification gated on
 `~alive'` alone fires every step thereafter, while one gated on
@@ -3238,10 +3279,10 @@ edges vs. levels, not a construct — the same distinction `btnp` draws against
 streams above are not merely *sufficient* for a client — they are the complete
 input to one, and that makes a stronger target reachable: a cart written
 entirely in `.story`, with no host code at all. The engine's loop reads the
-streams and drives video and audio from what they describe. Host JS becomes the
-escape hatch rather than the default, which is the right polarity for three
-separate reasons — a cart with no host code cannot rot, the offline player
-(§13) can run it without embedding a JS engine, and the remix on-ramp becomes
+streams and drives video and audio from what they describe. Host code becomes
+the escape hatch rather than the default, which is the right polarity for three
+separate reasons — a cart with no host code cannot rot, the runtime can run it
+with no script engine embedded at all (§13), and the remix on-ramp becomes
 "edit rules" instead of "edit rules and also learn the host API".
 
 The architecture that makes it factorable is the signalling split, and it is
@@ -3282,7 +3323,7 @@ own values between two positions it computed itself — the database says
 stealing whole: a transition interrupted mid-flight must restart from the
 current *interpolated* value or fast flips snap, and layout changes want
 FLIP — compute the new layout, then play the difference. One way the analogy
-runs in our favour: a browser's intermediate state is unobservable and
+runs in our favour: an animation's intermediate state is unobservable and
 unrecoverable, whereas tick states here are exact, so scrubbing a replay lands
 on a known state and the tween simply restarts. Declarative animation and time
 travel do not fight, which they would if motion were stored.
@@ -3604,8 +3645,8 @@ subscribed cone:
   client hold" is a subscription set; "which conclusions can it see" is a
   demand cone (§4.1). The client receives its `world_subscribe` delta
   stream and proposes actions through the do-port — the two-port kernel API
-  is already a client-server protocol shape, and the network seam is the
-  same payload as the WASM marshalling seam and the inspector channel
+  is already a client-server protocol shape, and the network seam carries the
+  same payload as an out-of-process client's and the inspector channel
   (above): one seam, three consumers. MMO interest management /
   area-of-interest is, in this vocabulary, a demand cone whose visibility
   predicate is fed by a spatial provider.
@@ -3623,7 +3664,7 @@ subscribed cone:
   cone lies inside the visible set — a static property of the dependency
   graph against the visibility interface. The compiler classifies every
   judgment client-predictable (cone ⊆ subscribed interface) or server-only;
-  the generated typed JS binding can type them differently. "What feels instant vs.
+  a generated typed binding can type them differently. "What feels instant vs.
   what waits for the server" becomes a compile-time report, not a QA
   discovery. The §5.3 dry-run query is the evaluation primitive prediction
   needs.
@@ -3635,8 +3676,10 @@ subscribed cone:
   concurrently; a client's subscription follows its avatar's sector;
   handoff is a resubscribe.
 
-**Trust is containment, not credentials.** Untrusted content runs in a
-WASM + sandboxed-iframe cage with a minimal import surface; that is the whole
+**Trust is containment, not credentials.** A cart gets **no ambient authority**
+— no filesystem, no network, no process spawn — and the presentation interface
+is the entire surface it can reach; where a cart carries glue at all, that glue
+runs in an embedded engine with only those ops imported. That is the whole
 security posture. The real safety property is that content is declarative data
 run through a vetted interpreter, not arbitrary code. Engine signing is
 optional provenance/UX (a verified-creator badge, unknown signers warned by
@@ -3690,15 +3733,14 @@ semantics. Names are working names.
   (`rose`/`fell`, entities whose verdict changed this tick — the `btnp` to
   level's `btn`). The loop **decides from these cached tables, never by
   re-querying** — safe because state is constant within a tick (I2); `query`/
-  `why` demote to one-shot reads and diagnostics. Across the WASM/JS split the
-  engine cannot poke a JS object in place, so a judgment table is a **typed-array
-  view over WASM linear memory**: the engine solves and writes its own memory, JS
-  reads through a zero-copy view (genuinely in place — one buffer), and edges
-  arrive as a compact delta buffer the engine writes and JS reads once, crossing
-  the boundary **once per step**, not per entry (the `world_subscribe` delta
-  seam). Internals stay packed bitvectors for the solve; exposed columns unpack
-  to byte columns for cheap reads (`memory.grow` detaches views, so JS rebuilds
-  them after a grow). The frame is
+  `why` demote to one-shot reads and diagnostics. A judgment table is therefore
+  a **column the engine owns and the client reads in place**: the engine solves
+  and writes its own memory, the client reads it zero-copy, and edges arrive as
+  one compact delta buffer read once per step rather than per entry (the
+  `world_subscribe` delta seam). In-process that is a pointer and the property
+  is free; behind any boundary a client is put behind, it is what keeps the
+  crossing **once per step**. Internals stay packed bitvectors for the solve;
+  exposed columns unpack to byte columns for cheap reads. The frame is
   **update → resolve → draw**: read tables and submit actions in update, resolve
   (a step) yields the next tick, draw renders it — so the player sees the
   consequence the same frame, and the displayed tick is exactly what the next
@@ -3712,12 +3754,13 @@ semantics. Names are working names.
   "rule" that declares rather than runs), misleading exactly the junior/remix
   audience the durability+learnability target serves. Keeping authoring in
   `.story` also keeps the host surface small — the same size argument as the
-  presentation interface above. The host language is **JS/ES modules** (decided
-  2026-07-21 with browser-primary, below); the session's PICO-8/Lua framing was
-  inspiration for the *shape* (small API, buildless, learnable), which is
-  language-neutral and ported unchanged. JS is not self-limiting the way Lua
-  was, so the minimalism is imposed by a deliberately small host API, not the
-  language.
+  presentation interface above. The loop itself belongs to the **runtime**, not
+  to the cart: a pure cart (below) carries no host code at all, so the question
+  of what language a cart's *optional* glue is written in — and therefore
+  whether the runtime embeds a script engine for it — is open (§13). Whatever
+  answers it, the PICO-8/Lua framing supplies the *shape* (small API, buildless,
+  learnable), which is language-neutral; the minimalism is imposed by a
+  deliberately small host API rather than by the language.
 - *Non-goal: speculative solve as a decision mechanism.* A "what-if future"
   query (run a step without committing, to decide from a predicted state) is
   rejected as a core primitive: it invites authors to move behavior out of rules
@@ -3728,35 +3771,43 @@ semantics. Names are working names.
   Genuine adversarial lookahead is out-of-scope host-side planning on a minimal
   pure-step primitive (the narrative-front-end rule: substrate, not kernel), not
   needed by the customer.
-- *Runtime and distribution (decided 2026-07-21).* **Browser-primary.** The
-  platform is a website — zero-friction discovery, instant play, in-place fork,
-  share-by-URL — which is what a remix community (§12) runs on; the web is also
-  the strongest durability substrate (§12). A **cart is a self-contained,
-  downloadable, forkable artifact** (the §12 one-container HTML), so the
-  retro-collectible identity survives *inside* the browser model with no install.
-  The engine ships as **WASM with SIMD128** (Baseline in every major browser
-  since Safari 16.4, 2023); the solver's integer `v128.and/or/xor` are
-  deterministic across engines, so browser SIMD never threatens I4 — WASM-SIMD,
-  scalar, and native-AVX builds compute bit-identical results (pinned by the
-  golden tests and the `test_col` differential fuzz oracle). The core speed is
-  SWAR (64 entities per `i64` word), fully preserved; SIMD128 recovers 128-bit
-  vectorization; only the *wider* native AVX-256/512 is browser-unavailable — a
-  bounded 2–4× on the vectorizable loops that matters only at large N. A **native
-  player is an optional later runtime over the same cart format** (the
-  ScummVM/source-port shape §12 blesses), where AVX returns for the RTS ceiling,
-  preservation, or offline. Same cart, two runtimes, two perf envelopes; results
-  identical by construction.
-- *Presentation is a frozen op-set, not Canvas.* Carts draw against the
-  **PICO-8-sized frozen presentation interface** (§12: ~a dozen ops — atlas/tile
-  blit, sprite with flip+alpha, text, primitives, one composite for fog/vision),
-  **never raw Canvas2D**. Canvas2D is the reference (and only shipped) *backend*;
-  the eventual optional native player (below) would be a second backend with
-  its own renderer — not raylib, and not a second shipped web renderer. A native app therefore does **not** reimplement the Canvas API — it
-  implements the dozen ops, which §12 already banks on being weekend-sized (the
-  smallness *is* the durability proof). Corollary of the JS host: the native
-  player must **embed a JS engine** (e.g. QuickJS) to run cart glue — the mirror
-  of "a Lua cart would need a Lua VM in the browser"; deferred with the native
-  player, cheap for an embeddable engine.
+- *Runtime and distribution (decided 2026-08-16).* **Native-primary.** The
+  product is a runtime installed once, and a **cart is a self-contained,
+  forkable artifact** (§12) that runs in it — the console model, which is what
+  the kernel's own shape already is once providers and presentation are
+  per-platform rather than per-game. Five things decide it against a browser
+  platform: a cart is *data*, so nothing about it wants a page; the JS platform
+  layer is the last per-game-shaped executable in the tree and the same
+  "per-PLATFORM, not per-game" argument that moved providers into C applies to
+  it; wasm32's 4 GB ceiling is a real wall when identity already dominates a
+  laned world's footprint (§8.1), which the ~1.5–2× speed gap is not; the
+  authoring answer is `story-lsp` (§9) plus the editor an author already has,
+  which beats an in-page one; and engine HTML5 exports have a long record of
+  going unused where they are offered at all (Unreal removed its own in 4.24).
+  Discovery and sharing move to where a runtime already has them — an
+  install-and-update client, with the **file extension registered** rather than
+  a URL scheme (a protocol handler fails on the first click, before the app is
+  installed and with no reliable failure signal; Zoom's attempt to route around
+  the consent dialog with a hidden localhost server was force-removed by Apple
+  in 2019).
+  Source ships with every artifact regardless of channel (above), so selling a
+  packaged build never closes the content.
+  Performance follows the same inversion: the shipped build is **native, with
+  AVX available** for the vectorizable loops at the RTS ceiling; the core speed
+  is SWAR (64 entities per `i64` word) either way, and a WASM backend, if built,
+  recovers 128-bit vectors via SIMD128. The solver's integer `v128.and/or/xor`
+  are deterministic across engines, so a vector width never threatens I4 —
+  scalar, SIMD128 and native-AVX builds compute bit-identical results (pinned by
+  the golden tests and the `test_col` differential fuzz oracle). Same cart,
+  several backends, several perf envelopes; results identical by construction.
+- *Presentation is a frozen op-set, not a platform API.* Carts draw against the
+  **PICO-8-sized frozen presentation interface** (§12: a couple of dozen ops —
+  atlas/tile blit, sprite with flip+alpha, text, primitives, one composite for
+  fog/vision, plus focus, audio and persistence), **never a platform's own
+  drawing API**. The shipped backend is the runtime's hand-written 2D renderer;
+  a browser backend would be a second implementation of the same list, and would
+  not reimplement anything else. §12 banks on that list being weekend-sized —
+  the smallness *is* the durability proof.
 
 ## 13. Open questions
 
@@ -3851,6 +3902,33 @@ semantics. Names are working names.
   rather than sample — is open. Sampled assets are one more thing an
   offline player must decode; a tiny synth spec is more to freeze but
   decodes to nothing. Decide with the asset pipeline.
+- **Cart glue, and therefore whether the runtime embeds a script engine**
+  (§12). A *pure* cart carries no host code at all — presentation is a
+  projection of the world, and the runtime supplies the loop — so the runtime
+  needs no script engine to run one. A cart that wants glue needs a language,
+  and a native runtime can only offer one by embedding an engine (QuickJS-sized,
+  cheap in itself). The question is not the language but whether the seam should
+  exist: an embeddable engine is a vendored dependency, a second thing a
+  re-implementer must supply, and a place for per-game code to accumulate in a
+  product whose whole claim is that a cart is data. Decide with the first cart
+  that genuinely cannot be expressed as a pure one — and treat that cart as
+  evidence about the *language* first (a missing `.story` construct), not as
+  evidence for the seam. If it is added: glue gets only the frozen ops, may not
+  touch facts except by submitting actions, and runs above the tick boundary, so
+  I4 is unaffected by construction.
+- **The console backend seam must be a source-and-build boundary** (§12).
+  Console platform SDKs are under NDA and cannot appear in a public tree, so the
+  layer beneath the frozen ops has to be replaceable *out of tree at build
+  time*. A runtime plugin interface would be the obvious factoring and is the
+  wrong one — it breaks the statically-linked per-cart export, which is what
+  makes a cart shippable to a store without a UGC obligation attaching. This
+  constrains how the backend is factored now, not at port time.
+- **What would let a browser backend earn its way back** (§12). The bar is that
+  it is a *backend* under the frozen presentation interface and nothing else: no
+  parallel cart format, no second host language, no per-game code, and the same
+  save and interface artifacts byte-for-byte. Its standing constraint is
+  wasm32's address space against §8.1's footprint, which decides *which* carts
+  it can host rather than whether it may exist.
 - **Server-authoritative riders** (§12): reconciliation semantics when a
   client-predicted judgment is contradicted by the authoritative delta
   (presentation-side rollback — but the boundary needs stating);
