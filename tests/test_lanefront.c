@@ -65,10 +65,30 @@ static const variant VARIANTS[] = {
       "    * (7 + test(resist_fire(T)) * (1 - test(vuln_fire(T))) * (7 / 2 - 7)\n"
       "         + test(vuln_fire(T)) * (1 - test(resist_fire(T))) * 7)\n", true },
 
+    /* a step rule gated on a derived JUDGMENT (#261). The verdict is queried
+     * per lane from the settled judgment layer and injected as a read-only
+     * column, so this shape lanes — which is what makes the crowd-scale
+     * modelling expressible: a pairwise interaction that grounds N^2 as a
+     * 2-var action is affordable as a judgment plus a per-unit effect. */
     { "judgment guard",
       "rule res(X: unit): resist_fire(X) => mitigated(X)\n"
       "action hurt(T: unit): requires ~mitigated(T)\n"
-      "    causes hp(T) -= 7\n", false },
+      "    causes hp(T) -= 7\n", true },
+
+    /* the same import read POSITIVELY, and by a ramification rather than an
+     * action — the shape bench_slice's reference uses (engage-proved units
+     * take damage) and the one #261 exists for */
+    { "judgment-gated ramification",
+      "rule res(X: unit): resist_fire(X) => mitigated(X)\n"
+      "action hurt(T: unit): causes on_fire(T)\n"
+      "rule bleed(X: unit): mitigated(X) causes hp(X) -= 3\n", true },
+
+    /* a judgment that depends on ANOTHER judgment: the import must read the
+     * settled layer, not a half-solved one */
+    { "chained judgment import",
+      "rule res(X: unit): resist_fire(X) => mitigated(X)\n"
+      "rule tough(X: unit): mitigated(X) & ~vuln_fire(X) => hardened(X)\n"
+      "action hurt(T: unit): requires ~hardened(T) causes hp(T) -= 7\n", true },
 
     { "accumulator + primed read",
       "rule zf(X: unit): on causes inc_fire(X) := 0\n"
