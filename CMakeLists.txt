@@ -48,6 +48,9 @@ add_library(infeasible_core STATIC
   src/platform/platform.c
   src/platform/headless.c
   src/runtime/runtime.c
+  src/runtime/iface.c
+  src/runtime/scene.c
+  src/runtime/purecart.c
   src/lang/dbound.c
   src/lsp/json.c
   src/lsp/lsp.c
@@ -58,14 +61,14 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 enable_testing()
-foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse test_scene test_bands test_clamp test_setparam test_domain test_sortunion test_intargs test_functional test_store test_fnprovider test_ground test_mv test_numeric test_numpipe test_numeff test_ramif test_prov test_lanes test_binder test_numlane test_binderlane test_judgstep test_provider test_roster test_provgen test_provjoin test_stockgrid test_hexgrid test_safety test_cardinality test_spatial test_factindex test_dbound test_matcher test_ticktime test_selectivity test_dlcol_incr test_locstable test_matchview test_sparsejfam test_sparseuniverse test_lazyq test_inits test_model test_lsp test_div test_value test_enumarg test_merge test_exprtest test_strata test_layers test_modeled test_kinds test_reaction test_split test_taxonomy test_taxprobe test_partial test_conflict test_cycle test_excl test_matchwatch test_probe5e test_testlane test_lanefront test_emit test_steplog test_guards test_provtrace test_provfill test_iface test_subscribe test_secondclient test_actions test_platform test_examples)
+foreach(t IN ITEMS test_dl test_world test_multival test_landmark test_spawn test_col test_parse test_scene test_bands test_clamp test_setparam test_domain test_sortunion test_intargs test_functional test_store test_fnprovider test_ground test_mv test_numeric test_numpipe test_numeff test_ramif test_prov test_lanes test_binder test_numlane test_binderlane test_judgstep test_provider test_roster test_provgen test_provjoin test_stockgrid test_hexgrid test_safety test_cardinality test_spatial test_factindex test_dbound test_matcher test_ticktime test_selectivity test_dlcol_incr test_locstable test_matchview test_sparsejfam test_sparseuniverse test_lazyq test_inits test_model test_lsp test_div test_value test_enumarg test_merge test_exprtest test_strata test_layers test_modeled test_kinds test_reaction test_split test_taxonomy test_taxprobe test_partial test_conflict test_cycle test_excl test_matchwatch test_probe5e test_testlane test_lanefront test_emit test_steplog test_guards test_provtrace test_provfill test_iface test_subscribe test_secondclient test_actions test_platform test_purecart test_examples)
   add_executable(${t} tests/${t}.c)
   target_link_libraries(${t} PRIVATE infeasible_core)
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
 
 # These compile real .story files from the source tree; hand them the path.
-foreach(t IN ITEMS test_parse test_ground test_mv test_numeric test_numeff test_ramif test_binder test_provider test_spatial test_stockgrid test_hexgrid test_reaction test_taxprobe test_probe5e test_emit test_secondclient test_actions test_platform test_examples)
+foreach(t IN ITEMS test_parse test_ground test_mv test_numeric test_numeff test_ramif test_binder test_provider test_spatial test_stockgrid test_hexgrid test_reaction test_taxprobe test_probe5e test_emit test_secondclient test_actions test_platform test_purecart test_examples)
   target_compile_definitions(${t} PRIVATE
     STORY_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples")
 endforeach()
@@ -75,6 +78,44 @@ endforeach()
 # copied into two files is a freeze that drifts; this is what stops it.
 target_compile_definitions(test_platform PRIVATE
   WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")
+
+# THE PLAYER — the runtime installed once that runs any cart (DESIGN.md §12).
+#
+# The DISPLAY backend is a BUILD-TIME choice, never a runtime plugin: a
+# per-cart export is statically linked with no loader, and a console's platform
+# layer is under NDA and cannot appear in a public tree, so a port is one file
+# beside src/platform/backends/ plus one line here. The default build compiles
+# `none.c` and needs no window at all, which is why the whole test suite runs
+# headless.
+option(INF_SDL "Build the SDL3 display backend into the player" OFF)
+
+set(INF_DISPLAY_BACKEND src/platform/backends/none.c)
+if(INF_SDL)
+  find_path(SDL3_INCLUDE_DIR SDL3/SDL.h)
+  find_library(SDL3_LIBRARY NAMES SDL3)
+  if(NOT SDL3_INCLUDE_DIR OR NOT SDL3_LIBRARY)
+    message(FATAL_ERROR
+      "INF_SDL=ON but SDL3 was not found. Point cmake at it with "
+      "-DSDL3_INCLUDE_DIR=<dir containing SDL3/SDL.h> -DSDL3_LIBRARY=<libSDL3.so>")
+  endif()
+  set(INF_DISPLAY_BACKEND src/platform/backends/sdl3.c)
+endif()
+
+add_executable(infeasible src/player/main.c ${INF_DISPLAY_BACKEND})
+target_link_libraries(infeasible PRIVATE infeasible_core)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(infeasible PRIVATE -Wall -Wextra)
+endif()
+if(INF_SDL)
+  target_include_directories(infeasible PRIVATE ${SDL3_INCLUDE_DIR})
+  target_link_libraries(infeasible PRIVATE ${SDL3_LIBRARY})
+endif()
+
+# The player plays a cart headless in the default build, so "does the shipped
+# binary still run a story end to end" is a ctest question and not a manual one.
+add_test(NAME test_player
+         COMMAND infeasible ${CMAKE_CURRENT_SOURCE_DIR}/examples/cellar_pure.story
+                 --headless --ticks 8)
 
 # The native .story language server (DESIGN.md §6.1 item 7): JSON-RPC over
 # stdio, pushing compiler diagnostics to an editor. Not a test — a shipped
