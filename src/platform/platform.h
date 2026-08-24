@@ -143,6 +143,9 @@ bool plat_keyp(plat *p, const char *name);
 enum { PLAT_MAX_TARGETS = 64, PLAT_MAX_ID = 48 };
 typedef struct { const char *id; int x, y, w, h; } plat_target;
 
+/* The returned ids point at the platform's own storage and are valid only
+ * until the next `plat_focus_targets` — copy one to hold it across a tick, or
+ * a comparison against "what it was before" silently compares it with itself. */
 void        plat_focus_targets(plat *p, const plat_target *list, int n);
 const char *plat_focus_current(const plat *p);
 const char *plat_focus_confirmed(const plat *p);
