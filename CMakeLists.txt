@@ -79,6 +79,44 @@ endforeach()
 target_compile_definitions(test_platform PRIVATE
   WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")
 
+# THE PLAYER — the runtime installed once that runs any cart (DESIGN.md §12).
+#
+# The DISPLAY backend is a BUILD-TIME choice, never a runtime plugin: a
+# per-cart export is statically linked with no loader, and a console's platform
+# layer is under NDA and cannot appear in a public tree, so a port is one file
+# beside src/platform/backends/ plus one line here. The default build compiles
+# `none.c` and needs no window at all, which is why the whole test suite runs
+# headless.
+option(INF_SDL "Build the SDL3 display backend into the player" OFF)
+
+set(INF_DISPLAY_BACKEND src/platform/backends/none.c)
+if(INF_SDL)
+  find_path(SDL3_INCLUDE_DIR SDL3/SDL.h)
+  find_library(SDL3_LIBRARY NAMES SDL3)
+  if(NOT SDL3_INCLUDE_DIR OR NOT SDL3_LIBRARY)
+    message(FATAL_ERROR
+      "INF_SDL=ON but SDL3 was not found. Point cmake at it with "
+      "-DSDL3_INCLUDE_DIR=<dir containing SDL3/SDL.h> -DSDL3_LIBRARY=<libSDL3.so>")
+  endif()
+  set(INF_DISPLAY_BACKEND src/platform/backends/sdl3.c)
+endif()
+
+add_executable(infeasible src/player/main.c ${INF_DISPLAY_BACKEND})
+target_link_libraries(infeasible PRIVATE infeasible_core)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(infeasible PRIVATE -Wall -Wextra)
+endif()
+if(INF_SDL)
+  target_include_directories(infeasible PRIVATE ${SDL3_INCLUDE_DIR})
+  target_link_libraries(infeasible PRIVATE ${SDL3_LIBRARY})
+endif()
+
+# The player plays a cart headless in the default build, so "does the shipped
+# binary still run a story end to end" is a ctest question and not a manual one.
+add_test(NAME test_player
+         COMMAND infeasible ${CMAKE_CURRENT_SOURCE_DIR}/examples/cellar_pure.story
+                 --headless --ticks 8)
+
 # The native .story language server (DESIGN.md §6.1 item 7): JSON-RPC over
 # stdio, pushing compiler diagnostics to an editor. Not a test — a shipped
 # binary; the server logic is covered by test_lsp.

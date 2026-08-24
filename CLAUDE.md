@@ -18,6 +18,13 @@ cmake -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
 
+# The PLAYER, with a window (DESIGN.md §12): the SDL3 display backend is
+# opt-in, so nothing above ever needs one.
+cmake -B build-sdl -DINF_SDL=ON      # add -DSDL3_INCLUDE_DIR=… -DSDL3_LIBRARY=… if not found
+cmake --build build-sdl --target infeasible
+./build-sdl/infeasible examples/cellar_pure.story          # play it
+./build/infeasible examples/cellar_pure.story --headless --ticks 8   # the ctest form
+
 # A single test target:
 ctest --test-dir build -R test_dl --output-on-failure
 ./build/test_dl          # or run the binary directly; it prints "test_dl: all passed"
@@ -41,7 +48,7 @@ valgrind -q --track-origins=yes --error-exitcode=99 ./build/test_foo
 
 UBSan's `bool`/`enum` checks catch an uninitialised load only when the garbage byte is out of range — a byte that lands on 0 or 1 is a valid `bool` and passes while the program still depends on it. Memcheck catches it every time, and `--track-origins` names the ALLOCATION site rather than the read, which is where the fix goes. It found the #94 row-cap bug in both pure carts on its first run.
 
-Default build type is `Debug`; core compiles with `-Wall -Wextra` under **C17**. The native build carries the platform tier but **no display backend yet** — `headless` implements every frozen op and draws nothing, so nothing in CMake needs a window. The WASM/JS boundary is a separate build, not part of the CMake project:
+Default build type is `Debug`; core compiles with `-Wall -Wextra` under **C17**. The default build compiles the `none` display backend, so nothing in CMake needs a window and `test_player` plays a cart headless; `-DINF_SDL=ON` swaps in the SDL3 backend and the player opens a real one. The WASM/JS boundary is a separate build, not part of the CMake project:
 
 ```sh
 scripts/build_wasm.sh   # bootstraps a repo-local pinned emsdk, emits build-wasm/ (git-ignored)
@@ -65,7 +72,8 @@ src/state/   fact store, step function, inertia gen      (deps: core, logic)
 src/lang/    .story compiler: lexer → parse → grounder    (deps: core, state)
 src/lsp/     native .story language server (JSON-RPC/stdio)  (deps: core, lang)
 src/stock/   the platform's provider library: the grid, two topologies (deps: core, state)
-src/platform/ the §12 frozen presentation interface + headless backend (deps: core)
+src/platform/ the §12 frozen interface, headless + display backends (deps: core)
+src/player/  the player binary: compile a .story, open a display, play (deps: all)
 src/runtime/ the loop, the §6.3 artifact reader, the pure-cart renderer (deps: core, state, lang, platform)
 src/wasm/    emcc-only JS↔C shim over world_* (not in CMake)
 tests/       golden semantic tests + benchmarks (ctest)
@@ -115,6 +123,8 @@ A thin **VS Code client** lives in `editors/vscode/` (buildless CommonJS, matchi
 The §12 presentation interface, in C, and the loop over it. `spec.c` is the freeze as data — the op names (each carrying the OFFSET of its `plat_backend` slot, so the presence check walks a list rather than a hand-written sequence of NULL tests), the palette, the blessed resolutions, the two text cells, the key set as an index space (a tick's keyboard is one `uint64`, and edge detection is an AND-NOT), and the letterbox arithmetic **with its inverse**. `platform.c` assembles the cart-facing surfaces over a backend: draw validates and forwards, while input sampling, edge detection and focus navigation live below the line because they are what every cart would otherwise reimplement slightly differently. `headless.c` is a backend that records ops as text instead of drawing them — the honest second implementation, since a backend that implements every op with no drawing at all cannot accidentally depend on a display. There is no display backend yet.
 
 `runtime.c` is the two clocks: a TICK is one `world_step` with input sampled once at its boundary (I4), a FRAME is a repaint that can never change a fact, and the runtime never reads a clock — a driver decides when to step, which is the seat a network schedule takes for lockstep. The cart PROPOSES and the source DISPOSES: live, the proposal is what happens; replaying, the log decides and the proposal is discarded, which is what makes `rt_save` a save rather than a recording. The written form is the one `examples/cellar_play.log` uses, so a save this runtime writes is a save the other clients read — and `test_platform` closes that loop by replaying the log the browser cart produced by clicking and landing in the world `test_secondclient` asserts.
+
+**A DISPLAY BACKEND IS A BUILD-TIME CHOICE, never a runtime plugin** (`src/platform/display.h`): exactly one file implementing `display_open` is compiled in, chosen by CMake — `backends/none.c` by default, `backends/sdl3.c` under `-DINF_SDL=ON`, and a console's platform layer as a file dropped in beside them out of tree, because those SDKs are under NDA and a per-cart export is statically linked with no loader. SDL3 supplies window, input, gamepad and audio and nothing else; the letterbox INVERSE is computed with `spec_to_internal` rather than SDL's own, so a pointer lands on the same internal pixel on every backend. Glyphs are the backend's business (§12 freezes metrics, not shapes) — sdl3.c carries a 3x5 set stretched to the large cell — and a sheet it has never been given is drawn as a generated placeholder atlas, since the asset format is still open (§13). `infeasible --shot FILE` writes the last frame as a BMP: a backend that executes every op and paints nothing looks identical in an op log, and that is the only question that tells them apart.
 
 `scene.c` is the pure-cart renderer natively: it knows the blessed presentation vocabulary (`panel`, `caption`, `shows`, `in_anchor`, `gauge`, `cue_sound`, …) and asks the §6.3 artifact — read back by `iface.c` — which domains to cross to enumerate each one, so it has never heard of the game it is drawing. `purecart.c` is the driver and contains no game: it declares the scene's focus targets, submits the command the world offered, and prints the guard the engine says refused a greyed row. `test_purecart` plays `examples/cellar_pure.story` to completion **on `plat_focus` alone** — no pointer, no key, the way a console would — then replays the resulting log into a fresh world, and draws `examples/duel_pure.story` through the same code with no edit. **Do not teach `scene.c` a game word**; when it needs one, that is a language gap (§13), not a renderer feature.
 
